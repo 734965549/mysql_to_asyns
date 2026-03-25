@@ -658,8 +658,15 @@ function getStatusText(status) {
 
 // 计算进度
 function getProgress(task) {
-  if (!task.context.total_rows) return 0
-  return Math.round((task.context.processed_rows / task.context.total_rows) * 100)
+  // 防止除零错误
+  if (!task.context.total_rows || task.context.total_rows <= 0) {
+    return 0
+  }
+  // 防止 processed_rows 为负数或异常值
+  const processed = Math.max(0, task.context.processed_rows || 0)
+  // 计算百分比，并限制在 0-100 之间
+  const percent = (processed / task.context.total_rows) * 100
+  return Math.min(100, Math.max(0, Math.round(percent)))
 }
 
 // 监听同步级别变化
