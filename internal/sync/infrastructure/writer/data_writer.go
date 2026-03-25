@@ -22,9 +22,14 @@ type DataWriter interface {
 	Delete(ctx context.Context, row map[string]interface{}) error
 }
 
+// SQLExecutor SQL 执行器接口，*sql.DB 和 *sql.Conn 均满足
+type SQLExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
 // BatchWriter 批量写入器
 type BatchWriter struct {
-	db          *sql.DB
+	db          SQLExecutor
 	sqlBuilder  *SQLBuilder
 	batchSize   int
 	timeout     time.Duration
@@ -48,6 +53,27 @@ func NewBatchWriter(db *sql.DB, identity *entity.TableIdentity, batchSize int) *
 func NewBatchWriterWithSchema(db *sql.DB, identity *entity.TableIdentity, batchSize int, schema string) *BatchWriter {
 	return &BatchWriter{
 		db:         db,
+		sqlBuilder: NewSQLBuilderWithSchema(identity, schema),
+		batchSize:  batchSize,
+		timeout:    30 * time.Second,
+	}
+}
+
+// NewBatchWriterWithTx 创建使用事务的批量写入器（*sql.Tx 满足 SQLExecutor 接口）
+func NewBatchWriterWithTx(tx *sql.Tx, identity *entity.TableIdentity, batchSize int, schema string) *BatchWriter {
+	return &BatchWriter{
+		db:         tx,
+		sqlBuilder: NewSQLBuilderWithSchema(identity, schema),
+		batchSize:  batchSize,
+		timeout:    30 * time.Second,
+	}
+}
+
+// NewBatchWriterWithConn 创建使用固定连接的批量写入器
+// 使用固定连接可确保 SET SESSION 变量（如 FOREIGN_KEY_CHECKS=0）在整个写入过程中生效
+func NewBatchWriterWithConn(conn *sql.Conn, identity *entity.TableIdentity, batchSize int, schema string) *BatchWriter {
+	return &BatchWriter{
+		db:         conn,
 		sqlBuilder: NewSQLBuilderWithSchema(identity, schema),
 		batchSize:  batchSize,
 		timeout:    30 * time.Second,

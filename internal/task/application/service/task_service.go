@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mysql-to-async/internal/audit"
@@ -577,11 +578,9 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
 		}
 	}
 
-	// 初始化只读管理器
-	if s.readOnlyManager == nil {
-		s.readOnlyManager = readonly.NewReadOnlyManager(s.targetDB)
-		s.enableReadOnly = true
-	}
+	// 初始化只读管理器（每次都重新创建，确保使用新的数据库连接）
+	s.readOnlyManager = readonly.NewReadOnlyManager(s.targetDB)
+	s.enableReadOnly = true
 
 	return nil
 }
@@ -786,330 +785,500 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				}
 			}
 
-			dataReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
-			dataWriter := writer.NewBatchWriterWithSchema(s.targetDB, identity, task.Config.BatchSize, targetSchema)
-
-			if s.auditLogger != nil {
-				dataWriter.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
-			}
-
 			var tableProcessedRows int64
-			tableRowReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
-			totalRows, err := tableRowReader.GetTotalCount(ctx)
-			if err != nil {
-				errMsg := fmt.Sprintf("Failed to get total count for table %s: %v", tableName, err)
-				log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-				s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-				errChan <- err
-				return
-			}
+			batchSize := int64(task.Config.BatchSize)
+			const txCommitEveryN = 20 // 每 20 批 commit 一次，平衡事务大小与 commit 开销
 
-			log.Printf("[Task %s] Table %s.%s has %d total rows, starting parallel sync", taskID, sourceSchema, tableName, totalRows)
+			// === 策略检测 ===
+			canParallelRange := identity.Strategy != entity.FullColumnsStrategy &&
+				len(identity.IdentifyCols) == 1 &&
+				workerCount > 1 &&
+				isNumericPKColumn(identity, identity.IdentifyCols[0])
 
-			// 计算分片数量：每个worker负责一部分数据
-			// 限制每个分片至少处理 10万行，避免分片过小
-			chunkSize := int64(100000)
-			if totalRows < chunkSize {
-				chunkSize = totalRows
-			}
-			chunkCount := (totalRows + chunkSize - 1) / chunkSize
+			canParallelSample := !canParallelRange &&
+				identity.Strategy != entity.FullColumnsStrategy &&
+				len(identity.IdentifyCols) == 1 &&
+				workerCount > 1
 
-			// 限制最大分片数为 workerCount，避免创建过多goroutine
-			if chunkCount > int64(workerCount) {
-				chunkSize = totalRows / int64(workerCount)
-				chunkCount = int64(workerCount)
-			}
-
-			log.Printf("[Task %s] Table %s.%s will be split into %d chunks, each ~%d rows",
-				taskID, sourceSchema, tableName, chunkCount, chunkSize)
-
-			// 使用分片并行处理
-			if identity.Strategy == entity.FullColumnsStrategy {
-				// 无主键表：按offset分片
-				batchSize := int64(task.Config.BatchSize)
-
-				var syncWg sync.WaitGroup
-				syncErrChan := make(chan error, chunkCount)
-
-				for chunkIndex := int64(0); chunkIndex < chunkCount; chunkIndex++ {
-					syncWg.Add(1)
-					go func(chunkIdx int64) {
-						defer syncWg.Done()
-
-						chunkStart := chunkIdx * chunkSize
-						chunkEnd := chunkStart + chunkSize
-						if chunkEnd > totalRows {
-							chunkEnd = totalRows
-						}
-
-						chunkReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
-						chunkWriter := writer.NewBatchWriterWithSchema(s.targetDB, identity, task.Config.BatchSize, targetSchema)
-						if s.auditLogger != nil {
-							chunkWriter.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
-						}
-
-						offset := chunkStart
-						for offset < chunkEnd {
-							if s.isTaskStopped(taskID) {
-								return
-							}
-
-							// 计算本次读取的批次大小
-							readSize := chunkEnd - offset
-							if readSize > batchSize {
-								readSize = batchSize
-							}
-
-							rows, err := chunkReader.ReadBatch(ctx, offset, readSize)
-							if err != nil {
-								errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` chunk %d at offset %d: %v",
-									sourceSchema, tableName, chunkIdx, offset, err)
-								log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-								syncErrChan <- fmt.Errorf("%s", errMsg)
-								return
-							}
-							if len(rows) == 0 {
-								break
-							}
-							if err := chunkWriter.WriteBatch(ctx, rows); err != nil {
-								errMsg := fmt.Sprintf("Failed to write batch for `%s`.`%s` chunk %d at offset %d: %v",
-									sourceSchema, tableName, chunkIdx, offset, err)
-								log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-								syncErrChan <- fmt.Errorf("%s", errMsg)
-								return
-							}
-							offset += int64(len(rows))
-							s.incrementTaskProgress(taskID, int64(len(rows)), fmt.Sprintf("%s.%s:chunk%d:%d", sourceSchema, tableName, chunkIdx, offset))
-						}
-
-						log.Printf("[Task %s] Chunk %d of table %s.%s completed (%d-%d rows)",
-							taskID, chunkIdx, sourceSchema, tableName, chunkStart, chunkEnd)
-					}(chunkIndex)
+			var minPK, maxPK int64
+			if canParallelRange {
+				if err := s.sourceDB.QueryRowContext(ctx,
+					fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
+						identity.IdentifyCols[0], identity.IdentifyCols[0], sourceSchema, tableName),
+				).Scan(&minPK, &maxPK); err != nil || maxPK < minPK {
+					canParallelRange = false
+					canParallelSample = identity.Strategy != entity.FullColumnsStrategy &&
+						len(identity.IdentifyCols) == 1 && workerCount > 1
+					log.Printf("[Task %s] Cannot get numeric PK range for %s.%s, trying sample parallel", taskID, sourceSchema, tableName)
 				}
+			}
 
-				syncWg.Wait()
-				close(syncErrChan)
+			var sampleBoundaries []interface{}
+			if canParallelSample {
+				var totalRows int64
+				if qErr := s.sourceDB.QueryRowContext(ctx,
+					fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", sourceSchema, tableName),
+				).Scan(&totalRows); qErr != nil || totalRows < int64(workerCount)*2 {
+					canParallelSample = false
+					log.Printf("[Task %s] Skipping sample parallel for %s.%s", taskID, sourceSchema, tableName)
+				} else {
+					var bErr error
+					sampleBoundaries, bErr = s.samplePKBoundaries(ctx, sourceSchema, tableName, identity.IdentifyCols[0], totalRows, workerCount)
+					if bErr != nil {
+						canParallelSample = false
+						log.Printf("[Task %s] Boundary sampling failed for %s.%s: %v", taskID, sourceSchema, tableName, bErr)
+					}
+				}
+			}
 
-				if err := <-syncErrChan; err != nil {
+			// === 执行同步 ===
+			if identity.Strategy == entity.FullColumnsStrategy {
+				// 无主键表：单协程流式读取 + 事务批量提交
+				conn, err := s.targetDB.Conn(ctx)
+				if err != nil {
+					errMsg := fmt.Sprintf("Failed to get write connection for %s: %v", tableName, err)
+					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 					errChan <- err
 					return
 				}
-			} else {
-				// 有主键表：需要先获取所有分片的主键范围，然后并行处理
-				batchSize := int64(task.Config.BatchSize)
+				defer func() {
+					conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
+					conn.Close()
+				}()
+				conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
 
-				// 第一步：获取所有分片的主键范围
-				type chunkRange struct {
-					startID interface{}
-					endID   interface{}
-				}
-				chunkRanges := make([]chunkRange, 0, chunkCount)
-
-				// 使用百分位点计算分片
-				for i := int64(0); i < chunkCount; i++ {
-					percent := float64(i+1) / float64(chunkCount)
-					var chunkID interface{}
-
-					if len(identity.IdentifyCols) == 1 {
-						// 单主键
-						var id interface{}
-						err := s.sourceDB.QueryRow(
-							fmt.Sprintf("SELECT MIN(%s) FROM (SELECT %s FROM `%s`.`%s` WHERE (%s >= (SELECT MIN(%s) FROM `%s`.`%s`)) LIMIT 1 OFFSET ?) t",
-								identity.IdentifyCols[0], identity.IdentifyCols[0],
-								sourceSchema, tableName, identity.IdentifyCols[0], identity.IdentifyCols[0],
-								sourceSchema, tableName),
-							int(float64(totalRows)*percent/100-1),
-						).Scan(&id)
-						if err != nil {
-							log.Printf("[Task %s] Warning: Failed to get chunk %d boundary, using sequential", taskID, i)
-							chunkRanges = nil
-							break
-						}
-						chunkID = id
-					} else {
-						// 复合主键：使用百分位点
-						query := fmt.Sprintf("SELECT * FROM `%s`.`%s` LIMIT 1 OFFSET ?", sourceSchema, tableName)
-						rows, err := s.sourceDB.Query(query, int(float64(totalRows)*percent/100)-1)
-						if err != nil {
-							log.Printf("[Task %s] Warning: Failed to get chunk %d boundary for composite PK, using sequential", taskID, i)
-							chunkRanges = nil
-							rows.Close()
-							break
-						}
-
-						if !rows.Next() {
-							rows.Close()
-							chunkRanges = nil
-							break
-						}
-
-						cols, _ := rows.Columns()
-						vals := make([]interface{}, len(cols))
-						valPtrs := make([]interface{}, len(cols))
-						for i := range vals {
-							valPtrs[i] = &vals[i]
-						}
-						rows.Scan(valPtrs...)
-						rows.Close()
-
-						// 提取主键值
-						pkVals := make([]interface{}, len(identity.IdentifyCols))
-						for i, col := range identity.IdentifyCols {
-							for j, c := range cols {
-								if c == col {
-									pkVals[i] = vals[j]
-									break
-								}
-							}
-						}
-						chunkID = pkVals
+				var curTx *sql.Tx
+				var txW *writer.BatchWriter
+				var txBatchN int
+				var txStartMark string
+				defer func() {
+					if curTx != nil {
+						curTx.Rollback()
 					}
-
-					if i == 0 {
-						chunkRanges = append(chunkRanges, chunkRange{startID: nil, endID: chunkID})
-					} else {
-						chunkRanges = append(chunkRanges, chunkRange{
-							startID: chunkRanges[len(chunkRanges)-1].endID,
-							endID:   chunkID,
-						})
+				}()
+				doWrite := func(rows []map[string]interface{}, mark string) error {
+					if curTx == nil {
+						var e error
+						curTx, e = conn.BeginTx(ctx, nil)
+						if e != nil {
+							return fmt.Errorf("begin tx at %s: %v", mark, e)
+						}
+						txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+						if s.auditLogger != nil {
+							txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+						}
+						txBatchN = 0
+						txStartMark = mark
 					}
+					if e := txW.WriteBatch(ctx, rows); e != nil {
+						curTx.Rollback()
+						curTx = nil
+						return fmt.Errorf("write at %s (tx from %s) rolled back: %v", mark, txStartMark, e)
+					}
+					txBatchN++
+					if txBatchN >= txCommitEveryN {
+						if e := curTx.Commit(); e != nil {
+							curTx = nil
+							return fmt.Errorf("commit at %s (tx from %s): %v", mark, txStartMark, e)
+						}
+						curTx = nil
+					}
+					return nil
 				}
 
-				// 如果无法计算分片，回退到串行处理
-				if len(chunkRanges) == 0 {
-					log.Printf("[Task %s] Unable to calculate chunk ranges, falling back to sequential sync", taskID)
-					var lastID interface{}
-					for {
-						if s.isTaskStopped(taskID) {
-							return
-						}
-						rows, err := dataReader.ReadBatchByKeys(ctx, lastID, batchSize)
-						if err != nil {
-							errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
-							log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-							s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-							errChan <- err
-							return
-						}
-						if len(rows) == 0 {
-							break
-						}
-						if err := dataWriter.WriteBatch(ctx, rows); err != nil {
-							errMsg := fmt.Sprintf("Failed to write batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
-							log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-							s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-							errChan <- err
-							return
-						}
-						tableProcessedRows += int64(len(rows))
-						lastRow := rows[len(rows)-1]
-						pkCols := identity.IdentifyCols
-						if len(pkCols) == 1 {
-							lastID = lastRow[pkCols[0]]
-						} else {
-							vals := make([]interface{}, len(pkCols))
-							for i, col := range pkCols {
-								vals[i] = lastRow[col]
-							}
-							lastID = vals
-						}
-						s.incrementTaskProgress(taskID, int64(len(rows)), fmt.Sprintf("%s.%s:%v", sourceSchema, tableName, lastID))
+				dr := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+				for {
+					if s.isTaskStopped(taskID) {
+						return
 					}
-				} else {
-					// 并行处理每个分片
-					var syncWg sync.WaitGroup
-					syncErrChan := make(chan error, len(chunkRanges))
-
-					for chunkIdx, chunk := range chunkRanges {
-						syncWg.Add(1)
-						go func(idx int, r chunkRange) {
-							defer syncWg.Done()
-
-							chunkReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
-							chunkWriter := writer.NewBatchWriterWithSchema(s.targetDB, identity, task.Config.BatchSize, targetSchema)
-							if s.auditLogger != nil {
-								chunkWriter.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
-							}
-
-							lastID := r.startID
-							endID := r.endID
-
-							for {
-								if s.isTaskStopped(taskID) {
-									return
-								}
-
-								rows, err := chunkReader.ReadBatchByKeys(ctx, lastID, batchSize)
-								if err != nil {
-									errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` chunk %d via keyset: %v",
-										sourceSchema, tableName, idx, err)
-									log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-									syncErrChan <- fmt.Errorf("%s", errMsg)
-									return
-								}
-								if len(rows) == 0 {
-									break
-								}
-
-								// 检查是否超出分片范围
-								lastRow := rows[len(rows)-1]
-								var exceeded bool
-								if len(identity.IdentifyCols) == 1 {
-									pkVal := lastRow[identity.IdentifyCols[0]]
-									if endID != nil && compareIDs(pkVal, endID) > 0 {
-										exceeded = true
-									}
-								} else {
-									// 复合主键：检查是否超出范围
-									endIDSlice, ok := endID.([]interface{})
-									if ok {
-										for i, col := range identity.IdentifyCols {
-											val := lastRow[col]
-											if i < len(endIDSlice) && compareIDs(val, endIDSlice[i]) > 0 {
-												exceeded = true
-												break
-											}
-										}
-									}
-								}
-
-								if exceeded {
-									break
-								}
-
-								if err := chunkWriter.WriteBatch(ctx, rows); err != nil {
-									errMsg := fmt.Sprintf("Failed to write batch for `%s`.`%s` chunk %d via keyset: %v",
-										sourceSchema, tableName, idx, err)
-									log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-									syncErrChan <- fmt.Errorf("%s", errMsg)
-									return
-								}
-
-								lastRow = rows[len(rows)-1]
-								pkCols := identity.IdentifyCols
-								if len(pkCols) == 1 {
-									lastID = lastRow[pkCols[0]]
-								} else {
-									vals := make([]interface{}, len(pkCols))
-									for i, col := range pkCols {
-										vals[i] = lastRow[col]
-									}
-									lastID = vals
-								}
-								s.incrementTaskProgress(taskID, int64(len(rows)), fmt.Sprintf("%s.%s:chunk%d:%v", sourceSchema, tableName, idx, lastID))
-							}
-
-							log.Printf("[Task %s] Chunk %d of table %s.%s completed", taskID, idx, sourceSchema, tableName)
-						}(chunkIdx, chunk)
-					}
-
-					syncWg.Wait()
-					close(syncErrChan)
-
-					if err := <-syncErrChan; err != nil {
+					rows, err := dr.ReadBatch(ctx, 0, batchSize)
+					if err != nil {
+						errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s`: %v", sourceSchema, tableName, err)
+						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 						errChan <- err
 						return
 					}
+					if len(rows) == 0 {
+						break
+					}
+					mark := fmt.Sprintf("%s.%s:%d", sourceSchema, tableName, tableProcessedRows+int64(len(rows)))
+					if err := doWrite(rows, mark); err != nil {
+						errMsg := fmt.Sprintf("Write failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
+						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						errChan <- err
+						return
+					}
+					tableProcessedRows += int64(len(rows))
+					s.incrementTaskProgress(taskID, int64(len(rows)), mark)
+				}
+				if curTx != nil {
+					if err := curTx.Commit(); err != nil {
+						errMsg := fmt.Sprintf("Final commit failed for `%s`.`%s` (from %s): %v", sourceSchema, tableName, txStartMark, err)
+						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						errChan <- err
+						return
+					}
+					curTx = nil
+				}
+
+			} else if canParallelRange {
+				// 数字单列主键：表内并行范围读写 + 每 worker 独立事务批量提交
+				log.Printf("[Task %s] Table %s.%s: parallel range sync PK=[%d,%d] workers=%d",
+					taskID, sourceSchema, tableName, minPK, maxPK, workerCount)
+				rangeSize := (maxPK - minPK + int64(workerCount)) / int64(workerCount)
+				var syncWg sync.WaitGroup
+				syncErrChan := make(chan error, workerCount)
+				var atomicProcessed int64
+
+				for w := 0; w < workerCount; w++ {
+					syncWg.Add(1)
+					go func(wIdx int) {
+						defer syncWg.Done()
+						rangeStart := minPK + int64(wIdx)*rangeSize
+						rangeEnd := rangeStart + rangeSize
+						if wIdx == workerCount-1 {
+							rangeEnd = maxPK + 1
+						}
+						conn, err := s.targetDB.Conn(ctx)
+						if err != nil {
+							syncErrChan <- fmt.Errorf("w%d conn: %v", wIdx, err)
+							return
+						}
+						conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
+						defer func() {
+							conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
+							conn.Close()
+						}()
+
+						var curTx *sql.Tx
+						var txW *writer.BatchWriter
+						var txBatchN int
+						var txStartMark string
+						defer func() {
+							if curTx != nil {
+								curTx.Rollback()
+							}
+						}()
+						doWrite := func(rows []map[string]interface{}, mark string) error {
+							if curTx == nil {
+								var e error
+								curTx, e = conn.BeginTx(ctx, nil)
+								if e != nil {
+									return fmt.Errorf("w%d begin tx at %s: %v", wIdx, mark, e)
+								}
+								txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+								if s.auditLogger != nil {
+									txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+								}
+								txBatchN = 0
+								txStartMark = mark
+							}
+							if e := txW.WriteBatch(ctx, rows); e != nil {
+								curTx.Rollback()
+								curTx = nil
+								return fmt.Errorf("w%d write at %s (tx from %s) rolled back: %v", wIdx, mark, txStartMark, e)
+							}
+							txBatchN++
+							if txBatchN >= txCommitEveryN {
+								if e := curTx.Commit(); e != nil {
+									curTx = nil
+									return fmt.Errorf("w%d commit at %s (tx from %s): %v", wIdx, mark, txStartMark, e)
+								}
+								curTx = nil
+							}
+							return nil
+						}
+
+						wReader := reader.NewRangeShardingReader(s.sourceDB, sourceSchema, tableName, identity)
+						for batchStart := rangeStart; batchStart < rangeEnd; {
+							if s.isTaskStopped(taskID) {
+								return
+							}
+							batchEnd := batchStart + batchSize
+							if batchEnd > rangeEnd {
+								batchEnd = rangeEnd
+							}
+							batchRows, err := wReader.ReadBatch(ctx, batchStart, batchEnd)
+							if err != nil {
+								syncErrChan <- fmt.Errorf("w%d read [%d,%d): %v", wIdx, batchStart, batchEnd, err)
+								return
+							}
+							if len(batchRows) > 0 {
+								mark := fmt.Sprintf("%s.%s:w%d:[%d,%d)", sourceSchema, tableName, wIdx, batchStart, batchEnd)
+								if err := doWrite(batchRows, mark); err != nil {
+									syncErrChan <- err
+									return
+								}
+								n := int64(len(batchRows))
+								atomic.AddInt64(&atomicProcessed, n)
+								s.incrementTaskProgress(taskID, n, mark)
+							}
+							batchStart = batchEnd
+						}
+						if curTx != nil {
+							if err := curTx.Commit(); err != nil {
+								syncErrChan <- fmt.Errorf("w%d final commit (from %s): %v", wIdx, txStartMark, err)
+								curTx = nil
+								return
+							}
+							curTx = nil
+						}
+					}(w)
+				}
+				syncWg.Wait()
+				close(syncErrChan)
+				if err := <-syncErrChan; err != nil {
+					errMsg := fmt.Sprintf("Parallel range sync failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
+					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+					errChan <- err
+					return
+				}
+				tableProcessedRows = atomic.LoadInt64(&atomicProcessed)
+
+			} else if canParallelSample {
+				// 字符串单列主键：采样边界 + 表内并行 keyset + 每 worker 独立事务批量提交
+				pkCol := identity.IdentifyCols[0]
+				log.Printf("[Task %s] Table %s.%s: parallel sample sync pk=%s workers=%d",
+					taskID, sourceSchema, tableName, pkCol, workerCount)
+				var syncWg sync.WaitGroup
+				syncErrChan := make(chan error, workerCount)
+				var atomicProcessed int64
+
+				for w := 0; w < workerCount; w++ {
+					syncWg.Add(1)
+					go func(wIdx int) {
+						defer syncWg.Done()
+						// sampleBoundaries[i] = 第 i+1 个 worker 的起始 key（前一 worker 的最后 key，exclusive）
+						var startBoundary, endBoundary interface{}
+						if wIdx > 0 {
+							startBoundary = sampleBoundaries[wIdx-1]
+						}
+						if wIdx < workerCount-1 {
+							endBoundary = sampleBoundaries[wIdx]
+						}
+
+						conn, err := s.targetDB.Conn(ctx)
+						if err != nil {
+							syncErrChan <- fmt.Errorf("w%d conn: %v", wIdx, err)
+							return
+						}
+						conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
+						defer func() {
+							conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
+							conn.Close()
+						}()
+
+						var curTx *sql.Tx
+						var txW *writer.BatchWriter
+						var txBatchN int
+						var txStartMark string
+						defer func() {
+							if curTx != nil {
+								curTx.Rollback()
+							}
+						}()
+						doWrite := func(rows []map[string]interface{}, mark string) error {
+							if curTx == nil {
+								var e error
+								curTx, e = conn.BeginTx(ctx, nil)
+								if e != nil {
+									return fmt.Errorf("w%d begin tx at %s: %v", wIdx, mark, e)
+								}
+								txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+								if s.auditLogger != nil {
+									txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+								}
+								txBatchN = 0
+								txStartMark = mark
+							}
+							if e := txW.WriteBatch(ctx, rows); e != nil {
+								curTx.Rollback()
+								curTx = nil
+								return fmt.Errorf("w%d write at %s (tx from %s) rolled back: %v", wIdx, mark, txStartMark, e)
+							}
+							txBatchN++
+							if txBatchN >= txCommitEveryN {
+								if e := curTx.Commit(); e != nil {
+									curTx = nil
+									return fmt.Errorf("w%d commit at %s (tx from %s): %v", wIdx, mark, txStartMark, e)
+								}
+								curTx = nil
+							}
+							return nil
+						}
+
+						wReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+						lastID := startBoundary
+						for {
+							if s.isTaskStopped(taskID) {
+								return
+							}
+							batchRows, err := wReader.ReadBatchByKeys(ctx, lastID, batchSize)
+							if err != nil {
+								syncErrChan <- fmt.Errorf("w%d read after %v: %v", wIdx, lastID, err)
+								return
+							}
+							if len(batchRows) == 0 {
+								break
+							}
+							// 非最后一个 worker：裁剪超出 endBoundary 的行
+							if endBoundary != nil {
+								endStr := fmt.Sprintf("%v", endBoundary)
+								cutIdx := len(batchRows)
+								for j, row := range batchRows {
+									if fmt.Sprintf("%v", row[pkCol]) > endStr {
+										cutIdx = j
+										break
+									}
+								}
+								batchRows = batchRows[:cutIdx]
+							}
+							if len(batchRows) == 0 {
+								break
+							}
+							lastRowPK := batchRows[len(batchRows)-1][pkCol]
+							mark := fmt.Sprintf("%s.%s:w%d:pk=%v", sourceSchema, tableName, wIdx, lastRowPK)
+							if err := doWrite(batchRows, mark); err != nil {
+								syncErrChan <- err
+								return
+							}
+							n := int64(len(batchRows))
+							atomic.AddInt64(&atomicProcessed, n)
+							s.incrementTaskProgress(taskID, n, mark)
+							lastID = lastRowPK
+							if endBoundary != nil && fmt.Sprintf("%v", lastRowPK) >= fmt.Sprintf("%v", endBoundary) {
+								break
+							}
+						}
+						if curTx != nil {
+							if err := curTx.Commit(); err != nil {
+								syncErrChan <- fmt.Errorf("w%d final commit (from %s): %v", wIdx, txStartMark, err)
+								curTx = nil
+								return
+							}
+							curTx = nil
+						}
+					}(w)
+				}
+				syncWg.Wait()
+				close(syncErrChan)
+				if err := <-syncErrChan; err != nil {
+					errMsg := fmt.Sprintf("Parallel sample sync failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
+					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+					errChan <- err
+					return
+				}
+				tableProcessedRows = atomic.LoadInt64(&atomicProcessed)
+
+			} else {
+				// 复合主键/回退：Keyset Pagination 顺序读取 + 事务批量提交
+				conn, err := s.targetDB.Conn(ctx)
+				if err != nil {
+					errMsg := fmt.Sprintf("Failed to get write connection for %s: %v", tableName, err)
+					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+					errChan <- err
+					return
+				}
+				defer func() {
+					conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
+					conn.Close()
+				}()
+				conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
+
+				var curTx *sql.Tx
+				var txW *writer.BatchWriter
+				var txBatchN int
+				var txStartMark string
+				defer func() {
+					if curTx != nil {
+						curTx.Rollback()
+					}
+				}()
+				doWrite := func(rows []map[string]interface{}, mark string) error {
+					if curTx == nil {
+						var e error
+						curTx, e = conn.BeginTx(ctx, nil)
+						if e != nil {
+							return fmt.Errorf("begin tx at %s: %v", mark, e)
+						}
+						txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+						if s.auditLogger != nil {
+							txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+						}
+						txBatchN = 0
+						txStartMark = mark
+					}
+					if e := txW.WriteBatch(ctx, rows); e != nil {
+						curTx.Rollback()
+						curTx = nil
+						return fmt.Errorf("write at %s (tx from %s) rolled back: %v", mark, txStartMark, e)
+					}
+					txBatchN++
+					if txBatchN >= txCommitEveryN {
+						if e := curTx.Commit(); e != nil {
+							curTx = nil
+							return fmt.Errorf("commit at %s (tx from %s): %v", mark, txStartMark, e)
+						}
+						curTx = nil
+					}
+					return nil
+				}
+
+				dr := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+				var lastID interface{}
+				for {
+					if s.isTaskStopped(taskID) {
+						return
+					}
+					rows, err := dr.ReadBatchByKeys(ctx, lastID, batchSize)
+					if err != nil {
+						errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
+						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						errChan <- err
+						return
+					}
+					if len(rows) == 0 {
+						break
+					}
+					lastRow := rows[len(rows)-1]
+					pkCols := identity.IdentifyCols
+					if len(pkCols) == 1 {
+						lastID = lastRow[pkCols[0]]
+					} else {
+						vals := make([]interface{}, len(pkCols))
+						for i, col := range pkCols {
+							vals[i] = lastRow[col]
+						}
+						lastID = vals
+					}
+					mark := fmt.Sprintf("%s.%s:%v", sourceSchema, tableName, lastID)
+					if err := doWrite(rows, mark); err != nil {
+						errMsg := fmt.Sprintf("Write failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
+						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						errChan <- err
+						return
+					}
+					tableProcessedRows += int64(len(rows))
+					s.incrementTaskProgress(taskID, int64(len(rows)), mark)
+				}
+				if curTx != nil {
+					if err := curTx.Commit(); err != nil {
+						errMsg := fmt.Sprintf("Final commit failed for `%s`.`%s` (from %s): %v", sourceSchema, tableName, txStartMark, err)
+						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						errChan <- err
+						return
+					}
+					curTx = nil
 				}
 			}
 
@@ -1309,29 +1478,59 @@ func extractTableDefinition(createSQL string) string {
 	return createSQL[startIdx:]
 }
 
-// compareIDs 比较两个ID值，返回 -1, 0, 1
-func compareIDs(id1, id2 interface{}) int {
-	// 处理 nil 值
-	if id1 == nil && id2 == nil {
-		return 0
-	}
-	if id1 == nil {
-		return -1
-	}
-	if id2 == nil {
-		return 1
-	}
+// samplePKBoundaries 并行采样 N-1 个边界值，将 PK 空间分成 n 段供 n 个 worker 使用
+// boundaries[i] 是第 i+1 个 worker 的起始 key（exclusive），前一 worker 的最后 key（inclusive）
+func (s *TaskService) samplePKBoundaries(ctx context.Context, schema, table, pkCol string, totalRows int64, n int) ([]interface{}, error) {
+	boundaries := make([]interface{}, n-1)
+	errs := make([]error, n-1)
+	var wg sync.WaitGroup
 
-	// 将两个值都转换为字符串进行比较
-	str1 := fmt.Sprintf("%v", id1)
-	str2 := fmt.Sprintf("%v", id2)
-
-	if str1 < str2 {
-		return -1
-	} else if str1 > str2 {
-		return 1
+	for i := 1; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			offset := totalRows*int64(idx)/int64(n) - 1
+			if offset < 0 {
+				offset = 0
+			}
+			var pk interface{}
+			err := s.sourceDB.QueryRowContext(ctx,
+				fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` LIMIT 1 OFFSET ?",
+					pkCol, schema, table, pkCol),
+				offset,
+			).Scan(&pk)
+			if err != nil {
+				errs[idx-1] = fmt.Errorf("boundary %d (offset %d): %v", idx, offset, err)
+				return
+			}
+			if b, ok := pk.([]byte); ok {
+				pk = string(b)
+			}
+			boundaries[idx-1] = pk
+		}(i)
 	}
-	return 0
+	wg.Wait()
+
+	for _, e := range errs {
+		if e != nil {
+			return nil, e
+		}
+	}
+	return boundaries, nil
+}
+
+// isNumericPKColumn 检查单列主键是否为整数类型（支持表内并行范围分片）
+func isNumericPKColumn(identity *entity.TableIdentity, pkCol string) bool {
+	for _, col := range identity.Columns {
+		if col.Name == pkCol {
+			switch strings.ToLower(col.DataType) {
+			case "int", "bigint", "tinyint", "smallint", "mediumint":
+				return true
+			}
+			return false
+		}
+	}
+	return false
 }
 
 // isTaskStopped 检查任务是否已停止
