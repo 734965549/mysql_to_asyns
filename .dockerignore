@@ -1,0 +1,51 @@
+# Binaries
+mysql-to-async
+mysql-to-async.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Node modules (frontend)
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Logs and data (will be mounted as volumes)
+data/
+logs/
+*.log
+
+# Documentation
+*.md
+!README.md
+
+# Development files
+Makefile
+OPTIMIZATION_CHECKLIST.md
+P0_OPTIMIZATION_REPORT.md
+P1_OPTIMIZATION_REPORT.md

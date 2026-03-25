@@ -1,0 +1,8 @@
+{
+  "name": "sync-users-blogs",
+  "source_schema": "test",
+  "target_schema": "test_target",
+  "tables": ["users", "blogs"],
+  "mode": "full",
+  "batch_size": 100
+}

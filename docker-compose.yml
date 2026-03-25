@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  # MySQL源数据库
+  mysql-source:
+    image: mysql:8.0
+    container_name: mysql-source
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: source_db
+      MYSQL_USER: sync_user
+      MYSQL_PASSWORD: sync_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-source-data:/var/lib/mysql
+      - ./docker/mysql-source/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: 
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --server-id=1
+    networks:
+      - mysql-sync-network
+
+  # MySQL目标数据库
+  mysql-target:
+    image: mysql:8.0
+    container_name: mysql-target
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: target_db
+      MYSQL_USER: sync_user
+      MYSQL_PASSWORD: sync_password
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-target-data:/var/lib/mysql
+    networks:
+      - mysql-sync-network
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: mysql-sync-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - mysql-sync-network
+
+  # MySQL-to-Async应用
+  app:
+    build: .
+    container_name: mysql-to-async
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./etc:/app/etc
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
+    depends_on:
+      - mysql-source
+      - mysql-target
+      - redis
+    networks:
+      - mysql-sync-network
+    restart: unless-stopped
+
+volumes:
+  mysql-source-data:
+  mysql-target-data:
+  redis-data:
+
+networks:
+  mysql-sync-network:
+    driver: bridge

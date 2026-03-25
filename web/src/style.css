@@ -1,0 +1,104 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ========================================
+   全局强制覆盖 Arco Design 菜单样式
+   确保侧边栏菜单按钮固定颜色、不闪烁
+   ======================================== */
+
+/* 菜单项默认状态 - 强制透明背景 */
+.arco-menu-light.arco-menu .arco-menu-item,
+.arco-menu-light .arco-menu-item,
+.arco-menu .arco-menu-item,
+.sider-menu .arco-menu-item {
+  background: transparent !important;
+  background-color: transparent !important;
+  color: #fff !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  animation: none !important;
+  transition: none !important;
+}
+
+/* 菜单项选中状态 - 强制透明背景 */
+.arco-menu-light.arco-menu .arco-menu-item.arco-menu-selected,
+.arco-menu-light .arco-menu-item.arco-menu-selected,
+.arco-menu .arco-menu-item.arco-menu-selected,
+.sider-menu .arco-menu-item.arco-menu-selected {
+  background: rgba(255, 255, 255, 0.25) !important;
+  background-color: rgba(255, 255, 255, 0.25) !important;
+  color: #fff !important;
+}
+
+/* 菜单项悬停状态 - 强制透明背景 */
+.arco-menu-light.arco-menu .arco-menu-item:hover,
+.arco-menu-light .arco-menu-item:hover,
+.arco-menu .arco-menu-item:hover,
+.sider-menu .arco-menu-item:hover {
+  background: rgba(255, 255, 255, 0.15) !important;
+  background-color: rgba(255, 255, 255, 0.15) !important;
+  color: #fff !important;
+}
+
+/* 菜单inner容器 */
+.arco-menu-inner {
+  opacity: 1 !important;
+  animation: none !important;
+  transition: none !important;
+}
+
+/* 菜单项图标 */
+.arco-menu-item .arco-menu-icon {
+  opacity: 1 !important;
+  visibility: visible !important;
+  color: #fff !important;
+}
+
+/* 菜单项文字 */
+.arco-menu-item .arco-menu-title {
+  opacity: 1 !important;
+  visibility: visible !important;
+  color: #fff !important;
+}
+
+/* 强制显示折叠菜单的内容 */
+.arco-menu-pop .arco-menu-item,
+.arco-menu-pop .arco-menu-title,
+.arco-menu-pop .arco-menu-icon {
+  opacity: 1 !important;
+}
+
+/* 确保菜单不被隐藏 */
+.arco-menu-collapsed .arco-menu-item {
+  opacity: 1 !important;
+}
+
+.arco-menu-collapsed .arco-menu-title {
+  display: inline !important;
+  opacity: 1 !important;
+}
+
+/* 强制覆盖Arco Design内联样式 */
+.arco-menu-item[style*="background"] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+.arco-menu-selected[style*="background"] {
+  background: rgba(255, 255, 255, 0.25) !important;
+  background-color: rgba(255, 255, 255, 0.25) !important;
+}

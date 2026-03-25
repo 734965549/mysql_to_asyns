@@ -1,0 +1,22 @@
+# 最小配置示例 - 启动时不需要配置数据库
+# 数据库配置将在创建同步任务时动态提供
+
+[http]
+  host = "127.0.0.1"
+  port = 8081
+
+[datasource]
+  debug = true
+
+[log]
+  level = "debug"
+
+[log.console]
+  enable = true
+  no_color = false
+
+[log.file]
+  enable = true
+
+# 不配置数据库和Redis，启动时不会验证连接
+# 数据库信息将在创建任务时通过API传入

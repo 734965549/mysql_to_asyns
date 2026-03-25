@@ -1,0 +1,42 @@
+[http]
+  # HTTP服务Host
+  host = "127.0.0.1"
+  # HTTP服务端口
+  port = 8081
+
+[datasource]
+  # 源数据库配置（可选 - 如果创建任务时不指定，将使用此默认值）
+  provider = "mysql"
+  # host = "192.168.139.143"
+  # port = 3306
+  # database = "test"
+  # username = "root"
+  # password = "123456"
+  debug = true
+
+[log]
+  # 日志的级别, 默认Debug
+  level = "debug"
+
+[log.console]
+  enable = true
+  no_color = false
+
+[log.file]
+  # 是否开启文件记录
+  enable = true
+
+[target]
+  # 目标数据库配置（可选 - 如果创建任务时不指定，将使用此默认值）
+  # host = "192.168.139.143"
+  # port = 3306
+  # database = "test_target"
+  # username = "root"
+  # password = "123456"
+
+[redis]
+  # Redis配置（可选 - 用于保存Checkpoint位点，如果不配置则使用内存）
+  # host = "127.0.0.1"
+  # port = 6379
+  # password = ""
+  # db = 0
