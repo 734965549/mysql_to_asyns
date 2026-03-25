@@ -764,9 +764,15 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				return
 			}
 
+			// 确保目标表存在，如果失败则停止同步
 			if err := s.ensureTargetTable(sourceSchema, targetSchema, tableName, identity); err != nil {
-				log.Printf("[Task %s] Warning: Failed to ensure target table: %v", taskID, err)
+				errMsg := fmt.Sprintf("Failed to ensure target table %s.%s: %v", targetSchema, tableName, err)
+				s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+				errChan <- fmt.Errorf("%s", errMsg)
+				return
 			}
+
+			log.Printf("[Task %s] Target table %s.%s is ready", taskID, targetSchema, tableName)
 
 			var savedIndexes []map[string]interface{}
 			if task.Config.OptimizeIndex {
@@ -788,75 +794,322 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			}
 
 			var tableProcessedRows int64
+			tableRowReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+			totalRows, err := tableRowReader.GetTotalCount(ctx)
+			if err != nil {
+				errMsg := fmt.Sprintf("Failed to get total count for table %s: %v", tableName, err)
+				log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+				s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+				errChan <- err
+				return
+			}
 
+			log.Printf("[Task %s] Table %s.%s has %d total rows, starting parallel sync", taskID, sourceSchema, tableName, totalRows)
+
+			// 计算分片数量：每个worker负责一部分数据
+			// 限制每个分片至少处理 10万行，避免分片过小
+			chunkSize := int64(100000)
+			if totalRows < chunkSize {
+				chunkSize = totalRows
+			}
+			chunkCount := (totalRows + chunkSize - 1) / chunkSize
+
+			// 限制最大分片数为 workerCount，避免创建过多goroutine
+			if chunkCount > int64(workerCount) {
+				chunkSize = totalRows / int64(workerCount)
+				chunkCount = int64(workerCount)
+			}
+
+			log.Printf("[Task %s] Table %s.%s will be split into %d chunks, each ~%d rows",
+				taskID, sourceSchema, tableName, chunkCount, chunkSize)
+
+			// 使用分片并行处理
 			if identity.Strategy == entity.FullColumnsStrategy {
+				// 无主键表：按offset分片
 				batchSize := int64(task.Config.BatchSize)
-				offset := int64(0)
-				for {
-					if s.isTaskStopped(taskID) {
-						return
-					}
-					rows, err := dataReader.ReadBatch(ctx, offset, batchSize)
-					if err != nil {
-						errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` at offset %d: %v", sourceSchema, tableName, offset, err)
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-						errChan <- err
-						return
-					}
-					if len(rows) == 0 {
-						break
-					}
-					if err := dataWriter.WriteBatch(ctx, rows); err != nil {
-						errMsg := fmt.Sprintf("Failed to write batch for `%s`.`%s` at offset %d: %v", sourceSchema, tableName, offset, err)
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-						errChan <- err
-						return
-					}
-					tableProcessedRows += int64(len(rows))
-					offset += batchSize
-					s.incrementTaskProgress(taskID, int64(len(rows)), fmt.Sprintf("%s.%s:%d", sourceSchema, tableName, offset))
+
+				var syncWg sync.WaitGroup
+				syncErrChan := make(chan error, chunkCount)
+
+				for chunkIndex := int64(0); chunkIndex < chunkCount; chunkIndex++ {
+					syncWg.Add(1)
+					go func(chunkIdx int64) {
+						defer syncWg.Done()
+
+						chunkStart := chunkIdx * chunkSize
+						chunkEnd := chunkStart + chunkSize
+						if chunkEnd > totalRows {
+							chunkEnd = totalRows
+						}
+
+						chunkReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+						chunkWriter := writer.NewBatchWriterWithSchema(s.targetDB, identity, task.Config.BatchSize, targetSchema)
+						if s.auditLogger != nil {
+							chunkWriter.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+						}
+
+						offset := chunkStart
+						for offset < chunkEnd {
+							if s.isTaskStopped(taskID) {
+								return
+							}
+
+							// 计算本次读取的批次大小
+							readSize := chunkEnd - offset
+							if readSize > batchSize {
+								readSize = batchSize
+							}
+
+							rows, err := chunkReader.ReadBatch(ctx, offset, readSize)
+							if err != nil {
+								errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` chunk %d at offset %d: %v",
+									sourceSchema, tableName, chunkIdx, offset, err)
+								log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+								syncErrChan <- fmt.Errorf("%s", errMsg)
+								return
+							}
+							if len(rows) == 0 {
+								break
+							}
+							if err := chunkWriter.WriteBatch(ctx, rows); err != nil {
+								errMsg := fmt.Sprintf("Failed to write batch for `%s`.`%s` chunk %d at offset %d: %v",
+									sourceSchema, tableName, chunkIdx, offset, err)
+								log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+								syncErrChan <- fmt.Errorf("%s", errMsg)
+								return
+							}
+							offset += int64(len(rows))
+							s.incrementTaskProgress(taskID, int64(len(rows)), fmt.Sprintf("%s.%s:chunk%d:%d", sourceSchema, tableName, chunkIdx, offset))
+						}
+
+						log.Printf("[Task %s] Chunk %d of table %s.%s completed (%d-%d rows)",
+							taskID, chunkIdx, sourceSchema, tableName, chunkStart, chunkEnd)
+					}(chunkIndex)
+				}
+
+				syncWg.Wait()
+				close(syncErrChan)
+
+				if err := <-syncErrChan; err != nil {
+					errChan <- err
+					return
 				}
 			} else {
+				// 有主键表：需要先获取所有分片的主键范围，然后并行处理
 				batchSize := int64(task.Config.BatchSize)
-				var lastID interface{}
-				for {
-					if s.isTaskStopped(taskID) {
-						return
-					}
-					rows, err := dataReader.ReadBatchByKeys(ctx, lastID, batchSize)
-					if err != nil {
-						errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-						errChan <- err
-						return
-					}
-					if len(rows) == 0 {
-						break
-					}
-					if err := dataWriter.WriteBatch(ctx, rows); err != nil {
-						errMsg := fmt.Sprintf("Failed to write batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-						errChan <- err
-						return
-					}
-					tableProcessedRows += int64(len(rows))
-					lastRow := rows[len(rows)-1]
-					pkCols := identity.IdentifyCols
-					if len(pkCols) == 1 {
-						lastID = lastRow[pkCols[0]]
-					} else {
-						// 复合主键：收集所有 PK 列的值
-						vals := make([]interface{}, len(pkCols))
-						for i, col := range pkCols {
-							vals[i] = lastRow[col]
+
+				// 第一步：获取所有分片的主键范围
+				type chunkRange struct {
+					startID interface{}
+					endID   interface{}
+				}
+				chunkRanges := make([]chunkRange, 0, chunkCount)
+
+				// 使用百分位点计算分片
+				for i := int64(0); i < chunkCount; i++ {
+					percent := float64(i+1) / float64(chunkCount)
+					var chunkID interface{}
+
+					if len(identity.IdentifyCols) == 1 {
+						// 单主键
+						var id interface{}
+						err := s.sourceDB.QueryRow(
+							fmt.Sprintf("SELECT MIN(%s) FROM (SELECT %s FROM `%s`.`%s` WHERE (%s >= (SELECT MIN(%s) FROM `%s`.`%s`)) LIMIT 1 OFFSET ?) t",
+								identity.IdentifyCols[0], identity.IdentifyCols[0],
+								sourceSchema, tableName, identity.IdentifyCols[0], identity.IdentifyCols[0],
+								sourceSchema, tableName),
+							int(float64(totalRows)*percent/100-1),
+						).Scan(&id)
+						if err != nil {
+							log.Printf("[Task %s] Warning: Failed to get chunk %d boundary, using sequential", taskID, i)
+							chunkRanges = nil
+							break
 						}
-						lastID = vals
+						chunkID = id
+					} else {
+						// 复合主键：使用百分位点
+						query := fmt.Sprintf("SELECT * FROM `%s`.`%s` LIMIT 1 OFFSET ?", sourceSchema, tableName)
+						rows, err := s.sourceDB.Query(query, int(float64(totalRows)*percent/100)-1)
+						if err != nil {
+							log.Printf("[Task %s] Warning: Failed to get chunk %d boundary for composite PK, using sequential", taskID, i)
+							chunkRanges = nil
+							rows.Close()
+							break
+						}
+
+						if !rows.Next() {
+							rows.Close()
+							chunkRanges = nil
+							break
+						}
+
+						cols, _ := rows.Columns()
+						vals := make([]interface{}, len(cols))
+						valPtrs := make([]interface{}, len(cols))
+						for i := range vals {
+							valPtrs[i] = &vals[i]
+						}
+						rows.Scan(valPtrs...)
+						rows.Close()
+
+						// 提取主键值
+						pkVals := make([]interface{}, len(identity.IdentifyCols))
+						for i, col := range identity.IdentifyCols {
+							for j, c := range cols {
+								if c == col {
+									pkVals[i] = vals[j]
+									break
+								}
+							}
+						}
+						chunkID = pkVals
 					}
-					s.incrementTaskProgress(taskID, int64(len(rows)), fmt.Sprintf("%s.%s:%v", sourceSchema, tableName, lastID))
+
+					if i == 0 {
+						chunkRanges = append(chunkRanges, chunkRange{startID: nil, endID: chunkID})
+					} else {
+						chunkRanges = append(chunkRanges, chunkRange{
+							startID: chunkRanges[len(chunkRanges)-1].endID,
+							endID:   chunkID,
+						})
+					}
+				}
+
+				// 如果无法计算分片，回退到串行处理
+				if len(chunkRanges) == 0 {
+					log.Printf("[Task %s] Unable to calculate chunk ranges, falling back to sequential sync", taskID)
+					var lastID interface{}
+					for {
+						if s.isTaskStopped(taskID) {
+							return
+						}
+						rows, err := dataReader.ReadBatchByKeys(ctx, lastID, batchSize)
+						if err != nil {
+							errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
+							log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+							s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+							errChan <- err
+							return
+						}
+						if len(rows) == 0 {
+							break
+						}
+						if err := dataWriter.WriteBatch(ctx, rows); err != nil {
+							errMsg := fmt.Sprintf("Failed to write batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
+							log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+							s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+							errChan <- err
+							return
+						}
+						tableProcessedRows += int64(len(rows))
+						lastRow := rows[len(rows)-1]
+						pkCols := identity.IdentifyCols
+						if len(pkCols) == 1 {
+							lastID = lastRow[pkCols[0]]
+						} else {
+							vals := make([]interface{}, len(pkCols))
+							for i, col := range pkCols {
+								vals[i] = lastRow[col]
+							}
+							lastID = vals
+						}
+						s.incrementTaskProgress(taskID, int64(len(rows)), fmt.Sprintf("%s.%s:%v", sourceSchema, tableName, lastID))
+					}
+				} else {
+					// 并行处理每个分片
+					var syncWg sync.WaitGroup
+					syncErrChan := make(chan error, len(chunkRanges))
+
+					for chunkIdx, chunk := range chunkRanges {
+						syncWg.Add(1)
+						go func(idx int, r chunkRange) {
+							defer syncWg.Done()
+
+							chunkReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+							chunkWriter := writer.NewBatchWriterWithSchema(s.targetDB, identity, task.Config.BatchSize, targetSchema)
+							if s.auditLogger != nil {
+								chunkWriter.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+							}
+
+							lastID := r.startID
+							endID := r.endID
+
+							for {
+								if s.isTaskStopped(taskID) {
+									return
+								}
+
+								rows, err := chunkReader.ReadBatchByKeys(ctx, lastID, batchSize)
+								if err != nil {
+									errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` chunk %d via keyset: %v",
+										sourceSchema, tableName, idx, err)
+									log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+									syncErrChan <- fmt.Errorf("%s", errMsg)
+									return
+								}
+								if len(rows) == 0 {
+									break
+								}
+
+								// 检查是否超出分片范围
+								lastRow := rows[len(rows)-1]
+								var exceeded bool
+								if len(identity.IdentifyCols) == 1 {
+									pkVal := lastRow[identity.IdentifyCols[0]]
+									if endID != nil && compareIDs(pkVal, endID) > 0 {
+										exceeded = true
+									}
+								} else {
+									// 复合主键：检查是否超出范围
+									endIDSlice, ok := endID.([]interface{})
+									if ok {
+										for i, col := range identity.IdentifyCols {
+											val := lastRow[col]
+											if i < len(endIDSlice) && compareIDs(val, endIDSlice[i]) > 0 {
+												exceeded = true
+												break
+											}
+										}
+									}
+								}
+
+								if exceeded {
+									break
+								}
+
+								if err := chunkWriter.WriteBatch(ctx, rows); err != nil {
+									errMsg := fmt.Sprintf("Failed to write batch for `%s`.`%s` chunk %d via keyset: %v",
+										sourceSchema, tableName, idx, err)
+									log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+									syncErrChan <- fmt.Errorf("%s", errMsg)
+									return
+								}
+
+								lastRow = rows[len(rows)-1]
+								pkCols := identity.IdentifyCols
+								if len(pkCols) == 1 {
+									lastID = lastRow[pkCols[0]]
+								} else {
+									vals := make([]interface{}, len(pkCols))
+									for i, col := range pkCols {
+										vals[i] = lastRow[col]
+									}
+									lastID = vals
+								}
+								s.incrementTaskProgress(taskID, int64(len(rows)), fmt.Sprintf("%s.%s:chunk%d:%v", sourceSchema, tableName, idx, lastID))
+							}
+
+							log.Printf("[Task %s] Chunk %d of table %s.%s completed", taskID, idx, sourceSchema, tableName)
+						}(chunkIdx, chunk)
+					}
+
+					syncWg.Wait()
+					close(syncErrChan)
+
+					if err := <-syncErrChan; err != nil {
+						errChan <- err
+						return
+					}
 				}
 			}
 
@@ -987,7 +1240,7 @@ func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName st
 	// 检查目标表是否存在
 	var tableNameCheck string
 	err = s.targetDB.QueryRow(
-		fmt.Sprintf("SHOW TABLES FROM `%s` LIKE '%s'", targetSchema, tableName),
+		fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name = '%s'", targetSchema, tableName),
 	).Scan(&tableNameCheck)
 
 	if err == nil {
@@ -1002,16 +1255,83 @@ func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName st
 	}
 
 	// 表不存在，创建它
-	log.Printf("[Task] Creating target table %s.%s", targetSchema, tableName)
+	log.Printf("[Task] Creating target table %s.%s (from %s.%s)", targetSchema, tableName, sourceSchema, tableName)
 
-	// 使用 LIKE 复制源表结构（包括索引和约束）
-	_, err = s.targetDB.Exec(fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
-		targetSchema, tableName, sourceSchema, tableName))
+	// 方法1：尝试使用源数据库连接创建表（如果源和目标在同一服务器）
+	if s.sourceDB != nil {
+		// 尝试使用完整的数据库名复制表结构
+		_, err = s.sourceDB.Exec(fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
+			targetSchema, tableName, sourceSchema, tableName))
+		if err == nil {
+			log.Printf("[Task] Successfully created target table %s.%s (using source DB connection)", targetSchema, tableName)
+			return nil
+		}
+		log.Printf("[Task] Failed to create table using source DB connection: %v", err)
+	}
+
+	// 方法2：获取源表的CREATE TABLE语句并在目标数据库执行
+	var createSQL string
+	err = s.sourceDB.QueryRow(
+		fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", sourceSchema, tableName),
+	).Scan(&tableName, &createSQL)
+	if err != nil {
+		return fmt.Errorf("failed to get CREATE TABLE statement for %s.%s: %v", sourceSchema, tableName, err)
+	}
+
+	// 修改SQL语句中的表名（去掉源库名，只保留表名）
+	// CREATE TABLE `source_schema`.`table_name` (...) -> CREATE TABLE `table_name` (...)
+	createSQL = fmt.Sprintf("CREATE TABLE `%s`.`%s` %s", targetSchema, tableName,
+		extractTableDefinition(createSQL))
+
+	// 在目标数据库中执行创建表的语句
+	_, err = s.targetDB.Exec(createSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create target table %s.%s: %v", targetSchema, tableName, err)
 	}
 
+	log.Printf("[Task] Successfully created target table %s.%s (using CREATE TABLE statement)", targetSchema, tableName)
 	return nil
+}
+
+// extractTableDefinition 从CREATE TABLE语句中提取表定义部分
+func extractTableDefinition(createSQL string) string {
+	// 找到第一个 '(' 的位置
+	startIdx := strings.Index(createSQL, "(")
+	if startIdx == -1 {
+		return createSQL
+	}
+	// 找到最后一个 ')' 的位置
+	endIdx := strings.LastIndex(createSQL, ")")
+	if endIdx == -1 {
+		return createSQL
+	}
+	// 提取表定义部分（包括表选项）
+	return createSQL[startIdx:]
+}
+
+// compareIDs 比较两个ID值，返回 -1, 0, 1
+func compareIDs(id1, id2 interface{}) int {
+	// 处理 nil 值
+	if id1 == nil && id2 == nil {
+		return 0
+	}
+	if id1 == nil {
+		return -1
+	}
+	if id2 == nil {
+		return 1
+	}
+
+	// 将两个值都转换为字符串进行比较
+	str1 := fmt.Sprintf("%v", id1)
+	str2 := fmt.Sprintf("%v", id2)
+
+	if str1 < str2 {
+		return -1
+	} else if str1 > str2 {
+		return 1
+	}
+	return 0
 }
 
 // isTaskStopped 检查任务是否已停止

@@ -36,6 +36,10 @@ const tables = ref([])
 const loading = ref(false)
 const taskFormPage = ref('none') // 'none' | 'create' | 'edit'
 
+// 搜索框状态
+const databaseSearchText = ref('')
+const tableSearchText = ref('')
+
 const selectedSyncLevel = ref('database')
 const selectedDatabases = ref([])        // 库级别同步时选中的源数据库列表
 const targetDatabaseMappings = ref([])   // [{source, target}] 源->目标库映射
@@ -260,12 +264,64 @@ async function fetchTables() {
   }
   loading.value = true
   try {
-    const res = await fetch(`${API_BASE}/metadata/tables?schema=${taskForm.value.source_schema}`)
+    // 确定使用哪个数据库配置
+    let dbConfig = null
+    
+    if (useCustomSourceDB.value) {
+      // 开启自定义源数据库：使用自定义配置
+      if (customSourceDB.value.host) {
+        dbConfig = {
+          host: customSourceDB.value.host,
+          port: customSourceDB.value.port,
+          username: customSourceDB.value.username,
+          password: customSourceDB.value.password,
+          database: customSourceDB.value.database || taskForm.value.source_schema
+        }
+      }
+    } else {
+      // 未开启自定义源数据库：使用配置文件中的源数据库配置
+      if (configForm.value.datasource && configForm.value.datasource.host) {
+        dbConfig = {
+          host: configForm.value.datasource.host,
+          port: configForm.value.datasource.port,
+          username: configForm.value.datasource.username,
+          password: configForm.value.datasource.password,
+          database: configForm.value.datasource.database || taskForm.value.source_schema
+        }
+      }
+    }
+    
+    let res
+    if (dbConfig && dbConfig.host) {
+      // 使用自定义配置获取表列表
+      res = await fetch(`${API_BASE}/metadata/tables-with-config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...dbConfig,
+          schema: taskForm.value.source_schema
+        })
+      })
+    } else {
+      // 使用默认连接（后端启动时建立的连接）
+      res = await fetch(`${API_BASE}/metadata/tables?schema=${taskForm.value.source_schema}`)
+    }
+    
     if (res.ok) {
       tables.value = await res.json()
+    } else {
+      // 解析错误信息并显示给用户
+      const errText = await res.text()
+      try {
+        const errData = JSON.parse(errText)
+        Message.error(`获取表列表失败: ${errData.error || errText}`)
+      } catch {
+        Message.error(`获取表列表失败: ${errText}`)
+      }
     }
   } catch (e) {
     console.error('获取表列表失败:', e)
+    Message.error(`获取表列表失败: ${e.message}`)
   } finally {
     loading.value = false
   }
@@ -611,9 +667,8 @@ function onSyncLevelChange() {
   selectedDatabases.value = []
   targetDatabaseMappings.value = []
   selectedTables.value = []
-  if (selectedSyncLevel.value === 'table') {
-    fetchTables()
-  }
+  // 注意：不在这里调用 fetchTables()，因为此时 source_schema 可能还没有值
+  // 表列表会在用户选择源数据库后通过 onSourceSchemaChange() 加载
 }
 
 // 监听源数据库变化
@@ -733,6 +788,28 @@ const sortedTasks = computed(() => {
   })
 })
 
+// 计算属性：过滤后的数据库列表
+const filteredDatabases = computed(() => {
+  if (!databaseSearchText.value) {
+    return databases.value
+  }
+  const searchText = databaseSearchText.value.toLowerCase()
+  return databases.value.filter(db => 
+    db.toLowerCase().includes(searchText)
+  )
+})
+
+// 计算属性：过滤后的表列表
+const filteredTables = computed(() => {
+  if (!tableSearchText.value) {
+    return tables.value
+  }
+  const searchText = tableSearchText.value.toLowerCase()
+  return tables.value.filter(table => 
+    table.table_name.toLowerCase().includes(searchText)
+  )
+})
+
 // 监听自定义源数据库开关变化，自动刷新数据库列表
 watch(useCustomSourceDB, (newVal) => {
   fetchDatabases()
@@ -846,21 +923,28 @@ watch(selectedDatabases, (newDbs) => {
                 <a-form-item v-if="selectedSyncLevel === 'database'" label="源数据库（可多选）" required>
                   <div style="display: flex; align-items: flex-start; gap: 8px">
                     <div style="flex: 1">
+                      <!-- 搜索框 -->
+                      <a-input-search
+                        v-model="databaseSearchText"
+                        placeholder="搜索数据库名..."
+                        style="margin-bottom: 8px"
+                        allow-clear
+                      />
                       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px">
-                        <a-button type="text" size="small" @click="selectedDatabases = selectedDatabases.length === databases.length ? [] : [...databases]">
-                          {{ selectedDatabases.length === databases.length && databases.length > 0 ? '取消全选' : '全选' }}
+                        <a-button type="text" size="small" @click="selectedDatabases = selectedDatabases.length === filteredDatabases.length ? [] : [...filteredDatabases]">
+                          {{ selectedDatabases.length === filteredDatabases.length && filteredDatabases.length > 0 ? '取消全选' : '全选' }}
                         </a-button>
-                        <a-typography-text type="secondary" style="font-size: 12px">已选 {{ selectedDatabases.length }} / {{ databases.length }}</a-typography-text>
+                        <a-typography-text type="secondary" style="font-size: 12px">已选 {{ selectedDatabases.length }} / {{ filteredDatabases.length }}</a-typography-text>
                       </div>
                       <div style="max-height: 180px; overflow-y: auto; border: 1px solid #e5e6eb; border-radius: 4px; padding: 8px; background: #fafafa">
                         <a-checkbox-group v-model="selectedDatabases" style="width: 100%">
                           <a-row :gutter="[8, 8]">
-                            <a-col :span="8" v-for="db in databases" :key="db">
+                            <a-col :span="8" v-for="db in filteredDatabases" :key="db">
                               <a-checkbox :value="db">{{ db }}</a-checkbox>
                             </a-col>
                           </a-row>
                         </a-checkbox-group>
-                        <a-empty v-if="databases.length === 0" description="暂无数据库" :style="{ padding: '8px 0' }" />
+                        <a-empty v-if="filteredDatabases.length === 0" description="暂无匹配的数据库" :style="{ padding: '8px 0' }" />
                       </div>
                     </div>
                     <a-button type="text" size="small" :loading="refreshingDatabases" @click="refreshDatabases">
@@ -920,17 +1004,24 @@ watch(selectedDatabases, (newDbs) => {
                   <template #extra>
                     <a-space>
                       <a-button type="text" size="small" @click="toggleAllTables">
-                        {{ selectedTables.length === tables.length ? '取消全选' : '全选' }}
+                        {{ selectedTables.length === filteredTables.length ? '取消全选' : '全选' }}
                       </a-button>
                       <a-button type="text" size="small" :loading="refreshingTables" @click="refreshTables">
                         <template #icon><icon-refresh /></template>刷新
                       </a-button>
                     </a-space>
                   </template>
+                  <!-- 表搜索框 -->
+                  <a-input-search
+                    v-model="tableSearchText"
+                    placeholder="搜索表名..."
+                    style="margin-bottom: 8px"
+                    allow-clear
+                  />
                   <div style="max-height: 300px; overflow-y: auto; border: 1px solid #e5e6eb; border-radius: 4px; padding: 8px; background: #fafafa">
-                    <a-checkbox-group v-model="selectedTables" v-if="tables.length > 0">
+                    <a-checkbox-group v-model="selectedTables" v-if="filteredTables.length > 0">
                       <a-row :gutter="[8, 8]">
-                        <a-col :span="12" v-for="table in tables" :key="table.table_name">
+                        <a-col :span="12" v-for="table in filteredTables" :key="table.table_name">
                           <a-checkbox :value="table.table_name">
                             {{ table.table_name }}
                             <a-tag size="small" color="gray">{{ table.table_row_count }} 行</a-tag>
@@ -938,10 +1029,10 @@ watch(selectedDatabases, (newDbs) => {
                         </a-col>
                       </a-row>
                     </a-checkbox-group>
-                    <a-empty v-else description="请先选择源数据库" :style="{ padding: '20px 0' }" />
+                    <a-empty v-else description="暂无匹配的表" :style="{ padding: '20px 0' }" />
                   </div>
                   <div style="margin-top: 8px">
-                    <a-typography-text type="secondary">已选择 {{ selectedTables.length }} 个表</a-typography-text>
+                    <a-typography-text type="secondary">已选择 {{ selectedTables.length }} / {{ filteredTables.length }} 个表</a-typography-text>
                   </div>
                 </a-form-item>
 

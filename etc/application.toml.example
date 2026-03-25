@@ -1,3 +1,6 @@
+# MySQL-to-Async 配置文件示例
+# 复制此文件为 application.toml 并根据实际情况修改配置
+
 [http]
   # HTTP服务Host
   host = "127.0.0.1"
@@ -5,7 +8,8 @@
   port = 8081
 
 [datasource]
-  # 源数据库配置（可选 - 如果创建任务时不指定，将使用此默认值）
+  # 源数据库配置（默认值）
+  # 如果创建任务时没有指定自定义源数据库，将使用此配置
   provider = "mysql"
   # host = "192.168.139.143"
   # port = 3306
@@ -14,29 +18,81 @@
   # password = "123456"
   debug = true
 
-[log]
-  # 日志的级别, 默认Debug
-  level = "debug"
-
-[log.console]
-  enable = true
-  no_color = false
-
-[log.file]
-  # 是否开启文件记录
-  enable = true
-
 [target]
-  # 目标数据库配置（可选 - 如果创建任务时不指定，将使用此默认值）
+  # 目标数据库配置（默认值）
+  # 如果创建任务时没有指定目标数据库，将使用此配置
   # host = "192.168.139.143"
   # port = 3306
   # database = "test_target"
   # username = "root"
   # password = "123456"
 
+[storage]
+  # 任务存储后端配置
+  # 支持 "file" 或 "mysql"
+  mode = "file"
+  
+  # 文件存储配置（mode = "file" 时使用）
+  data_dir = "data"
+  
+  # MySQL存储配置（mode = "mysql" 时使用）
+  # host = "127.0.0.1"
+  # port = 3306
+  # database = "mysql_to_async"
+  # username = "root"
+  # password = "123456"
+
 [redis]
-  # Redis配置（可选 - 用于保存Checkpoint位点，如果不配置则使用内存）
+  # Redis配置（可选）
+  # 用于保存增量同步的Checkpoint位点
+  # 如果不配置，则使用内存存储（服务重启后位点丢失）
   # host = "127.0.0.1"
   # port = 6379
   # password = ""
   # db = 0
+
+[log]
+  # 日志级别: debug, info, warn, error
+  level = "debug"
+
+[log.console]
+  # 是否输出到控制台
+  enable = true
+  # 是否禁用彩色输出
+  no_color = false
+
+[log.file]
+  # 是否输出到文件
+  enable = true
+  # 日志文件目录（默认为 logs/）
+  # dir = "logs"
+
+# ========== 性能优化相关配置（可选）==========
+# 这些配置可以在创建任务时覆盖
+
+[sync]
+  # 默认批次大小（每次读取/写入的行数）
+  # 较大的值可以提高吞吐量，但会占用更多内存
+  # 建议值：1000 - 10000
+  # batch_size = 1000
+  
+  # 默认并发Worker数量
+  # 用于表级别同步时的并发表数
+  # 以及单表内部的并发分片数
+  # 建议值：2 - 8，根据CPU核心数和数据库性能调整
+  # worker_count = 4
+  
+  # 单表分片大小（行数）
+  # 大表会被分成多个分片并行处理
+  # 较小的值会产生更多分片，提高并行度，但增加开销
+  # 建议值：50000 - 200000
+  # chunk_size = 100000
+
+# ========== 功能开关 ==========
+
+[features]
+  # 是否启用只读模式（同步期间目标数据库设为只读）
+  # enable_readonly = true
+  
+  # 是否启用索引优化（删除非主键索引，同步完成后再重建）
+  # optimize_index = false
