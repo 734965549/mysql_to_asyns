@@ -57,6 +57,7 @@ type TaskConfig struct {
 	WorkerCount     int             `json:"worker_count"`
 	EnableLimitOne  bool            `json:"enable_limit_one"`    // 无主键表LIMIT 1保护
 	OptimizeIndex   bool            `json:"optimize_index"`      // 索引优化：先删除非主键索引，数据迁移完成后再重建
+	EnableReadOnly  bool            `json:"enable_read_only"`    // 同步前临时关闭目标库只读，同步后恢复
 	SourceDB        *DatabaseConfig `json:"source_db,omitempty"` // 源数据库配置（可选，覆盖配置文件）
 	TargetDB        *DatabaseConfig `json:"target_db,omitempty"` // 目标数据库配置（可选，覆盖配置文件）
 }

@@ -589,32 +589,33 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
 func (s *TaskService) executeSync(ctx context.Context, taskID string) {
 	s.mu.RLock()
 	task, exists := s.tasks[taskID]
-	enableReadOnly := s.enableReadOnly
 	s.mu.RUnlock()
 
 	if !exists {
 		return
 	}
 
+	enableReadOnly := task.Config.EnableReadOnly
+
 	log.Printf("[Task %s] Starting sync, mode: %s, tables: %v", taskID, task.Config.Mode, task.Config.Tables)
 
-	// 在同步开始前，设置目标实例普通用户为只读模式
+	// 在同步开始前，若任务开启了只读管理，临时关闭目标库只读以允许数据写入
 	if enableReadOnly && s.readOnlyManager != nil {
-		log.Printf("[Task %s] 正在设置目标实例用户为只读模式...", taskID)
+		log.Printf("[Task %s] 正在临时关闭目标实例只读以进行同步...", taskID)
 		if err := s.readOnlyManager.SetReadOnly(); err != nil {
-			log.Printf("[Task %s] 警告: 设置只读模式失败: %v", taskID, err)
+			log.Printf("[Task %s] 警告: 关闭只读失败: %v", taskID, err)
 			// 记录错误但继续执行同步
 		} else {
-			log.Printf("[Task %s] 目标实例用户已设置为只读模式", taskID)
+			log.Printf("[Task %s] 目标实例只读已临时关闭，同步结束后自动恢复", taskID)
 		}
 	}
 
-	// 确保在函数退出时恢复用户权限
+	// 确保在函数退出时恢复只读状态
 	defer func() {
 		if enableReadOnly && s.readOnlyManager != nil {
-			log.Printf("[Task %s] 正在恢复目标实例用户权限...", taskID)
+			log.Printf("[Task %s] 正在恢复目标实例只读状态...", taskID)
 			if err := s.readOnlyManager.RestoreReadOnly(); err != nil {
-				log.Printf("[Task %s] 警告: 恢复用户权限失败: %v", taskID, err)
+				log.Printf("[Task %s] 警告: 恢复只读状态失败: %v", taskID, err)
 			} else {
 				log.Printf("[Task %s] 目标实例用户权限已恢复", taskID)
 			}

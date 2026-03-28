@@ -81,7 +81,8 @@ const taskForm = ref({
   batch_size: 1000,
   worker_count: 4,
   enable_limit_one: false,
-  optimize_index: false
+  optimize_index: false,
+  enable_read_only: false
 })
 
 // 刷新状态
@@ -364,7 +365,8 @@ function resetForm() {
     batch_size: 1000,
     worker_count: 4,
     enable_limit_one: false,
-    optimize_index: false
+    optimize_index: false,
+    enable_read_only: false
   }
   selectedSyncLevel.value = 'database'
   selectedDatabases.value = []
@@ -563,7 +565,8 @@ function openEditDialog(task) {
     batch_size: task.config.batch_size,
     worker_count: task.config.worker_count,
     enable_limit_one: task.config.enable_limit_one,
-    optimize_index: task.config.optimize_index || false
+    optimize_index: task.config.optimize_index || false,
+    enable_read_only: task.config.enable_read_only || false
   }
   
   // 设置同步级别
@@ -1123,6 +1126,17 @@ watch(selectedDatabases, (newDbs) => {
                       <span style="font-weight: 500">启用索引优化</span>
                       <a-typography-text type="secondary" style="font-size: 12px">
                         同步前删除非主键索引以提高写入性能，同步完成后自动重建
+                      </a-typography-text>
+                    </a-space>
+                  </a-checkbox>
+                </a-form-item>
+
+                <a-form-item>
+                  <a-checkbox v-model="taskForm.enable_read_only">
+                    <a-space direction="vertical" :size="4">
+                      <span style="font-weight: 500">临时关闭目标库只读</span>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        同步开始时自动关闭目标库 read_only / super_read_only，同步结束后自动恢复
                       </a-typography-text>
                     </a-space>
                   </a-checkbox>
