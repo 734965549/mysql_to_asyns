@@ -800,16 +800,23 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			batchSize := int64(task.Config.BatchSize)
 			const txCommitEveryN = 20 // 每 20 批 commit 一次，平衡事务大小与 commit 开销
 
+			// 单表内部并发 worker 数：独立于表级并发数，避免单表开 N*N 个连接
+			const maxIntraTableWorkers = 8
+			intraWorkers := workerCount
+			if intraWorkers > maxIntraTableWorkers {
+				intraWorkers = maxIntraTableWorkers
+			}
+
 			// === 策略检测 ===
 			canParallelRange := identity.Strategy != entity.FullColumnsStrategy &&
 				len(identity.IdentifyCols) == 1 &&
-				workerCount > 1 &&
+				intraWorkers > 1 &&
 				isNumericPKColumn(identity, identity.IdentifyCols[0])
 
 			canParallelSample := !canParallelRange &&
 				identity.Strategy != entity.FullColumnsStrategy &&
 				len(identity.IdentifyCols) == 1 &&
-				workerCount > 1
+				intraWorkers > 1
 
 			var minPK, maxPK int64
 			if canParallelRange {
@@ -819,7 +826,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				).Scan(&minPK, &maxPK); err != nil || maxPK < minPK {
 					canParallelRange = false
 					canParallelSample = identity.Strategy != entity.FullColumnsStrategy &&
-						len(identity.IdentifyCols) == 1 && workerCount > 1
+						len(identity.IdentifyCols) == 1 && intraWorkers > 1
 					log.Printf("[Task %s] Cannot get numeric PK range for %s.%s, trying sample parallel", taskID, sourceSchema, tableName)
 				}
 			}
@@ -829,12 +836,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				var totalRows int64
 				if qErr := s.sourceDB.QueryRowContext(ctx,
 					fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", sourceSchema, tableName),
-				).Scan(&totalRows); qErr != nil || totalRows < int64(workerCount)*2 {
+				).Scan(&totalRows); qErr != nil || totalRows < int64(intraWorkers)*2 {
 					canParallelSample = false
 					log.Printf("[Task %s] Skipping sample parallel for %s.%s", taskID, sourceSchema, tableName)
 				} else {
 					var bErr error
-					sampleBoundaries, bErr = s.samplePKBoundaries(ctx, sourceSchema, tableName, identity.IdentifyCols[0], totalRows, workerCount)
+					sampleBoundaries, bErr = s.samplePKBoundaries(ctx, sourceSchema, tableName, identity.IdentifyCols[0], totalRows, intraWorkers)
 					if bErr != nil {
 						canParallelSample = false
 						log.Printf("[Task %s] Boundary sampling failed for %s.%s: %v", taskID, sourceSchema, tableName, bErr)
@@ -939,19 +946,19 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			} else if canParallelRange {
 				// 数字单列主键：表内并行范围读写 + 每 worker 独立事务批量提交
 				log.Printf("[Task %s] Table %s.%s: parallel range sync PK=[%d,%d] workers=%d",
-					taskID, sourceSchema, tableName, minPK, maxPK, workerCount)
-				rangeSize := (maxPK - minPK + int64(workerCount)) / int64(workerCount)
+					taskID, sourceSchema, tableName, minPK, maxPK, intraWorkers)
+				rangeSize := (maxPK - minPK + int64(intraWorkers)) / int64(intraWorkers)
 				var syncWg sync.WaitGroup
-				syncErrChan := make(chan error, workerCount)
+				syncErrChan := make(chan error, intraWorkers)
 				var atomicProcessed int64
 
-				for w := 0; w < workerCount; w++ {
+				for w := 0; w < intraWorkers; w++ {
 					syncWg.Add(1)
 					go func(wIdx int) {
 						defer syncWg.Done()
 						rangeStart := minPK + int64(wIdx)*rangeSize
 						rangeEnd := rangeStart + rangeSize
-						if wIdx == workerCount-1 {
+						if wIdx == intraWorkers-1 {
 							rangeEnd = maxPK + 1
 						}
 						conn, err := s.targetDB.Conn(ctx)
@@ -1055,12 +1062,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				// 字符串单列主键：采样边界 + 表内并行 keyset + 每 worker 独立事务批量提交
 				pkCol := identity.IdentifyCols[0]
 				log.Printf("[Task %s] Table %s.%s: parallel sample sync pk=%s workers=%d",
-					taskID, sourceSchema, tableName, pkCol, workerCount)
+					taskID, sourceSchema, tableName, pkCol, intraWorkers)
 				var syncWg sync.WaitGroup
-				syncErrChan := make(chan error, workerCount)
+				syncErrChan := make(chan error, intraWorkers)
 				var atomicProcessed int64
 
-				for w := 0; w < workerCount; w++ {
+				for w := 0; w < intraWorkers; w++ {
 					syncWg.Add(1)
 					go func(wIdx int) {
 						defer syncWg.Done()
@@ -1069,7 +1076,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 						if wIdx > 0 {
 							startBoundary = sampleBoundaries[wIdx-1]
 						}
-						if wIdx < workerCount-1 {
+						if wIdx < intraWorkers-1 {
 							endBoundary = sampleBoundaries[wIdx]
 						}
 

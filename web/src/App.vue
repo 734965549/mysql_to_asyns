@@ -625,9 +625,12 @@ function formatTime(time) {
 function calculateDuration(startTime, endTime) {
   if (!startTime) return '-'
   const start = new Date(startTime)
-  const end = endTime ? new Date(endTime) : new Date()
+  if (isNaN(start.getTime()) || start.getFullYear() < 2000) return '-'
+  // Go 零值 time.Time{} 序列化为 "0001-01-01T..."，year < 2000 时视为无效结束时间
+  const endDate = endTime ? new Date(endTime) : null
+  const end = (endDate && endDate.getFullYear() >= 2000) ? endDate : new Date()
   const diff = Math.floor((end - start) / 1000)
-  
+  if (diff < 0) return '-'
   if (diff < 60) return `${diff}秒`
   if (diff < 3600) return `${Math.floor(diff / 60)}分${diff % 60}秒`
   const hours = Math.floor(diff / 3600)

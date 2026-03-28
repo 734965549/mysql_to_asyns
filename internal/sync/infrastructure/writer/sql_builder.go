@@ -173,20 +173,12 @@ func (b *SQLBuilder) BuildBatchInsert(rows []map[string]interface{}) (string, []
 		}
 	}
 
-	var query string
-	if len(updates) == 0 {
-		// 全列均为主键时，重复插入直接忽略（不更新任何字段）
-		query = fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES %s",
-			b.tableRef(),
-			strings.Join(columns, ", "),
-			strings.Join(rowPlaceholders, ", "))
-	} else {
-		query = fmt.Sprintf("INSERT INTO %s (%s) VALUES %s ON DUPLICATE KEY UPDATE %s",
-			b.tableRef(),
-			strings.Join(columns, ", "),
-			strings.Join(rowPlaceholders, ", "),
-			strings.Join(updates, ", "))
-	}
+	// 全量同步场景：目标表通常为空，ON DUPLICATE KEY UPDATE 的 UPDATE 步骤纯属开销。
+	// 使用 INSERT IGNORE 可跳过重复键检查的写入代价，对空表与 ON DUPLICATE 行为一致。
+	query := fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES %s",
+		b.tableRef(),
+		strings.Join(columns, ", "),
+		strings.Join(rowPlaceholders, ", "))
 
 	return query, values
 }
