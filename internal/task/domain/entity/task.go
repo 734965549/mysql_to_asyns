@@ -43,12 +43,13 @@ type DatabaseConfig struct {
 
 // TaskConfig 任务配置
 type TaskConfig struct {
+	StorageID       int64           `json:"storage_id,omitempty"`
 	ID              string          `json:"id"`
 	Name            string          `json:"name"`
 	SyncLevel       SyncLevel       `json:"sync_level"` // 同步级别：DATABASE(全库) 或 TABLE(指定表)
 	SourceSchema    string          `json:"source_schema"`
 	TargetSchema    string          `json:"target_schema"`
-	SourceDatabases []string        `json:"source_databases"` // 源数据库列表（库级别同步时使用）
+	SourceDatabases []string        `json:"source_databases"` // 源数据库列表（库级别/表级别多库时使用）
 	TargetDatabase  string          `json:"target_database"`  // 目标数据库（库级别同步时，所有库同步到此库）
 	TargetDatabases []string        `json:"target_databases"` // 目标数据库列表（与 SourceDatabases 一一对应）
 	Tables          []string        `json:"tables"`

@@ -240,6 +240,25 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 	return r.scanRows(rows)
 }
 
+// ReadBatchInRange 批量读取数据（指定范围内，且带 LIMIT）
+func (r *RangeShardingReader) ReadBatchInRange(ctx context.Context, startID, endID, limit int64) ([]map[string]interface{}, error) {
+	var colParts []string
+	for _, col := range r.identity.Columns {
+		colParts = append(colParts, "`"+col.Name+"`")
+	}
+	columns := strings.Join(colParts, ", ")
+
+	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` >= ? AND `%s` < ? ORDER BY `%s` ASC LIMIT ?",
+		columns, r.schema, r.table, r.pkColumn, r.pkColumn, r.pkColumn)
+	rows, err := r.db.QueryContext(ctx, query, startID, endID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return r.scanRows(rows)
+}
+
 // ReadByRange 按范围读取
 func (r *RangeShardingReader) ReadByRange(ctx context.Context, startID, endID int64) ([]map[string]interface{}, error) {
 	return r.ReadBatch(ctx, startID, endID)

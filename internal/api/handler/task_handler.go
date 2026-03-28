@@ -386,6 +386,12 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) {
 	if req.TargetSchema != "" {
 		task.Config.TargetSchema = req.TargetSchema
 	}
+	if len(req.SourceDatabases) > 0 || req.SyncLevel != "" {
+		task.Config.SourceDatabases = req.SourceDatabases
+	}
+	if len(req.TargetDatabases) > 0 || req.SyncLevel != "" {
+		task.Config.TargetDatabases = req.TargetDatabases
+	}
 	// 表列表：允许清空（库级别同步时 tables 为空）
 	task.Config.Tables = req.Tables
 	if req.Mode != "" {
@@ -454,17 +460,19 @@ func (h *TaskHandler) DeleteTask(c *gin.Context) {
 
 // UpdateTaskRequest 更新任务请求
 type UpdateTaskRequest struct {
-	Name           string                 `json:"name"`
-	SyncLevel      string                 `json:"sync_level"`
-	SourceSchema   string                 `json:"source_schema"`
-	TargetSchema   string                 `json:"target_schema"`
-	Tables         []string               `json:"tables"`
-	Mode           string                 `json:"mode"`
-	BatchSize      int                    `json:"batch_size"`
-	WorkerCount    int                    `json:"worker_count"`
-	EnableLimitOne bool                   `json:"enable_limit_one"`
-	SourceDB       *DatabaseConfigRequest `json:"source_db,omitempty"`
-	TargetDB       *DatabaseConfigRequest `json:"target_db,omitempty"`
+	Name            string                 `json:"name"`
+	SyncLevel       string                 `json:"sync_level"`
+	SourceSchema    string                 `json:"source_schema"`
+	TargetSchema    string                 `json:"target_schema"`
+	SourceDatabases []string               `json:"source_databases"`
+	TargetDatabases []string               `json:"target_databases"`
+	Tables          []string               `json:"tables"`
+	Mode            string                 `json:"mode"`
+	BatchSize       int                    `json:"batch_size"`
+	WorkerCount     int                    `json:"worker_count"`
+	EnableLimitOne  bool                   `json:"enable_limit_one"`
+	SourceDB        *DatabaseConfigRequest `json:"source_db,omitempty"`
+	TargetDB        *DatabaseConfigRequest `json:"target_db,omitempty"`
 }
 
 // generateID 生成唯一ID

@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -98,13 +100,30 @@ func NewMySQLTaskStorageFromConfig(cfg *config.StorageConfig) (*MySQLTaskStorage
 func (s *MySQLTaskStorage) initTable() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS sys_sync_tasks (
-		id VARCHAR(64) PRIMARY KEY,
+		pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+		id VARCHAR(64) NOT NULL,
 		name VARCHAR(255),
 		content JSON,
-		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+		PRIMARY KEY (pk_id),
+		UNIQUE KEY uk_task_id (id)
 	)`
-	_, err := s.db.Exec(query)
-	return err
+	if _, err := s.db.Exec(query); err != nil {
+		return err
+	}
+
+	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN IF NOT EXISTS pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST"); err != nil {
+		log.Printf("Warning: failed to ensure pk_id column: %v", err)
+	}
+	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"); err != nil {
+		log.Printf("Warning: failed to ensure created_at column: %v", err)
+	}
+	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD UNIQUE KEY IF NOT EXISTS uk_task_id (id)"); err != nil {
+		log.Printf("Warning: failed to ensure uk_task_id index: %v", err)
+	}
+
+	return nil
 }
 
 // Save 保存任务到数据库
@@ -117,9 +136,20 @@ func (s *MySQLTaskStorage) Save(task *taskEntity.SyncTask) error {
 		return err
 	}
 
-	query := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content)"
-	_, err = s.db.Exec(query, task.Config.ID, task.Config.Name, data)
-	return err
+	query := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content), pk_id = LAST_INSERT_ID(pk_id)"
+	res, err := s.db.Exec(query, task.Config.ID, task.Config.Name, data)
+	if err != nil {
+		fallbackQuery := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content)"
+		if _, fbErr := s.db.Exec(fallbackQuery, task.Config.ID, task.Config.Name, data); fbErr != nil {
+			return err
+		}
+		return nil
+	}
+
+	if storageID, idErr := res.LastInsertId(); idErr == nil && storageID > 0 {
+		task.Config.StorageID = storageID
+	}
+	return nil
 }
 
 // Delete 从数据库删除任务
@@ -137,23 +167,43 @@ func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	query := "SELECT content FROM sys_sync_tasks"
+	query := "SELECT pk_id, content FROM sys_sync_tasks ORDER BY pk_id ASC"
 	rows, err := s.db.Query(query)
 	if err != nil {
-		return nil, err
+		fallbackRows, fbErr := s.db.Query("SELECT content FROM sys_sync_tasks")
+		if fbErr != nil {
+			return nil, err
+		}
+		defer fallbackRows.Close()
+
+		var fallbackTasks []*taskEntity.SyncTask
+		for fallbackRows.Next() {
+			var data []byte
+			if scanErr := fallbackRows.Scan(&data); scanErr != nil {
+				continue
+			}
+			var task taskEntity.SyncTask
+			if unmarshalErr := json.Unmarshal(data, &task); unmarshalErr != nil {
+				continue
+			}
+			fallbackTasks = append(fallbackTasks, &task)
+		}
+		return fallbackTasks, nil
 	}
 	defer rows.Close()
 
 	var tasks []*taskEntity.SyncTask
 	for rows.Next() {
+		var storageID int64
 		var data []byte
-		if err := rows.Scan(&data); err != nil {
+		if err := rows.Scan(&storageID, &data); err != nil {
 			continue
 		}
 		var task taskEntity.SyncTask
 		if err := json.Unmarshal(data, &task); err != nil {
 			continue
 		}
+		task.Config.StorageID = storageID
 		tasks = append(tasks, &task)
 	}
 	return tasks, nil
@@ -670,10 +720,36 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		pairs = append(pairs, dbPair{src, dst})
 	}
 
+	tablesBySource := make(map[string][]string)
+	if len(task.Config.Tables) > 0 {
+		defaultSource := task.Config.SourceSchema
+		if defaultSource == "" && len(task.Config.SourceDatabases) > 0 {
+			defaultSource = task.Config.SourceDatabases[0]
+		}
+		for _, fullTableName := range task.Config.Tables {
+			sourceSchema := defaultSource
+			tableName := fullTableName
+
+			if parts := strings.SplitN(fullTableName, ".", 2); len(parts) == 2 {
+				sourceSchema = parts[0]
+				tableName = parts[1]
+			}
+
+			if sourceSchema == "" || tableName == "" {
+				continue
+			}
+
+			tablesBySource[sourceSchema] = append(tablesBySource[sourceSchema], tableName)
+		}
+	}
+
 	// 计算所有库的总行数
 	var totalRows int64
 	for _, p := range pairs {
-		tables := task.Config.Tables
+		tables := tablesBySource[p.src]
+		if task.Config.SyncLevel == taskEntity.SyncLevelTable && len(task.Config.Tables) > 0 && len(tables) == 0 {
+			continue
+		}
 		if len(tables) == 0 {
 			allTables, err := s.analyzer.GetAllTables(p.src)
 			if err != nil {
@@ -704,7 +780,10 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		if s.isTaskStopped(taskID) {
 			return nil
 		}
-		if err := s.syncDatabasePair(ctx, task, p.src, p.dst); err != nil {
+		if task.Config.SyncLevel == taskEntity.SyncLevelTable && len(task.Config.Tables) > 0 && len(tablesBySource[p.src]) == 0 {
+			continue
+		}
+		if err := s.syncDatabasePair(ctx, task, p.src, p.dst, tablesBySource[p.src]); err != nil {
 			return err
 		}
 	}
@@ -715,11 +794,11 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 }
 
 // syncDatabasePair 同步单个源库到目标库（含全部或指定表）
-func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, sourceSchema, targetSchema string) error {
+func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, sourceSchema, targetSchema string, specifiedTables []string) error {
 	taskID := task.Config.ID
 
 	// 确定要同步的表
-	tables := task.Config.Tables
+	tables := append([]string{}, specifiedTables...)
 	if len(tables) == 0 {
 		log.Printf("[Task %s] 库级别同步：正在获取数据库 %s 的所有表...", taskID, sourceSchema)
 		allTables, err := s.analyzer.GetAllTables(sourceSchema)
@@ -775,6 +854,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 		wg.Add(1)
 		go func(tableName string, identity *entity.TableIdentity) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[Task %s] Critical: Table %s sync panicked: %v\n%s", taskID, tableName, r, debug.Stack())
+					errChan <- fmt.Errorf("table %s panic: %v", tableName, r)
+				}
+			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
@@ -956,6 +1041,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					syncWg.Add(1)
 					go func(wIdx int) {
 						defer syncWg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								syncErrChan <- fmt.Errorf("w%d panic: %v", wIdx, r)
+							}
+						}()
 						rangeStart := minPK + int64(wIdx)*rangeSize
 						rangeEnd := rangeStart + rangeSize
 						if wIdx == intraWorkers-1 {
@@ -1011,73 +1101,72 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							return nil
 						}
 
-						// 每 worker 用独立源库连接执行一次流式查询，避免反复发小范围查询引起的源库 I/O 抖动
-						srcConn, err := s.sourceDB.Conn(ctx)
-						if err != nil {
-							syncErrChan <- fmt.Errorf("w%d source conn: %v", wIdx, err)
-							return
-						}
-						defer srcConn.Close()
-
 						wReader := reader.NewRangeShardingReader(s.sourceDB, sourceSchema, tableName, identity)
-						sqlRows, cols, err := wReader.OpenRangeStream(srcConn, ctx, rangeStart, rangeEnd)
-						if err != nil {
-							syncErrChan <- fmt.Errorf("w%d stream [%d,%d): %v", wIdx, rangeStart, rangeEnd, err)
-							return
-						}
-						defer sqlRows.Close()
-
-						values := make([]interface{}, len(cols))
-						valuePtrs := make([]interface{}, len(cols))
-						for i := range values {
-							valuePtrs[i] = &values[i]
-						}
-						batch := make([]map[string]interface{}, 0, batchSize)
+						currentStart := rangeStart
 						rangeMark := fmt.Sprintf("%s.%s:w%d:[%d,%d)", sourceSchema, tableName, wIdx, rangeStart, rangeEnd)
 
 						for {
 							if s.isTaskStopped(taskID) {
 								return
 							}
-							if !sqlRows.Next() {
+							if currentStart >= rangeEnd {
 								break
 							}
-							if err := sqlRows.Scan(valuePtrs...); err != nil {
-								syncErrChan <- fmt.Errorf("w%d scan: %v", wIdx, err)
+
+							batch, err := wReader.ReadBatchInRange(ctx, currentStart, rangeEnd, batchSize)
+							if err != nil {
+								syncErrChan <- fmt.Errorf("w%d read [%d,%d): %v", wIdx, currentStart, rangeEnd, err)
 								return
 							}
-							row := make(map[string]interface{}, len(cols))
-							for i, col := range cols {
-								if b, ok := values[i].([]byte); ok {
-									row[col] = string(b)
-								} else {
-									row[col] = values[i]
-								}
+							if len(batch) == 0 {
+								break
 							}
-							batch = append(batch, row)
-							if int64(len(batch)) >= batchSize {
-								if err := doWrite(batch, rangeMark); err != nil {
-									syncErrChan <- err
-									return
-								}
-								n := int64(len(batch))
-								atomic.AddInt64(&atomicProcessed, n)
-								s.incrementTaskProgress(taskID, n, rangeMark)
-								batch = batch[:0]
-							}
-						}
-						if err := sqlRows.Err(); err != nil {
-							syncErrChan <- fmt.Errorf("w%d stream error: %v", wIdx, err)
-							return
-						}
-						if len(batch) > 0 {
+
 							if err := doWrite(batch, rangeMark); err != nil {
 								syncErrChan <- err
 								return
 							}
+
 							n := int64(len(batch))
 							atomic.AddInt64(&atomicProcessed, n)
 							s.incrementTaskProgress(taskID, n, rangeMark)
+
+							// 下一批次从最后一条记录的主键+1开始（假设主键是连续的或者递增的）
+							// 或者更准确地，从最后一条记录的主键值开始，并在查询中使用 >
+							// 但这里的 ReadBatchInRange 使用的是 >= 和 <，所以我们需要找到当前批次的最大 ID
+							lastRowPK := batch[len(batch)-1][identity.IdentifyCols[0]]
+
+							var lastPKVal int64
+							switch v := lastRowPK.(type) {
+							case int64:
+								lastPKVal = v
+							case uint64:
+								lastPKVal = int64(v)
+							case int32:
+								lastPKVal = int64(v)
+							case uint32:
+								lastPKVal = int64(v)
+							case int:
+								lastPKVal = int64(v)
+							case uint:
+								lastPKVal = int64(v)
+							case float64:
+								lastPKVal = int64(v)
+							case string:
+								lastPKVal, _ = strconv.ParseInt(v, 10, 64)
+							case []byte:
+								lastPKVal, _ = strconv.ParseInt(string(v), 10, 64)
+							default:
+								// 如果无法解析，保守一点，尝试转字符串解析
+								sVal := fmt.Sprintf("%v", v)
+								parsed, err := strconv.ParseInt(sVal, 10, 64)
+								if err != nil {
+									syncErrChan <- fmt.Errorf("w%d unsupported PK type: %T (value: %v), parse err: %v", wIdx, v, v, err)
+									return
+								}
+								lastPKVal = parsed
+							}
+							currentStart = lastPKVal + 1
 						}
 						if curTx != nil {
 							if err := curTx.Commit(); err != nil {
@@ -1113,6 +1202,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					syncWg.Add(1)
 					go func(wIdx int) {
 						defer syncWg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								syncErrChan <- fmt.Errorf("w%d panic: %v", wIdx, r)
+							}
+						}()
 						// sampleBoundaries[i] = 第 i+1 个 worker 的起始 key（前一 worker 的最后 key，exclusive）
 						var startBoundary, endBoundary interface{}
 						if wIdx > 0 {
@@ -1573,6 +1667,11 @@ func (s *TaskService) samplePKBoundaries(ctx context.Context, schema, table, pkC
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errs[idx-1] = fmt.Errorf("sample worker %d panic: %v", idx, r)
+				}
+			}()
 			offset := totalRows*int64(idx)/int64(n) - 1
 			if offset < 0 {
 				offset = 0

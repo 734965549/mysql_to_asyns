@@ -44,6 +44,8 @@ const selectedSyncLevel = ref('database')
 const selectedDatabases = ref([])        // 库级别同步时选中的源数据库列表
 const targetDatabaseMappings = ref([])   // [{source, target}] 源->目标库映射
 const selectedTables = ref([])
+const activeTableSourceDatabase = ref('')
+const tableSelectionsByDatabase = ref({})
 const editMode = ref(false)
 const editingTaskId = ref(null)
 
@@ -239,14 +241,15 @@ async function saveTargetConfig() {
 
 // 刷新表列表
 async function refreshTables() {
-  if (!taskForm.value.source_schema) {
+  const currentSourceSchema = activeTableSourceDatabase.value || taskForm.value.source_schema
+  if (!currentSourceSchema) {
     Message.warning('请先选择源数据库')
     return
   }
   refreshingTables.value = true
   try {
     await fetch(`${API_BASE}/metadata/refresh`, { method: 'POST' })
-    const res = await fetch(`${API_BASE}/metadata/tables?schema=${taskForm.value.source_schema}`)
+    const res = await fetch(`${API_BASE}/metadata/tables?schema=${currentSourceSchema}`)
     if (res.ok) {
       tables.value = await res.json()
     }
@@ -260,9 +263,12 @@ async function refreshTables() {
 
 // 获取表列表
 async function fetchTables() {
-  if (!taskForm.value.source_schema) {
+  const currentSourceSchema = activeTableSourceDatabase.value || taskForm.value.source_schema
+  if (!currentSourceSchema) {
     return
   }
+
+  taskForm.value.source_schema = currentSourceSchema
   loading.value = true
   try {
     // 确定使用哪个数据库配置
@@ -287,7 +293,7 @@ async function fetchTables() {
           port: configForm.value.datasource.port,
           username: configForm.value.datasource.username,
           password: configForm.value.datasource.password,
-          database: configForm.value.datasource.database || taskForm.value.source_schema
+          database: configForm.value.datasource.database || currentSourceSchema
         }
       }
     }
@@ -300,12 +306,12 @@ async function fetchTables() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...dbConfig,
-          schema: taskForm.value.source_schema
+          schema: currentSourceSchema
         })
       })
     } else {
       // 使用默认连接（后端启动时建立的连接）
-      res = await fetch(`${API_BASE}/metadata/tables?schema=${taskForm.value.source_schema}`)
+      res = await fetch(`${API_BASE}/metadata/tables?schema=${currentSourceSchema}`)
     }
     
     if (res.ok) {
@@ -372,6 +378,8 @@ function resetForm() {
   selectedDatabases.value = []
   targetDatabaseMappings.value = []
   selectedTables.value = []
+  activeTableSourceDatabase.value = ''
+  tableSelectionsByDatabase.value = {}
   editMode.value = false
   editingTaskId.value = null
   useCustomSourceDB.value = false
@@ -380,12 +388,65 @@ function resetForm() {
   customTargetDB.value = { host: '', port: 3306, database: '', username: '', password: '' }
 }
 
+function getQualifiedTableName(database, tableName) {
+  return `${database}.${tableName}`
+}
+
+function parseQualifiedTableName(qualifiedName) {
+  const parts = String(qualifiedName || '').split('.')
+  if (parts.length < 2) {
+    return { database: '', table: String(qualifiedName || '') }
+  }
+  return {
+    database: parts.shift(),
+    table: parts.join('.')
+  }
+}
+
+function ensureTableSelectionBucket(database) {
+  if (!database) {
+    return
+  }
+  if (!Array.isArray(tableSelectionsByDatabase.value[database])) {
+    tableSelectionsByDatabase.value[database] = []
+  }
+}
+
+function onTableSourceDatabasesChange(databases) {
+  selectedDatabases.value = databases
+  if (databases.length === 0) {
+    activeTableSourceDatabase.value = ''
+    tables.value = []
+    tableSearchText.value = ''
+    return
+  }
+
+  if (!databases.includes(activeTableSourceDatabase.value)) {
+    activeTableSourceDatabase.value = databases[0]
+  }
+
+  taskForm.value.source_schema = activeTableSourceDatabase.value || ''
+  fetchTables()
+}
+
+function onActiveTableSourceDatabaseChange() {
+  taskForm.value.source_schema = activeTableSourceDatabase.value || ''
+  tableSearchText.value = ''
+  fetchTables()
+}
+
 // 全选/取消全选表
 function toggleAllTables() {
-  if (selectedTables.value.length === tables.value.length) {
-    selectedTables.value = []
+  const currentDb = activeTableSourceDatabase.value
+  if (!currentDb) {
+    return
+  }
+
+  const currentSelection = currentDatabaseSelectedTables.value
+  if (currentSelection.length === filteredTables.value.length) {
+    currentDatabaseSelectedTables.value = []
   } else {
-    selectedTables.value = tables.value.map(t => t.table_name)
+    currentDatabaseSelectedTables.value = filteredTables.value.map(t => t.table_name)
   }
 }
 
@@ -402,11 +463,11 @@ async function createTask() {
       return
     }
   } else {
-    if (!taskForm.value.source_schema) {
-      Message.warning('请选择源数据库')
+    if (selectedDatabases.value.length === 0) {
+      Message.warning('请至少选择一个源数据库')
       return
     }
-    if (selectedTables.value.length === 0) {
+    if (totalSelectedTables.value === 0) {
       Message.warning('请至少选择一个表')
       return
     }
@@ -427,7 +488,20 @@ async function createTask() {
     sourceSchemaPayload = ''
     targetSchemaPayload = ''
   } else {
-    tablesPayload = selectedTables.value
+    sourceDatabasesPayload = selectedDatabases.value
+    targetDatabasesPayload = selectedDatabases.value.map(db => {
+      const mapping = targetDatabaseMappings.value.find(item => item.source === db)
+      return mapping?.target || db
+    })
+    sourceSchemaPayload = selectedDatabases.value[0] || ''
+    targetSchemaPayload = targetDatabasesPayload[0] || ''
+
+    tablesPayload = selectedDatabases.value.flatMap(db => {
+      const tableNames = tableSelectionsByDatabase.value[db] || []
+      return tableNames.map(tableName => getQualifiedTableName(db, tableName))
+    })
+
+    selectedTables.value = [...tablesPayload]
   }
 
   const payload = {
@@ -582,10 +656,42 @@ function openEditDialog(task) {
     }))
   } else {
     selectedSyncLevel.value = 'table'
-    // 加载表列表并设置选中的表
-    fetchTables().then(() => {
-      selectedTables.value = task.config.tables || []
-    })
+    const sourceDatabases = (task.config.source_databases && task.config.source_databases.length > 0)
+      ? task.config.source_databases
+      : (task.config.source_schema ? [task.config.source_schema] : [])
+
+    selectedDatabases.value = sourceDatabases
+    targetDatabaseMappings.value = sourceDatabases.map((db, i) => ({
+      source: db,
+      target: (task.config.target_databases && task.config.target_databases[i]) || task.config.target_schema || db
+    }))
+
+    tableSelectionsByDatabase.value = {}
+    for (const db of sourceDatabases) {
+      ensureTableSelectionBucket(db)
+    }
+
+    const rawTables = task.config.tables || []
+    selectedTables.value = [...rawTables]
+    for (const table of rawTables) {
+      const parsed = parseQualifiedTableName(table)
+      if (parsed.database && sourceDatabases.includes(parsed.database)) {
+        ensureTableSelectionBucket(parsed.database)
+        if (!tableSelectionsByDatabase.value[parsed.database].includes(parsed.table)) {
+          tableSelectionsByDatabase.value[parsed.database].push(parsed.table)
+        }
+      } else if (sourceDatabases.length > 0 && parsed.table) {
+        const fallbackDb = sourceDatabases[0]
+        ensureTableSelectionBucket(fallbackDb)
+        if (!tableSelectionsByDatabase.value[fallbackDb].includes(parsed.table)) {
+          tableSelectionsByDatabase.value[fallbackDb].push(parsed.table)
+        }
+      }
+    }
+
+    activeTableSourceDatabase.value = sourceDatabases[0] || ''
+    taskForm.value.source_schema = activeTableSourceDatabase.value || ''
+    fetchTables()
   }
   
   // 设置自定义数据库配置
@@ -680,16 +786,13 @@ function onSyncLevelChange() {
   selectedDatabases.value = []
   targetDatabaseMappings.value = []
   selectedTables.value = []
+  activeTableSourceDatabase.value = ''
+  tableSelectionsByDatabase.value = {}
+  tableSearchText.value = ''
+  taskForm.value.source_schema = ''
+  taskForm.value.target_schema = ''
   // 注意：不在这里调用 fetchTables()，因为此时 source_schema 可能还没有值
-  // 表列表会在用户选择源数据库后通过 onSourceSchemaChange() 加载
-}
-
-// 监听源数据库变化
-function onSourceSchemaChange() {
-  selectedTables.value = []
-  if (selectedSyncLevel.value === 'table') {
-    fetchTables()
-  }
+  // 表列表会在用户选择源数据库后通过 onTableSourceDatabasesChange() 加载
 }
 
 // 系统配置状态
@@ -796,9 +899,41 @@ const currentPage = computed(() => selectedKey.value[0])
 // 计算属性：对任务列表进行稳定排序（避免列表闪烁）
 const sortedTasks = computed(() => {
   return [...tasks.value].sort((a, b) => {
-    // 按任务ID排序（ID包含时间戳，可以保持稳定）
+    const aStorageID = Number(a?.config?.storage_id || 0)
+    const bStorageID = Number(b?.config?.storage_id || 0)
+    if (aStorageID > 0 || bStorageID > 0) {
+      return aStorageID - bStorageID
+    }
     return a.config.id.localeCompare(b.config.id)
   })
+})
+
+const currentDatabaseSelectedTables = computed({
+  get() {
+    const currentDb = activeTableSourceDatabase.value
+    if (!currentDb) {
+      return []
+    }
+    ensureTableSelectionBucket(currentDb)
+    return tableSelectionsByDatabase.value[currentDb]
+  },
+  set(newValue) {
+    const currentDb = activeTableSourceDatabase.value
+    if (!currentDb) {
+      return
+    }
+    tableSelectionsByDatabase.value[currentDb] = [...newValue]
+    selectedTables.value = selectedDatabases.value.flatMap(db => {
+      const tableNames = tableSelectionsByDatabase.value[db] || []
+      return tableNames.map(tableName => getQualifiedTableName(db, tableName))
+    })
+  }
+})
+
+const totalSelectedTables = computed(() => {
+  return selectedDatabases.value.reduce((sum, db) => {
+    return sum + ((tableSelectionsByDatabase.value[db] || []).length)
+  }, 0)
 })
 
 // 计算属性：过滤后的数据库列表
@@ -830,6 +965,27 @@ watch(useCustomSourceDB, (newVal) => {
 
 // 监听选中的源数据库变化，自动同步目标数据库映射
 watch(selectedDatabases, (newDbs) => {
+  if (selectedSyncLevel.value === 'table') {
+    if (newDbs.length === 0) {
+      activeTableSourceDatabase.value = ''
+      tables.value = []
+    } else if (!newDbs.includes(activeTableSourceDatabase.value)) {
+      activeTableSourceDatabase.value = newDbs[0]
+      fetchTables()
+    }
+
+    const nextSelections = {}
+    newDbs.forEach(db => {
+      nextSelections[db] = [...(tableSelectionsByDatabase.value[db] || [])]
+    })
+    tableSelectionsByDatabase.value = nextSelections
+    selectedTables.value = newDbs.flatMap(db => {
+      const tableNames = tableSelectionsByDatabase.value[db] || []
+      return tableNames.map(tableName => getQualifiedTableName(db, tableName))
+    })
+    taskForm.value.source_schema = activeTableSourceDatabase.value || ''
+  }
+
   const newMappings = newDbs.map(db => {
     const existing = targetDatabaseMappings.value.find(m => m.source === db)
     return existing || { source: db, target: db }
@@ -1026,12 +1182,27 @@ watch(selectedDatabases, (newDbs) => {
                   </div>
                 </div>
 
-                <!-- 表级别：单选源数据库 -->
+                <!-- 表级别：多选源数据库 -->
                 <a-form-item v-if="selectedSyncLevel === 'table'" label="源数据库" required>
-                  <a-space>
-                    <a-select v-model="taskForm.source_schema" placeholder="请选择源数据库" style="width: 260px" @change="onSourceSchemaChange">
-                      <a-option value="">请选择源数据库</a-option>
+                  <a-space wrap>
+                    <a-select
+                      v-model="selectedDatabases"
+                      placeholder="请选择源数据库（可多选）"
+                      style="width: 360px"
+                      multiple
+                      allow-clear
+                      @change="onTableSourceDatabasesChange"
+                    >
                       <a-option v-for="db in databases" :key="db" :value="db">{{ db }}</a-option>
+                    </a-select>
+                    <a-select
+                      v-model="activeTableSourceDatabase"
+                      placeholder="请选择当前要选表的源库"
+                      style="width: 300px"
+                      :disabled="selectedDatabases.length === 0"
+                      @change="onActiveTableSourceDatabaseChange"
+                    >
+                      <a-option v-for="db in selectedDatabases" :key="db" :value="db">{{ db }}</a-option>
                     </a-select>
                     <a-button type="text" size="small" :loading="refreshingDatabases" @click="refreshDatabases">
                       <template #icon><icon-refresh /></template>
@@ -1039,7 +1210,19 @@ watch(selectedDatabases, (newDbs) => {
                   </a-space>
                 </a-form-item>
 
-                <!-- 表级别：单个目标库输入 + 同步模式 -->
+                <div v-if="selectedSyncLevel === 'table'" class="table-mapping-panel">
+                  <div class="table-mapping-title">源库 -> 目标库映射（表级别）</div>
+                  <div class="table-mapping-list">
+                    <div v-for="mapping in targetDatabaseMappings" :key="mapping.source" class="table-mapping-item">
+                      <span class="table-mapping-source">{{ mapping.source }}</span>
+                      <icon-arrow-right style="color: #86909c" />
+                      <a-input v-model="mapping.target" placeholder="目标库名" style="width: 220px" />
+                    </div>
+                    <a-empty v-if="targetDatabaseMappings.length === 0" description="请先选择源数据库" />
+                  </div>
+                </div>
+
+                <!-- 表级别：保留单个目标库输入兼容旧任务 + 同步模式 -->
                 <a-row :gutter="16">
                   <a-col v-if="selectedSyncLevel === 'table'" :span="12">
                     <a-form-item label="目标数据库" required>
@@ -1060,142 +1243,157 @@ watch(selectedDatabases, (newDbs) => {
 
               <a-col :span="12">
                 <!-- 表级别：选择表 -->
-                <a-form-item v-if="selectedSyncLevel === 'table'" label="选择要同步的表">
-                  <!-- 搜索框 + 操作按钮（始终置顶） -->
-                  <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
-                    <a-input
-                      v-model="tableSearchText"
-                      placeholder="搜索表名..."
-                      allow-clear
-                      style="flex: 1"
-                    >
-                      <template #suffix><icon-search /></template>
-                    </a-input>
-                    <a-button type="text" size="small" @click="toggleAllTables">
-                      {{ selectedTables.length === filteredTables.length && filteredTables.length > 0 ? '取消全选' : '全选' }}
-                    </a-button>
-                    <a-button type="text" size="small" :loading="refreshingTables" @click="refreshTables">
-                      <template #icon><icon-refresh /></template>
-                    </a-button>
-                  </div>
-                  <!-- 表格列表（可滚动区域） -->
-                  <div style="max-height: 300px; overflow-y: auto; border: 1px solid #e5e6eb; border-radius: 4px; padding: 8px; background: #fafafa">
-                    <a-checkbox-group v-model="selectedTables" v-if="filteredTables.length > 0">
-                      <a-row :gutter="[8, 8]">
-                        <a-col :span="12" v-for="table in filteredTables" :key="table.table_name">
-                          <a-checkbox :value="table.table_name">
-                            {{ table.table_name }}
-                            <a-tag size="small" color="gray">{{ table.table_row_count }} 行</a-tag>
-                          </a-checkbox>
-                        </a-col>
-                      </a-row>
-                    </a-checkbox-group>
-                    <a-empty v-else description="暂无匹配的表" :style="{ padding: '20px 0' }" />
-                  </div>
-                  <div style="margin-top: 8px">
-                    <a-typography-text type="secondary">已选择 {{ selectedTables.length }} / {{ filteredTables.length }} 个表</a-typography-text>
-                  </div>
-                </a-form-item>
-
-                <!-- 高级配置 -->
-                <a-typography-title :heading="6" style="margin-bottom: 12px">高级配置</a-typography-title>
-
-                <a-row :gutter="16">
-                  <a-col :span="12">
-                    <a-form-item label="批量大小">
-                      <a-input-number
-                        :model-value="taskForm.batch_size"
-                        @change="v => taskForm.batch_size = v"
-                        :min="1"
-                        style="width: 100%"
-                      />
-                    </a-form-item>
-                  </a-col>
-                  <a-col :span="12">
-                    <a-form-item label="表并发数">
-                      <a-input-number
-                        :model-value="taskForm.worker_count"
-                        @change="v => taskForm.worker_count = v"
-                        :min="1"
-                        style="width: 100%"
-                      />
-                    </a-form-item>
-                  </a-col>
-                </a-row>
-
-                <a-form-item>
-                  <a-checkbox v-model="taskForm.optimize_index">
-                    <a-space direction="vertical" :size="4">
-                      <span style="font-weight: 500">启用索引优化</span>
-                      <a-typography-text type="secondary" style="font-size: 12px">
-                        同步前删除非主键索引以提高写入性能，同步完成后自动重建
-                      </a-typography-text>
-                    </a-space>
-                  </a-checkbox>
-                </a-form-item>
-
-                <a-form-item>
-                  <a-checkbox v-model="taskForm.enable_read_only">
-                    <a-space direction="vertical" :size="4">
-                      <span style="font-weight: 500">临时关闭目标库只读</span>
-                      <a-typography-text type="secondary" style="font-size: 12px">
-                        同步开始时自动关闭目标库 read_only / super_read_only，同步结束后自动恢复
-                      </a-typography-text>
-                    </a-space>
-                  </a-checkbox>
-                </a-form-item>
-
-                <!-- 自定义数据库连接 -->
-                <a-collapse :default-active-key="[]">
-                  <a-collapse-item key="source" header="自定义源数据库连接">
-                    <template #extra><a-switch v-model="useCustomSourceDB" size="small" @click.stop /></template>
-                    <div v-if="useCustomSourceDB">
-                      <a-row :gutter="16">
-                        <a-col :span="12"><a-form-item label="主机"><a-input v-model="customSourceDB.host" placeholder="如: 192.168.1.100" /></a-form-item></a-col>
-                        <a-col :span="12"><a-form-item label="端口"><a-input-number v-model="customSourceDB.port" :min="1" :max="65535" /></a-form-item></a-col>
-                      </a-row>
-                      <a-row :gutter="16">
-                        <a-col :span="12"><a-form-item label="数据库"><a-input v-model="customSourceDB.database" /></a-form-item></a-col>
-                        <a-col :span="12"><a-form-item label="用户名"><a-input v-model="customSourceDB.username" /></a-form-item></a-col>
-                      </a-row>
-                      <a-row :gutter="16">
-                        <a-col :span="12"><a-form-item label="密码"><a-input-password v-model="customSourceDB.password" /></a-form-item></a-col>
-                        <a-col :span="12">
-                          <a-form-item label="操作">
-                            <a-space>
-                              <a-button type="outline" size="small" @click="testSourceConnection"><template #icon><icon-check /></template>测试连接</a-button>
-                              <a-button type="primary" size="small" @click="saveSourceConfig"><template #icon><icon-save /></template>保存配置</a-button>
-                            </a-space>
-                          </a-form-item>
-                        </a-col>
-                      </a-row>
+                <div v-if="selectedSyncLevel === 'table'" class="table-selector-panel">
+                  <a-form-item label="选择要同步的表" class="table-selector-form-item">
+                    <a-alert v-if="!activeTableSourceDatabase" type="info" style="margin-bottom: 8px" show-icon>
+                      请先选择至少一个源数据库，再选择当前源库后勾选表
+                    </a-alert>
+                    <div class="table-toolbar">
+                      <a-input
+                        v-model="tableSearchText"
+                        placeholder="搜索表名..."
+                        allow-clear
+                        class="table-search-input"
+                        :disabled="!activeTableSourceDatabase"
+                      >
+                        <template #suffix><icon-search /></template>
+                      </a-input>
+                      <a-button type="text" size="small" :disabled="!activeTableSourceDatabase" @click="toggleAllTables">
+                        {{ currentDatabaseSelectedTables.length === filteredTables.length && filteredTables.length > 0 ? '取消全选' : '全选' }}
+                      </a-button>
+                      <a-button type="text" size="small" :disabled="!activeTableSourceDatabase" :loading="refreshingTables" @click="refreshTables">
+                        <template #icon><icon-refresh /></template>
+                      </a-button>
                     </div>
-                  </a-collapse-item>
-                  <a-collapse-item key="target" header="自定义目标数据库连接">
-                    <template #extra><a-switch v-model="useCustomTargetDB" size="small" @click.stop /></template>
-                    <div v-if="useCustomTargetDB">
-                      <a-row :gutter="16">
-                        <a-col :span="12"><a-form-item label="主机"><a-input v-model="customTargetDB.host" placeholder="如: 192.168.1.101" /></a-form-item></a-col>
-                        <a-col :span="12"><a-form-item label="端口"><a-input-number v-model="customTargetDB.port" :min="1" :max="65535" /></a-form-item></a-col>
-                      </a-row>
-                      <a-row :gutter="16">
-                        <a-col :span="12"><a-form-item label="数据库"><a-input v-model="customTargetDB.database" /></a-form-item></a-col>
-                        <a-col :span="12"><a-form-item label="用户名"><a-input v-model="customTargetDB.username" /></a-form-item></a-col>
-                      </a-row>
-                      <a-row :gutter="16">
-                        <a-col :span="12"><a-form-item label="密码"><a-input-password v-model="customTargetDB.password" /></a-form-item></a-col>
-                        <a-col :span="12">
-                          <a-form-item label="操作">
-                            <a-space>
-                              <a-button type="outline" size="small" @click="testTargetConnection"><template #icon><icon-check /></template>测试连接</a-button>
-                              <a-button type="primary" size="small" @click="saveTargetConfig"><template #icon><icon-save /></template>保存配置</a-button>
-                            </a-space>
-                          </a-form-item>
-                        </a-col>
-                      </a-row>
+                    <div class="table-list-panel">
+                      <a-checkbox-group
+                        v-model="currentDatabaseSelectedTables"
+                        v-if="activeTableSourceDatabase && filteredTables.length > 0"
+                        class="table-checkbox-group"
+                      >
+                        <div class="table-list-grid">
+                          <div class="table-list-item" v-for="table in filteredTables" :key="table.table_name">
+                            <a-checkbox :value="table.table_name">
+                              {{ table.table_name }}
+                              <a-tag size="small" color="gray">{{ table.table_row_count }} 行</a-tag>
+                            </a-checkbox>
+                          </div>
+                        </div>
+                      </a-checkbox-group>
+                      <a-empty v-else :description="activeTableSourceDatabase ? '暂无匹配的表' : '请先选择当前源库'" :style="{ padding: '20px 0' }" />
                     </div>
-                  </a-collapse-item>
-                </a-collapse>
+                    <div style="margin-top: 8px">
+                      <a-typography-text type="secondary">
+                        当前库 {{ activeTableSourceDatabase || '-' }} 已选 {{ currentDatabaseSelectedTables.length }} 个表，
+                        总计已选 {{ totalSelectedTables }} 个表
+                      </a-typography-text>
+                    </div>
+                  </a-form-item>
+                </div>
+              </a-col>
+            </a-row>
+
+            <a-row :gutter="32" class="advanced-config-row">
+              <a-col :span="24">
+                <a-card class="advanced-config-card" :bordered="false">
+                  <a-typography-title :heading="6" style="margin-bottom: 12px">高级配置</a-typography-title>
+
+                  <a-row :gutter="16">
+                    <a-col :span="12">
+                      <a-form-item label="批量大小">
+                        <a-input-number
+                          :model-value="taskForm.batch_size"
+                          @change="v => taskForm.batch_size = v"
+                          :min="1"
+                          style="width: 100%"
+                        />
+                      </a-form-item>
+                    </a-col>
+                    <a-col :span="12">
+                      <a-form-item label="表并发数">
+                        <a-input-number
+                          :model-value="taskForm.worker_count"
+                          @change="v => taskForm.worker_count = v"
+                          :min="1"
+                          style="width: 100%"
+                        />
+                      </a-form-item>
+                    </a-col>
+                  </a-row>
+
+                  <a-form-item>
+                    <a-checkbox v-model="taskForm.optimize_index">
+                      <a-space direction="vertical" :size="4">
+                        <span style="font-weight: 500">启用索引优化</span>
+                        <a-typography-text type="secondary" style="font-size: 12px">
+                          同步前删除非主键索引以提高写入性能，同步完成后自动重建
+                        </a-typography-text>
+                      </a-space>
+                    </a-checkbox>
+                  </a-form-item>
+
+                  <a-form-item>
+                    <a-checkbox v-model="taskForm.enable_read_only">
+                      <a-space direction="vertical" :size="4">
+                        <span style="font-weight: 500">临时关闭目标库只读</span>
+                        <a-typography-text type="secondary" style="font-size: 12px">
+                          同步开始时自动关闭目标库 read_only / super_read_only，同步结束后自动恢复
+                        </a-typography-text>
+                      </a-space>
+                    </a-checkbox>
+                  </a-form-item>
+
+                  <a-collapse :default-active-key="[]">
+                    <a-collapse-item key="source" header="自定义源数据库连接">
+                      <template #extra><a-switch v-model="useCustomSourceDB" size="small" @click.stop /></template>
+                      <div v-if="useCustomSourceDB">
+                        <a-row :gutter="16">
+                          <a-col :span="12"><a-form-item label="主机"><a-input v-model="customSourceDB.host" placeholder="如: 192.168.1.100" /></a-form-item></a-col>
+                          <a-col :span="12"><a-form-item label="端口"><a-input-number v-model="customSourceDB.port" :min="1" :max="65535" /></a-form-item></a-col>
+                        </a-row>
+                        <a-row :gutter="16">
+                          <a-col :span="12"><a-form-item label="数据库"><a-input v-model="customSourceDB.database" /></a-form-item></a-col>
+                          <a-col :span="12"><a-form-item label="用户名"><a-input v-model="customSourceDB.username" /></a-form-item></a-col>
+                        </a-row>
+                        <a-row :gutter="16">
+                          <a-col :span="12"><a-form-item label="密码"><a-input-password v-model="customSourceDB.password" /></a-form-item></a-col>
+                          <a-col :span="12">
+                            <a-form-item label="操作">
+                              <a-space>
+                                <a-button type="outline" size="small" @click="testSourceConnection"><template #icon><icon-check /></template>测试连接</a-button>
+                                <a-button type="primary" size="small" @click="saveSourceConfig"><template #icon><icon-save /></template>保存配置</a-button>
+                              </a-space>
+                            </a-form-item>
+                          </a-col>
+                        </a-row>
+                      </div>
+                    </a-collapse-item>
+                    <a-collapse-item key="target" header="自定义目标数据库连接">
+                      <template #extra><a-switch v-model="useCustomTargetDB" size="small" @click.stop /></template>
+                      <div v-if="useCustomTargetDB">
+                        <a-row :gutter="16">
+                          <a-col :span="12"><a-form-item label="主机"><a-input v-model="customTargetDB.host" placeholder="如: 192.168.1.101" /></a-form-item></a-col>
+                          <a-col :span="12"><a-form-item label="端口"><a-input-number v-model="customTargetDB.port" :min="1" :max="65535" /></a-form-item></a-col>
+                        </a-row>
+                        <a-row :gutter="16">
+                          <a-col :span="12"><a-form-item label="数据库"><a-input v-model="customTargetDB.database" /></a-form-item></a-col>
+                          <a-col :span="12"><a-form-item label="用户名"><a-input v-model="customTargetDB.username" /></a-form-item></a-col>
+                        </a-row>
+                        <a-row :gutter="16">
+                          <a-col :span="12"><a-form-item label="密码"><a-input-password v-model="customTargetDB.password" /></a-form-item></a-col>
+                          <a-col :span="12">
+                            <a-form-item label="操作">
+                              <a-space>
+                                <a-button type="outline" size="small" @click="testTargetConnection"><template #icon><icon-check /></template>测试连接</a-button>
+                                <a-button type="primary" size="small" @click="saveTargetConfig"><template #icon><icon-save /></template>保存配置</a-button>
+                              </a-space>
+                            </a-form-item>
+                          </a-col>
+                        </a-row>
+                      </div>
+                    </a-collapse-item>
+                  </a-collapse>
+                </a-card>
               </a-col>
             </a-row>
           </a-form>
@@ -1515,11 +1713,21 @@ watch(selectedDatabases, (newDbs) => {
               </span>
             </a-space>
           </a-descriptions-item>
-          <a-descriptions-item v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'" label="源数据库">
-            {{ selectedTaskForDetail.config.source_schema }}
+          <a-descriptions-item v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'" label="源数据库" :span="2">
+            <a-space wrap>
+              <template v-if="(selectedTaskForDetail.config.source_databases || []).length">
+                <a-tag v-for="db in selectedTaskForDetail.config.source_databases" :key="db" color="arcoblue">{{ db }}</a-tag>
+              </template>
+              <span v-else>{{ selectedTaskForDetail.config.source_schema || '-' }}</span>
+            </a-space>
           </a-descriptions-item>
-          <a-descriptions-item v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'" label="目标数据库">
-            {{ selectedTaskForDetail.config.target_schema }}
+          <a-descriptions-item v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'" label="目标数据库" :span="2">
+            <a-space wrap>
+              <template v-if="(selectedTaskForDetail.config.target_databases || []).length">
+                <a-tag v-for="db in selectedTaskForDetail.config.target_databases" :key="db" color="green">{{ db }}</a-tag>
+              </template>
+              <span v-else>{{ selectedTaskForDetail.config.target_schema || '-' }}</span>
+            </a-space>
           </a-descriptions-item>
           <a-descriptions-item label="批量大小">
             {{ selectedTaskForDetail.config.batch_size }}
@@ -1935,6 +2143,126 @@ watch(selectedDatabases, (newDbs) => {
 .transfer-search {
   padding: 8px 12px;
   border-bottom: 1px solid #e5e6eb;
+}
+
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  width: 100%;
+}
+
+.table-search-input {
+  flex: 1;
+  min-width: 260px;
+}
+
+.table-selector-panel {
+  height: 100%;
+  min-height: 460px;
+  border: 1px solid #e5e6eb;
+  border-radius: 8px;
+  background: #fff;
+  padding: 12px;
+}
+
+.table-selector-form-item {
+  margin-bottom: 0;
+}
+
+.table-selector-form-item :deep(.arco-form-item-content-wrapper) {
+  width: 100%;
+}
+
+.table-selector-form-item :deep(.arco-form-item-content) {
+  width: 100%;
+  display: block;
+}
+
+.table-list-panel {
+  width: 100%;
+  height: 430px;
+  overflow-y: auto;
+  border: 1px solid #e5e6eb;
+  border-radius: 6px;
+  padding: 10px;
+  background: #fafafa;
+  display: block;
+}
+
+.table-checkbox-group {
+  width: 100%;
+  display: block;
+}
+
+.table-list-panel > :deep(*) {
+  width: 100%;
+}
+
+.table-list-grid {
+  display: grid;
+  width: 100%;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.table-list-item {
+  width: 100%;
+  min-width: 0;
+}
+
+.table-list-item :deep(.arco-checkbox) {
+  width: 100%;
+}
+
+.table-list-item :deep(.arco-checkbox-label) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.advanced-config-row {
+  margin-top: 16px;
+}
+
+.advanced-config-card {
+  background: #fff;
+  border-radius: 8px;
+}
+
+.table-mapping-panel {
+  margin-bottom: 12px;
+  border: 1px solid #e5e6eb;
+  border-radius: 4px;
+  padding: 10px 12px;
+  background: #fafbfc;
+}
+
+.table-mapping-title {
+  margin-bottom: 8px;
+  color: #4e5969;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.table-mapping-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.table-mapping-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.table-mapping-source {
+  min-width: 120px;
+  color: #1d2129;
+  font-size: 13px;
 }
 
 .transfer-content {
