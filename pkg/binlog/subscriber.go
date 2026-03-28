@@ -51,13 +51,14 @@ type Subscriber struct {
 
 // SubscriberConfig 订阅器配置
 type SubscriberConfig struct {
-	Host     string
-	Port     int
-	Username string
-	Password string
-	Database string
-	Tables   []string
-	ServerID uint32
+	Host      string
+	Port      int
+	Username  string
+	Password  string
+	Database  string   // Deprecated: Use Databases instead
+	Databases []string // List of databases to subscribe
+	Tables    []string // Specific tables (if empty, subscribe all tables in Databases)
+	ServerID  uint32
 }
 
 // NewSubscriber 创建Binlog订阅器
@@ -94,15 +95,35 @@ func (s *Subscriber) Start(ctx context.Context, position mysql.Position) error {
 	cfg.ServerID = s.config.ServerID
 	cfg.Dump.ExecutionPath = "mysqldump"
 
-	// 只订阅指定的数据库和表
+	// 确定要订阅的数据库列表
+	dbs := s.config.Databases
+	if len(dbs) == 0 && s.config.Database != "" {
+		dbs = []string{s.config.Database}
+	}
+
+	// 构建 IncludeTableRegex
+	var regexes []string
 	if len(s.config.Tables) > 0 {
-		cfg.IncludeTableRegex = make([]string, len(s.config.Tables))
-		for i, table := range s.config.Tables {
-			cfg.IncludeTableRegex[i] = fmt.Sprintf("%s\\.%s", s.config.Database, table)
+		// 指定了表 (通常用于单库模式)
+		// 如果指定了 Databases，则假设 Tables 属于这些库 (或者只取第一个库)
+		// 为了兼容性，如果 Database 字段存在，使用它
+		db := s.config.Database
+		if db == "" && len(dbs) > 0 {
+			db = dbs[0]
+		}
+		if db != "" {
+			for _, table := range s.config.Tables {
+				regexes = append(regexes, fmt.Sprintf("%s\\.%s", db, table))
+			}
 		}
 	} else {
-		cfg.IncludeTableRegex = []string{fmt.Sprintf("%s\\..*", s.config.Database)}
+		// 未指定表，订阅库下所有表
+		for _, db := range dbs {
+			regexes = append(regexes, fmt.Sprintf("%s\\..*", db))
+		}
 	}
+
+	cfg.IncludeTableRegex = regexes
 
 	c, err := canal.NewCanal(cfg)
 	if err != nil {

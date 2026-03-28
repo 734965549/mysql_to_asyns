@@ -1349,16 +1349,18 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	// 创建增量同步配置
 	syncConfig := &syncApp.SyncConfig{
-		TaskID:         taskID,
-		SourceHost:     sourceHost,
-		SourcePort:     sourcePort,
-		SourceUsername: sourceUsername,
-		SourcePassword: sourcePassword,
-		SourceSchema:   sourceSchema,
-		TargetSchema:   targetSchema,
-		Tables:         task.Config.Tables,
-		BatchSize:      task.Config.BatchSize,
-		ServerID:       generateServerID(taskID),
+		TaskID:          taskID,
+		SourceHost:      sourceHost,
+		SourcePort:      sourcePort,
+		SourceUsername:  sourceUsername,
+		SourcePassword:  sourcePassword,
+		SourceSchema:    sourceSchema,
+		TargetSchema:    targetSchema,
+		SourceDatabases: task.Config.SourceDatabases,
+		TargetDatabases: task.Config.TargetDatabases,
+		Tables:          task.Config.Tables,
+		BatchSize:       task.Config.BatchSize,
+		ServerID:        generateServerID(taskID),
 	}
 
 	// 创建增量同步服务

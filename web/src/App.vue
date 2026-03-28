@@ -926,39 +926,99 @@ watch(selectedDatabases, (newDbs) => {
                   </a-radio-group>
                 </a-form-item>
 
-                <!-- 库级别：多选源数据库 -->
-                <a-form-item v-if="selectedSyncLevel === 'database'" label="源数据库（可多选）" required>
-                  <div style="display: flex; align-items: flex-start; gap: 8px">
-                    <div style="flex: 1">
-                      <!-- 搜索框 -->
+                <!-- 库级别：双栏选择器 (仿阿里云 DTS/DMS 布局) -->
+                <div v-if="selectedSyncLevel === 'database'" class="db-transfer-container">
+                  <!-- 左侧：可选库 -->
+                  <div class="transfer-pane">
+                    <div class="transfer-header">
+                      <span class="title">源数据库</span>
+                      <a-button type="text" size="mini" :loading="refreshingDatabases" @click="refreshDatabases">
+                        <template #icon><icon-refresh /></template>
+                      </a-button>
+                    </div>
+                    <div class="transfer-search">
                       <a-input-search
                         v-model="databaseSearchText"
-                        placeholder="搜索数据库名..."
-                        style="margin-bottom: 8px"
+                        placeholder="搜索库名..."
+                        size="small"
                         allow-clear
                       />
-                      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px">
-                        <a-button type="text" size="small" @click="selectedDatabases = selectedDatabases.length === filteredDatabases.length ? [] : [...filteredDatabases]">
-                          {{ selectedDatabases.length === filteredDatabases.length && filteredDatabases.length > 0 ? '取消全选' : '全选' }}
-                        </a-button>
-                        <a-typography-text type="secondary" style="font-size: 12px">已选 {{ selectedDatabases.length }} / {{ filteredDatabases.length }}</a-typography-text>
+                    </div>
+                    <div class="transfer-content">
+                      <div class="transfer-list-header">
+                        <a-checkbox 
+                          :model-value="selectedDatabases.length === filteredDatabases.length && filteredDatabases.length > 0"
+                          :indeterminate="selectedDatabases.length > 0 && selectedDatabases.length < filteredDatabases.length"
+                          @change="() => {
+                            if (selectedDatabases.length === filteredDatabases.length) {
+                              selectedDatabases = []
+                            } else {
+                              selectedDatabases = filteredDatabases
+                            }
+                          }"
+                        >
+                          全选
+                        </a-checkbox>
+                        <span class="count">{{ filteredDatabases.length }} 个库</span>
                       </div>
-                      <div style="max-height: 180px; overflow-y: auto; border: 1px solid #e5e6eb; border-radius: 4px; padding: 8px; background: #fafafa">
-                        <a-checkbox-group v-model="selectedDatabases" style="width: 100%">
-                          <a-row :gutter="[8, 8]">
-                            <a-col :span="8" v-for="db in filteredDatabases" :key="db">
-                              <a-checkbox :value="db">{{ db }}</a-checkbox>
-                            </a-col>
-                          </a-row>
+                      <div class="transfer-list">
+                        <a-checkbox-group v-model="selectedDatabases" direction="vertical" style="width: 100%">
+                          <div v-for="db in filteredDatabases" :key="db" class="transfer-list-item">
+                            <a-checkbox :value="db">{{ db }}</a-checkbox>
+                          </div>
                         </a-checkbox-group>
-                        <a-empty v-if="filteredDatabases.length === 0" description="暂无匹配的数据库" :style="{ padding: '8px 0' }" />
+                        <a-empty v-if="filteredDatabases.length === 0" description="暂无数据" />
                       </div>
                     </div>
-                    <a-button type="text" size="small" :loading="refreshingDatabases" @click="refreshDatabases">
-                      <template #icon><icon-refresh /></template>
-                    </a-button>
                   </div>
-                </a-form-item>
+
+                  <!-- 中间：箭头 (可选) -->
+                  <div class="transfer-arrow">
+                    <icon-arrow-right size="20" />
+                  </div>
+
+                  <!-- 右侧：已选库及映射 -->
+                  <div class="transfer-pane">
+                    <div class="transfer-header">
+                      <span class="title">已选库 ({{ selectedDatabases.length }})</span>
+                      <a-button type="text" size="mini" status="danger" @click="selectedDatabases = []" :disabled="selectedDatabases.length === 0">
+                        清空
+                      </a-button>
+                    </div>
+                    <div class="transfer-header-tip">
+                      <span>源库名</span>
+                      <span>目标库名 (可修改)</span>
+                    </div>
+                    <div class="transfer-content bg-white">
+                      <div class="transfer-list">
+                        <div v-for="(mapping, idx) in targetDatabaseMappings" :key="mapping.source" class="mapped-item">
+                          <div class="source-name" :title="mapping.source">
+                            <icon-storage style="margin-right: 4px; color: #165dff" />
+                            {{ mapping.source }}
+                          </div>
+                          <div class="target-input">
+                            <a-input 
+                              v-model="mapping.target" 
+                              size="small" 
+                              placeholder="目标库名"
+                              :style="{ width: '100%', borderColor: mapping.target ? '' : '#ff7d00' }"
+                            />
+                          </div>
+                          <a-button 
+                            type="text" 
+                            size="mini" 
+                            status="danger" 
+                            class="remove-btn"
+                            @click="selectedDatabases = selectedDatabases.filter(d => d !== mapping.source)"
+                          >
+                            <icon-close />
+                          </a-button>
+                        </div>
+                        <a-empty v-if="targetDatabaseMappings.length === 0" description="请从左侧选择数据库" />
+                      </div>
+                    </div>
+                  </div>
+                </div>
 
                 <!-- 表级别：单选源数据库 -->
                 <a-form-item v-if="selectedSyncLevel === 'table'" label="源数据库" required>
@@ -971,19 +1031,6 @@ watch(selectedDatabases, (newDbs) => {
                       <template #icon><icon-refresh /></template>
                     </a-button>
                   </a-space>
-                </a-form-item>
-
-                <!-- 库级别：目标数据库映射表 -->
-                <a-form-item v-if="selectedSyncLevel === 'database'" label="目标数据库映射">
-                  <div v-if="targetDatabaseMappings.length > 0">
-                    <div v-for="(mapping, i) in targetDatabaseMappings" :key="mapping.source"
-                      style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
-                      <a-tag color="arcoblue" style="min-width: 130px; text-align: center">{{ mapping.source }}</a-tag>
-                      <icon-arrow-right style="color: #86909c" />
-                      <a-input v-model="targetDatabaseMappings[i].target" style="width: 200px" placeholder="目标库名" />
-                    </div>
-                  </div>
-                  <a-typography-text v-else type="secondary">请先选择源数据库</a-typography-text>
                 </a-form-item>
 
                 <!-- 表级别：单个目标库输入 + 同步模式 -->
@@ -1425,10 +1472,25 @@ watch(selectedDatabases, (newDbs) => {
             <a-tag v-else-if="selectedTaskForDetail.config.mode === 'INCREMENTAL'" color="green">增量同步</a-tag>
             <a-tag v-else color="purple">全量+增量</a-tag>
           </a-descriptions-item>
-          <a-descriptions-item label="源数据库">
+          <a-descriptions-item v-if="selectedTaskForDetail.config.sync_level === 'DATABASE'" label="源数据库列表" :span="2">
+            <a-space wrap>
+              <a-tag v-for="db in (selectedTaskForDetail.config.source_databases || [])" :key="db" color="blue">{{ db }}</a-tag>
+              <span v-if="!(selectedTaskForDetail.config.source_databases || []).length">-</span>
+            </a-space>
+          </a-descriptions-item>
+          <a-descriptions-item v-if="selectedTaskForDetail.config.sync_level === 'DATABASE'" label="数据库映射" :span="2">
+            <a-space wrap>
+              <span v-for="(src, i) in (selectedTaskForDetail.config.source_databases || [])" :key="src" style="display: inline-flex; align-items: center; margin-right: 12px">
+                <a-tag color="blue">{{ src }}</a-tag>
+                <span style="margin: 0 4px">→</span>
+                <a-tag color="green">{{ ((selectedTaskForDetail.config.target_databases || [])[i]) || src }}</a-tag>
+              </span>
+            </a-space>
+          </a-descriptions-item>
+          <a-descriptions-item v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'" label="源数据库">
             {{ selectedTaskForDetail.config.source_schema }}
           </a-descriptions-item>
-          <a-descriptions-item label="目标数据库">
+          <a-descriptions-item v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'" label="目标数据库">
             {{ selectedTaskForDetail.config.target_schema }}
           </a-descriptions-item>
           <a-descriptions-item label="批量大小">
@@ -1484,15 +1546,15 @@ watch(selectedDatabases, (newDbs) => {
           </a-descriptions-item>
         </a-descriptions>
         
-        <!-- 同步表列表 -->
-        <a-descriptions title="同步表" :column="1" bordered style="margin-top: 20px">
+        <!-- 同步表列表（仅表级别显示） -->
+        <a-descriptions v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'" title="同步表" :column="1" bordered style="margin-top: 20px">
           <a-descriptions-item label="表列表">
-            <a-tag v-for="table in selectedTaskForDetail.config.tables" :key="table" style="margin: 4px">
-              {{ table }}
-            </a-tag>
-            <span v-if="!selectedTaskForDetail.config.tables || selectedTaskForDetail.config.tables.length === 0">
-              全库同步
-            </span>
+            <a-space wrap>
+              <a-tag v-for="table in selectedTaskForDetail.config.tables" :key="table">{{ table }}</a-tag>
+              <span v-if="!selectedTaskForDetail.config.tables || selectedTaskForDetail.config.tables.length === 0">
+                全库同步
+              </span>
+            </a-space>
           </a-descriptions-item>
         </a-descriptions>
         
@@ -1775,21 +1837,155 @@ watch(selectedDatabases, (newDbs) => {
 .task-progress {
   display: flex;
   align-items: center;
-  gap: 16px;
-  margin-bottom: 12px;
+  gap: 12px;
+  margin-bottom: 16px;
 }
 
 .progress-text {
+  font-size: 12px;
   color: #86909c;
-  font-size: 13px;
-  white-space: nowrap;
+  min-width: 100px;
+  text-align: right;
 }
 
 .task-actions {
   display: flex;
-  gap: 8px;
   justify-content: flex-end;
-  padding-top: 12px;
+  gap: 8px;
   border-top: 1px solid #e5e6eb;
+  padding-top: 12px;
+}
+
+/* 双栏选择器样式 */
+.db-transfer-container {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  height: 400px;
+  margin-bottom: 24px;
+}
+
+.transfer-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #e5e6eb;
+  border-radius: 4px;
+  background: #fff;
+  height: 100%;
+  overflow: hidden;
+}
+
+.transfer-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid #e5e6eb;
+  background: #f7f8fa;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.transfer-header .title {
+  font-weight: 500;
+  font-size: 14px;
+  color: #1d2129;
+}
+
+.transfer-header-tip {
+  display: flex;
+  padding: 6px 12px;
+  background: #fff;
+  border-bottom: 1px solid #f2f3f5;
+  font-size: 12px;
+  color: #86909c;
+}
+
+.transfer-header-tip span {
+  flex: 1;
+}
+
+.transfer-search {
+  padding: 8px 12px;
+  border-bottom: 1px solid #e5e6eb;
+}
+
+.transfer-content {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.transfer-content.bg-white {
+  background: #fff;
+}
+
+.transfer-list-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid #f2f3f5;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  color: #4e5969;
+}
+
+.transfer-list {
+  padding: 4px 0;
+}
+
+.transfer-list-item {
+  padding: 6px 12px;
+  display: flex;
+  align-items: center;
+}
+
+.transfer-list-item:hover {
+  background: #f2f3f5;
+}
+
+.mapped-item {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid #f2f3f5;
+  gap: 8px;
+}
+
+.mapped-item:hover {
+  background: #f7f8fa;
+}
+
+.mapped-item .source-name {
+  flex: 1;
+  font-size: 13px;
+  color: #1d2129;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+}
+
+.mapped-item .target-input {
+  flex: 1;
+}
+
+.mapped-item .remove-btn {
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.mapped-item:hover .remove-btn {
+  opacity: 1;
+}
+
+.transfer-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #86909c;
+  padding-top: 40px; /* 稍微下移一点，对齐内容区 */
 }
 </style>

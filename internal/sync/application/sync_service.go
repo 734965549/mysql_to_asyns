@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"mysql-to-async/internal/checkpoint"
 	"mysql-to-async/internal/metadata/domain/entity"
@@ -24,6 +25,7 @@ type IncrementalSyncService struct {
 	subscriber    *binlog.Subscriber
 	writers       map[string]*writer.BufferedWriter
 	identities    map[string]*entity.TableIdentity
+	targetSchemas map[string]string
 	mu            sync.RWMutex
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -56,6 +58,7 @@ func NewIncrementalSyncService(
 		checkpointMgr: checkpointMgr,
 		writers:       make(map[string]*writer.BufferedWriter),
 		identities:    make(map[string]*entity.TableIdentity),
+		targetSchemas: make(map[string]string),
 		auditChan:     make(chan *AuditLog, 1000),
 	}
 }
@@ -64,28 +67,63 @@ func NewIncrementalSyncService(
 func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, config *SyncConfig) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	// 初始化表的标识信息
-	for _, tableName := range config.Tables {
-		identity, err := s.analyzer.AnalyzeTable(config.SourceSchema, tableName)
-		if err != nil {
-			return err
-		}
-		s.mu.Lock()
-		s.identities[tableName] = identity
-		s.mu.Unlock()
+	// 构建数据库映射
+	dbMapping := make(map[string]string)
+	sourceDBs := config.SourceDatabases
+	if len(sourceDBs) == 0 && config.SourceSchema != "" {
+		sourceDBs = []string{config.SourceSchema}
+	}
 
-		// 创建写入器（使用TargetSchema确保数据写入正确的目标库）
-		schema := config.TargetSchema
-		if schema == "" {
-			schema = config.SourceSchema
+	for i, src := range sourceDBs {
+		tgt := src
+		// 尝试从TargetDatabases获取映射
+		if i < len(config.TargetDatabases) && config.TargetDatabases[i] != "" {
+			tgt = config.TargetDatabases[i]
+		} else if len(config.SourceDatabases) == 0 && config.TargetSchema != "" {
+			// 如果是单库模式(SourceDatabases为空)，使用TargetSchema
+			tgt = config.TargetSchema
 		}
-		s.writers[tableName] = writer.NewBufferedWriterWithSchema(
-			s.targetDB,
-			identity,
-			config.BatchSize,
-			500*time.Millisecond,
-			schema,
-		)
+		dbMapping[src] = tgt
+	}
+
+	// 初始化表的标识信息和写入器
+	for srcDB, tgtDB := range dbMapping {
+		tables := config.Tables
+		// 如果未指定表（库级别同步），获取该库所有表
+		if len(tables) == 0 {
+			allTables, err := s.analyzer.GetAllTables(srcDB)
+			if err != nil {
+				return err
+			}
+			tables = make([]string, 0, len(allTables))
+			for _, t := range allTables {
+				tables = append(tables, t.TableName)
+			}
+		}
+
+		for _, tableName := range tables {
+			identity, err := s.analyzer.AnalyzeTable(srcDB, tableName)
+			if err != nil {
+				return err
+			}
+
+			key := fmt.Sprintf("%s.%s", srcDB, tableName)
+
+			// 创建写入器（使用TargetSchema确保数据写入正确的目标库）
+			bw := writer.NewBufferedWriterWithSchema(
+				s.targetDB,
+				identity,
+				config.BatchSize,
+				500*time.Millisecond,
+				tgtDB,
+			)
+
+			s.mu.Lock()
+			s.identities[key] = identity
+			s.targetSchemas[key] = tgtDB
+			s.writers[key] = bw
+			s.mu.Unlock()
+		}
 	}
 
 	// 获取保存的位点
@@ -96,13 +134,14 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 
 	// 创建Binlog订阅器
 	s.subscriber = binlog.NewSubscriber(&binlog.SubscriberConfig{
-		Host:     config.SourceHost,
-		Port:     config.SourcePort,
-		Username: config.SourceUsername,
-		Password: config.SourcePassword,
-		Database: config.SourceSchema,
-		Tables:   config.Tables,
-		ServerID: config.ServerID,
+		Host:      config.SourceHost,
+		Port:      config.SourcePort,
+		Username:  config.SourceUsername,
+		Password:  config.SourcePassword,
+		Database:  config.SourceSchema,
+		Databases: sourceDBs,
+		Tables:    config.Tables,
+		ServerID:  config.ServerID,
 	})
 
 	// 添加事件处理器
@@ -182,18 +221,27 @@ func (s *IncrementalSyncService) getIdentity(tableName string) *entity.TableIden
 	return s.identities[tableName]
 }
 
+// getTargetSchema 获取目标数据库名
+func (s *IncrementalSyncService) getTargetSchema(key string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.targetSchemas[key]
+}
+
 // SyncConfig 同步配置
 type SyncConfig struct {
-	TaskID         string
-	SourceHost     string
-	SourcePort     int
-	SourceUsername string
-	SourcePassword string
-	SourceSchema   string
-	TargetSchema   string
-	Tables         []string
-	BatchSize      int
-	ServerID       uint32
+	TaskID          string
+	SourceHost      string
+	SourcePort      int
+	SourceUsername  string
+	SourcePassword  string
+	SourceSchema    string
+	TargetSchema    string
+	SourceDatabases []string
+	TargetDatabases []string
+	Tables          []string
+	BatchSize       int
+	ServerID        uint32
 }
 
 // syncEventHandler 同步事件处理器
@@ -204,24 +252,27 @@ type syncEventHandler struct {
 
 // OnEvent 处理Binlog事件
 func (h *syncEventHandler) OnEvent(event *binlog.BinlogEvent) error {
-	w := h.service.getWriter(event.Table)
+	key := fmt.Sprintf("%s.%s", event.Schema, event.Table)
+	w := h.service.getWriter(key)
 	if w == nil {
 		return nil // 不是我们需要同步的表
 	}
 
-	identity := h.service.getIdentity(event.Table)
+	identity := h.service.getIdentity(key)
 	if identity == nil {
 		return nil
 	}
+
+	targetSchema := h.service.getTargetSchema(key)
 
 	var err error
 	switch event.EventType {
 	case binlog.EventTypeInsert:
 		err = h.handleInsert(event, w)
 	case binlog.EventTypeUpdate:
-		err = h.handleUpdate(event, w, identity)
+		err = h.handleUpdate(event, w, identity, targetSchema)
 	case binlog.EventTypeDelete:
-		err = h.handleDelete(event, w, identity)
+		err = h.handleDelete(event, w, identity, targetSchema)
 	}
 
 	// 记录审计日志
@@ -257,8 +308,8 @@ func (h *syncEventHandler) handleInsert(event *binlog.BinlogEvent, w *writer.Buf
 }
 
 // handleUpdate 处理UPDATE事件
-func (h *syncEventHandler) handleUpdate(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity) error {
-	batchWriter := writer.NewBatchWriter(h.service.targetDB, identity, 1000)
+func (h *syncEventHandler) handleUpdate(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity, targetSchema string) error {
+	batchWriter := writer.NewBatchWriterWithSchema(h.service.targetDB, identity, 1000, targetSchema)
 	for i, row := range event.Rows {
 		var err error
 		if identity.Strategy == entity.FullColumnsStrategy && i < len(event.BeforeImage) {
@@ -276,8 +327,8 @@ func (h *syncEventHandler) handleUpdate(event *binlog.BinlogEvent, w *writer.Buf
 }
 
 // handleDelete 处理DELETE事件
-func (h *syncEventHandler) handleDelete(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity) error {
-	batchWriter := writer.NewBatchWriter(h.service.targetDB, identity, 1000)
+func (h *syncEventHandler) handleDelete(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity, targetSchema string) error {
+	batchWriter := writer.NewBatchWriterWithSchema(h.service.targetDB, identity, 1000, targetSchema)
 	for _, row := range event.Rows {
 		if err := batchWriter.Delete(context.Background(), row); err != nil {
 			return err
