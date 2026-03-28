@@ -1011,31 +1011,73 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							return nil
 						}
 
+						// 每 worker 用独立源库连接执行一次流式查询，避免反复发小范围查询引起的源库 I/O 抖动
+						srcConn, err := s.sourceDB.Conn(ctx)
+						if err != nil {
+							syncErrChan <- fmt.Errorf("w%d source conn: %v", wIdx, err)
+							return
+						}
+						defer srcConn.Close()
+
 						wReader := reader.NewRangeShardingReader(s.sourceDB, sourceSchema, tableName, identity)
-						for batchStart := rangeStart; batchStart < rangeEnd; {
+						sqlRows, cols, err := wReader.OpenRangeStream(srcConn, ctx, rangeStart, rangeEnd)
+						if err != nil {
+							syncErrChan <- fmt.Errorf("w%d stream [%d,%d): %v", wIdx, rangeStart, rangeEnd, err)
+							return
+						}
+						defer sqlRows.Close()
+
+						values := make([]interface{}, len(cols))
+						valuePtrs := make([]interface{}, len(cols))
+						for i := range values {
+							valuePtrs[i] = &values[i]
+						}
+						batch := make([]map[string]interface{}, 0, batchSize)
+						rangeMark := fmt.Sprintf("%s.%s:w%d:[%d,%d)", sourceSchema, tableName, wIdx, rangeStart, rangeEnd)
+
+						for {
 							if s.isTaskStopped(taskID) {
 								return
 							}
-							batchEnd := batchStart + batchSize
-							if batchEnd > rangeEnd {
-								batchEnd = rangeEnd
+							if !sqlRows.Next() {
+								break
 							}
-							batchRows, err := wReader.ReadBatch(ctx, batchStart, batchEnd)
-							if err != nil {
-								syncErrChan <- fmt.Errorf("w%d read [%d,%d): %v", wIdx, batchStart, batchEnd, err)
+							if err := sqlRows.Scan(valuePtrs...); err != nil {
+								syncErrChan <- fmt.Errorf("w%d scan: %v", wIdx, err)
 								return
 							}
-							if len(batchRows) > 0 {
-								mark := fmt.Sprintf("%s.%s:w%d:[%d,%d)", sourceSchema, tableName, wIdx, batchStart, batchEnd)
-								if err := doWrite(batchRows, mark); err != nil {
+							row := make(map[string]interface{}, len(cols))
+							for i, col := range cols {
+								if b, ok := values[i].([]byte); ok {
+									row[col] = string(b)
+								} else {
+									row[col] = values[i]
+								}
+							}
+							batch = append(batch, row)
+							if int64(len(batch)) >= batchSize {
+								if err := doWrite(batch, rangeMark); err != nil {
 									syncErrChan <- err
 									return
 								}
-								n := int64(len(batchRows))
+								n := int64(len(batch))
 								atomic.AddInt64(&atomicProcessed, n)
-								s.incrementTaskProgress(taskID, n, mark)
+								s.incrementTaskProgress(taskID, n, rangeMark)
+								batch = batch[:0]
 							}
-							batchStart = batchEnd
+						}
+						if err := sqlRows.Err(); err != nil {
+							syncErrChan <- fmt.Errorf("w%d stream error: %v", wIdx, err)
+							return
+						}
+						if len(batch) > 0 {
+							if err := doWrite(batch, rangeMark); err != nil {
+								syncErrChan <- err
+								return
+							}
+							n := int64(len(batch))
+							atomic.AddInt64(&atomicProcessed, n)
+							s.incrementTaskProgress(taskID, n, rangeMark)
 						}
 						if curTx != nil {
 							if err := curTx.Commit(); err != nil {

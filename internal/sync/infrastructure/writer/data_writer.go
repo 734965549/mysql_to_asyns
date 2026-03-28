@@ -45,7 +45,7 @@ func NewBatchWriter(db *sql.DB, identity *entity.TableIdentity, batchSize int) *
 		db:         db,
 		sqlBuilder: NewSQLBuilder(identity),
 		batchSize:  batchSize,
-		timeout:    30 * time.Second,
+		timeout:    300 * time.Second,
 	}
 }
 
@@ -55,7 +55,7 @@ func NewBatchWriterWithSchema(db *sql.DB, identity *entity.TableIdentity, batchS
 		db:         db,
 		sqlBuilder: NewSQLBuilderWithSchema(identity, schema),
 		batchSize:  batchSize,
-		timeout:    30 * time.Second,
+		timeout:    300 * time.Second,
 	}
 }
 
@@ -65,7 +65,7 @@ func NewBatchWriterWithTx(tx *sql.Tx, identity *entity.TableIdentity, batchSize 
 		db:         tx,
 		sqlBuilder: NewSQLBuilderWithSchema(identity, schema),
 		batchSize:  batchSize,
-		timeout:    30 * time.Second,
+		timeout:    300 * time.Second,
 	}
 }
 
@@ -76,7 +76,7 @@ func NewBatchWriterWithConn(conn *sql.Conn, identity *entity.TableIdentity, batc
 		db:         conn,
 		sqlBuilder: NewSQLBuilderWithSchema(identity, schema),
 		batchSize:  batchSize,
-		timeout:    30 * time.Second,
+		timeout:    300 * time.Second,
 	}
 }
 

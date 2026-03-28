@@ -245,6 +245,31 @@ func (r *RangeShardingReader) ReadByRange(ctx context.Context, startID, endID in
 	return r.ReadBatch(ctx, startID, endID)
 }
 
+// OpenRangeStream 在指定连接上打开一次覆盖整个范围的流式查询。
+// 调用方负责调用 rows.Close()。
+// 使用独立连接而非连接池，避免多 worker 并发时连接池竞争和源库 I/O 抖动。
+func (r *RangeShardingReader) OpenRangeStream(conn *sql.Conn, ctx context.Context, minID, maxID int64) (*sql.Rows, []string, error) {
+	var colParts []string
+	for _, col := range r.identity.Columns {
+		colParts = append(colParts, "`"+col.Name+"`")
+	}
+	columns := strings.Join(colParts, ", ")
+	query := fmt.Sprintf(
+		"SELECT %s FROM `%s`.`%s` WHERE `%s` >= ? AND `%s` < ? ORDER BY `%s` ASC",
+		columns, r.schema, r.table, r.pkColumn, r.pkColumn, r.pkColumn,
+	)
+	rows, err := conn.QueryContext(ctx, query, minID, maxID)
+	if err != nil {
+		return nil, nil, err
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	return rows, cols, nil
+}
+
 // GetTotalCount 获取总行数
 func (r *RangeShardingReader) GetTotalCount(ctx context.Context) (int64, error) {
 	var count int64
