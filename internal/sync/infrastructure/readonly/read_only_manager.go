@@ -12,12 +12,13 @@ import (
 type ReadOnlyManager struct {
 	targetDB      *sql.DB
 	originalState *readOnlyState // 保存原始只读状态
-	mu            sync.RWMutex
+	mu            sync.Mutex
 }
 
-// readOnlyState 保存只读状态
+// readOnlyState 保存只读状态（同时跟踪 read_only 和 super_read_only）
 type readOnlyState struct {
-	ReadOnly bool
+	ReadOnly      bool
+	SuperReadOnly bool
 }
 
 // NewReadOnlyManager 创建只读管理器
@@ -27,36 +28,41 @@ func NewReadOnlyManager(targetDB *sql.DB) *ReadOnlyManager {
 	}
 }
 
-// SetReadOnly 设置目标实例为只读模式
-// 使用 MySQL 的 read_only 全局变量
-// 注意：read_only 只限制普通用户，超级用户仍可写入
+// SetReadOnly 同步开始时调用：
+//   - 保存 read_only / super_read_only 原始状态
+//   - 设置 super_read_only=OFF, read_only=ON
+//     → 普通用户无法写入（保护目标库），SUPER 用户（root）可以写入同步数据
 func (m *ReadOnlyManager) SetReadOnly() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	log.Println("[ReadOnlyManager] 开始设置目标实例为只读模式...")
 
-	// 1. 先保存当前的只读状态
 	originalState, err := m.getReadOnlyState()
 	if err != nil {
 		return fmt.Errorf("获取当前只读状态失败: %v", err)
 	}
 	m.originalState = originalState
 
-	log.Printf("[ReadOnlyManager] 当前状态: read_only=%v\n", originalState.ReadOnly)
+	log.Printf("[ReadOnlyManager] 当前状态: read_only=%v super_read_only=%v",
+		originalState.ReadOnly, originalState.SuperReadOnly)
 
-	// 2. 设置 read_only = ON
-	// read_only 只限制普通用户，超级用户仍可写入
-	err = m.setGlobalReadOnly(true)
-	if err != nil {
-		return fmt.Errorf("设置只读模式失败: %v", err)
+	// 先关 super_read_only（必须先关，否则 read_only 操作本身也会被拦截）
+	if originalState.SuperReadOnly {
+		if _, err = m.targetDB.Exec("SET GLOBAL super_read_only = 0"); err != nil {
+			return fmt.Errorf("关闭 super_read_only 失败: %v", err)
+		}
+	}
+	// 确保 read_only=ON（阻止非 SUPER 用户写入）
+	if _, err = m.targetDB.Exec("SET GLOBAL read_only = 1"); err != nil {
+		return fmt.Errorf("设置 read_only 失败: %v", err)
 	}
 
-	log.Println("[ReadOnlyManager] 目标实例已设置为只读模式 (read_only=ON)，超级用户仍可写入")
+	log.Println("[ReadOnlyManager] 目标实例: super_read_only=OFF read_only=ON，SUPER 用户可写入同步数据")
 	return nil
 }
 
-// RestoreReadOnly 恢复原始的只读状态
+// RestoreReadOnly 同步结束时调用：恢复 read_only / super_read_only 到原始状态
 func (m *ReadOnlyManager) RestoreReadOnly() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -68,86 +74,125 @@ func (m *ReadOnlyManager) RestoreReadOnly() error {
 
 	log.Println("[ReadOnlyManager] 开始恢复目标实例的读写状态...")
 
-	// 恢复到原始状态
-	err := m.restoreGlobalReadOnly(m.originalState)
-	if err != nil {
-		return fmt.Errorf("恢复读写状态失败: %v", err)
+	var err error
+	// 恢复顺序：先恢复 read_only，再恢复 super_read_only
+	roVal := 0
+	if m.originalState.ReadOnly {
+		roVal = 1
+	}
+	if _, err = m.targetDB.Exec("SET GLOBAL read_only = ?", roVal); err != nil {
+		return fmt.Errorf("恢复 read_only 失败: %v", err)
 	}
 
-	log.Printf("[ReadOnlyManager] 目标实例已恢复读写状态: read_only=%v\n",
-		m.originalState.ReadOnly)
+	sroVal := 0
+	if m.originalState.SuperReadOnly {
+		sroVal = 1
+	}
+	if _, err = m.targetDB.Exec("SET GLOBAL super_read_only = ?", sroVal); err != nil {
+		return fmt.Errorf("恢复 super_read_only 失败: %v", err)
+	}
 
-	// 清空保存的状态
+	log.Printf("[ReadOnlyManager] 已恢复: read_only=%v super_read_only=%v",
+		m.originalState.ReadOnly, m.originalState.SuperReadOnly)
+
 	m.originalState = nil
 	return nil
 }
 
-// getReadOnlyState 获取当前的只读状态
-func (m *ReadOnlyManager) getReadOnlyState() (*readOnlyState, error) {
-	state := &readOnlyState{}
+// WithWriteAccess 临时关闭 read_only 和 super_read_only，执行 DDL，完成后恢复。
+// 在 SetReadOnly() 之后调用时，执行完恢复为 super_read_only=OFF, read_only=ON。
+func (m *ReadOnlyManager) WithWriteAccess(fn func() error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	// 使用独立的连接执行查询，避免 "commands out of sync" 错误
-	// 获取连接
+	state, err := m.getReadOnlyState()
+	if err != nil {
+		log.Printf("[ReadOnlyManager] 警告：无法查询只读状态，直接执行写操作: %v", err)
+		return fn()
+	}
+
+	needRestore := state.ReadOnly || state.SuperReadOnly
+	if !needRestore {
+		return fn()
+	}
+
+	// 先关 super_read_only，再关 read_only
+	if state.SuperReadOnly {
+		if _, err = m.targetDB.Exec("SET GLOBAL super_read_only = 0"); err != nil {
+			return fmt.Errorf("临时关闭 super_read_only 失败: %v", err)
+		}
+	}
+	if state.ReadOnly {
+		if _, err = m.targetDB.Exec("SET GLOBAL read_only = 0"); err != nil {
+			return fmt.Errorf("临时关闭 read_only 失败: %v", err)
+		}
+	}
+	log.Println("[ReadOnlyManager] 已临时开放写权限以执行 DDL")
+
+	defer func() {
+		// 恢复：先 read_only=ON，再 super_read_only（如果原本就没有则保持 OFF）
+		if state.ReadOnly {
+			if _, e := m.targetDB.Exec("SET GLOBAL read_only = 1"); e != nil {
+				log.Printf("[ReadOnlyManager] 警告：恢复 read_only 失败: %v", e)
+			}
+		}
+		// DDL 后 super_read_only 保持 OFF（由 SetReadOnly 统一管理），不在此恢复
+		log.Println("[ReadOnlyManager] DDL 完成，read_only 已恢复")
+	}()
+
+	return fn()
+}
+
+// getReadOnlyState 获取当前 read_only 和 super_read_only 状态（不加锁，供内部使用）
+func (m *ReadOnlyManager) getReadOnlyState() (*readOnlyState, error) {
 	conn, err := m.targetDB.Conn(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("获取数据库连接失败: %v", err)
 	}
 	defer conn.Close()
 
-	// 获取 read_only 状态
-	err = conn.QueryRowContext(context.Background(), "SELECT @@read_only").Scan(&state.ReadOnly)
+	state := &readOnlyState{}
+	err = conn.QueryRowContext(context.Background(),
+		"SELECT @@read_only, @@super_read_only",
+	).Scan(&state.ReadOnly, &state.SuperReadOnly)
 	if err != nil {
-		return nil, fmt.Errorf("查询 read_only 失败: %v", err)
+		// 部分 MySQL 版本不支持 super_read_only，降级只查 read_only
+		err2 := conn.QueryRowContext(context.Background(), "SELECT @@read_only").Scan(&state.ReadOnly)
+		if err2 != nil {
+			return nil, fmt.Errorf("查询 read_only 失败: %v", err2)
+		}
 	}
-
 	return state, nil
 }
 
-// setGlobalReadOnly 设置全局只读模式
-func (m *ReadOnlyManager) setGlobalReadOnly(readOnly bool) error {
-	var value int
-	if readOnly {
-		value = 1
-	} else {
-		value = 0
-	}
-
-	// 只使用 read_only，不使用 super_read_only
-	// 这样超级用户仍可写入数据
-	_, err := m.targetDB.Exec("SET GLOBAL read_only = ?", value)
-	if err != nil {
-		return fmt.Errorf("设置只读模式失败: %v", err)
-	}
-
-	return nil
-}
-
-// restoreGlobalReadOnly 恢复到指定的只读状态
-func (m *ReadOnlyManager) restoreGlobalReadOnly(state *readOnlyState) error {
-	var readOnlyValue int
-	if state.ReadOnly {
-		readOnlyValue = 1
-	} else {
-		readOnlyValue = 0
-	}
-
-	_, err := m.targetDB.Exec("SET GLOBAL read_only = ?", readOnlyValue)
-	if err != nil {
-		return fmt.Errorf("恢复只读状态失败: %v", err)
-	}
-
-	return nil
-}
-
-// IsReadOnly 检查当前是否处于只读模式
+// IsReadOnly 检查当前是否处于只读模式（read_only 或 super_read_only 任一为 ON）
 func (m *ReadOnlyManager) IsReadOnly() (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	state, err := m.getReadOnlyState()
 	if err != nil {
 		return false, err
 	}
+	return state.ReadOnly || state.SuperReadOnly, nil
+}
 
-	return state.ReadOnly, nil
+// setGlobalReadOnly 保留供测试兼容（仅设置 read_only）
+func (m *ReadOnlyManager) setGlobalReadOnly(readOnly bool) error {
+	val := 0
+	if readOnly {
+		val = 1
+	}
+	_, err := m.targetDB.Exec("SET GLOBAL read_only = ?", val)
+	return err
+}
+
+// restoreGlobalReadOnly 保留供测试兼容
+func (m *ReadOnlyManager) restoreGlobalReadOnly(state *readOnlyState) error {
+	val := 0
+	if state.ReadOnly {
+		val = 1
+	}
+	_, err := m.targetDB.Exec("SET GLOBAL read_only = ?", val)
+	return err
 }

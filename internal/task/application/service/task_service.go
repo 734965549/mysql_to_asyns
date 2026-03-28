@@ -737,14 +737,42 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 	if workerCount <= 0 {
 		workerCount = 4
 	}
-	sem := make(chan struct{}, workerCount)
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(tables))
-
+	// === 阶段1：串行同步所有表结构（集中 DDL，减少 read_only 切换次数） ===
+	type tableReady struct {
+		name     string
+		identity *entity.TableIdentity
+	}
+	log.Printf("[Task %s] 阶段1: 同步 %d 个表结构...", taskID, len(tables))
+	ready := make([]tableReady, 0, len(tables))
 	for _, tableName := range tables {
+		if s.isTaskStopped(taskID) {
+			return fmt.Errorf("task stopped")
+		}
+		log.Printf("[Task %s] 确保目标表: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
+		identity, err := s.analyzer.AnalyzeTable(sourceSchema, tableName)
+		if err != nil {
+			errMsg := fmt.Sprintf("Failed to analyze table %s: %v", tableName, err)
+			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		if err := s.ensureTargetTable(sourceSchema, targetSchema, tableName, identity); err != nil {
+			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s: %v", targetSchema, tableName, err)
+			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		log.Printf("[Task %s] Target table %s.%s is ready", taskID, targetSchema, tableName)
+		ready = append(ready, tableReady{tableName, identity})
+	}
+	log.Printf("[Task %s] 阶段1完成：%d 个表结构就绪，开始同步数据...", taskID, len(ready))
+
+	// === 阶段2：并发同步所有表数据 ===
+	sem := make(chan struct{}, workerCount)
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(ready))
+
+	for _, r := range ready {
 		wg.Add(1)
-		go func(tableName string) {
+		go func(tableName string, identity *entity.TableIdentity) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -753,25 +781,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				return
 			}
 
-			log.Printf("[Task %s] Syncing table: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
-
-			identity, err := s.analyzer.AnalyzeTable(sourceSchema, tableName)
-			if err != nil {
-				errMsg := fmt.Sprintf("Failed to analyze table %s: %v", tableName, err)
-				s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-				errChan <- err
-				return
-			}
-
-			// 确保目标表存在，如果失败则停止同步
-			if err := s.ensureTargetTable(sourceSchema, targetSchema, tableName, identity); err != nil {
-				errMsg := fmt.Sprintf("Failed to ensure target table %s.%s: %v", targetSchema, tableName, err)
-				s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-				errChan <- fmt.Errorf("%s", errMsg)
-				return
-			}
-
-			log.Printf("[Task %s] Target table %s.%s is ready", taskID, targetSchema, tableName)
+			log.Printf("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
 
 			var savedIndexes []map[string]interface{}
 			if task.Config.OptimizeIndex {
@@ -1292,7 +1302,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			}
 
 			log.Printf("[Task %s] Table %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, tableProcessedRows)
-		}(tableName)
+		}(r.name, r.identity)
 	}
 
 	wg.Wait()
@@ -1400,13 +1410,34 @@ func generateServerID(taskID string) uint32 {
 	return hash
 }
 
+// withDDL 在只读目标库上安全执行 DDL：若 readOnlyManager 存在则临时关闭 read_only 再恢复，否则直接执行
+func (s *TaskService) withDDL(fn func() error) error {
+	if s.readOnlyManager != nil {
+		return s.readOnlyManager.WithWriteAccess(fn)
+	}
+	return fn()
+}
+
 // ensureTargetTable 确保目标表存在
 func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName string, identity *entity.TableIdentity) error {
-	// 首先确保目标数据库存在
-	_, err := s.targetDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", targetSchema))
-	if err != nil {
-		return fmt.Errorf("failed to create target database %s: %v", targetSchema, err)
+	// 首先确保目标数据库存在：先用 SELECT 查询（只读操作），避免在 read_only 目标库上无谓执行 DDL
+	var dbExists string
+	err := s.targetDB.QueryRow(
+		"SELECT schema_name FROM information_schema.schemata WHERE schema_name = ?", targetSchema,
+	).Scan(&dbExists)
+	if err == sql.ErrNoRows {
+		// 数据库不存在，临时解除只读后创建
+		if err = s.withDDL(func() error {
+			_, e := s.targetDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetSchema))
+			return e
+		}); err != nil {
+			return fmt.Errorf("failed to create target database %s: %v", targetSchema, err)
+		}
+		log.Printf("[Task] Target database '%s' created", targetSchema)
+	} else if err != nil {
+		return fmt.Errorf("failed to check target database %s: %v", targetSchema, err)
 	}
+	// err == nil 说明数据库已存在，直接跳过创建
 
 	// 检查目标表是否存在
 	var tableNameCheck string
@@ -1428,16 +1459,18 @@ func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName st
 	// 表不存在，创建它
 	log.Printf("[Task] Creating target table %s.%s (from %s.%s)", targetSchema, tableName, sourceSchema, tableName)
 
-	// 方法1：尝试使用源数据库连接创建表（如果源和目标在同一服务器）
+	// 方法1：尝试使用源数据库连接在目标库创建表（源和目标在同一服务器时有效）
 	if s.sourceDB != nil {
-		// 尝试使用完整的数据库名复制表结构
-		_, err = s.sourceDB.Exec(fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
-			targetSchema, tableName, sourceSchema, tableName))
-		if err == nil {
+		tryErr := s.withDDL(func() error {
+			_, e := s.sourceDB.Exec(fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
+				targetSchema, tableName, sourceSchema, tableName))
+			return e
+		})
+		if tryErr == nil {
 			log.Printf("[Task] Successfully created target table %s.%s (using source DB connection)", targetSchema, tableName)
 			return nil
 		}
-		log.Printf("[Task] Failed to create table using source DB connection: %v", err)
+		log.Printf("[Task] Failed to create table using source DB connection: %v", tryErr)
 	}
 
 	// 方法2：获取源表的CREATE TABLE语句并在目标数据库执行
@@ -1449,14 +1482,13 @@ func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName st
 		return fmt.Errorf("failed to get CREATE TABLE statement for %s.%s: %v", sourceSchema, tableName, err)
 	}
 
-	// 修改SQL语句中的表名（去掉源库名，只保留表名）
-	// CREATE TABLE `source_schema`.`table_name` (...) -> CREATE TABLE `table_name` (...)
 	createSQL = fmt.Sprintf("CREATE TABLE `%s`.`%s` %s", targetSchema, tableName,
 		extractTableDefinition(createSQL))
 
-	// 在目标数据库中执行创建表的语句
-	_, err = s.targetDB.Exec(createSQL)
-	if err != nil {
+	if err = s.withDDL(func() error {
+		_, e := s.targetDB.Exec(createSQL)
+		return e
+	}); err != nil {
 		return fmt.Errorf("failed to create target table %s.%s: %v", targetSchema, tableName, err)
 	}
 

@@ -1055,23 +1055,24 @@ watch(selectedDatabases, (newDbs) => {
               <a-col :span="12">
                 <!-- 表级别：选择表 -->
                 <a-form-item v-if="selectedSyncLevel === 'table'" label="选择要同步的表">
-                  <template #extra>
-                    <a-space>
-                      <a-button type="text" size="small" @click="toggleAllTables">
-                        {{ selectedTables.length === filteredTables.length ? '取消全选' : '全选' }}
-                      </a-button>
-                      <a-button type="text" size="small" :loading="refreshingTables" @click="refreshTables">
-                        <template #icon><icon-refresh /></template>刷新
-                      </a-button>
-                    </a-space>
-                  </template>
-                  <!-- 表搜索框 -->
-                  <a-input-search
-                    v-model="tableSearchText"
-                    placeholder="搜索表名..."
-                    style="margin-bottom: 8px"
-                    allow-clear
-                  />
+                  <!-- 搜索框 + 操作按钮（始终置顶） -->
+                  <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
+                    <a-input
+                      v-model="tableSearchText"
+                      placeholder="搜索表名..."
+                      allow-clear
+                      style="flex: 1"
+                    >
+                      <template #suffix><icon-search /></template>
+                    </a-input>
+                    <a-button type="text" size="small" @click="toggleAllTables">
+                      {{ selectedTables.length === filteredTables.length && filteredTables.length > 0 ? '取消全选' : '全选' }}
+                    </a-button>
+                    <a-button type="text" size="small" :loading="refreshingTables" @click="refreshTables">
+                      <template #icon><icon-refresh /></template>
+                    </a-button>
+                  </div>
+                  <!-- 表格列表（可滚动区域） -->
                   <div style="max-height: 300px; overflow-y: auto; border: 1px solid #e5e6eb; border-radius: 4px; padding: 8px; background: #fafafa">
                     <a-checkbox-group v-model="selectedTables" v-if="filteredTables.length > 0">
                       <a-row :gutter="[8, 8]">
@@ -1096,12 +1097,22 @@ watch(selectedDatabases, (newDbs) => {
                 <a-row :gutter="16">
                   <a-col :span="12">
                     <a-form-item label="批量大小">
-                      <a-input-number v-model="taskForm.batch_size" :min="1" style="width: 100%" />
+                      <a-input-number
+                        :model-value="taskForm.batch_size"
+                        @change="v => taskForm.batch_size = v"
+                        :min="1"
+                        style="width: 100%"
+                      />
                     </a-form-item>
                   </a-col>
                   <a-col :span="12">
                     <a-form-item label="表并发数">
-                      <a-input-number v-model="taskForm.worker_count" :min="1" :max="32" style="width: 100%" />
+                      <a-input-number
+                        :model-value="taskForm.worker_count"
+                        @change="v => taskForm.worker_count = v"
+                        :min="1"
+                        style="width: 100%"
+                      />
                     </a-form-item>
                   </a-col>
                 </a-row>
