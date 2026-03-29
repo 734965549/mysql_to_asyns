@@ -385,6 +385,21 @@
 - 需要足够的临时空间
 - 建议在低峰期执行
 
+### 并发一致性快照（enable_consistent_snapshot）
+
+**作用**:
+- 在全量阶段启用并发一致性快照读取。
+- 前端在创建/编辑任务时通过“启用并发一致性快照（全量）”复选框控制。
+
+**接口传参**:
+- 勾选后，请求体会自动携带：`"enable_consistent_snapshot": true`
+- 未勾选时为：`"enable_consistent_snapshot": false`
+- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`），不是 `application.toml` 全局配置。
+
+**注意事项**:
+- 开启后快照建立阶段会短暂使用 FTWRL（`FLUSH TABLES WITH READ LOCK`）。
+- 建议在业务低峰执行大表全量同步，并确保源库账号具备相关权限。
+
 ---
 
 ## 自定义数据库配置

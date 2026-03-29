@@ -248,9 +248,40 @@ cp etc/application.toml.example etc/application.toml
   "batch_size": 5000,           // 覆盖全局 batch_size
   "worker_count": 8,            // 覆盖全局 worker_count
   "optimize_index": true,        // 覆盖全局 optimize_index
-  ...
+  "enable_consistent_snapshot": true // 任务级一致性快照开关
 }
 ```
+
+### enable_consistent_snapshot（任务级参数）
+
+`enable_consistent_snapshot` 不是 `etc/application.toml` 的全局配置项，
+而是创建/更新任务时的 JSON 字段：
+
+- 创建任务：`POST /api/tasks`
+- 更新任务：`PUT /api/tasks/:id`
+
+示例：
+
+```json
+{
+  "name": "full-sync-orders",
+  "mode": "FULL",
+  "sync_level": "TABLE",
+  "source_schema": "db_src",
+  "target_schema": "db_dst",
+  "tables": ["orders"],
+  "worker_count": 16,
+  "intra_table_worker_count": 16,
+  "batch_size": 2000,
+  "enable_consistent_snapshot": true
+}
+```
+
+说明：
+
+- 打开后，全量阶段会使用并行一致性快照读取，保证多个 worker 读取同一时点数据视图。
+- 快照建立阶段会短暂执行 `FLUSH TABLES WITH READ LOCK`，请在业务低峰执行大表全量同步。
+- 源库账号需具备相应权限（至少可执行快照建立所需语句）。
 
 ## 监控和日志
 

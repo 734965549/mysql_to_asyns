@@ -83,6 +83,9 @@ expire_logs_days=7
 ``sql
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 GRANT SELECT ON *.* TO 'username'@'%';
+# 若创建任务时启用 enable_consistent_snapshot=true（并发一致性快照）
+# 建议额外授予 RELOAD 权限（用于快照建立阶段的 FTWRL）
+# GRANT RELOAD ON *.* TO 'username'@'%';
 FLUSH PRIVILEGES;
 ``
 
@@ -185,9 +188,10 @@ Content-Type: application/json
   "tables": ["users", "orders"],
   "batch_size": 1000,
   "worker_count": 4,
-  "enable_limit_one": false
+  "enable_limit_one": false,
+  "enable_consistent_snapshot": true
 }
-``
+```
 
 **请求参数说明：**
 
@@ -202,46 +206,52 @@ Content-Type: application/json
 | batch_size | int | 否 | 批量大小，默认1000 |
 | worker_count | int | 否 | 工作线程数，默认4 |
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
+| enable_consistent_snapshot | bool | 否 | 全量阶段启用并发一致性快照（任务级参数，默认false） |
+
+**`enable_consistent_snapshot` 说明：**
+- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`），不是 `application.toml` 全局配置。
+- 开启后，全量阶段会让多个 worker 在同一时点快照上并发读取。
+- 快照建立时会短暂执行 FTWRL（`FLUSH TABLES WITH READ LOCK`），建议在低峰时段执行。
 
 #### 获取所有任务
 
-``bash
+```bash
 GET /api/tasks
-``
+```
 
 #### 获取任务详情
 
-``bash
+```bash
 GET /api/tasks/:id
-``
+```
 
 #### 启动任务
 
-``bash
+```bash
 POST /api/tasks/:id/start
-``
+```
 
 #### 暂停任务
 
-``bash
+```bash
 POST /api/tasks/:id/pause
-``
+```
 
 #### 删除任务
 
-``bash
+```bash
 DELETE /api/tasks/:id
-``
+```
 
 #### 获取任务指标
 
-``bash
+```bash
 GET /api/tasks/:id/metrics
-``
+```
 
 **响应示例：**
 
-``json
+```json
 {
   "processed_rows": 12345,
   "total_rows": 50000,
@@ -252,47 +262,47 @@ GET /api/tasks/:id/metrics
   "binlog_pos": 4567,
   "lag": 0
 }
-``
+```
 
 ### 元数据接口
 
 #### 获取数据库列表
 
-``bash
+```bash
 GET /api/metadata/databases
-``
+```
 
 #### 获取表列表
 
-``bash
+```bash
 GET /api/metadata/tables?schema=database_name
-``
+```
 
 #### 获取表标识信息
 
-``bash
+```bash
 GET /api/metadata/identity?schema=database_name&table=table_name
-``
+```
 
 #### 刷新元数据
 
-``bash
+```bash
 POST /api/metadata/refresh
-``
+```
 
 ### 配置接口
 
 #### 获取默认配置
 
-``bash
+```bash
 GET /api/config/default
-``
+```
 
 ## 使用示例
 
 ### 示例1：全量同步
 
-``bash
+```bash
 curl -X POST http://localhost:8081/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
@@ -302,13 +312,16 @@ curl -X POST http://localhost:8081/api/tasks \
     "source_schema": "production",
     "target_schema": "backup",
     "tables": ["orders", "order_items"],
-    "batch_size": 2000
+    "batch_size": 2000,
+    "worker_count": 16,
+    "intra_table_worker_count": 16,
+    "enable_consistent_snapshot": true
   }'
-``
+```
 
 ### 示例2：增量同步
 
-``bash
+```bash
 curl -X POST http://localhost:8081/api/tasks \
   -H "Content-Type: application/json" \
   -d '{

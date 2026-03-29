@@ -85,7 +85,8 @@ const taskForm = ref({
   intra_table_worker_count: 0,
   enable_limit_one: false,
   optimize_index: false,
-  enable_read_only: false
+  enable_read_only: false,
+  enable_consistent_snapshot: false
 })
 
 // 刷新状态
@@ -374,7 +375,8 @@ function resetForm() {
     intra_table_worker_count: 0,
     enable_limit_one: false,
     optimize_index: false,
-    enable_read_only: false
+    enable_read_only: false,
+    enable_consistent_snapshot: false
   }
   selectedSyncLevel.value = 'database'
   selectedDatabases.value = []
@@ -638,7 +640,8 @@ function fillTaskFormFromTask(task) {
     intra_table_worker_count: task.config.intra_table_worker_count ?? 0,
     enable_limit_one: task.config.enable_limit_one,
     optimize_index: task.config.optimize_index || false,
-    enable_read_only: task.config.enable_read_only || false
+    enable_read_only: task.config.enable_read_only || false,
+    enable_consistent_snapshot: task.config.enable_consistent_snapshot || false
   }
 
   if (task.config.sync_level === 'DATABASE') {
@@ -1376,6 +1379,17 @@ watch(selectedDatabases, (newDbs) => {
                     </a-checkbox>
                   </a-form-item>
 
+                  <a-form-item>
+                    <a-checkbox v-model="taskForm.enable_consistent_snapshot">
+                      <a-space direction="vertical" :size="4">
+                        <span style="font-weight: 500">启用并发一致性快照（全量）</span>
+                        <a-typography-text type="secondary" style="font-size: 12px">
+                          全量阶段并发 worker 读取同一时点快照，提升一致性；快照建立时会短暂加读锁（FTWRL）
+                        </a-typography-text>
+                      </a-space>
+                    </a-checkbox>
+                  </a-form-item>
+
                   <a-collapse :default-active-key="[]">
                     <a-collapse-item key="source" header="自定义源数据库连接">
                       <template #extra><a-switch v-model="useCustomSourceDB" size="small" @click.stop /></template>
@@ -1781,6 +1795,9 @@ watch(selectedDatabases, (newDbs) => {
                 ? selectedTaskForDetail.config.intra_table_worker_count
                 : '默认（≤16）'
             }}
+          </a-descriptions-item>
+          <a-descriptions-item label="并发一致性快照">
+            {{ selectedTaskForDetail.config.enable_consistent_snapshot ? '开启' : '关闭' }}
           </a-descriptions-item>
         </a-descriptions>
         

@@ -113,3 +113,25 @@
   
   # 是否启用索引优化（删除非主键索引，同步完成后再重建）
   # optimize_index = false
+
+# ========== 任务级参数说明（非 application.toml 全局配置）==========
+# enable_consistent_snapshot 不是 TOML 配置项，而是创建/更新任务时的 JSON 字段。
+# 用途：全量阶段开启“并发 + 强一致”读取（多 worker 在同一时间点快照上读取）。
+# 适用位置：POST /api/tasks 与 PUT /api/tasks/:id 的请求体。
+#
+# 示例（创建任务时传入）：
+# {
+#   "name": "full-sync-orders",
+#   "mode": "FULL",
+#   "sync_level": "TABLE",
+#   "source_schema": "db_src",
+#   "target_schema": "db_dst",
+#   "tables": ["orders"],
+#   "worker_count": 16,
+#   "intra_table_worker_count": 16,
+#   "batch_size": 2000,
+#   "enable_consistent_snapshot": true
+# }
+#
+# 注意：开启后会在快照建立阶段短暂使用 FTWRL（FLUSH TABLES WITH READ LOCK），
+# 需确保源库账号具备相关权限，并建议在业务低峰时段执行大表全量同步。
