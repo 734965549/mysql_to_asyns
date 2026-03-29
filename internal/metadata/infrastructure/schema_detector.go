@@ -19,7 +19,8 @@ func NewSchemaDetector(db *sql.DB) *SchemaDetector { // 创建Schema探测器实
 
 // GetTableColumns 获取表的列信息方法
 func (d *SchemaDetector) GetTableColumns(schema, tableName string) ([]entity.ColumnMeta, error) { // 获取表的所有列信息
-	query := ` // 定义SQL查询语句
+	// 定义SQL查询语句
+	query := `
 		SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT
 		FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -58,11 +59,12 @@ func (d *SchemaDetector) GetTableColumns(schema, tableName string) ([]entity.Col
 
 // GetPrimaryKeyColumns 获取主键列方法
 func (d *SchemaDetector) GetPrimaryKeyColumns(schema, tableName string) ([]string, error) { // 获取表的主键列名
-	query := ` // 定义SQL查询语句
-		SELECT COLUMN_NAME // 查询列名
-		FROM information_schema.KEY_COLUMN_USAGE // 从系统表查询
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' // 查询主键约束
-		ORDER BY ORDINAL_POSITION // 按列位置排序
+	// 定义SQL查询语句
+	query := `
+		SELECT COLUMN_NAME
+		FROM information_schema.KEY_COLUMN_USAGE
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
+		ORDER BY ORDINAL_POSITION
 	`
 
 	rows, err := d.db.Query(query, schema, tableName) // 执行查询
@@ -85,7 +87,8 @@ func (d *SchemaDetector) GetPrimaryKeyColumns(schema, tableName string) ([]strin
 
 // GetUniqueKeyColumns 获取唯一键列方法
 func (d *SchemaDetector) GetUniqueKeyColumns(schema, tableName string) ([]string, error) { // 获取表的唯一键列名
-	query := ` // 定义SQL查询语句
+	// 定义SQL查询语句
+	query := `
 		SELECT COLUMN_NAME
 		FROM information_schema.STATISTICS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -114,7 +117,8 @@ func (d *SchemaDetector) GetUniqueKeyColumns(schema, tableName string) ([]string
 
 // GetAllTables 获取所有表方法
 func (d *SchemaDetector) GetAllTables(schema string) ([]entity.TableInfo, error) { // 获取数据库的所有表
-	query := ` // 定义SQL查询语句
+	// 定义SQL查询语句
+	query := `
 		SELECT TABLE_NAME, TABLE_ROWS
 		FROM information_schema.TABLES
 		WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
@@ -151,7 +155,8 @@ func (d *SchemaDetector) CheckBinlogRowImage() (string, error) { // 检查binlog
 
 // GetAllDatabases 获取所有数据库列表方法
 func (d *SchemaDetector) GetAllDatabases() ([]string, error) { // 获取所有数据库
-	query := ` // 定义SQL查询语句
+	// 定义SQL查询语句
+	query := `
 		SELECT SCHEMA_NAME
 		FROM information_schema.SCHEMATA
 		WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')

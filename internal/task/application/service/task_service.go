@@ -98,7 +98,8 @@ func NewMySQLTaskStorageFromConfig(cfg *config.StorageConfig) (*MySQLTaskStorage
 }
 
 func (s *MySQLTaskStorage) initTable() error { // 初始化数据表
-	query := ` // 定义建表SQL语句
+	// 定义建表SQL语句
+	query := `
 	CREATE TABLE IF NOT EXISTS sys_sync_tasks (
 		pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 		id VARCHAR(64) NOT NULL,
