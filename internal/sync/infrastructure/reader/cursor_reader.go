@@ -132,8 +132,9 @@ func (r *CursorReader) ReadBatch(ctx context.Context, _ /* offset */, limit int6
 		for _, col := range r.identity.Columns {
 			colParts = append(colParts, selectExprForColumn(col))
 		}
-		query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`", strings.Join(colParts, ", "), r.schema, r.table)
-		rows, err := r.db.QueryContext(ctx, query)
+		// 添加 LIMIT 子句，避免一次性加载整表到内存
+		query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` LIMIT ?", strings.Join(colParts, ", "), r.schema, r.table)
+		rows, err := r.db.QueryContext(ctx, query, limit)
 		if err != nil {
 			return nil, fmt.Errorf("打开流式游标失败: %v, SQL: %s", err, query)
 		}

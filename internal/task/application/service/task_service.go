@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1019,7 +1018,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					log.Printf("[Task %s] Skipping sample parallel for %s.%s", taskID, sourceSchema, tableName)
 				} else {
 					var bErr error
-					sampleBoundaries, bErr = s.samplePKBoundaries(ctx, sourceSchema, tableName, identity.IdentifyCols[0], totalRows, intraWorkers)
+					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, sourceSchema, tableName, identity.IdentifyCols[0], totalRows, intraWorkers)
 					if bErr != nil {
 						canParallelSample = false
 						log.Printf("[Task %s] Boundary sampling failed for %s.%s: %v", taskID, sourceSchema, tableName, bErr)
@@ -1122,13 +1121,28 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				}
 
 			} else if canParallelRange {
-				// 数字单列主键：表内并行范围读写 + 每 worker 独立事务批量提交
-				log.Printf("[Task %s] Table %s.%s: parallel range sync PK=[%d,%d] workers=%d",
-					taskID, sourceSchema, tableName, minPK, maxPK, intraWorkers)
-				rangeSize := (maxPK - minPK + int64(intraWorkers)) / int64(intraWorkers)
+				// 真正的keyset分页：每个worker从上一个worker的结束位置开始
+				log.Printf("[Task %s] Table %s.%s: parallel keyset sync workers=%d",
+					taskID, sourceSchema, tableName, intraWorkers)
 				var syncWg sync.WaitGroup
 				syncErrChan := make(chan error, intraWorkers)
 				var atomicProcessed int64
+
+				// 创建reader用于边界计算
+				wReader := reader.NewRangeShardingReader(s.sourceDB, sourceSchema, tableName, identity)
+
+				// 使用改进的边界计算（统一处理所有主键类型）
+				var boundaries []interface{}
+				if totalRows, err := wReader.GetTotalCount(ctx); err == nil && totalRows > 0 {
+					boundaries, err = s.samplePKBoundariesImproved(ctx, sourceSchema, tableName,
+						identity.IdentifyCols[0], totalRows, intraWorkers)
+					if err != nil {
+						log.Printf("[Task %s] Boundary calculation failed for %s.%s: %v, falling back to single worker",
+							taskID, sourceSchema, tableName, err)
+						// 降级为单worker处理
+						intraWorkers = 1
+					}
+				}
 
 				for w := 0; w < intraWorkers; w++ {
 					syncWg.Add(1)
@@ -1139,11 +1153,18 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 								syncErrChan <- fmt.Errorf("w%d panic: %v", wIdx, r)
 							}
 						}()
-						rangeStart := minPK + int64(wIdx)*rangeSize
-						rangeEnd := rangeStart + rangeSize
-						if wIdx == intraWorkers-1 {
-							rangeEnd = maxPK + 1
+
+						// 每个worker的起始位置
+						var startBoundary interface{}
+						if wIdx > 0 && wIdx-1 < len(boundaries) {
+							startBoundary = boundaries[wIdx-1]
 						}
+
+						var endBoundary interface{}
+						if wIdx < len(boundaries) {
+							endBoundary = boundaries[wIdx]
+						}
+
 						conn, err := s.targetDB.Conn(ctx)
 						if err != nil {
 							syncErrChan <- fmt.Errorf("w%d conn: %v", wIdx, err)
@@ -1194,26 +1215,58 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							return nil
 						}
 
-						wReader := reader.NewRangeShardingReader(s.sourceDB, sourceSchema, tableName, identity)
-						currentStart := rangeStart
-						rangeMark := fmt.Sprintf("%s.%s:w%d:[%d,%d)", sourceSchema, tableName, wIdx, rangeStart, rangeEnd)
+						lastID := startBoundary
+						rangeMark := fmt.Sprintf("%s.%s:w%d:keyset", sourceSchema, tableName, wIdx)
 
 						for {
 							if s.isTaskStopped(taskID) {
 								return
 							}
-							if currentStart >= rangeEnd {
+
+							// 使用 ReadBatchByKeys 进行keyset分页
+							batch, err := wReader.ReadBatchByKeys(ctx, lastID, readLimit)
+							if err != nil {
+								syncErrChan <- fmt.Errorf("w%d read after %v: %v", wIdx, lastID, err)
+								return
+							}
+							if len(batch) == 0 {
+								log.Printf("[Task %s] w%d reached end of data at %v", taskID, wIdx, lastID)
 								break
 							}
 
-							batch, err := wReader.ReadBatchInRange(ctx, currentStart, rangeEnd, readLimit)
-							if err != nil {
-								syncErrChan <- fmt.Errorf("w%d read [%d,%d): %v", wIdx, currentStart, rangeEnd, err)
-								return
+							// 数据一致性检查：验证第一批数据的连续性
+							if lastID != nil {
+								firstPK := batch[0][identity.IdentifyCols[0]]
+								if fmt.Sprintf("%v", firstPK) <= fmt.Sprintf("%v", lastID) {
+									syncErrChan <- fmt.Errorf("w%d data continuity error: first PK %v should be > lastID %v", wIdx, firstPK, lastID)
+									return
+								}
+							}
+
+							// 非最后一个worker：检查是否超出边界
+							if endBoundary != nil {
+								endStr := fmt.Sprintf("%v", endBoundary)
+								cutIdx := len(batch)
+								for j, row := range batch {
+									if fmt.Sprintf("%v", row[identity.IdentifyCols[0]]) >= endStr {
+										cutIdx = j
+										break
+									}
+								}
+								if cutIdx < len(batch) {
+									log.Printf("[Task %s] w%d cutting %d rows that exceed boundary %s", taskID, wIdx, len(batch)-cutIdx, endStr)
+									batch = batch[:cutIdx]
+								}
 							}
 							if len(batch) == 0 {
 								break
 							}
+
+							// 记录批次范围信息
+							firstPK := batch[0][identity.IdentifyCols[0]]
+							lastPK := batch[len(batch)-1][identity.IdentifyCols[0]]
+							log.Printf("[Task %s] w%d processing batch: %s (%d rows) from %v to %v",
+								taskID, wIdx, rangeMark, len(batch), firstPK, lastPK)
 
 							if err := doWrite(batch, rangeMark); err != nil {
 								syncErrChan <- err
@@ -1224,42 +1277,15 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							atomic.AddInt64(&atomicProcessed, n)
 							s.incrementTaskProgress(taskID, n, rangeMark)
 
-							// 下一批次从最后一条记录的主键+1开始（假设主键是连续的或者递增的）
-							// 或者更准确地，从最后一条记录的主键值开始，并在查询中使用 >
-							// 但这里的 ReadBatchInRange 使用的是 >= 和 <，所以我们需要找到当前批次的最大 ID
-							lastRowPK := batch[len(batch)-1][identity.IdentifyCols[0]]
+							// 更新 lastID 为最后一条记录的主键值，确保连续性
+							lastRow := batch[len(batch)-1]
+							lastID = lastRow[identity.IdentifyCols[0]]
 
-							var lastPKVal int64
-							switch v := lastRowPK.(type) {
-							case int64:
-								lastPKVal = v
-							case uint64:
-								lastPKVal = int64(v)
-							case int32:
-								lastPKVal = int64(v)
-							case uint32:
-								lastPKVal = int64(v)
-							case int:
-								lastPKVal = int64(v)
-							case uint:
-								lastPKVal = int64(v)
-							case float64:
-								lastPKVal = int64(v)
-							case string:
-								lastPKVal, _ = strconv.ParseInt(v, 10, 64)
-							case []byte:
-								lastPKVal, _ = strconv.ParseInt(string(v), 10, 64)
-							default:
-								// 如果无法解析，保守一点，尝试转字符串解析
-								sVal := fmt.Sprintf("%v", v)
-								parsed, err := strconv.ParseInt(sVal, 10, 64)
-								if err != nil {
-									syncErrChan <- fmt.Errorf("w%d unsupported PK type: %T (value: %v), parse err: %v", wIdx, v, v, err)
-									return
-								}
-								lastPKVal = parsed
+							// 检查是否达到边界
+							if endBoundary != nil && fmt.Sprintf("%v", lastID) >= fmt.Sprintf("%v", endBoundary) {
+								log.Printf("[Task %s] w%d reached boundary %v at %v", taskID, wIdx, endBoundary, lastID)
+								break
 							}
-							currentStart = lastPKVal + 1
 						}
 						if curTx != nil {
 							if err := curTx.Commit(); err != nil {
@@ -1749,50 +1775,64 @@ func extractTableDefinition(createSQL string) string {
 	return createSQL[startIdx:]
 }
 
-// samplePKBoundaries 并行采样 N-1 个边界值，将 PK 空间分成 n 段供 n 个 worker 使用
-// boundaries[i] 是第 i+1 个 worker 的起始 key（exclusive），前一 worker 的最后 key（inclusive）
-func (s *TaskService) samplePKBoundaries(ctx context.Context, schema, table, pkCol string, totalRows int64, n int) ([]interface{}, error) {
-	boundaries := make([]interface{}, n-1)
-	errs := make([]error, n-1)
-	var wg sync.WaitGroup
-
-	for i := 1; i < n; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					errs[idx-1] = fmt.Errorf("sample worker %d panic: %v", idx, r)
-				}
-			}()
-			offset := totalRows*int64(idx)/int64(n) - 1
-			if offset < 0 {
-				offset = 0
-			}
-			var pk interface{}
-			err := s.sourceDB.QueryRowContext(ctx,
-				fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` LIMIT 1 OFFSET ?",
-					pkCol, schema, table, pkCol),
-				offset,
-			).Scan(&pk)
-			if err != nil {
-				errs[idx-1] = fmt.Errorf("boundary %d (offset %d): %v", idx, offset, err)
-				return
-			}
-			if b, ok := pk.([]byte); ok {
-				pk = string(b)
-			}
-			boundaries[idx-1] = pk
-		}(i)
+// 并发采样边界计算：统一处理所有主键类型
+func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, schema, table, pkCol string, totalRows int64, n int) ([]interface{}, error) {
+	if totalRows < int64(n)*2 {
+		// 数据量太少，不值得并行
+		return nil, fmt.Errorf("insufficient rows for parallel processing: %d", totalRows)
 	}
-	wg.Wait()
 
-	for _, e := range errs {
-		if e != nil {
-			return nil, e
+	boundaries := make([]interface{}, n-1)
+
+	// 使用动态采样：先获取几个采样点来评估分布
+	samplePoints := min(10, n) // 最多采样10个点
+	samples := make([]interface{}, samplePoints)
+
+	for i := 0; i < samplePoints; i++ {
+		offset := totalRows * int64(i) / int64(samplePoints-1)
+		if offset >= totalRows {
+			offset = totalRows - 1
+		}
+
+		var pk interface{}
+		err := s.sourceDB.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` LIMIT 1 OFFSET ?",
+				pkCol, schema, table, pkCol),
+			offset,
+		).Scan(&pk)
+		if err != nil {
+			return nil, fmt.Errorf("sample point %d failed: %v", i, err)
+		}
+		samples[i] = pk
+	}
+
+	// 基于采样点智能分配边界
+	if n <= 2 {
+		// 2个worker：直接在中点分割
+		boundaries[0] = samples[1] // 使用第二个采样点作为边界
+	} else {
+		// 多个worker：均匀分布边界点
+		step := float64(samplePoints-1) / float64(n-1)
+		for i := 1; i < n; i++ {
+			sampleIdx := int(step * float64(i))
+			if sampleIdx >= len(samples) {
+				sampleIdx = len(samples) - 1
+			}
+			boundaries[i-1] = samples[sampleIdx]
 		}
 	}
+
+	log.Printf("Dynamic boundary sampling: totalRows=%d, workers=%d, boundaries=%v",
+		totalRows, n, boundaries)
+
 	return boundaries, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // isNumericPKColumn 检查单列主键是否为整数类型（支持表内并行范围分片）
