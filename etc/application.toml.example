@@ -17,6 +17,8 @@
   # username = "root"
   # password = "123456"
   debug = true
+  # 跨机房或大 JSON/文本字段时建议 true，启用 MySQL 协议压缩降低传输量（略增 CPU）
+  # compress = true
 
 [target]
   # 目标数据库配置（默认值）
@@ -26,6 +28,21 @@
   # database = "test_target"
   # username = "root"
   # password = "123456"
+  # compress = true
+
+# 全量同步吞吐与连接池（实例资源充足时可加大；需小于 MySQL max_connections，并留余量给其它客户端）
+[sync]
+  # 源/目标 sql.DB 最大连接数；0 或未写则默认 256
+  # source_max_open_conns = 512
+  # target_max_open_conns = 512
+  # source_max_idle_conns = 256
+  # target_max_idle_conns = 256
+  # 连接最大存活秒数；<=0 或未写时程序默认 180，须小于源/目标库 wait_timeout，减轻 invalid connection
+  # conn_max_lifetime_seconds = 120
+  # intra_table_legacy_cap = 64
+  # intra_table_hard_max = 512
+  # api_default_worker_count = 32
+  # api_default_batch_size = 2000
 
 [storage]
   # 任务存储后端配置

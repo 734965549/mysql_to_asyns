@@ -88,6 +88,22 @@ func TestDatasourceConfig_GetDSN(t *testing.T) {
 	}
 }
 
+func TestDatasourceConfig_GetDSN_Compress(t *testing.T) {
+	cfg := DatasourceConfig{
+		Host:     "localhost",
+		Port:     3306,
+		Username: "root",
+		Password: "password",
+		Database: "testdb",
+		Compress: true,
+	}
+	dsn := cfg.GetDSN()
+	expected := "root:password@tcp(localhost:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local&compress=true"
+	if dsn != expected {
+		t.Errorf("Expected DSN %s, got %s", expected, dsn)
+	}
+}
+
 func TestTargetConfig_GetDSN(t *testing.T) {
 	cfg := TargetConfig{
 		Host:     "localhost",
@@ -100,6 +116,22 @@ func TestTargetConfig_GetDSN(t *testing.T) {
 	dsn := cfg.GetDSN()
 	expected := "root:password@tcp(localhost:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local"
 
+	if dsn != expected {
+		t.Errorf("Expected DSN %s, got %s", expected, dsn)
+	}
+}
+
+func TestTargetConfig_GetDSN_Compress(t *testing.T) {
+	cfg := TargetConfig{
+		Host:     "localhost",
+		Port:     3306,
+		Username: "root",
+		Password: "password",
+		Database: "testdb",
+		Compress: true,
+	}
+	dsn := cfg.GetDSN()
+	expected := "root:password@tcp(localhost:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local&compress=true"
 	if dsn != expected {
 		t.Errorf("Expected DSN %s, got %s", expected, dsn)
 	}

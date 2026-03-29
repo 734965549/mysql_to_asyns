@@ -322,6 +322,28 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 	return ts
 }
 
+func syncTuneFrom(cfg *config.Config) *config.SyncTuneConfig {
+	if cfg == nil {
+		return nil
+	}
+	return &cfg.Sync
+}
+
+func (s *TaskService) intraTableConcurrencyCaps() (legacyCap, hardMax int) {
+	legacyCap, hardMax = 16, 64
+	if s.config == nil {
+		return
+	}
+	t := s.config.Sync
+	if t.IntraTableLegacyCap > 0 {
+		legacyCap = t.IntraTableLegacyCap
+	}
+	if t.IntraTableHardMax > 0 {
+		hardMax = t.IntraTableHardMax
+	}
+	return
+}
+
 // SetEnableReadOnly 设置是否启用只读限制
 func (s *TaskService) SetEnableReadOnly(enable bool) {
 	s.mu.Lock()
@@ -544,12 +566,14 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
 
 	// 连接源数据库
 	if s.sourceDB == nil {
-		sourceDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+		srcCompress := s.config != nil && s.config.Datasource.Compress
+		sourceDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s",
 			sourceConfig.Username,
 			sourceConfig.Password,
 			sourceConfig.Host,
 			sourceConfig.Port,
 			sourceConfig.Database,
+			config.MySQLTCPParams(srcCompress),
 		)
 		s.sourceDB, err = sql.Open("mysql", sourceDSN)
 		if err != nil {
@@ -562,18 +586,21 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
 			s.sourceDB = nil
 			return fmt.Errorf("failed to ping source database: %w", err)
 		}
+		config.ApplySyncMySQLPool(s.sourceDB, syncTuneFrom(s.config), true, fmt.Sprintf("task %s source", task.Config.ID))
 
 		log.Printf("[Task %s] Source database connected: %s:%d/%s", task.Config.ID, sourceConfig.Host, sourceConfig.Port, sourceConfig.Database)
 	}
 
 	// 连接目标数据库
 	if s.targetDB == nil {
+		tgtCompress := s.config != nil && s.config.Target.Compress
 		// 先连接到MySQL服务器（不指定数据库）以便能够创建数据库
-		targetDSNNoDB := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4&parseTime=True&loc=Local",
+		targetDSNNoDB := fmt.Sprintf("%s:%s@tcp(%s:%d)/?%s",
 			targetConfig.Username,
 			targetConfig.Password,
 			targetConfig.Host,
 			targetConfig.Port,
+			config.MySQLTCPParams(tgtCompress),
 		)
 
 		targetDBNoDB, err := sql.Open("mysql", targetDSNNoDB)
@@ -589,12 +616,13 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
 		}
 
 		// 连接到目标数据库
-		targetDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+		targetDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s",
 			targetConfig.Username,
 			targetConfig.Password,
 			targetConfig.Host,
 			targetConfig.Port,
 			targetConfig.Database,
+			config.MySQLTCPParams(tgtCompress),
 		)
 		s.targetDB, err = sql.Open("mysql", targetDSN)
 		if err != nil {
@@ -607,6 +635,7 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
 			s.targetDB = nil
 			return fmt.Errorf("failed to ping target database: %w", err)
 		}
+		config.ApplySyncMySQLPool(s.targetDB, syncTuneFrom(s.config), false, fmt.Sprintf("task %s target", task.Config.ID))
 
 		log.Printf("[Task %s] Target database connected: %s:%d/%s", task.Config.ID, targetConfig.Host, targetConfig.Port, targetConfig.Database)
 	}
@@ -793,6 +822,60 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	return nil
 }
 
+// syncReadBatchLimit 每次从源库读取的最大行数，必须与 SQL LIMIT 一致。
+// 使用任务配置中的 batch_size；<=0 时用默认；过大时封顶防止单次占用过多内存。
+func syncReadBatchLimit(batchSize int) int64 {
+	const defaultLimit int64 = 1000
+	const hardMax int64 = 100000
+	b := int64(batchSize)
+	if b <= 0 {
+		return defaultLimit
+	}
+	if b > hardMax {
+		return hardMax
+	}
+	return b
+}
+
+// adjustReadLimitForWideColumns 当表含 JSON/BLOB/TEXT 等大列时缩小单次 LIMIT，降低单轮结果集体积与驱动 Scan 耗时。
+func adjustReadLimitForWideColumns(base int64, identity *entity.TableIdentity) int64 {
+	if identity == nil || len(identity.Columns) == 0 {
+		return base
+	}
+	heavy := 0
+	for _, col := range identity.Columns {
+		dt := strings.ToLower(strings.TrimSpace(col.DataType))
+		if i := strings.IndexByte(dt, '('); i >= 0 {
+			dt = dt[:i]
+		}
+		dt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(dt, " unsigned"), " zerofill"))
+		switch dt {
+		case "json", "blob", "tinyblob", "mediumblob", "longblob",
+			"text", "tinytext", "mediumtext", "longtext":
+			heavy++
+		}
+	}
+	if heavy == 0 {
+		return base
+	}
+	const maxWideBatch int64 = 500
+	div := int64(2 + heavy)
+	if div < 2 {
+		div = 2
+	}
+	scaled := base / div
+	if scaled > maxWideBatch {
+		scaled = maxWideBatch
+	}
+	if scaled < 25 {
+		scaled = 25
+	}
+	if scaled > base {
+		return base
+	}
+	return scaled
+}
+
 // syncDatabasePair 同步单个源库到目标库（含全部或指定表）
 func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, sourceSchema, targetSchema string, specifiedTables []string) error {
 	taskID := task.Config.ID
@@ -882,14 +965,24 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			}
 
 			var tableProcessedRows int64
-			batchSize := int64(task.Config.BatchSize)
-			const txCommitEveryN = 20 // 每 20 批 commit 一次，平衡事务大小与 commit 开销
+			readLimit := syncReadBatchLimit(task.Config.BatchSize)
+			if task.Config.BatchSize > 0 && int64(task.Config.BatchSize) != readLimit {
+				log.Printf("[Task %s] Table %s.%s: batch_size=%d capped to read limit %d per round-trip",
+					taskID, sourceSchema, tableName, task.Config.BatchSize, readLimit)
+			}
+			readLimitBefore := readLimit
+			readLimit = adjustReadLimitForWideColumns(readLimit, identity)
+			if readLimit != readLimitBefore {
+				log.Printf("[Task %s] Table %s.%s: wide columns (json/blob/text) detected, read batch %d -> %d rows per round-trip",
+					taskID, sourceSchema, tableName, readLimitBefore, readLimit)
+			}
+			const txCommitEveryN = 40 // 每 40 批 commit 一次，减少 fsync 频率、提高吞吐
 
-			// 单表内部并发 worker 数：独立于表级并发数，避免单表开 N*N 个连接
-			const maxIntraTableWorkers = 8
-			intraWorkers := workerCount
-			if intraWorkers > maxIntraTableWorkers {
-				intraWorkers = maxIntraTableWorkers
+			legacyCap, hardMax := s.intraTableConcurrencyCaps()
+			intraWorkers := taskEntity.EffectiveIntraTableWorkers(task.Config.IntraTableWorkerCount, workerCount, legacyCap, hardMax)
+			if task.Config.IntraTableWorkerCount > 0 {
+				log.Printf("[Task %s] Table %s.%s: intra_table_worker_count effective=%d (table-level worker_count=%d)",
+					taskID, sourceSchema, tableName, intraWorkers, workerCount)
 			}
 
 			// === 策略检测 ===
@@ -995,7 +1088,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					if s.isTaskStopped(taskID) {
 						return
 					}
-					rows, err := dr.ReadBatch(ctx, 0, batchSize)
+					rows, err := dr.ReadBatch(ctx, 0, readLimit)
 					if err != nil {
 						errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s`: %v", sourceSchema, tableName, err)
 						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
@@ -1113,7 +1206,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 								break
 							}
 
-							batch, err := wReader.ReadBatchInRange(ctx, currentStart, rangeEnd, batchSize)
+							batch, err := wReader.ReadBatchInRange(ctx, currentStart, rangeEnd, readLimit)
 							if err != nil {
 								syncErrChan <- fmt.Errorf("w%d read [%d,%d): %v", wIdx, currentStart, rangeEnd, err)
 								return
@@ -1272,7 +1365,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							if s.isTaskStopped(taskID) {
 								return
 							}
-							batchRows, err := wReader.ReadBatchByKeys(ctx, lastID, batchSize)
+							batchRows, err := wReader.ReadBatchByKeys(ctx, lastID, readLimit)
 							if err != nil {
 								syncErrChan <- fmt.Errorf("w%d read after %v: %v", wIdx, lastID, err)
 								return
@@ -1391,7 +1484,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					if s.isTaskStopped(taskID) {
 						return
 					}
-					rows, err := dr.ReadBatchByKeys(ctx, lastID, batchSize)
+					rows, err := dr.ReadBatchByKeys(ctx, lastID, readLimit)
 					if err != nil {
 						errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
 						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)

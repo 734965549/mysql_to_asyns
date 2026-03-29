@@ -82,6 +82,7 @@ const taskForm = ref({
   mode: 'FULL',
   batch_size: 1000,
   worker_count: 4,
+  intra_table_worker_count: 0,
   enable_limit_one: false,
   optimize_index: false,
   enable_read_only: false
@@ -370,6 +371,7 @@ function resetForm() {
     mode: 'FULL',
     batch_size: 1000,
     worker_count: 4,
+    intra_table_worker_count: 0,
     enable_limit_one: false,
     optimize_index: false,
     enable_read_only: false
@@ -623,13 +625,8 @@ function showTaskDetail(task) {
   detailDrawerVisible.value = true
 }
 
-// 打开编辑对话框
-function openEditDialog(task) {
-  resetForm()
-  editMode.value = true
-  editingTaskId.value = task.config.id
-  
-  // 填充表单数据
+// 将已有任务配置写入表单（创建副本与编辑共用）
+function fillTaskFormFromTask(task) {
   taskForm.value = {
     name: task.config.name,
     source_schema: task.config.source_schema,
@@ -638,15 +635,14 @@ function openEditDialog(task) {
     mode: task.config.mode,
     batch_size: task.config.batch_size,
     worker_count: task.config.worker_count,
+    intra_table_worker_count: task.config.intra_table_worker_count ?? 0,
     enable_limit_one: task.config.enable_limit_one,
     optimize_index: task.config.optimize_index || false,
     enable_read_only: task.config.enable_read_only || false
   }
-  
-  // 设置同步级别
+
   if (task.config.sync_level === 'DATABASE') {
     selectedSyncLevel.value = 'database'
-    // 恢复多库选择状态
     const srcDbs = task.config.source_databases || []
     const dstDbs = task.config.target_databases || []
     selectedDatabases.value = srcDbs
@@ -693,8 +689,7 @@ function openEditDialog(task) {
     taskForm.value.source_schema = activeTableSourceDatabase.value || ''
     fetchTables()
   }
-  
-  // 设置自定义数据库配置
+
   if (task.config.source_db) {
     useCustomSourceDB.value = true
     customSourceDB.value = {
@@ -705,7 +700,7 @@ function openEditDialog(task) {
       password: task.config.source_db.password
     }
   }
-  
+
   if (task.config.target_db) {
     useCustomTargetDB.value = true
     customTargetDB.value = {
@@ -716,9 +711,30 @@ function openEditDialog(task) {
       password: task.config.target_db.password
     }
   }
-  
+}
+
+// 打开编辑对话框
+function openEditDialog(task) {
+  resetForm()
+  editMode.value = true
+  editingTaskId.value = task.config.id
+  fillTaskFormFromTask(task)
   taskFormPage.value = 'edit'
   window.history.pushState({ taskForm: 'edit' }, '', `#/tasks/${editingTaskId.value}/edit`)
+}
+
+// 从历史任务复制配置，新建一条任务（新 ID 由后端生成）
+function openDuplicateFromTask(task) {
+  resetForm()
+  editMode.value = false
+  editingTaskId.value = null
+  fillTaskFormFromTask(task)
+  const base = (task.config.name || '同步任务').trim()
+  const suffix = '（副本）'
+  taskForm.value.name = base.endsWith(suffix) ? `${base}_${Date.now()}` : `${base}${suffix}`
+  taskFormPage.value = 'create'
+  window.history.pushState({ taskForm: 'create' }, '', '#/tasks/new')
+  Message.success('已载入该任务配置，请检查后点击「创建」')
 }
 
 // 格式化时间
@@ -1321,6 +1337,23 @@ watch(selectedDatabases, (newDbs) => {
                     </a-col>
                   </a-row>
 
+                  <a-row :gutter="16">
+                    <a-col :span="12">
+                      <a-form-item label="单表内并发">
+                        <a-input-number
+                          :model-value="taskForm.intra_table_worker_count"
+                          @change="v => taskForm.intra_table_worker_count = v ?? 0"
+                          :min="0"
+                          :max="1024"
+                          style="width: 100%"
+                        />
+                        <a-typography-text type="secondary" style="font-size: 12px; display: block; margin-top: 4px">
+                          0 为默认（与表并发相同，单表封顶见服务端 intra_table_legacy_cap）；有主键且可并行时按此值拆范围读。实际并发还受连接池与 MySQL max_connections 限制，上限见 application.toml [sync].intra_table_hard_max。
+                        </a-typography-text>
+                      </a-form-item>
+                    </a-col>
+                  </a-row>
+
                   <a-form-item>
                     <a-checkbox v-model="taskForm.optimize_index">
                       <a-space direction="vertical" :size="4">
@@ -1509,6 +1542,13 @@ watch(selectedDatabases, (newDbs) => {
                     >
                       <template #icon><icon-eye /></template>
                       详情
+                    </a-button>
+                    <a-button 
+                      size="small"
+                      @click="openDuplicateFromTask(task)"
+                    >
+                      <template #icon><icon-copy /></template>
+                      复制新建
                     </a-button>
                     <a-button 
                       v-if="task.context.status === 'PENDING' || task.context.status === 'PAUSED'" 
@@ -1732,8 +1772,15 @@ watch(selectedDatabases, (newDbs) => {
           <a-descriptions-item label="批量大小">
             {{ selectedTaskForDetail.config.batch_size }}
           </a-descriptions-item>
-          <a-descriptions-item label="工作线程">
+          <a-descriptions-item label="表并发数">
             {{ selectedTaskForDetail.config.worker_count }}
+          </a-descriptions-item>
+          <a-descriptions-item label="单表内并发">
+            {{
+              selectedTaskForDetail.config.intra_table_worker_count > 0
+                ? selectedTaskForDetail.config.intra_table_worker_count
+                : '默认（≤16）'
+            }}
           </a-descriptions-item>
         </a-descriptions>
         
@@ -1797,6 +1844,13 @@ watch(selectedDatabases, (newDbs) => {
         <!-- 操作按钮 -->
         <div style="margin-top: 20px; text-align: right">
           <a-space>
+            <a-button
+              type="outline"
+              @click="openDuplicateFromTask(selectedTaskForDetail); detailDrawerVisible = false"
+            >
+              <template #icon><icon-copy /></template>
+              复制新建
+            </a-button>
             <a-button 
               v-if="selectedTaskForDetail.context.status === 'PENDING' || selectedTaskForDetail.context.status === 'PAUSED'" 
               type="primary"

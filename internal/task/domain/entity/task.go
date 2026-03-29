@@ -43,24 +43,25 @@ type DatabaseConfig struct {
 
 // TaskConfig 任务配置
 type TaskConfig struct {
-	StorageID       int64           `json:"storage_id,omitempty"`
-	ID              string          `json:"id"`
-	Name            string          `json:"name"`
-	SyncLevel       SyncLevel       `json:"sync_level"` // 同步级别：DATABASE(全库) 或 TABLE(指定表)
-	SourceSchema    string          `json:"source_schema"`
-	TargetSchema    string          `json:"target_schema"`
-	SourceDatabases []string        `json:"source_databases"` // 源数据库列表（库级别/表级别多库时使用）
-	TargetDatabase  string          `json:"target_database"`  // 目标数据库（库级别同步时，所有库同步到此库）
-	TargetDatabases []string        `json:"target_databases"` // 目标数据库列表（与 SourceDatabases 一一对应）
-	Tables          []string        `json:"tables"`
-	Mode            SyncMode        `json:"mode"`
-	BatchSize       int             `json:"batch_size"`
-	WorkerCount     int             `json:"worker_count"`
-	EnableLimitOne  bool            `json:"enable_limit_one"`    // 无主键表LIMIT 1保护
-	OptimizeIndex   bool            `json:"optimize_index"`      // 索引优化：先删除非主键索引，数据迁移完成后再重建
-	EnableReadOnly  bool            `json:"enable_read_only"`    // 同步前临时关闭目标库只读，同步后恢复
-	SourceDB        *DatabaseConfig `json:"source_db,omitempty"` // 源数据库配置（可选，覆盖配置文件）
-	TargetDB        *DatabaseConfig `json:"target_db,omitempty"` // 目标数据库配置（可选，覆盖配置文件）
+	StorageID             int64           `json:"storage_id,omitempty"`
+	ID                    string          `json:"id"`
+	Name                  string          `json:"name"`
+	SyncLevel             SyncLevel       `json:"sync_level"` // 同步级别：DATABASE(全库) 或 TABLE(指定表)
+	SourceSchema          string          `json:"source_schema"`
+	TargetSchema          string          `json:"target_schema"`
+	SourceDatabases       []string        `json:"source_databases"` // 源数据库列表（库级别/表级别多库时使用）
+	TargetDatabase        string          `json:"target_database"`  // 目标数据库（库级别同步时，所有库同步到此库）
+	TargetDatabases       []string        `json:"target_databases"` // 目标数据库列表（与 SourceDatabases 一一对应）
+	Tables                []string        `json:"tables"`
+	Mode                  SyncMode        `json:"mode"`
+	BatchSize             int             `json:"batch_size"`
+	WorkerCount           int             `json:"worker_count"`
+	IntraTableWorkerCount int             `json:"intra_table_worker_count"` // 单表内并行读/写 goroutine 数；0 表示沿用旧逻辑 min(worker_count,16)
+	EnableLimitOne        bool            `json:"enable_limit_one"`         // 无主键表LIMIT 1保护
+	OptimizeIndex         bool            `json:"optimize_index"`           // 索引优化：先删除非主键索引，数据迁移完成后再重建
+	EnableReadOnly        bool            `json:"enable_read_only"`         // 同步前临时关闭目标库只读，同步后恢复
+	SourceDB              *DatabaseConfig `json:"source_db,omitempty"`      // 源数据库配置（可选，覆盖配置文件）
+	TargetDB              *DatabaseConfig `json:"target_db,omitempty"`      // 目标数据库配置（可选，覆盖配置文件）
 }
 
 // ProcessContext 处理上下文
@@ -129,6 +130,40 @@ func (t *SyncTask) UpdateProgress(processedRows int64, position string) {
 		t.Context.ProgressPercent = float64(processedRows) / float64(t.Context.TotalRows) * 100
 	}
 	t.Context.LastUpdateTime = time.Now()
+}
+
+// EffectiveIntraTableWorkers 计算单表内实际并行 worker 数。intraConfigured<=0 时：取表级 worker 数且封顶 legacyCap；>0 时显式配置，封顶 hardMax。
+// legacyCap/hardMax 传入 <=0 时分别回退为 16、64。
+func EffectiveIntraTableWorkers(intraConfigured, tableWorkerCount, legacyCap, hardMax int) int {
+	if legacyCap < 1 {
+		legacyCap = 16
+	}
+	if hardMax < 1 {
+		hardMax = 64
+	}
+	if legacyCap > hardMax {
+		legacyCap = hardMax
+	}
+	tw := tableWorkerCount
+	if tw < 1 {
+		tw = 1
+	}
+	var intra int
+	if intraConfigured > 0 {
+		intra = intraConfigured
+	} else {
+		intra = tw
+		if intra > legacyCap {
+			intra = legacyCap
+		}
+	}
+	if intra < 1 {
+		intra = 1
+	}
+	if intra > hardMax {
+		intra = hardMax
+	}
+	return intra
 }
 
 // Checkpoint 位点信息

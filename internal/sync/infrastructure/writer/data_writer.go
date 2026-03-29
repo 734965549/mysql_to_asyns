@@ -3,12 +3,16 @@ package writer
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"mysql-to-async/internal/audit"
 	"mysql-to-async/internal/metadata/domain/entity"
 	"sync"
 	"time"
 )
+
+// mysqlMaxPreparedPlaceholders MySQL 单条预处理语句占位符上限（留余量）
+const mysqlMaxPreparedPlaceholders = 62000
 
 // DataWriter 数据写入器接口
 type DataWriter interface {
@@ -88,33 +92,50 @@ func (w *BatchWriter) SetAuditLogger(logger *audit.AuditLogger, taskID, schema, 
 	w.tableName = tableName
 }
 
-// WriteBatch 批量写入数据
+// WriteBatch 批量写入数据（列多时会自动拆成多条 INSERT，避免占位符超限）
 func (w *BatchWriter) WriteBatch(ctx context.Context, rows []map[string]interface{}) error {
 	if len(rows) == 0 {
 		return nil
 	}
 
-	query, args := w.sqlBuilder.BuildBatchInsert(rows)
-	if query == "" {
-		return nil
+	nCols := len(w.sqlBuilder.identity.Columns)
+	if nCols == 0 {
+		return fmt.Errorf("table %s has no columns in identity", w.sqlBuilder.identity.TableName)
+	}
+	maxRowsPerStmt := mysqlMaxPreparedPlaceholders / nCols
+	if maxRowsPerStmt < 1 {
+		maxRowsPerStmt = 1
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, w.timeout)
 	defer cancel()
 
-	_, err := w.db.ExecContext(ctx, query, args...)
-
-	// 记录审计日志
-	if w.auditLogger != nil {
-		success := err == nil
-		errorMsg := ""
-		if err != nil {
-			errorMsg = err.Error()
+	var lastErr error
+	for start := 0; start < len(rows); start += maxRowsPerStmt {
+		end := start + maxRowsPerStmt
+		if end > len(rows) {
+			end = len(rows)
 		}
-		w.auditLogger.LogDataWrite(w.taskID, w.schema, w.tableName, int64(len(rows)), success, errorMsg)
+		chunk := rows[start:end]
+		query, args := w.sqlBuilder.BuildBatchInsert(chunk)
+		if query == "" {
+			continue
+		}
+		_, err := w.db.ExecContext(ctx, query, args...)
+		if w.auditLogger != nil {
+			success := err == nil
+			errorMsg := ""
+			if err != nil {
+				errorMsg = err.Error()
+			}
+			w.auditLogger.LogDataWrite(w.taskID, w.schema, w.tableName, int64(len(chunk)), success, errorMsg)
+		}
+		if err != nil {
+			lastErr = err
+			break
+		}
 	}
-
-	return err
+	return lastErr
 }
 
 // Update 更新数据

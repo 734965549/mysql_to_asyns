@@ -53,6 +53,7 @@ func main() {
 				log.Printf("Warning: Failed to ping datasource database: %v", err)
 			} else {
 				log.Printf("Successfully connected to datasource database")
+				config.ApplySyncMySQLPool(db, &cfg.Sync, true, "metadata-datasource")
 				// 创建分析器
 				schemaDetector := infrastructure.NewSchemaDetector(db)
 				analyzer = service.NewIdentityAnalyzerService(schemaDetector)

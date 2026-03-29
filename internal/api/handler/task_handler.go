@@ -46,20 +46,21 @@ type DatabaseConfigRequest struct {
 
 // CreateTaskRequest 创建任务请求
 type CreateTaskRequest struct {
-	Name            string                 `json:"name" binding:"required"`
-	SyncLevel       string                 `json:"sync_level"` // 同步级别: DATABASE 或 TABLE
-	SourceSchema    string                 `json:"source_schema"`
-	TargetSchema    string                 `json:"target_schema"`
-	SourceDatabases []string               `json:"source_databases"` // 源数据库列表（库级别同步时使用）
-	TargetDatabase  string                 `json:"target_database"`  // 目标数据库（库级别同步时，所有库同步到此库）
-	TargetDatabases []string               `json:"target_databases"` // 目标数据库列表（与 SourceDatabases 一一对应）
-	Tables          []string               `json:"tables"`
-	Mode            string                 `json:"mode" binding:"required"`
-	BatchSize       int                    `json:"batch_size"`
-	WorkerCount     int                    `json:"worker_count"`
-	EnableLimitOne  bool                   `json:"enable_limit_one"`
-	SourceDB        *DatabaseConfigRequest `json:"source_db,omitempty"` // 源数据库配置（可选）
-	TargetDB        *DatabaseConfigRequest `json:"target_db,omitempty"` // 目标数据库配置（可选）
+	Name                  string                 `json:"name" binding:"required"`
+	SyncLevel             string                 `json:"sync_level"` // 同步级别: DATABASE 或 TABLE
+	SourceSchema          string                 `json:"source_schema"`
+	TargetSchema          string                 `json:"target_schema"`
+	SourceDatabases       []string               `json:"source_databases"` // 源数据库列表（库级别同步时使用）
+	TargetDatabase        string                 `json:"target_database"`  // 目标数据库（库级别同步时，所有库同步到此库）
+	TargetDatabases       []string               `json:"target_databases"` // 目标数据库列表（与 SourceDatabases 一一对应）
+	Tables                []string               `json:"tables"`
+	Mode                  string                 `json:"mode" binding:"required"`
+	BatchSize             int                    `json:"batch_size"`
+	WorkerCount           int                    `json:"worker_count"`
+	IntraTableWorkerCount int                    `json:"intra_table_worker_count"`
+	EnableLimitOne        bool                   `json:"enable_limit_one"`
+	SourceDB              *DatabaseConfigRequest `json:"source_db,omitempty"` // 源数据库配置（可选）
+	TargetDB              *DatabaseConfigRequest `json:"target_db,omitempty"` // 目标数据库配置（可选）
 }
 
 // CreateTask 创建任务
@@ -70,12 +71,21 @@ func (h *TaskHandler) CreateTask(c *gin.Context) {
 		return
 	}
 
-	// 设置默认值
+	// 设置默认值（可被 application.toml [sync] 覆盖）
+	gc := config.GlobalConfig
 	if req.BatchSize == 0 {
-		req.BatchSize = 1000
+		if gc != nil && gc.Sync.APIDefaultBatchSize > 0 {
+			req.BatchSize = gc.Sync.APIDefaultBatchSize
+		} else {
+			req.BatchSize = 1000
+		}
 	}
 	if req.WorkerCount == 0 {
-		req.WorkerCount = 4
+		if gc != nil && gc.Sync.APIDefaultWorkerCount > 0 {
+			req.WorkerCount = gc.Sync.APIDefaultWorkerCount
+		} else {
+			req.WorkerCount = 4
+		}
 	}
 
 	// 转换数据库配置
@@ -108,21 +118,22 @@ func (h *TaskHandler) CreateTask(c *gin.Context) {
 	}
 
 	taskCfg := taskEntity.TaskConfig{
-		ID:              generateID(),
-		Name:            req.Name,
-		SyncLevel:       syncLevel,
-		SourceSchema:    req.SourceSchema,
-		TargetSchema:    req.TargetSchema,
-		SourceDatabases: req.SourceDatabases,
-		TargetDatabase:  req.TargetDatabase,
-		TargetDatabases: req.TargetDatabases,
-		Tables:          req.Tables,
-		Mode:            taskEntity.SyncMode(req.Mode),
-		BatchSize:       req.BatchSize,
-		WorkerCount:     req.WorkerCount,
-		EnableLimitOne:  req.EnableLimitOne,
-		SourceDB:        sourceDB,
-		TargetDB:        targetDB,
+		ID:                    generateID(),
+		Name:                  req.Name,
+		SyncLevel:             syncLevel,
+		SourceSchema:          req.SourceSchema,
+		TargetSchema:          req.TargetSchema,
+		SourceDatabases:       req.SourceDatabases,
+		TargetDatabase:        req.TargetDatabase,
+		TargetDatabases:       req.TargetDatabases,
+		Tables:                req.Tables,
+		Mode:                  taskEntity.SyncMode(req.Mode),
+		BatchSize:             req.BatchSize,
+		WorkerCount:           req.WorkerCount,
+		IntraTableWorkerCount: req.IntraTableWorkerCount,
+		EnableLimitOne:        req.EnableLimitOne,
+		SourceDB:              sourceDB,
+		TargetDB:              targetDB,
 	}
 	task, err := h.taskService.CreateTask(taskCfg)
 	if err != nil {
@@ -403,6 +414,9 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) {
 	if req.WorkerCount > 0 {
 		task.Config.WorkerCount = req.WorkerCount
 	}
+	if req.IntraTableWorkerCount != nil {
+		task.Config.IntraTableWorkerCount = *req.IntraTableWorkerCount
+	}
 	// enable_limit_one 是 bool 类型，直接赋值
 	task.Config.EnableLimitOne = req.EnableLimitOne
 
@@ -460,19 +474,20 @@ func (h *TaskHandler) DeleteTask(c *gin.Context) {
 
 // UpdateTaskRequest 更新任务请求
 type UpdateTaskRequest struct {
-	Name            string                 `json:"name"`
-	SyncLevel       string                 `json:"sync_level"`
-	SourceSchema    string                 `json:"source_schema"`
-	TargetSchema    string                 `json:"target_schema"`
-	SourceDatabases []string               `json:"source_databases"`
-	TargetDatabases []string               `json:"target_databases"`
-	Tables          []string               `json:"tables"`
-	Mode            string                 `json:"mode"`
-	BatchSize       int                    `json:"batch_size"`
-	WorkerCount     int                    `json:"worker_count"`
-	EnableLimitOne  bool                   `json:"enable_limit_one"`
-	SourceDB        *DatabaseConfigRequest `json:"source_db,omitempty"`
-	TargetDB        *DatabaseConfigRequest `json:"target_db,omitempty"`
+	Name                  string                 `json:"name"`
+	SyncLevel             string                 `json:"sync_level"`
+	SourceSchema          string                 `json:"source_schema"`
+	TargetSchema          string                 `json:"target_schema"`
+	SourceDatabases       []string               `json:"source_databases"`
+	TargetDatabases       []string               `json:"target_databases"`
+	Tables                []string               `json:"tables"`
+	Mode                  string                 `json:"mode"`
+	BatchSize             int                    `json:"batch_size"`
+	WorkerCount           int                    `json:"worker_count"`
+	IntraTableWorkerCount *int                   `json:"intra_table_worker_count,omitempty"`
+	EnableLimitOne        bool                   `json:"enable_limit_one"`
+	SourceDB              *DatabaseConfigRequest `json:"source_db,omitempty"`
+	TargetDB              *DatabaseConfigRequest `json:"target_db,omitempty"`
 }
 
 // generateID 生成唯一ID

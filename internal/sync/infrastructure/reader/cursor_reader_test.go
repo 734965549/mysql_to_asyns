@@ -53,8 +53,7 @@ func TestCursorReader_ReadBatch(t *testing.T) {
 				rows := sqlmock.NewRows([]string{"id", "name"}).
 					AddRow(1, "Alice").
 					AddRow(2, "Bob")
-				mock.ExpectQuery("SELECT id, name FROM test_db.users").
-					WithArgs(int64(0), int64(10)).
+				mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users`").
 					WillReturnRows(rows)
 			},
 			expectErr: false,
@@ -71,8 +70,7 @@ func TestCursorReader_ReadBatch(t *testing.T) {
 			},
 			setupMock: func(mock sqlmock.Sqlmock) {
 				rows := sqlmock.NewRows([]string{"id"})
-				mock.ExpectQuery("SELECT id FROM test_db.users").
-					WithArgs(int64(100), int64(10)).
+				mock.ExpectQuery("SELECT `id` FROM `test_db`.`users`").
 					WillReturnRows(rows)
 			},
 			expectErr: false,
@@ -88,8 +86,7 @@ func TestCursorReader_ReadBatch(t *testing.T) {
 				IdentifyCols: []string{},
 			},
 			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT id FROM test_db.users").
-					WithArgs(int64(0), int64(10)).
+				mock.ExpectQuery("SELECT `id` FROM `test_db`.`users`").
 					WillReturnError(sql.ErrConnDone)
 			},
 			expectErr: true,
@@ -130,7 +127,7 @@ func TestCursorReader_GetTotalCount(t *testing.T) {
 		{
 			name: "成功获取总数",
 			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT COUNT(.*) FROM test_db.users").
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `test_db`.`users`").
 					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(100)))
 			},
 			expectErr: false,
@@ -139,7 +136,7 @@ func TestCursorReader_GetTotalCount(t *testing.T) {
 		{
 			name: "查询错误",
 			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT COUNT(.*) FROM test_db.users").
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `test_db`.`users`").
 					WillReturnError(sql.ErrConnDone)
 			},
 			expectErr: true,
@@ -213,7 +210,7 @@ func TestRangeShardingReader_ReadBatch(t *testing.T) {
 				rows := sqlmock.NewRows([]string{"id", "name"}).
 					AddRow(1, "Alice").
 					AddRow(50, "Bob")
-				mock.ExpectQuery("SELECT id, name FROM test_db.users WHERE id >= .* AND id < .*").
+				mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
 					WithArgs(int64(0), int64(100)).
 					WillReturnRows(rows)
 			},
@@ -231,7 +228,7 @@ func TestRangeShardingReader_ReadBatch(t *testing.T) {
 			},
 			setupMock: func(mock sqlmock.Sqlmock) {
 				rows := sqlmock.NewRows([]string{"id"})
-				mock.ExpectQuery("SELECT id FROM test_db.users WHERE id >= .* AND id < .*").
+				mock.ExpectQuery("SELECT `id` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
 					WithArgs(int64(1000), int64(2000)).
 					WillReturnRows(rows)
 			},
@@ -248,7 +245,7 @@ func TestRangeShardingReader_ReadBatch(t *testing.T) {
 				IdentifyCols: []string{"id"},
 			},
 			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT id FROM test_db.users WHERE id >= .* AND id < .*").
+				mock.ExpectQuery("SELECT `id` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
 					WithArgs(int64(0), int64(100)).
 					WillReturnError(sql.ErrConnDone)
 			},
@@ -294,7 +291,7 @@ func TestRangeShardingReader_ReadByRange(t *testing.T) {
 	}
 
 	rows := sqlmock.NewRows([]string{"id", "name"}).AddRow(1, "Alice")
-	mock.ExpectQuery("SELECT id, name FROM test_db.users WHERE id >= .* AND id < .*").
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
 		WithArgs(int64(0), int64(100)).
 		WillReturnRows(rows)
 
@@ -316,7 +313,7 @@ func TestRangeShardingReader_GetTotalCount(t *testing.T) {
 		{
 			name: "成功获取总数",
 			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT COUNT(.*) FROM test_db.users").
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `test_db`.`users`").
 					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(500)))
 			},
 			expectErr: false,
@@ -325,7 +322,7 @@ func TestRangeShardingReader_GetTotalCount(t *testing.T) {
 		{
 			name: "查询错误",
 			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT COUNT(.*) FROM test_db.users").
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `test_db`.`users`").
 					WillReturnError(sql.ErrConnDone)
 			},
 			expectErr: true,
@@ -396,6 +393,12 @@ func TestNewReader(t *testing.T) {
 	assert.True(t, ok, "Expected RangeShardingReader for UKStrategy")
 }
 
+func TestSelectExprForColumn_JSON(t *testing.T) {
+	col := entity.ColumnMeta{Name: "tabs", DataType: "json"}
+	assert.Equal(t, "`tabs`", selectExprForColumn(col))
+	assert.Equal(t, "`plain`", selectExprForColumn(entity.ColumnMeta{Name: "plain", DataType: "varchar"}))
+}
+
 func TestCursorReader_ScanRowsWithByteData(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -413,8 +416,7 @@ func TestCursorReader_ScanRowsWithByteData(t *testing.T) {
 	rows := sqlmock.NewRows([]string{"id", "data"}).
 		AddRow(1, []byte("binary_data"))
 
-	mock.ExpectQuery("SELECT id, data FROM test_db.users").
-		WithArgs(int64(0), int64(10)).
+	mock.ExpectQuery("SELECT `id`, `data` FROM `test_db`.`users`").
 		WillReturnRows(rows)
 
 	reader := NewCursorReader(db, "test_db", "users", identity)
