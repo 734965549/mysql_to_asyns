@@ -1257,7 +1257,25 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							// 数据一致性检查：验证第一批数据的连续性
 							if lastID != nil {
 								firstPK := batch[0][identity.IdentifyCols[0]]
-								if fmt.Sprintf("%v", firstPK) <= fmt.Sprintf("%v", lastID) {
+								firstPKStr := fmt.Sprintf("%v", firstPK)
+								lastIDStr := fmt.Sprintf("%v", lastID)
+
+								// 添加详细日志
+								log.Printf("[Task %s] w%d continuity check: lastID=%s, firstPK=%s", taskID, wIdx, lastIDStr, firstPKStr)
+
+								// 改进比较逻辑：支持数字类型
+								var shouldContinue bool
+								if firstPKInt, ok := firstPK.(int64); ok {
+									if lastIDInt, ok := lastID.(int64); ok {
+										shouldContinue = firstPKInt <= lastIDInt
+									} else {
+										shouldContinue = firstPKStr <= lastIDStr
+									}
+								} else {
+									shouldContinue = firstPKStr <= lastIDStr
+								}
+
+								if shouldContinue {
 									syncErrChan <- fmt.Errorf("w%d data continuity error: first PK %v should be > lastID %v", wIdx, firstPK, lastID)
 									return
 								}
@@ -1829,16 +1847,36 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, schema, ta
 	// 基于采样点智能分配边界
 	if n <= 2 {
 		// 2个worker：直接在中点分割
-		boundaries[0] = samples[1] // 使用第二个采样点作为边界
+		if len(samples) > 1 {
+			// 确保边界不等于第一个采样点
+			for i := 1; i < len(samples); i++ {
+				if fmt.Sprintf("%v", samples[i]) != fmt.Sprintf("%v", samples[0]) {
+					boundaries[0] = samples[i]
+					break
+				}
+			}
+		}
 	} else {
-		// 多个worker：均匀分布边界点
+		// 多个worker：均匀分布边界点，确保不重复
 		step := float64(samplePoints-1) / float64(n-1)
 		for i := 1; i < n; i++ {
 			sampleIdx := int(step * float64(i))
 			if sampleIdx >= len(samples) {
 				sampleIdx = len(samples) - 1
 			}
-			boundaries[i-1] = samples[sampleIdx]
+
+			// 确保边界不重复且递增
+			if i > 1 {
+				prevBoundary := boundaries[i-2]
+				for sampleIdx < len(samples) &&
+					fmt.Sprintf("%v", samples[sampleIdx]) == fmt.Sprintf("%v", prevBoundary) {
+					sampleIdx++
+				}
+			}
+
+			if sampleIdx < len(samples) {
+				boundaries[i-1] = samples[sampleIdx]
+			}
 		}
 	}
 
