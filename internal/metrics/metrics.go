@@ -1,141 +1,141 @@
-package metrics
+package metrics // 声明当前文件属于metrics包，用于Prometheus指标管理
 
-import (
-	"sync"
+import ( // 导入外部包和标准库
+	"sync" // 导入sync包，用于并发控制
 
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus" // 导入Prometheus客户端库
 )
 
-// Metrics Prometheus指标
-type Metrics struct {
-	TasksTotal       prometheus.Gauge
-	TasksRunning     prometheus.Gauge
-	TasksCompleted   prometheus.Gauge
-	TasksFailed      prometheus.Gauge
+// Metrics Prometheus指标结构体
+type Metrics struct { // 定义Prometheus指标结构体
+	TasksTotal       prometheus.Gauge // 任务总数指标
+	TasksRunning     prometheus.Gauge // 运行中任务数指标
+	TasksCompleted   prometheus.Gauge // 已完成任务数指标
+	TasksFailed      prometheus.Gauge // 失败任务数指标
 	
-	RowsProcessed    prometheus.Counter
-	RowsTotal        prometheus.Gauge
-	BytesTransferred prometheus.Counter
+	RowsProcessed    prometheus.Counter // 已处理行数计数器
+	RowsTotal        prometheus.Gauge // 总行数指标
+	BytesTransferred prometheus.Counter // 传输字节数计数器
 	
-	SyncDuration     prometheus.Histogram
-	SyncErrors       prometheus.Counter
+	SyncDuration     prometheus.Histogram // 同步耗时直方图
+	SyncErrors       prometheus.Counter // 同步错误计数器
 	
-	BinlogLag        prometheus.Gauge
-	BinlogPosition   prometheus.Gauge
+	BinlogLag        prometheus.Gauge // Binlog延迟指标
+	BinlogPosition   prometheus.Gauge // Binlog位置指标
 }
 
-var (
-	instance *Metrics
-	once     sync.Once
+var ( // 定义包级别变量
+	instance *Metrics // Metrics实例，单例模式
+	once     sync.Once // 用于确保只初始化一次
 )
 
-// GetMetrics 获取指标实例
-func GetMetrics() *Metrics {
-	once.Do(func() {
-		instance = &Metrics{
-			TasksTotal: prometheus.NewGauge(prometheus.GaugeOpts{
-				Name: "mysql_sync_tasks_total",
-				Help: "Total number of sync tasks",
+// GetMetrics 获取指标实例函数
+func GetMetrics() *Metrics { // 获取Metrics单例实例
+	once.Do(func() { // 确保只执行一次初始化
+		instance = &Metrics{ // 创建Metrics实例
+			TasksTotal: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建任务总数指标
+				Name: "mysql_sync_tasks_total", // 指标名称
+				Help: "Total number of sync tasks", // 指标帮助信息
 			}),
-			TasksRunning: prometheus.NewGauge(prometheus.GaugeOpts{
-				Name: "mysql_sync_tasks_running",
-				Help: "Number of running tasks",
+			TasksRunning: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建运行中任务数指标
+				Name: "mysql_sync_tasks_running", // 指标名称
+				Help: "Number of running tasks", // 指标帮助信息
 			}),
-			TasksCompleted: prometheus.NewGauge(prometheus.GaugeOpts{
-				Name: "mysql_sync_tasks_completed",
-				Help: "Number of completed tasks",
+			TasksCompleted: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建已完成任务数指标
+				Name: "mysql_sync_tasks_completed", // 指标名称
+				Help: "Number of completed tasks", // 指标帮助信息
 			}),
-			TasksFailed: prometheus.NewGauge(prometheus.GaugeOpts{
-				Name: "mysql_sync_tasks_failed",
-				Help: "Number of failed tasks",
+			TasksFailed: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建失败任务数指标
+				Name: "mysql_sync_tasks_failed", // 指标名称
+				Help: "Number of failed tasks", // 指标帮助信息
 			}),
-			RowsProcessed: prometheus.NewCounter(prometheus.CounterOpts{
-				Name: "mysql_sync_rows_processed_total",
-				Help: "Total number of rows processed",
+			RowsProcessed: prometheus.NewCounter(prometheus.CounterOpts{ // 创建已处理行数计数器
+				Name: "mysql_sync_rows_processed_total", // 指标名称
+				Help: "Total number of rows processed", // 指标帮助信息
 			}),
-			RowsTotal: prometheus.NewGauge(prometheus.GaugeOpts{
-				Name: "mysql_sync_rows_total",
-				Help: "Total number of rows to process",
+			RowsTotal: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建总行数指标
+				Name: "mysql_sync_rows_total", // 指标名称
+				Help: "Total number of rows to process", // 指标帮助信息
 			}),
-			BytesTransferred: prometheus.NewCounter(prometheus.CounterOpts{
-				Name: "mysql_sync_bytes_transferred_total",
-				Help: "Total bytes transferred",
+			BytesTransferred: prometheus.NewCounter(prometheus.CounterOpts{ // 创建传输字节数计数器
+				Name: "mysql_sync_bytes_transferred_total", // 指标名称
+				Help: "Total bytes transferred", // 指标帮助信息
 			}),
-			SyncDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-				Name:    "mysql_sync_duration_seconds",
-				Help:    "Duration of sync operations",
-				Buckets: prometheus.DefBuckets,
+			SyncDuration: prometheus.NewHistogram(prometheus.HistogramOpts{ // 创建同步耗时直方图
+				Name:    "mysql_sync_duration_seconds", // 指标名称
+				Help:    "Duration of sync operations", // 指标帮助信息
+				Buckets: prometheus.DefBuckets, // 使用默认桶配置
 			}),
-			SyncErrors: prometheus.NewCounter(prometheus.CounterOpts{
-				Name: "mysql_sync_errors_total",
-				Help: "Total number of sync errors",
+			SyncErrors: prometheus.NewCounter(prometheus.CounterOpts{ // 创建同步错误计数器
+				Name: "mysql_sync_errors_total", // 指标名称
+				Help: "Total number of sync errors", // 指标帮助信息
 			}),
-			BinlogLag: prometheus.NewGauge(prometheus.GaugeOpts{
-				Name: "mysql_sync_binlog_lag_seconds",
-				Help: "Binlog lag in seconds",
+			BinlogLag: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建Binlog延迟指标
+				Name: "mysql_sync_binlog_lag_seconds", // 指标名称
+				Help: "Binlog lag in seconds", // 指标帮助信息
 			}),
-			BinlogPosition: prometheus.NewGauge(prometheus.GaugeOpts{
-				Name: "mysql_sync_binlog_position",
-				Help: "Current binlog position",
+			BinlogPosition: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建Binlog位置指标
+				Name: "mysql_sync_binlog_position", // 指标名称
+				Help: "Current binlog position", // 指标帮助信息
 			}),
 		}
 		
 		// 注册指标
-		prometheus.MustRegister(instance.TasksTotal)
-		prometheus.MustRegister(instance.TasksRunning)
-		prometheus.MustRegister(instance.TasksCompleted)
-		prometheus.MustRegister(instance.TasksFailed)
-		prometheus.MustRegister(instance.RowsProcessed)
-		prometheus.MustRegister(instance.RowsTotal)
-		prometheus.MustRegister(instance.BytesTransferred)
-		prometheus.MustRegister(instance.SyncDuration)
-		prometheus.MustRegister(instance.SyncErrors)
-		prometheus.MustRegister(instance.BinlogLag)
-		prometheus.MustRegister(instance.BinlogPosition)
+		prometheus.MustRegister(instance.TasksTotal) // 注册任务总数指标
+		prometheus.MustRegister(instance.TasksRunning) // 注册运行中任务数指标
+		prometheus.MustRegister(instance.TasksCompleted) // 注册已完成任务数指标
+		prometheus.MustRegister(instance.TasksFailed) // 注册失败任务数指标
+		prometheus.MustRegister(instance.RowsProcessed) // 注册已处理行数指标
+		prometheus.MustRegister(instance.RowsTotal) // 注册总行数指标
+		prometheus.MustRegister(instance.BytesTransferred) // 注册传输字节数指标
+		prometheus.MustRegister(instance.SyncDuration) // 注册同步耗时指标
+		prometheus.MustRegister(instance.SyncErrors) // 注册同步错误指标
+		prometheus.MustRegister(instance.BinlogLag) // 注册Binlog延迟指标
+		prometheus.MustRegister(instance.BinlogPosition) // 注册Binlog位置指标
 	})
 	
-	return instance
+	return instance // 返回实例
 }
 
-// UpdateTaskMetrics 更新任务指标
-func (m *Metrics) UpdateTaskMetrics(total, running, completed, failed int) {
-	m.TasksTotal.Set(float64(total))
-	m.TasksRunning.Set(float64(running))
-	m.TasksCompleted.Set(float64(completed))
-	m.TasksFailed.Set(float64(failed))
+// UpdateTaskMetrics 更新任务指标方法
+func (m *Metrics) UpdateTaskMetrics(total, running, completed, failed int) { // 更新任务相关指标
+	m.TasksTotal.Set(float64(total)) // 设置任务总数
+	m.TasksRunning.Set(float64(running)) // 设置运行中任务数
+	m.TasksCompleted.Set(float64(completed)) // 设置已完成任务数
+	m.TasksFailed.Set(float64(failed)) // 设置失败任务数
 }
 
-// IncrementRowsProcessed 增加已处理行数
-func (m *Metrics) IncrementRowsProcessed(count int) {
-	m.RowsProcessed.Add(float64(count))
+// IncrementRowsProcessed 增加已处理行数方法
+func (m *Metrics) IncrementRowsProcessed(count int) { // 增加已处理行数
+	m.RowsProcessed.Add(float64(count)) // 增加已处理行数计数器
 }
 
-// SetRowsTotal 设置总行数
-func (m *Metrics) SetRowsTotal(total int64) {
-	m.RowsTotal.Set(float64(total))
+// SetRowsTotal 设置总行数方法
+func (m *Metrics) SetRowsTotal(total int64) { // 设置总行数
+	m.RowsTotal.Set(float64(total)) // 设置总行数指标
 }
 
-// IncrementBytesTransferred 增加传输字节数
-func (m *Metrics) IncrementBytesTransferred(bytes int) {
-	m.BytesTransferred.Add(float64(bytes))
+// IncrementBytesTransferred 增加传输字节数方法
+func (m *Metrics) IncrementBytesTransferred(bytes int) { // 增加传输字节数
+	m.BytesTransferred.Add(float64(bytes)) // 增加传输字节数计数器
 }
 
-// RecordSyncDuration 记录同步耗时
-func (m *Metrics) RecordSyncDuration(duration float64) {
-	m.SyncDuration.Observe(duration)
+// RecordSyncDuration 记录同步耗时方法
+func (m *Metrics) RecordSyncDuration(duration float64) { // 记录同步耗时
+	m.SyncDuration.Observe(duration) // 观察并记录同步耗时
 }
 
-// IncrementSyncErrors 增加错误计数
-func (m *Metrics) IncrementSyncErrors() {
-	m.SyncErrors.Inc()
+// IncrementSyncErrors 增加错误计数方法
+func (m *Metrics) IncrementSyncErrors() { // 增加错误计数
+	m.SyncErrors.Inc() // 增加同步错误计数器
 }
 
-// SetBinlogLag 设置Binlog延迟
-func (m *Metrics) SetBinlogLag(lag float64) {
-	m.BinlogLag.Set(lag)
+// SetBinlogLag 设置Binlog延迟方法
+func (m *Metrics) SetBinlogLag(lag float64) { // 设置Binlog延迟
+	m.BinlogLag.Set(lag) // 设置Binlog延迟指标
 }
 
-// SetBinlogPosition 设置Binlog位置
-func (m *Metrics) SetBinlogPosition(position uint32) {
-	m.BinlogPosition.Set(float64(position))
+// SetBinlogPosition 设置Binlog位置方法
+func (m *Metrics) SetBinlogPosition(position uint32) { // 设置Binlog位置
+	m.BinlogPosition.Set(float64(position)) // 设置Binlog位置指标
 }

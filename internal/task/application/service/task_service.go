@@ -1,103 +1,104 @@
+// 声明 service 包
 package service
 
 import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"log"
-	"os"
-	"path/filepath"
-	"runtime/debug"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+	"context"       // 上下文管理
+	"database/sql"  // 数据库操作
+	"encoding/json" // JSON 编解码
+	"fmt"           // 格式化输出
+	"log"           // 日志记录
+	"os"            // 操作系统接口
+	"path/filepath" // 文件路径操作
+	"runtime/debug" // 运行时调试信息
+	"strings"       // 字符串处理
+	"sync"          // 并发同步
+	"sync/atomic"   // 原子操作
+	"time"          // 时间处理
 
-	"mysql-to-async/internal/audit"
-	"mysql-to-async/internal/checkpoint"
-	"mysql-to-async/internal/config"
-	"mysql-to-async/internal/metadata/domain/entity"
-	"mysql-to-async/internal/metadata/domain/service"
-	"mysql-to-async/internal/metadata/infrastructure"
-	syncApp "mysql-to-async/internal/sync/application"
-	"mysql-to-async/internal/sync/infrastructure/reader"
-	"mysql-to-async/internal/sync/infrastructure/readonly"
-	"mysql-to-async/internal/sync/infrastructure/writer"
-	taskEntity "mysql-to-async/internal/task/domain/entity"
+	"mysql-to-async/internal/audit"                         // 审计日志包
+	"mysql-to-async/internal/checkpoint"                    // 检查点管理包
+	"mysql-to-async/internal/config"                        // 配置管理包
+	"mysql-to-async/internal/metadata/domain/entity"        // 元数据实体包
+	"mysql-to-async/internal/metadata/domain/service"       // 元数据服务包
+	"mysql-to-async/internal/metadata/infrastructure"       // 元数据基础设施包
+	syncApp "mysql-to-async/internal/sync/application"      // 同步应用包
+	"mysql-to-async/internal/sync/infrastructure/reader"    // 同步读取器包
+	"mysql-to-async/internal/sync/infrastructure/readonly"  // 只读管理包
+	"mysql-to-async/internal/sync/infrastructure/writer"    // 同步写入器包
+	taskEntity "mysql-to-async/internal/task/domain/entity" // 任务实体包
 
-	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9" // Redis 客户端
 )
 
-// TaskService 任务服务
+// TaskService 任务服务结构体
 type TaskService struct {
-	mu                sync.RWMutex
-	tasks             map[string]*taskEntity.SyncTask
-	storage           TaskStorage
-	sourceDB          *sql.DB
-	targetDB          *sql.DB
-	analyzer          service.IdentityAnalyzer
-	readOnlyManager   *readonly.ReadOnlyManager
+	mu                sync.RWMutex                               // 读写锁，保护并发访问
+	tasks             map[string]*taskEntity.SyncTask            // 任务映射表，键为任务ID
+	storage           TaskStorage                                // 任务存储接口
+	sourceDB          *sql.DB                                    // 源数据库连接
+	targetDB          *sql.DB                                    // 目标数据库连接
+	analyzer          service.IdentityAnalyzer                   // 身份分析器
+	readOnlyManager   *readonly.ReadOnlyManager                  // 只读管理器
 	enableReadOnly    bool                                       // 是否启用只读限制
 	checkpointManager checkpoint.Manager                         // 位点管理器
 	incrementalSyncs  map[string]*syncApp.IncrementalSyncService // 增量同步服务映射
-	config            *config.Config                             // 配置
+	config            *config.Config                             // 配置对象
 	auditLogger       *audit.AuditLogger                         // 审计日志器
 }
 
 // TaskStorage 任务存储接口
 type TaskStorage interface {
-	Save(task *taskEntity.SyncTask) error
-	Delete(taskID string) error
-	LoadAll() ([]*taskEntity.SyncTask, error)
+	Save(task *taskEntity.SyncTask) error     // 保存任务
+	Delete(taskID string) error               // 删除任务
+	LoadAll() ([]*taskEntity.SyncTask, error) // 加载所有任务
 }
 
-// MySQLTaskStorage MySQL 任务存储
+// MySQLTaskStorage MySQL 任务存储结构体
 type MySQLTaskStorage struct {
-	db *sql.DB
-	mu sync.RWMutex
+	db *sql.DB      // 数据库连接
+	mu sync.RWMutex // 读写锁，保护并发访问
 }
 
 // NewMySQLTaskStorage 创建 MySQL 任务存储（dsn 不含数据库名，dbName 为目标库名）
 func NewMySQLTaskStorage(db *sql.DB) *MySQLTaskStorage {
-	s := &MySQLTaskStorage{db: db}
-	if err := s.initTable(); err != nil {
-		log.Printf("Warning: failed to initialize task storage table: %v", err)
+	s := &MySQLTaskStorage{db: db}        // 创建存储实例
+	if err := s.initTable(); err != nil { // 初始化数据表
+		log.Printf("Warning: failed to initialize task storage table: %v", err) // 打印警告日志
 	}
-	return s
+	return s // 返回存储实例
 }
 
 // NewMySQLTaskStorageFromConfig 通过配置创建 MySQL 任务存储，自动建库建表
 func NewMySQLTaskStorageFromConfig(cfg *config.StorageConfig) (*MySQLTaskStorage, error) {
 	// 先用不带数据库名的 DSN 连接，创建数据库
 	noDB := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4&parseTime=True&loc=Local",
-		cfg.Username, cfg.Password, cfg.Host, cfg.Port)
-	tmpDB, err := sql.Open("mysql", noDB)
+		cfg.Username, cfg.Password, cfg.Host, cfg.Port) // 构建无数据库名的DSN
+	tmpDB, err := sql.Open("mysql", noDB) // 打开临时数据库连接
 	if err != nil {
-		return nil, fmt.Errorf("failed to open mysql: %w", err)
+		return nil, fmt.Errorf("failed to open mysql: %w", err) // 返回错误
 	}
 	if _, err = tmpDB.Exec(fmt.Sprintf(
-		"CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", cfg.Database)); err != nil {
-		tmpDB.Close()
-		return nil, fmt.Errorf("failed to create database %s: %w", cfg.Database, err)
+		"CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", cfg.Database)); err != nil { // 创建数据库
+		tmpDB.Close()                                                                 // 关闭临时连接
+		return nil, fmt.Errorf("failed to create database %s: %w", cfg.Database, err) // 返回错误
 	}
-	tmpDB.Close()
+	tmpDB.Close() // 关闭临时连接
 
 	// 再连接到目标数据库
-	dsn := cfg.GetDSN()
-	db, err := sql.Open("mysql", dsn)
+	dsn := cfg.GetDSN()               // 获取完整的DSN
+	db, err := sql.Open("mysql", dsn) // 打开数据库连接
 	if err != nil {
-		return nil, fmt.Errorf("failed to open storage database: %w", err)
+		return nil, fmt.Errorf("failed to open storage database: %w", err) // 返回错误
 	}
-	if err = db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to ping storage database: %w", err)
+	if err = db.Ping(); err != nil { // 测试连接
+		db.Close()                                                         // 关闭连接
+		return nil, fmt.Errorf("failed to ping storage database: %w", err) // 返回错误
 	}
-	return NewMySQLTaskStorage(db), nil
+	return NewMySQLTaskStorage(db), nil // 创建并返回存储实例
 }
 
-func (s *MySQLTaskStorage) initTable() error {
-	query := `
+func (s *MySQLTaskStorage) initTable() error { // 初始化数据表
+	query := ` // 定义建表SQL语句
 	CREATE TABLE IF NOT EXISTS sys_sync_tasks (
 		pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 		id VARCHAR(64) NOT NULL,
@@ -108,18 +109,18 @@ func (s *MySQLTaskStorage) initTable() error {
 		PRIMARY KEY (pk_id),
 		UNIQUE KEY uk_task_id (id)
 	)`
-	if _, err := s.db.Exec(query); err != nil {
-		return err
+	if _, err := s.db.Exec(query); err != nil { // 执行建表语句
+		return err // 返回错误
 	}
 
-	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN IF NOT EXISTS pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST"); err != nil {
-		log.Printf("Warning: failed to ensure pk_id column: %v", err)
+	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN IF NOT EXISTS pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST"); err != nil { // 添加 pk_id 列
+		log.Printf("Warning: failed to ensure pk_id column: %v", err) // 打印警告日志
 	}
-	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"); err != nil {
-		log.Printf("Warning: failed to ensure created_at column: %v", err)
+	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"); err != nil { // 添加 created_at 列
+		log.Printf("Warning: failed to ensure created_at column: %v", err) // 打印警告日志
 	}
-	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD UNIQUE KEY IF NOT EXISTS uk_task_id (id)"); err != nil {
-		log.Printf("Warning: failed to ensure uk_task_id index: %v", err)
+	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD UNIQUE KEY IF NOT EXISTS uk_task_id (id)"); err != nil { // 添加唯一索引
+		log.Printf("Warning: failed to ensure uk_task_id index: %v", err) // 打印警告日志
 	}
 
 	return nil
@@ -127,150 +128,151 @@ func (s *MySQLTaskStorage) initTable() error {
 
 // Save 保存任务到数据库
 func (s *MySQLTaskStorage) Save(task *taskEntity.SyncTask) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.Lock()         // 获取写锁
+	defer s.mu.Unlock() // 延迟释放写锁
 
-	data, err := json.Marshal(task)
+	data, err := json.Marshal(task) // 序列化任务
 	if err != nil {
-		return err
+		return err // 返回错误
 	}
 
-	query := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content), pk_id = LAST_INSERT_ID(pk_id)"
-	res, err := s.db.Exec(query, task.Config.ID, task.Config.Name, data)
+	query := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content), pk_id = LAST_INSERT_ID(pk_id)" // 构建插入或更新SQL
+	res, err := s.db.Exec(query, task.Config.ID, task.Config.Name, data)                                                                                                             // 执行SQL
 	if err != nil {
-		fallbackQuery := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content)"
-		if _, fbErr := s.db.Exec(fallbackQuery, task.Config.ID, task.Config.Name, data); fbErr != nil {
-			return err
+		fallbackQuery := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content)" // 构建备用SQL
+		if _, fbErr := s.db.Exec(fallbackQuery, task.Config.ID, task.Config.Name, data); fbErr != nil {                                                           // 执行备用SQL
+			return err // 返回原始错误
 		}
-		return nil
+		return nil // 返回成功
 	}
 
-	if storageID, idErr := res.LastInsertId(); idErr == nil && storageID > 0 {
-		task.Config.StorageID = storageID
+	if storageID, idErr := res.LastInsertId(); idErr == nil && storageID > 0 { // 获取插入的ID
+		task.Config.StorageID = storageID // 设置存储ID
 	}
-	return nil
+	return nil // 返回成功
 }
 
 // Delete 从数据库删除任务
 func (s *MySQLTaskStorage) Delete(taskID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.Lock()         // 获取写锁
+	defer s.mu.Unlock() // 延迟释放写锁
 
-	query := "DELETE FROM sys_sync_tasks WHERE id = ?"
-	_, err := s.db.Exec(query, taskID)
-	return err
+	query := "DELETE FROM sys_sync_tasks WHERE id = ?" // 构建删除SQL
+	_, err := s.db.Exec(query, taskID)                 // 执行删除
+	return err                                         // 返回结果
 }
 
 // LoadAll 从数据库加载所有任务
 func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.RLock()         // 获取读锁
+	defer s.mu.RUnlock() // 延迟释放读锁
 
-	query := "SELECT pk_id, content FROM sys_sync_tasks ORDER BY pk_id ASC"
-	rows, err := s.db.Query(query)
+	query := "SELECT pk_id, content FROM sys_sync_tasks ORDER BY pk_id ASC" // 构建查询SQL
+	rows, err := s.db.Query(query)                                          // 执行查询
 	if err != nil {
-		fallbackRows, fbErr := s.db.Query("SELECT content FROM sys_sync_tasks")
+		fallbackRows, fbErr := s.db.Query("SELECT content FROM sys_sync_tasks") // 执行备用查询
 		if fbErr != nil {
-			return nil, err
+			return nil, err // 返回原始错误
 		}
-		defer fallbackRows.Close()
+		defer fallbackRows.Close() // 延迟关闭结果集
 
-		var fallbackTasks []*taskEntity.SyncTask
-		for fallbackRows.Next() {
-			var data []byte
-			if scanErr := fallbackRows.Scan(&data); scanErr != nil {
-				continue
+		var fallbackTasks []*taskEntity.SyncTask // 声明备用任务列表
+		for fallbackRows.Next() {                // 遍历备用结果集
+			var data []byte                                          // 声明数据字节数组
+			if scanErr := fallbackRows.Scan(&data); scanErr != nil { // 扫描数据
+				continue // 跳过错误行
 			}
-			var task taskEntity.SyncTask
-			if unmarshalErr := json.Unmarshal(data, &task); unmarshalErr != nil {
-				continue
+			var task taskEntity.SyncTask                                          // 声明任务对象
+			if unmarshalErr := json.Unmarshal(data, &task); unmarshalErr != nil { // 反序列化任务
+				log.Printf("Warning: failed to unmarshal task: %v", unmarshalErr) // 打印警告日志
+				continue                                                          // 跳过错误行
 			}
-			fallbackTasks = append(fallbackTasks, &task)
+			fallbackTasks = append(fallbackTasks, &task) // 添加到任务列表
 		}
-		return fallbackTasks, nil
+		return fallbackTasks, nil // 返回任务列表
 	}
 	defer rows.Close()
 
-	var tasks []*taskEntity.SyncTask
-	for rows.Next() {
-		var storageID int64
-		var data []byte
-		if err := rows.Scan(&storageID, &data); err != nil {
-			continue
+	var tasks []*taskEntity.SyncTask // 声明任务列表
+	for rows.Next() {                // 遍历结果集
+		var storageID int64                                  // 声明存储ID
+		var data []byte                                      // 声明数据字节数组
+		if err := rows.Scan(&storageID, &data); err != nil { // 扫描数据
+			continue // 跳过错误行
 		}
-		var task taskEntity.SyncTask
-		if err := json.Unmarshal(data, &task); err != nil {
-			continue
+		var task taskEntity.SyncTask                        // 声明任务对象
+		if err := json.Unmarshal(data, &task); err != nil { // 反序列化任务
+			continue // 跳过错误行
 		}
-		task.Config.StorageID = storageID
-		tasks = append(tasks, &task)
+		task.Config.StorageID = storageID // 设置存储ID
+		tasks = append(tasks, &task)      // 添加到任务列表
 	}
-	return tasks, nil
+	return tasks, nil // 返回任务列表
 }
 
 // NewTaskService 创建任务服务（启动时不依赖数据库）
 func NewTaskService(cfg *config.Config) *TaskService {
 	ts := &TaskService{
-		tasks:            make(map[string]*taskEntity.SyncTask),
-		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService),
-		config:           cfg,
-		auditLogger:      audit.NewAuditLogger("logs/audit"),
+		tasks:            make(map[string]*taskEntity.SyncTask),            // 初始化任务映射
+		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService), // 初始化增量同步映射
+		config:           cfg,                                              // 设置配置
+		auditLogger:      audit.NewAuditLogger("logs/audit"),               // 创建审计日志器
 	}
 
 	// 初始化存储后端
-	if cfg.Storage.Mode == "mysql" {
-		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage)
+	if cfg.Storage.Mode == "mysql" { // 检查存储模式是否为MySQL
+		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage) // 创建MySQL存储
 		if err != nil {
-			log.Printf("Warning: failed to initialize MySQL storage: %v, falling back to file storage", err)
-			ts.storage = NewFileTaskStorage("data")
+			log.Printf("Warning: failed to initialize MySQL storage: %v, falling back to file storage", err) // 打印警告日志
+			ts.storage = NewFileTaskStorage("data")                                                          // 降级为文件存储
 		} else {
-			ts.storage = storage
-			log.Println("Using MySQL task storage")
+			ts.storage = storage                    // 使用MySQL存储
+			log.Println("Using MySQL task storage") // 打印日志
 		}
 	} else {
-		ts.storage = NewFileTaskStorage("data")
-		log.Println("Using file task storage")
+		ts.storage = NewFileTaskStorage("data") // 使用文件存储
+		log.Println("Using file task storage")  // 打印日志
 	}
 
 	// 初始化位点管理器
-	if cfg != nil && cfg.Redis.Host != "" {
+	if cfg != nil && cfg.Redis.Host != "" { // 检查Redis配置
 		// 使用Redis位点管理器
-		rdb := redis.NewClient(&redis.Options{
-			Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
-			Password: cfg.Redis.Password,
-			DB:       cfg.Redis.DB,
+		rdb := redis.NewClient(&redis.Options{ // 创建Redis客户端
+			Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port), // 设置地址
+			Password: cfg.Redis.Password,                                   // 设置密码
+			DB:       cfg.Redis.DB,                                         // 设置数据库
 		})
-		ts.checkpointManager = checkpoint.NewRedisCheckpointManager(rdb, "dts:checkpoint")
-		log.Println("Using Redis checkpoint manager")
+		ts.checkpointManager = checkpoint.NewRedisCheckpointManager(rdb, "dts:checkpoint") // 创建Redis检查点管理器
+		log.Println("Using Redis checkpoint manager")                                      // 打印日志
 	} else {
 		// 使用内存位点管理器
-		ts.checkpointManager = checkpoint.NewMemoryCheckpointManager()
-		log.Println("Using in-memory checkpoint manager")
+		ts.checkpointManager = checkpoint.NewMemoryCheckpointManager() // 创建内存检查点管理器
+		log.Println("Using in-memory checkpoint manager")              // 打印日志
 	}
 
 	// 加载已保存的任务
-	ts.loadTasks()
-	return ts
+	ts.loadTasks() // 加载任务
+	return ts      // 返回服务实例
 }
 
 // NewTaskServiceWithDB 创建带数据库连接的任务服务
 func NewTaskServiceWithDB(sourceDB, targetDB *sql.DB, analyzer service.IdentityAnalyzer) *TaskService {
 	ts := &TaskService{
-		tasks:            make(map[string]*taskEntity.SyncTask),
-		storage:          NewFileTaskStorage("data"),
-		sourceDB:         sourceDB,
-		targetDB:         targetDB,
-		analyzer:         analyzer,
-		enableReadOnly:   true, // 默认启用只读限制
-		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService),
-		auditLogger:      audit.NewAuditLogger("logs/audit"),
+		tasks:            make(map[string]*taskEntity.SyncTask),            // 初始化任务映射
+		storage:          NewFileTaskStorage("data"),                       // 使用文件存储
+		sourceDB:         sourceDB,                                         // 设置源数据库
+		targetDB:         targetDB,                                         // 设置目标数据库
+		analyzer:         analyzer,                                         // 设置分析器
+		enableReadOnly:   true,                                             // 默认启用只读限制
+		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService), // 初始化增量同步映射
+		auditLogger:      audit.NewAuditLogger("logs/audit"),               // 创建审计日志器
 	}
 	// 初始化只读管理器
-	ts.readOnlyManager = readonly.NewReadOnlyManager(targetDB)
+	ts.readOnlyManager = readonly.NewReadOnlyManager(targetDB) // 创建只读管理器
 	// 初始化位点管理器（默认使用内存）
-	ts.checkpointManager = checkpoint.NewMemoryCheckpointManager()
-	ts.loadTasks()
-	return ts
+	ts.checkpointManager = checkpoint.NewMemoryCheckpointManager() // 创建内存检查点管理器
+	ts.loadTasks()                                                 // 加载任务
+	return ts                                                      // 返回服务实例
 }
 
 // NewTaskServiceWithDBAndConfig 创建带数据库连接和配置的任务服务
@@ -345,44 +347,44 @@ func (s *TaskService) intraTableConcurrencyCaps() (legacyCap, hardMax int) {
 
 // SetEnableReadOnly 设置是否启用只读限制
 func (s *TaskService) SetEnableReadOnly(enable bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.enableReadOnly = enable
+	s.mu.Lock()               // 获取写锁
+	defer s.mu.Unlock()       // 延迟释放写锁
+	s.enableReadOnly = enable // 设置只读状态
 }
 
 // GetEnableReadOnly 获取是否启用只读限制
 func (s *TaskService) GetEnableReadOnly() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.enableReadOnly
+	s.mu.RLock()            // 获取读锁
+	defer s.mu.RUnlock()    // 延迟释放读锁
+	return s.enableReadOnly // 返回只读状态
 }
 
 // loadTasks 从存储加载任务
 func (s *TaskService) loadTasks() {
-	tasks, err := s.storage.LoadAll()
+	tasks, err := s.storage.LoadAll() // 加载所有任务
 	if err != nil {
-		fmt.Printf("加载任务失败: %v\n", err)
-		return
+		fmt.Printf("加载任务失败: %v\n", err) // 打印错误信息
+		return                          // 返回
 	}
-	for _, task := range tasks {
-		s.tasks[task.Config.ID] = task
+	for _, task := range tasks { // 遍历任务列表
+		s.tasks[task.Config.ID] = task // 添加到任务映射
 	}
 }
 
 // CreateTask 创建任务
 func (s *TaskService) CreateTask(config taskEntity.TaskConfig) (*taskEntity.SyncTask, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.Lock()         // 获取写锁
+	defer s.mu.Unlock() // 延迟释放写锁
 
-	task := taskEntity.NewSyncTask(config)
-	s.tasks[config.ID] = task
+	task := taskEntity.NewSyncTask(config) // 创建同步任务
+	s.tasks[config.ID] = task              // 添加到任务映射
 
 	// 保存到存储
 	if err := s.storage.Save(task); err != nil {
 		fmt.Printf("保存任务失败: %v\n", err)
 	}
 
-	return task, nil
+	return task, nil // 返回任务和成功状态
 }
 
 // GetTask 获取任务
@@ -464,8 +466,8 @@ func (s *TaskService) DeleteTask(taskID string) error {
 
 // StartTask 启动任务
 func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.Lock()         // 获取写锁
+	defer s.mu.Unlock() // 延迟释放写锁
 
 	task, exists := s.tasks[taskID]
 	if !exists {
@@ -473,8 +475,8 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 	}
 
 	// 检查任务状态，防止重复启动
-	if task.Context.Status == taskEntity.TaskStatusRunning {
-		return fmt.Errorf("task is already running: %s", taskID)
+	if task.Context.Status == taskEntity.TaskStatusRunning { // 检查是否正在运行
+		return fmt.Errorf("task is already running: %s", taskID) // 返回错误
 	}
 
 	// 动态创建数据库连接（如果还没有创建或需要更新）
