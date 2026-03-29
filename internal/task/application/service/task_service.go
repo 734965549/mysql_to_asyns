@@ -114,14 +114,31 @@ func (s *MySQLTaskStorage) initTable() error { // 初始化数据表
 		return err // 返回错误
 	}
 
-	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN IF NOT EXISTS pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST"); err != nil { // 添加 pk_id 列
-		log.Printf("Warning: failed to ensure pk_id column: %v", err) // 打印警告日志
+	// 检查并添加 pk_id 列（如果不存在）
+	var pkIDExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name = 'sys_sync_tasks' AND column_name = 'pk_id'").Scan(&pkIDExists)
+	if err == nil && pkIDExists == 0 {
+		if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST"); err != nil {
+			log.Printf("Warning: failed to add pk_id column: %v", err) // 打印警告日志
+		}
 	}
-	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"); err != nil { // 添加 created_at 列
-		log.Printf("Warning: failed to ensure created_at column: %v", err) // 打印警告日志
+
+	// 检查并添加 created_at 列（如果不存在）
+	var createdExists int
+	err = s.db.QueryRow("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name = 'sys_sync_tasks' AND column_name = 'created_at'").Scan(&createdExists)
+	if err == nil && createdExists == 0 {
+		if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"); err != nil {
+			log.Printf("Warning: failed to add created_at column: %v", err) // 打印警告日志
+		}
 	}
-	if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD UNIQUE KEY IF NOT EXISTS uk_task_id (id)"); err != nil { // 添加唯一索引
-		log.Printf("Warning: failed to ensure uk_task_id index: %v", err) // 打印警告日志
+
+	// 检查并添加唯一索引（如果不存在）
+	var indexExists int
+	err = s.db.QueryRow("SELECT COUNT(*) FROM information_schema.STATISTICS WHERE table_schema = DATABASE() AND table_name = 'sys_sync_tasks' AND index_name = 'uk_task_id'").Scan(&indexExists)
+	if err == nil && indexExists == 0 {
+		if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD UNIQUE KEY uk_task_id (id)"); err != nil {
+			log.Printf("Warning: failed to add uk_task_id index: %v", err) // 打印警告日志
+		}
 	}
 
 	return nil
