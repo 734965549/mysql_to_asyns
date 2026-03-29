@@ -10,6 +10,7 @@ import (
 	"os"            // 操作系统接口
 	"path/filepath" // 文件路径操作
 	"runtime/debug" // 运行时调试信息
+	"strconv"       // 字符串数字转换
 	"strings"       // 字符串处理
 	"sync"          // 并发同步
 	"sync/atomic"   // 原子操作
@@ -44,6 +45,11 @@ type TaskService struct {
 	incrementalSyncs  map[string]*syncApp.IncrementalSyncService // 增量同步服务映射
 	config            *config.Config                             // 配置对象
 	auditLogger       *audit.AuditLogger                         // 审计日志器
+}
+
+type sourceQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
 
 // TaskStorage 任务存储接口
@@ -1147,22 +1153,45 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				var syncWg sync.WaitGroup
 				syncErrChan := make(chan error, intraWorkers)
 				var atomicProcessed int64
-
-				// 创建reader用于边界计算
-				wReader := reader.NewRangeShardingReader(s.sourceDB, sourceSchema, tableName, identity)
-
-				// 使用改进的边界计算（统一处理所有主键类型）
-				var boundaries []interface{}
-				if totalRows, err := wReader.GetTotalCount(ctx); err == nil && totalRows > 0 {
-					boundaries, err = s.samplePKBoundariesImproved(ctx, sourceSchema, tableName,
-						identity.IdentifyCols[0], totalRows, intraWorkers)
+				var workerSnapshotConns []*sql.Conn
+				if task.Config.EnableConsistentSnapshot {
+					conns, err := s.prepareConsistentSnapshotReaders(ctx, intraWorkers)
 					if err != nil {
-						log.Printf("[Task %s] Boundary calculation failed for %s.%s: %v, falling back to single worker",
-							taskID, sourceSchema, tableName, err)
-						// 降级为单worker处理
+						errMsg := fmt.Sprintf("Failed to prepare parallel consistent snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
+						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						errChan <- err
+						return
+					}
+					workerSnapshotConns = conns
+					defer s.releaseConsistentSnapshotReaders(workerSnapshotConns)
+					if len(workerSnapshotConns) > 0 {
+						if err := workerSnapshotConns[0].QueryRowContext(ctx,
+							fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
+								identity.IdentifyCols[0], identity.IdentifyCols[0], sourceSchema, tableName),
+						).Scan(&minPK, &maxPK); err != nil || maxPK < minPK {
+							errMsg := fmt.Sprintf("Failed to get numeric PK range in snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
+							log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+							s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+							errChan <- fmt.Errorf("snapshot range failed: %w", err)
+							return
+						}
+					}
+					log.Printf("[Task %s] Table %s.%s: parallel consistent snapshot enabled with %d workers",
+						taskID, sourceSchema, tableName, intraWorkers)
+				}
+
+				// 数值主键按 min/max 等分，避免采样边界导致有效 worker 塌缩
+				span := maxPK - minPK + 1
+				if span < int64(intraWorkers) {
+					intraWorkers = int(span)
+					if intraWorkers < 1 {
 						intraWorkers = 1
 					}
 				}
+				chunkSize := (span + int64(intraWorkers) - 1) / int64(intraWorkers)
+				log.Printf("[Task %s] Table %s.%s: numeric range split min=%d max=%d workers=%d chunk=%d",
+					taskID, sourceSchema, tableName, minPK, maxPK, intraWorkers, chunkSize)
 
 				for w := 0; w < intraWorkers; w++ {
 					syncWg.Add(1)
@@ -1174,16 +1203,28 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							}
 						}()
 
-						// 每个worker的起始位置
-						var startBoundary interface{}
-						if wIdx > 0 && wIdx-1 < len(boundaries) {
-							startBoundary = boundaries[wIdx-1]
+						readSource := sourceQueryer(s.sourceDB)
+						if len(workerSnapshotConns) == intraWorkers {
+							readSource = workerSnapshotConns[wIdx]
 						}
 
-						var endBoundary interface{}
-						if wIdx < len(boundaries) {
-							endBoundary = boundaries[wIdx]
+						// 创建reader
+						wReader := reader.NewRangeShardingReader(readSource, sourceSchema, tableName, identity)
+
+						// 每个worker负责 [workerStart, workerEnd)
+						workerStart := minPK + int64(wIdx)*chunkSize
+						if workerStart > maxPK {
+							return
 						}
+						workerEnd := maxPK + 1
+						if wIdx < intraWorkers-1 {
+							nextStart := minPK + int64(wIdx+1)*chunkSize
+							if nextStart < workerEnd {
+								workerEnd = nextStart
+							}
+						}
+						startBoundary := interface{}(workerStart - 1)
+						endBoundary := interface{}(workerEnd)
 
 						conn, err := s.targetDB.Conn(ctx)
 						if err != nil {
@@ -1257,25 +1298,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							// 数据一致性检查：验证第一批数据的连续性
 							if lastID != nil {
 								firstPK := batch[0][identity.IdentifyCols[0]]
-								firstPKStr := fmt.Sprintf("%v", firstPK)
-								lastIDStr := fmt.Sprintf("%v", lastID)
-
-								// 添加详细日志
-								log.Printf("[Task %s] w%d continuity check: lastID=%s, firstPK=%s", taskID, wIdx, lastIDStr, firstPKStr)
-
-								// 改进比较逻辑：支持数字类型
-								var shouldContinue bool
-								if firstPKInt, ok := firstPK.(int64); ok {
-									if lastIDInt, ok := lastID.(int64); ok {
-										shouldContinue = firstPKInt <= lastIDInt
-									} else {
-										shouldContinue = firstPKStr <= lastIDStr
-									}
-								} else {
-									shouldContinue = firstPKStr <= lastIDStr
-								}
-
-								if shouldContinue {
+								if comparePKValues(firstPK, lastID) <= 0 {
 									syncErrChan <- fmt.Errorf("w%d data continuity error: first PK %v should be > lastID %v", wIdx, firstPK, lastID)
 									return
 								}
@@ -1283,16 +1306,15 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							// 非最后一个worker：检查是否超出边界
 							if endBoundary != nil {
-								endStr := fmt.Sprintf("%v", endBoundary)
 								cutIdx := len(batch)
 								for j, row := range batch {
-									if fmt.Sprintf("%v", row[identity.IdentifyCols[0]]) >= endStr {
+									if comparePKValues(row[identity.IdentifyCols[0]], endBoundary) >= 0 {
 										cutIdx = j
 										break
 									}
 								}
 								if cutIdx < len(batch) {
-									log.Printf("[Task %s] w%d cutting %d rows that exceed boundary %s", taskID, wIdx, len(batch)-cutIdx, endStr)
+									log.Printf("[Task %s] w%d cutting %d rows that exceed boundary %v", taskID, wIdx, len(batch)-cutIdx, endBoundary)
 									batch = batch[:cutIdx]
 								}
 							}
@@ -1320,7 +1342,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							lastID = lastRow[identity.IdentifyCols[0]]
 
 							// 检查是否达到边界
-							if endBoundary != nil && fmt.Sprintf("%v", lastID) >= fmt.Sprintf("%v", endBoundary) {
+							if endBoundary != nil && comparePKValues(lastID, endBoundary) >= 0 {
 								log.Printf("[Task %s] w%d reached boundary %v at %v", taskID, wIdx, endBoundary, lastID)
 								break
 							}
@@ -1891,6 +1913,138 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (s *TaskService) prepareConsistentSnapshotReaders(ctx context.Context, workers int) ([]*sql.Conn, error) {
+	if workers < 1 {
+		return nil, fmt.Errorf("invalid workers: %d", workers)
+	}
+
+	lockConn, err := s.sourceDB.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get lock connection failed: %w", err)
+	}
+
+	if _, err := lockConn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
+		lockConn.Close()
+		return nil, fmt.Errorf("acquire global read lock failed: %w", err)
+	}
+
+	conns := make([]*sql.Conn, 0, workers)
+	cleanup := func() {
+		for _, c := range conns {
+			if c != nil {
+				c.ExecContext(context.Background(), "ROLLBACK")
+				c.Close()
+			}
+		}
+		lockConn.ExecContext(context.Background(), "UNLOCK TABLES")
+		lockConn.Close()
+	}
+
+	for i := 0; i < workers; i++ {
+		conn, err := s.sourceDB.Conn(ctx)
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("get worker snapshot connection %d failed: %w", i, err)
+		}
+		if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			conn.Close()
+			cleanup()
+			return nil, fmt.Errorf("set worker %d isolation failed: %w", i, err)
+		}
+		if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"); err != nil {
+			conn.Close()
+			cleanup()
+			return nil, fmt.Errorf("start worker %d snapshot transaction failed: %w", i, err)
+		}
+		conns = append(conns, conn)
+	}
+
+	if _, err := lockConn.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
+		lockConn.Close()
+		for _, c := range conns {
+			if c != nil {
+				c.ExecContext(context.Background(), "ROLLBACK")
+				c.Close()
+			}
+		}
+		return nil, fmt.Errorf("unlock tables failed: %w", err)
+	}
+	lockConn.Close()
+
+	return conns, nil
+}
+
+func (s *TaskService) releaseConsistentSnapshotReaders(conns []*sql.Conn) {
+	for _, c := range conns {
+		if c == nil {
+			continue
+		}
+		c.ExecContext(context.Background(), "ROLLBACK")
+		c.Close()
+	}
+}
+
+func toInt64PK(v interface{}) (int64, bool) {
+	switch t := v.(type) {
+	case int:
+		return int64(t), true
+	case int8:
+		return int64(t), true
+	case int16:
+		return int64(t), true
+	case int32:
+		return int64(t), true
+	case int64:
+		return t, true
+	case uint:
+		return int64(t), true
+	case uint8:
+		return int64(t), true
+	case uint16:
+		return int64(t), true
+	case uint32:
+		return int64(t), true
+	case uint64:
+		if t > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(t), true
+	case string:
+		i, err := strconv.ParseInt(t, 10, 64)
+		return i, err == nil
+	case []byte:
+		i, err := strconv.ParseInt(string(t), 10, 64)
+		return i, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func comparePKValues(a, b interface{}) int {
+	ai, aok := toInt64PK(a)
+	bi, bok := toInt64PK(b)
+	if aok && bok {
+		switch {
+		case ai < bi:
+			return -1
+		case ai > bi:
+			return 1
+		default:
+			return 0
+		}
+	}
+	as := fmt.Sprintf("%v", a)
+	bs := fmt.Sprintf("%v", b)
+	switch {
+	case as < bs:
+		return -1
+	case as > bs:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // isNumericPKColumn 检查单列主键是否为整数类型（支持表内并行范围分片）
