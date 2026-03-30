@@ -29,8 +29,8 @@ func TestReadOnlyManager_SetReadOnly_Success(t *testing.T) {
 
 	manager := NewReadOnlyManager(db)
 
-	// 模拟查询 read_only 状态
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(0))
+	// 模拟查询 read_only/super_read_only 状态
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(0, 0))
 	// 模拟设置 read_only
 	mock.ExpectExec("SET GLOBAL read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -51,7 +51,7 @@ func TestReadOnlyManager_SetReadOnly_QueryError(t *testing.T) {
 	manager := NewReadOnlyManager(db)
 
 	// 模拟查询失败
-	mock.ExpectQuery("SELECT @@read_only").WillReturnError(errors.New("query error"))
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnError(errors.New("query error"))
 
 	err = manager.SetReadOnly()
 	assert.Error(t, err)
@@ -71,13 +71,13 @@ func TestReadOnlyManager_SetReadOnly_SetError(t *testing.T) {
 	manager := NewReadOnlyManager(db)
 
 	// 模拟查询成功
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(0))
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(0, 0))
 	// 模拟设置失败
 	mock.ExpectExec("SET GLOBAL read_only = ?").WillReturnError(errors.New("set error"))
 
 	err = manager.SetReadOnly()
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "设置只读模式失败")
+	assert.Contains(t, err.Error(), "设置 read_only 失败")
 
 	// 验证所有期望都被满足
 	assert.NoError(t, mock.ExpectationsWereMet())
@@ -105,8 +105,8 @@ func TestReadOnlyManager_RestoreReadOnly_WithState(t *testing.T) {
 
 	manager := NewReadOnlyManager(db)
 
-	// 模拟查询 read_only 状态
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(0))
+	// 模拟查询 read_only/super_read_only 状态
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(0, 0))
 	// 模拟设置 read_only
 	mock.ExpectExec("SET GLOBAL read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -114,8 +114,9 @@ func TestReadOnlyManager_RestoreReadOnly_WithState(t *testing.T) {
 	err = manager.SetReadOnly()
 	assert.NoError(t, err)
 
-	// 模拟恢复 read_only
+	// 模拟恢复 read_only 与 super_read_only
 	mock.ExpectExec("SET GLOBAL read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("SET GLOBAL super_read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	// 恢复只读状态
 	err = manager.RestoreReadOnly()
@@ -134,8 +135,8 @@ func TestReadOnlyManager_RestoreReadOnly_Error(t *testing.T) {
 
 	manager := NewReadOnlyManager(db)
 
-	// 模拟查询 read_only 状态
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(0))
+	// 模拟查询 read_only/super_read_only 状态
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(0, 0))
 	// 模拟设置 read_only
 	mock.ExpectExec("SET GLOBAL read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -149,7 +150,7 @@ func TestReadOnlyManager_RestoreReadOnly_Error(t *testing.T) {
 	// 恢复只读状态
 	err = manager.RestoreReadOnly()
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "恢复读写状态失败")
+	assert.Contains(t, err.Error(), "恢复 read_only 失败")
 
 	// 验证所有期望都被满足
 	assert.NoError(t, mock.ExpectationsWereMet())
@@ -164,8 +165,8 @@ func TestReadOnlyManager_IsReadOnly_Success(t *testing.T) {
 
 	manager := NewReadOnlyManager(db)
 
-	// 模拟查询 read_only 状态
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(1))
+	// 模拟查询 read_only/super_read_only 状态
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(1, 0))
 
 	readOnly, err := manager.IsReadOnly()
 	assert.NoError(t, err)
@@ -184,8 +185,8 @@ func TestReadOnlyManager_IsReadOnly_False(t *testing.T) {
 
 	manager := NewReadOnlyManager(db)
 
-	// 模拟查询 read_only 状态
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(0))
+	// 模拟查询 read_only/super_read_only 状态
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(0, 0))
 
 	readOnly, err := manager.IsReadOnly()
 	assert.NoError(t, err)
@@ -205,7 +206,7 @@ func TestReadOnlyManager_IsReadOnly_Error(t *testing.T) {
 	manager := NewReadOnlyManager(db)
 
 	// 模拟查询失败
-	mock.ExpectQuery("SELECT @@read_only").WillReturnError(errors.New("query error"))
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnError(errors.New("query error"))
 
 	readOnly, err := manager.IsReadOnly()
 	assert.Error(t, err)
@@ -224,8 +225,8 @@ func TestReadOnlyManager_GetReadOnlyState_Success(t *testing.T) {
 
 	manager := NewReadOnlyManager(db)
 
-	// 模拟查询 read_only 状态
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(1))
+	// 模拟查询 read_only/super_read_only 状态
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(1, 0))
 
 	// 使用反射调用私有方法进行测试
 	// 这里我们通过公共方法间接测试
@@ -262,7 +263,7 @@ func TestReadOnlyManager_SetGlobalReadOnly_Success(t *testing.T) {
 	manager := NewReadOnlyManager(db)
 
 	// 先设置只读状态
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(0))
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(0, 0))
 	// 模拟设置 read_only
 	mock.ExpectExec("SET GLOBAL read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -282,8 +283,8 @@ func TestReadOnlyManager_RestoreGlobalReadOnly_Success(t *testing.T) {
 
 	manager := NewReadOnlyManager(db)
 
-	// 模拟查询 read_only 状态
-	mock.ExpectQuery("SELECT @@read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only"}).AddRow(1))
+	// 模拟查询 read_only/super_read_only 状态
+	mock.ExpectQuery("SELECT @@read_only, @@super_read_only").WillReturnRows(sqlmock.NewRows([]string{"@@read_only", "@@super_read_only"}).AddRow(1, 0))
 	// 模拟设置 read_only
 	mock.ExpectExec("SET GLOBAL read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -291,8 +292,9 @@ func TestReadOnlyManager_RestoreGlobalReadOnly_Success(t *testing.T) {
 	err = manager.SetReadOnly()
 	assert.NoError(t, err)
 
-	// 模拟恢复 read_only
+	// 模拟恢复 read_only 与 super_read_only
 	mock.ExpectExec("SET GLOBAL read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("SET GLOBAL super_read_only = ?").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	// 恢复只读状态
 	err = manager.RestoreReadOnly()

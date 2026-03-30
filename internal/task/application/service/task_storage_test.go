@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 import (
 	"fmt"
@@ -12,7 +12,7 @@ func TestTaskStorage_Save(t *testing.T) {
 	dataDir := "./test_data"
 	defer os.RemoveAll(dataDir)
 
-	storage := NewTaskStorage(dataDir)
+	storage := NewFileTaskStorage(dataDir)
 
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
 		ID:           "test_task_1",
@@ -28,7 +28,7 @@ func TestTaskStorage_Save(t *testing.T) {
 		t.Errorf("failed to save task: %v", err)
 	}
 
-	// 验证文件是否存在
+	// 楠岃瘉鏂囦欢鏄惁瀛樺湪
 	filePath := dataDir + "/test_task_1.json"
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		t.Error("task file not created")
@@ -39,7 +39,7 @@ func TestTaskStorage_Delete(t *testing.T) {
 	dataDir := "./test_data"
 	defer os.RemoveAll(dataDir)
 
-	storage := NewTaskStorage(dataDir)
+	storage := NewFileTaskStorage(dataDir)
 
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
 		ID:   "test_task_2",
@@ -48,13 +48,13 @@ func TestTaskStorage_Delete(t *testing.T) {
 
 	storage.Save(task)
 
-	// 删除任务
+	// 鍒犻櫎浠诲姟
 	err := storage.Delete("test_task_2")
 	if err != nil {
 		t.Errorf("failed to delete task: %v", err)
 	}
 
-	// 验证文件已删除
+	// 楠岃瘉鏂囦欢宸插垹闄?
 	filePath := dataDir + "/test_task_2.json"
 	if _, err := os.Stat(filePath); err == nil {
 		t.Error("task file still exists after deletion")
@@ -65,9 +65,9 @@ func TestTaskStorage_DeleteNonExistent(t *testing.T) {
 	dataDir := "./test_data"
 	defer os.RemoveAll(dataDir)
 
-	storage := NewTaskStorage(dataDir)
+	storage := NewFileTaskStorage(dataDir)
 
-	// 删除不存在的任务不应该报错
+	// 鍒犻櫎涓嶅瓨鍦ㄧ殑浠诲姟涓嶅簲璇ユ姤閿?
 	err := storage.Delete("non_existent_task")
 	if err != nil {
 		t.Errorf("deleting non-existent task should not error: %v", err)
@@ -78,9 +78,9 @@ func TestTaskStorage_LoadAll(t *testing.T) {
 	dataDir := "./test_data"
 	defer os.RemoveAll(dataDir)
 
-	storage := NewTaskStorage(dataDir)
+	storage := NewFileTaskStorage(dataDir)
 
-	// 创建多个任务
+	// 鍒涘缓澶氫釜浠诲姟
 	task1 := taskEntity.NewSyncTask(taskEntity.TaskConfig{
 		ID:           "test_task_1",
 		Name:         "Task 1",
@@ -98,7 +98,7 @@ func TestTaskStorage_LoadAll(t *testing.T) {
 	storage.Save(task1)
 	storage.Save(task2)
 
-	// 加载所有任务
+	// 鍔犺浇鎵€鏈変换鍔?
 	tasks, err := storage.LoadAll()
 	if err != nil {
 		t.Errorf("failed to load tasks: %v", err)
@@ -108,7 +108,7 @@ func TestTaskStorage_LoadAll(t *testing.T) {
 		t.Errorf("expected 2 tasks, got %d", len(tasks))
 	}
 
-	// 验证任务内容
+	// 楠岃瘉浠诲姟鍐呭
 	taskMap := make(map[string]*taskEntity.SyncTask)
 	for _, task := range tasks {
 		taskMap[task.Config.ID] = task
@@ -127,9 +127,9 @@ func TestTaskStorage_LoadAllEmpty(t *testing.T) {
 	dataDir := "./test_data_empty"
 	defer os.RemoveAll(dataDir)
 
-	storage := NewTaskStorage(dataDir)
+	storage := NewFileTaskStorage(dataDir)
 
-	// 空目录应该返回空列表
+	// 绌虹洰褰曞簲璇ヨ繑鍥炵┖鍒楄〃
 	tasks, err := storage.LoadAll()
 	if err != nil {
 		t.Errorf("failed to load tasks from empty directory: %v", err)
@@ -144,9 +144,9 @@ func TestTaskStorage_ConcurrentAccess(t *testing.T) {
 	dataDir := "./test_data_concurrent"
 	defer os.RemoveAll(dataDir)
 
-	storage := NewTaskStorage(dataDir)
+	storage := NewFileTaskStorage(dataDir)
 
-	// 并发写入
+	// 骞跺彂鍐欏叆
 	done := make(chan bool, 10)
 
 	for i := 0; i < 10; i++ {
@@ -161,12 +161,12 @@ func TestTaskStorage_ConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 
-	// 等待所有goroutine完成
+	// 绛夊緟鎵€鏈塯oroutine瀹屾垚
 	for i := 0; i < 10; i++ {
 		<-done
 	}
 
-	// 验证所有任务都保存成功
+	// 楠岃瘉鎵€鏈変换鍔￠兘淇濆瓨鎴愬姛
 	tasks, _ := storage.LoadAll()
 	if len(tasks) != 10 {
 		t.Errorf("expected 10 tasks, got %d", len(tasks))
@@ -177,7 +177,7 @@ func TestTaskStorage_SaveAndUpdate(t *testing.T) {
 	dataDir := "./test_data"
 	defer os.RemoveAll(dataDir)
 
-	storage := NewTaskStorage(dataDir)
+	storage := NewFileTaskStorage(dataDir)
 
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
 		ID:           "test_task_update",
@@ -186,17 +186,17 @@ func TestTaskStorage_SaveAndUpdate(t *testing.T) {
 		TargetSchema: "target_db",
 	})
 
-	// 保存
+	// 淇濆瓨
 	storage.Save(task)
 
-	// 修改状态
+	// 淇敼鐘舵€?
 	task.Start()
 	task.Context.TotalRows = 10000
 
-	// 再次保存
+	// 鍐嶆淇濆瓨
 	storage.Save(task)
 
-	// 加载验证
+	// 鍔犺浇楠岃瘉
 	tasks, _ := storage.LoadAll()
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
@@ -210,3 +210,5 @@ func TestTaskStorage_SaveAndUpdate(t *testing.T) {
 		t.Errorf("expected total rows 10000, got %d", tasks[0].Context.TotalRows)
 	}
 }
+
+

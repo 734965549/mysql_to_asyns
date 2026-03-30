@@ -1,4 +1,4 @@
-package router
+﻿package router
 
 import (
 	"net/http"
@@ -12,10 +12,10 @@ import (
 	taskService "mysql-to-async/internal/task/application/service"
 )
 
-// MockAnalyzer 模拟 IdentityAnalyzer
+// MockAnalyzer 妯℃嫙 IdentityAnalyzer
 type MockAnalyzer struct{}
 
-// AnalyzeTable 实现 IdentityAnalyzer 接口
+// AnalyzeTable 瀹炵幇 IdentityAnalyzer 鎺ュ彛
 func (m *MockAnalyzer) AnalyzeTable(schema, tableName string) (*metadataEntity.TableIdentity, error) {
 	return &metadataEntity.TableIdentity{
 		TableName:    tableName,
@@ -24,17 +24,17 @@ func (m *MockAnalyzer) AnalyzeTable(schema, tableName string) (*metadataEntity.T
 	}, nil
 }
 
-// GetAllTables 实现 IdentityAnalyzer 接口
+// GetAllTables 瀹炵幇 IdentityAnalyzer 鎺ュ彛
 func (m *MockAnalyzer) GetAllTables(schema string) ([]metadataEntity.TableInfo, error) {
 	return []metadataEntity.TableInfo{{Schema: schema, TableName: "test_table"}}, nil
 }
 
-// GetAllDatabases 实现 IdentityAnalyzer 接口
+// GetAllDatabases 瀹炵幇 IdentityAnalyzer 鎺ュ彛
 func (m *MockAnalyzer) GetAllDatabases() ([]string, error) {
 	return []string{"test_db"}, nil
 }
 
-// testConfig 创建测试配置
+// testConfig 鍒涘缓娴嬭瘯閰嶇疆
 func testConfig() *config.Config {
 	return &config.Config{
 		Datasource: config.DatasourceConfig{
@@ -46,7 +46,7 @@ func testConfig() *config.Config {
 func TestSetupRouter(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -60,7 +60,7 @@ func TestSetupRouter(t *testing.T) {
 func TestSetupRouterWithNilConfig(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 
 	router := SetupRouter(taskSvc, analyzer, nil)
@@ -73,7 +73,7 @@ func TestSetupRouterWithNilConfig(t *testing.T) {
 func TestHealthEndpoint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -88,7 +88,7 @@ func TestHealthEndpoint(t *testing.T) {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
 
-	// 验证响应内容
+	// 楠岃瘉鍝嶅簲鍐呭
 	expected := `{"status":"ok"}`
 	if w.Body.String() != expected {
 		t.Errorf("expected %s, got %s", expected, w.Body.String())
@@ -98,7 +98,7 @@ func TestHealthEndpoint(t *testing.T) {
 func TestAPIHealthEndpoint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -117,7 +117,7 @@ func TestAPIHealthEndpoint(t *testing.T) {
 func TestMetricsEndpoint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -136,13 +136,13 @@ func TestMetricsEndpoint(t *testing.T) {
 func TestCORSMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
 	router := SetupRouter(taskSvc, analyzer, cfg)
 
-	// OPTIONS请求应该返回204
+	// OPTIONS璇锋眰搴旇杩斿洖204
 	req := httptest.NewRequest("OPTIONS", "/api/tasks", nil)
 	w := httptest.NewRecorder()
 
@@ -152,7 +152,7 @@ func TestCORSMiddleware(t *testing.T) {
 		t.Errorf("expected status 204, got %d", w.Code)
 	}
 
-	// 验证CORS头
+	// 楠岃瘉CORS澶?
 	if w.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Errorf("expected Access-Control-Allow-Origin: *, got %s", w.Header().Get("Access-Control-Allow-Origin"))
 	}
@@ -161,7 +161,7 @@ func TestCORSMiddleware(t *testing.T) {
 func TestTasksEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -180,7 +180,7 @@ func TestTasksEndpoints(t *testing.T) {
 func TestTaskByIDEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -199,7 +199,7 @@ func TestTaskByIDEndpoints(t *testing.T) {
 func TestMetadataEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -218,7 +218,7 @@ func TestMetadataEndpoints(t *testing.T) {
 func TestTablesEndpoint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -237,7 +237,7 @@ func TestTablesEndpoint(t *testing.T) {
 func TestIdentityEndpoint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
@@ -256,18 +256,18 @@ func TestIdentityEndpoint(t *testing.T) {
 func TestConfigEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := testConfig()
 
 	router := SetupRouter(taskSvc, analyzer, cfg)
 
-	// GET /api/config/default - 可能返回500因为没有配置文件
+	// GET /api/config/default - 鍙兘杩斿洖500鍥犱负娌℃湁閰嶇疆鏂囦欢
 	req := httptest.NewRequest("GET", "/api/config/default", nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
-	// 接受200或500（配置文件可能不存在）
+	// 鎺ュ彈200鎴?00锛堥厤缃枃浠跺彲鑳戒笉瀛樺湪锛?
 	if w.Code != http.StatusOK && w.Code != http.StatusInternalServerError {
 		t.Errorf("GET /api/config/default: expected status 200 or 500, got %d", w.Code)
 	}
@@ -276,7 +276,7 @@ func TestConfigEndpoints(t *testing.T) {
 func TestDebugMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	taskSvc := taskService.NewTaskService()
+	taskSvc := taskService.NewTaskService(testConfig())
 	analyzer := &MockAnalyzer{}
 	cfg := &config.Config{
 		Datasource: config.DatasourceConfig{
@@ -290,3 +290,4 @@ func TestDebugMode(t *testing.T) {
 		t.Fatal("expected router, got nil")
 	}
 }
+

@@ -1,4 +1,4 @@
-package writer
+﻿package writer
 
 import (
 	"context"
@@ -28,7 +28,7 @@ func TestNewBatchWriter(t *testing.T) {
 	writer := NewBatchWriter(db, identity, 100)
 	assert.NotNil(t, writer)
 	assert.Equal(t, 100, writer.batchSize)
-	assert.Equal(t, 30*time.Second, writer.timeout)
+	assert.Equal(t, 300*time.Second, writer.timeout)
 }
 
 func TestBatchWriter_WriteBatch(t *testing.T) {
@@ -39,36 +39,36 @@ func TestBatchWriter_WriteBatch(t *testing.T) {
 		expectErr bool
 	}{
 		{
-			name: "成功批量写入",
+			name: "鎴愬姛鎵归噺鍐欏叆",
 			rows: []map[string]interface{}{
 				{"id": 1, "name": "Alice"},
 				{"id": 2, "name": "Bob"},
 			},
 			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectExec("REPLACE INTO").
+				mock.ExpectExec("INSERT").
 					WillReturnResult(sqlmock.NewResult(0, 2))
 			},
 			expectErr: false,
 		},
 		{
-			name:      "空数据直接返回",
+			name:      "Empty data returns directly",
 			rows:      []map[string]interface{}{},
 			setupMock: func(mock sqlmock.Sqlmock) {},
 			expectErr: false,
 		},
 		{
-			name:      "nil数据直接返回",
+			name:      "Nil data",
 			rows:      nil,
 			setupMock: func(mock sqlmock.Sqlmock) {},
 			expectErr: false,
 		},
 		{
-			name: "数据库错误",
+			name: "Database error",
 			rows: []map[string]interface{}{
 				{"id": 1, "name": "Alice"},
 			},
 			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectExec("REPLACE INTO").
+				mock.ExpectExec("INSERT").
 					WillReturnError(sql.ErrConnDone)
 			},
 			expectErr: true,
@@ -112,7 +112,7 @@ func TestBatchWriter_Update(t *testing.T) {
 		expectErr bool
 	}{
 		{
-			name: "成功更新",
+			name: "Update row",
 			row:  map[string]interface{}{"id": 1, "name": "Alice Updated"},
 			setupMock: func(mock sqlmock.Sqlmock) {
 				mock.ExpectExec("UPDATE").
@@ -121,7 +121,7 @@ func TestBatchWriter_Update(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name: "更新无匹配行（数据漂移）",
+			name: "Update non-existent row",
 			row:  map[string]interface{}{"id": 999, "name": "Unknown"},
 			setupMock: func(mock sqlmock.Sqlmock) {
 				mock.ExpectExec("UPDATE").
@@ -130,7 +130,7 @@ func TestBatchWriter_Update(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name: "数据库错误",
+			name: "Database error",
 			row:  map[string]interface{}{"id": 1, "name": "Alice"},
 			setupMock: func(mock sqlmock.Sqlmock) {
 				mock.ExpectExec("UPDATE").
@@ -178,7 +178,7 @@ func TestBatchWriter_UpdateWithBeforeImage(t *testing.T) {
 		expectErr   bool
 	}{
 		{
-			name:        "成功使用before image更新",
+			name:        "Update row with before image",
 			row:         map[string]interface{}{"id": 1, "name": "Alice Updated"},
 			beforeImage: map[string]interface{}{"id": 1, "name": "Alice"},
 			setupMock: func(mock sqlmock.Sqlmock) {
@@ -188,7 +188,7 @@ func TestBatchWriter_UpdateWithBeforeImage(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name:        "无匹配行",
+			name:        "Update non-existent row",
 			row:         map[string]interface{}{"id": 999, "name": "Unknown"},
 			beforeImage: map[string]interface{}{"id": 999, "name": "Old"},
 			setupMock: func(mock sqlmock.Sqlmock) {
@@ -198,7 +198,7 @@ func TestBatchWriter_UpdateWithBeforeImage(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name:        "数据库错误",
+			name:        "Database error",
 			row:         map[string]interface{}{"id": 1, "name": "Alice"},
 			beforeImage: map[string]interface{}{"id": 1, "name": "Old"},
 			setupMock: func(mock sqlmock.Sqlmock) {
@@ -246,7 +246,7 @@ func TestBatchWriter_Delete(t *testing.T) {
 		expectErr bool
 	}{
 		{
-			name: "成功删除",
+			name: "鎴愬姛鍒犻櫎",
 			row:  map[string]interface{}{"id": 1},
 			setupMock: func(mock sqlmock.Sqlmock) {
 				mock.ExpectExec("DELETE").
@@ -255,7 +255,7 @@ func TestBatchWriter_Delete(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name: "删除无匹配行（数据漂移）",
+			name: "鍒犻櫎鏃犲尮閰嶈锛堟暟鎹紓绉伙級",
 			row:  map[string]interface{}{"id": 999},
 			setupMock: func(mock sqlmock.Sqlmock) {
 				mock.ExpectExec("DELETE").
@@ -264,7 +264,7 @@ func TestBatchWriter_Delete(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name: "数据库错误",
+			name: "Database error",
 			row:  map[string]interface{}{"id": 1},
 			setupMock: func(mock sqlmock.Sqlmock) {
 				mock.ExpectExec("DELETE").
@@ -340,7 +340,7 @@ func TestNewBufferedWriter(t *testing.T) {
 	assert.Equal(t, 100, writer.batchSize)
 	assert.Equal(t, time.Second, writer.flushInterval)
 
-	// 关闭以停止后台goroutine
+	// 鍏抽棴浠ュ仠姝㈠悗鍙癵oroutine
 	err = writer.Close()
 	assert.NoError(t, err)
 }
@@ -358,20 +358,20 @@ func TestBufferedWriter_WriteAndFlush(t *testing.T) {
 		IdentifyCols: []string{"id"},
 	}
 
-	// 设置批量大小为2，写入2条数据后应该自动flush
+	// 璁剧疆鎵归噺澶у皬涓?锛屽啓鍏?鏉℃暟鎹悗搴旇鑷姩flush
 	writer := NewBufferedWriter(db, identity, 2, time.Minute)
 
-	// 第一条写入，不应该触发flush
+	// 绗竴鏉″啓鍏ワ紝涓嶅簲璇ヨЕ鍙慺lush
 	err = writer.Write(map[string]interface{}{"id": 1, "name": "Alice"})
 	assert.NoError(t, err)
 
-	// 第二条写入，应该触发flush
-	mock.ExpectExec("REPLACE INTO").
+	// 绗簩鏉″啓鍏ワ紝搴旇瑙﹀彂flush
+	mock.ExpectExec("INSERT").
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	err = writer.Write(map[string]interface{}{"id": 2, "name": "Bob"})
 	assert.NoError(t, err)
 
-	// 关闭writer（此时缓冲区应该为空，不会再有Exec调用）
+	// 鍏抽棴writer锛堟鏃剁紦鍐插尯搴旇涓虹┖锛屼笉浼氬啀鏈塃xec璋冪敤锛?
 	err = writer.Close()
 	assert.NoError(t, err)
 
@@ -393,11 +393,11 @@ func TestBufferedWriter_FlushEmpty(t *testing.T) {
 
 	writer := NewBufferedWriter(db, identity, 100, time.Minute)
 
-	// 空缓冲区刷新应该直接返回
+	// 绌虹紦鍐插尯鍒锋柊搴旇鐩存帴杩斿洖
 	err = writer.Flush()
 	assert.NoError(t, err)
 
-	// 关闭writer
+	// 鍏抽棴writer
 	err = writer.Close()
 	assert.NoError(t, err)
 }
@@ -417,7 +417,7 @@ func TestBatchWriter_SetAuditLogger(t *testing.T) {
 
 	writer := NewBatchWriter(db, identity, 100)
 
-	// 设置审计日志器（可以为nil）
+	// 璁剧疆瀹¤鏃ュ織鍣紙鍙互涓簄il锛?
 	writer.SetAuditLogger(nil, "task-123", "test_db", "users")
 
 	assert.Equal(t, "task-123", writer.taskID)
@@ -432,7 +432,7 @@ func TestBatchWriter_WriteBatchWithAuditLogger(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec("REPLACE INTO").
+	mock.ExpectExec("INSERT").
 		WillReturnResult(sqlmock.NewResult(0, 2))
 
 	identity := &entity.TableIdentity{
@@ -442,7 +442,7 @@ func TestBatchWriter_WriteBatchWithAuditLogger(t *testing.T) {
 	}
 
 	writer := NewBatchWriter(db, identity, 100)
-	// 设置审计日志器为nil，但不影响功能
+	// 璁剧疆瀹¤鏃ュ織鍣ㄤ负nil锛屼絾涓嶅奖鍝嶅姛鑳?
 	writer.SetAuditLogger(nil, "task-123", "test_db", "users")
 
 	rows := []map[string]interface{}{
@@ -470,7 +470,7 @@ func TestBufferedWriter_FlushWithData(t *testing.T) {
 
 	writer := NewBufferedWriter(db, identity, 100, time.Minute)
 
-	// 手动添加数据到缓冲区
+	// 鎵嬪姩娣诲姞鏁版嵁鍒扮紦鍐插尯
 	writer.mu.Lock()
 	writer.buffer = append(writer.buffer,
 		map[string]interface{}{"id": 1, "name": "Alice"},
@@ -478,14 +478,14 @@ func TestBufferedWriter_FlushWithData(t *testing.T) {
 	)
 	writer.mu.Unlock()
 
-	// Flush应该触发写入
-	mock.ExpectExec("REPLACE INTO").
+	// Flush搴旇瑙﹀彂鍐欏叆
+	mock.ExpectExec("INSERT").
 		WillReturnResult(sqlmock.NewResult(0, 2))
 
 	err = writer.Flush()
 	assert.NoError(t, err)
 
-	// 关闭writer（缓冲区已空）
+	// 鍏抽棴writer锛堢紦鍐插尯宸茬┖锛?
 	err = writer.Close()
 	assert.NoError(t, err)
 

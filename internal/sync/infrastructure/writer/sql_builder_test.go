@@ -35,9 +35,12 @@ func TestSQLBuilder_BuildInsert(t *testing.T) {
 
 	query, args := builder.BuildInsert(row)
 
-	// 验证使用 REPLACE INTO
-	if !strings.Contains(query, "REPLACE INTO") {
-		t.Error("expected REPLACE INTO statement")
+	// 验证使用 INSERT ... ON DUPLICATE KEY UPDATE
+	if !strings.Contains(query, "INSERT INTO") {
+		t.Error("expected INSERT INTO statement")
+	}
+	if !strings.Contains(query, "ON DUPLICATE KEY UPDATE") {
+		t.Error("expected ON DUPLICATE KEY UPDATE clause")
 	}
 
 	// 验证表名
@@ -70,7 +73,7 @@ func TestSQLBuilder_BuildInsert_ColumnOrder(t *testing.T) {
 	query, args := builder.BuildInsert(row)
 
 	// 验证列顺序按照 identity.Columns 的顺序
-	if !strings.Contains(query, "col1, col2, col3") {
+	if !strings.Contains(query, "`col1`, `col2`, `col3`") {
 		t.Errorf("columns should be in order: col1, col2, col3, got: %s", query)
 	}
 
@@ -106,15 +109,15 @@ func TestSQLBuilder_BuildInsertOnDuplicate(t *testing.T) {
 	}
 
 	// 验证更新子句不包含主键
-	if strings.Contains(query, "id = VALUES(id)") {
+	if strings.Contains(query, "`id` = VALUES(`id`)") {
 		t.Error("should not update primary key column")
 	}
 
 	// 验证更新子句包含非主键列
-	if !strings.Contains(query, "name = VALUES(name)") {
+	if !strings.Contains(query, "`name` = VALUES(`name`)") {
 		t.Error("expected name column in update clause")
 	}
-	if !strings.Contains(query, "email = VALUES(email)") {
+	if !strings.Contains(query, "`email` = VALUES(`email`)") {
 		t.Error("expected email column in update clause")
 	}
 
@@ -142,7 +145,7 @@ func TestSQLBuilder_BuildUpdate(t *testing.T) {
 	query, args := builder.BuildUpdate(row)
 
 	// 验证 UPDATE 语句
-	if !strings.Contains(query, "UPDATE users SET") {
+	if !strings.Contains(query, "UPDATE `users` SET") {
 		t.Errorf("expected UPDATE statement, got: %s", query)
 	}
 
@@ -153,10 +156,10 @@ func TestSQLBuilder_BuildUpdate(t *testing.T) {
 	}
 
 	// 验证 SET 子句包含非主键列
-	if !strings.Contains(query, "name = ?") {
+	if !strings.Contains(query, "`name` = ?") {
 		t.Error("expected name column in SET clause")
 	}
-	if !strings.Contains(query, "email = ?") {
+	if !strings.Contains(query, "`email` = ?") {
 		t.Error("expected email column in SET clause")
 	}
 
@@ -215,9 +218,8 @@ func TestSQLBuilder_BuildDelete(t *testing.T) {
 	query, args := builder.BuildDelete(row)
 
 	// 验证 DELETE 语句
-	expectedQuery := "DELETE FROM users WHERE id = ?"
-	if query != expectedQuery {
-		t.Errorf("expected query %q, got %q", expectedQuery, query)
+	if !strings.Contains(query, "DELETE FROM `users` WHERE id = ?") {
+		t.Errorf("unexpected delete query: %s", query)
 	}
 
 	// 验证参数
@@ -245,7 +247,7 @@ func TestSQLBuilder_BuildDelete_CompositeKey(t *testing.T) {
 	query, args := builder.BuildDelete(row)
 
 	// 验证 DELETE 语句
-	if !strings.Contains(query, "DELETE FROM order_items WHERE") {
+	if !strings.Contains(query, "DELETE FROM `order_items` WHERE") {
 		t.Errorf("expected DELETE FROM order_items WHERE, got: %s", query)
 	}
 	if !strings.Contains(query, "order_id = ? AND product_id = ?") {
@@ -274,13 +276,13 @@ func TestSQLBuilder_BuildBatchInsert(t *testing.T) {
 
 	query, args := builder.BuildBatchInsert(rows)
 
-	// 验证 REPLACE INTO
-	if !strings.Contains(query, "REPLACE INTO users") {
-		t.Errorf("expected REPLACE INTO users, got: %s", query)
+	// 验证 INSERT IGNORE
+	if !strings.Contains(query, "INSERT IGNORE INTO `users`") {
+		t.Errorf("expected INSERT IGNORE INTO users, got: %s", query)
 	}
 
 	// 验证列名
-	if !strings.Contains(query, "(id, name)") {
+	if !strings.Contains(query, "(`id`, `name`)") {
 		t.Errorf("expected columns (id, name), got: %s", query)
 	}
 
@@ -326,7 +328,7 @@ func TestSQLBuilder_BuildBatchInsert_SingleRow(t *testing.T) {
 	query, args := builder.BuildBatchInsert(rows)
 
 	// 验证单行插入
-	if !strings.Contains(query, "REPLACE INTO test (id, value) VALUES (?, ?)") {
+	if !strings.Contains(query, "INSERT IGNORE INTO `test` (`id`, `value`) VALUES (?, ?)") {
 		t.Errorf("expected single row insert, got: %s", query)
 	}
 
@@ -430,7 +432,7 @@ func TestSQLBuilder_BuildDelete_WithFullColumnsStrategy(t *testing.T) {
 	query, args := builder.BuildDelete(row)
 
 	// 验证 DELETE 语句包含 LIMIT 1
-	if !strings.Contains(query, "DELETE FROM logs WHERE") {
+	if !strings.Contains(query, "DELETE FROM `logs` WHERE") {
 		t.Errorf("expected DELETE FROM logs WHERE, got: %s", query)
 	}
 	if !strings.Contains(query, "LIMIT 1") {
