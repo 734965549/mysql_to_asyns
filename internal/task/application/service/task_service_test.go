@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	"mysql-to-async/internal/config"
 	"mysql-to-async/internal/metadata/domain/entity"
@@ -376,6 +378,83 @@ func TestStartTask_AlreadyRunning(t *testing.T) {
 	err := ts.StartTask(ctx, "test_task_running")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "already running")
+}
+
+func TestStartTask_ConcurrentRuntimeIsolation(t *testing.T) {
+	dataDir := "./test_task_service_start_concurrent_runtime"
+	defer os.RemoveAll(dataDir)
+
+	ts := newTestTaskService(dataDir)
+	ts.runtimes = make(map[string]*taskRuntime)
+
+	_, err := ts.CreateTask(taskEntity.TaskConfig{ID: "task_concurrent_1", Name: "Task Concurrent 1"})
+	require.NoError(t, err)
+	_, err = ts.CreateTask(taskEntity.TaskConfig{ID: "task_concurrent_2", Name: "Task Concurrent 2"})
+	require.NoError(t, err)
+
+	createdRuntimes := make(map[string]*taskRuntime)
+	var createdMu sync.Mutex
+	ts.initRuntimeFn = func(task *taskEntity.SyncTask) (*taskRuntime, error) {
+		r := &taskRuntime{}
+		createdMu.Lock()
+		createdRuntimes[task.Config.ID] = r
+		createdMu.Unlock()
+		return r, nil
+	}
+
+	execStarted := make(chan string, 2)
+	ts.executeSyncFn = func(_ context.Context, taskID string, _ *taskRuntime) {
+		execStarted <- taskID
+	}
+
+	startErrCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, taskID := range []string{"task_concurrent_1", "task_concurrent_2"} {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			startErrCh <- ts.StartTask(context.Background(), id)
+		}(taskID)
+	}
+	wg.Wait()
+	close(startErrCh)
+
+	for startErr := range startErrCh {
+		assert.NoError(t, startErr)
+	}
+
+	received := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case taskID := <-execStarted:
+			received[taskID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting executeSync for task %d", i+1)
+		}
+	}
+	assert.True(t, received["task_concurrent_1"])
+	assert.True(t, received["task_concurrent_2"])
+
+	ts.mu.RLock()
+	runtime1 := ts.runtimes["task_concurrent_1"]
+	runtime2 := ts.runtimes["task_concurrent_2"]
+	ts.mu.RUnlock()
+
+	require.NotNil(t, runtime1)
+	require.NotNil(t, runtime2)
+	assert.NotSame(t, runtime1, runtime2)
+
+	createdMu.Lock()
+	assert.Same(t, createdRuntimes["task_concurrent_1"], runtime1)
+	assert.Same(t, createdRuntimes["task_concurrent_2"], runtime2)
+	createdMu.Unlock()
+
+	task1, ok1 := ts.GetTask("task_concurrent_1")
+	task2, ok2 := ts.GetTask("task_concurrent_2")
+	require.True(t, ok1)
+	require.True(t, ok2)
+	assert.Equal(t, taskEntity.TaskStatusRunning, task1.Context.Status)
+	assert.Equal(t, taskEntity.TaskStatusRunning, task2.Context.Status)
 }
 
 func TestPauseTask(t *testing.T) {

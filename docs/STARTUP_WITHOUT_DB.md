@@ -51,7 +51,7 @@
 #### 3. 创建任务时指定数据库
 
 ```bash
-curl -X POST http://localhost:8081/api/tasks \
+curl -X POST http://localhost:8080/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "用户数据同步",
@@ -119,7 +119,7 @@ curl -X POST http://localhost:8081/api/tasks \
 #### 3. 创建任务（使用默认数据库配置）
 
 ```bash
-curl -X POST http://localhost:8081/api/tasks \
+curl -X POST http://localhost:8080/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "本地测试同步",

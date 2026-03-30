@@ -33,8 +33,13 @@ import (
 
 // TaskService 任务服务结构体
 type TaskService struct {
-	mu                sync.RWMutex                               // 读写锁，保护并发访问
-	tasks             map[string]*taskEntity.SyncTask            // 任务映射表，键为任务ID
+	mu       sync.RWMutex                    // 读写锁，保护并发访问
+	tasks    map[string]*taskEntity.SyncTask // 任务映射表，键为任务ID
+	runtimes map[string]*taskRuntime         // 任务运行时上下文（每任务独立连接）
+	// 测试注入点：允许在单测中替换 runtime 初始化逻辑，避免依赖真实数据库
+	initRuntimeFn func(task *taskEntity.SyncTask) (*taskRuntime, error)
+	// 测试注入点：允许在单测中替换异步执行逻辑，稳定断言 StartTask 并发行为
+	executeSyncFn     func(ctx context.Context, taskID string, runtime *taskRuntime)
 	storage           TaskStorage                                // 任务存储接口
 	sourceDB          *sql.DB                                    // 源数据库连接
 	targetDB          *sql.DB                                    // 目标数据库连接
@@ -45,6 +50,25 @@ type TaskService struct {
 	incrementalSyncs  map[string]*syncApp.IncrementalSyncService // 增量同步服务映射
 	config            *config.Config                             // 配置对象
 	auditLogger       *audit.AuditLogger                         // 审计日志器
+}
+
+type taskRuntime struct {
+	sourceDB        *sql.DB
+	targetDB        *sql.DB
+	analyzer        service.IdentityAnalyzer
+	readOnlyManager *readonly.ReadOnlyManager
+}
+
+func (r *taskRuntime) Close() {
+	if r == nil {
+		return
+	}
+	if r.sourceDB != nil {
+		r.sourceDB.Close()
+	}
+	if r.targetDB != nil && r.targetDB != r.sourceDB {
+		r.targetDB.Close()
+	}
 }
 
 type sourceQueryer interface {
@@ -238,6 +262,7 @@ func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 func NewTaskService(cfg *config.Config) *TaskService {
 	ts := &TaskService{
 		tasks:            make(map[string]*taskEntity.SyncTask),            // 初始化任务映射
+		runtimes:         make(map[string]*taskRuntime),                    // 初始化任务运行时映射
 		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService), // 初始化增量同步映射
 		config:           cfg,                                              // 设置配置
 		auditLogger:      audit.NewAuditLogger("logs/audit"),               // 创建审计日志器
@@ -283,6 +308,7 @@ func NewTaskService(cfg *config.Config) *TaskService {
 func NewTaskServiceWithDB(sourceDB, targetDB *sql.DB, analyzer service.IdentityAnalyzer) *TaskService {
 	ts := &TaskService{
 		tasks:            make(map[string]*taskEntity.SyncTask),            // 初始化任务映射
+		runtimes:         make(map[string]*taskRuntime),                    // 初始化任务运行时映射
 		storage:          NewFileTaskStorage("data"),                       // 使用文件存储
 		sourceDB:         sourceDB,                                         // 设置源数据库
 		targetDB:         targetDB,                                         // 设置目标数据库
@@ -303,6 +329,7 @@ func NewTaskServiceWithDB(sourceDB, targetDB *sql.DB, analyzer service.IdentityA
 func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.IdentityAnalyzer, cfg *config.Config) *TaskService {
 	ts := &TaskService{
 		tasks:            make(map[string]*taskEntity.SyncTask),
+		runtimes:         make(map[string]*taskRuntime),
 		sourceDB:         sourceDB,
 		targetDB:         targetDB,
 		analyzer:         analyzer,
@@ -465,6 +492,10 @@ func (s *TaskService) DeleteTask(taskID string) error {
 		incrSync.Stop()
 		delete(s.incrementalSyncs, taskID)
 	}
+	if runtime, exists := s.runtimes[taskID]; exists {
+		runtime.Close()
+		delete(s.runtimes, taskID)
+	}
 
 	delete(s.tasks, taskID)
 
@@ -504,9 +535,19 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 	}
 
 	// 动态创建数据库连接（如果还没有创建或需要更新）
-	if err := s.initDatabaseConnections(task); err != nil {
+	initRuntime := s.initRuntimeFn
+	if initRuntime == nil {
+		initRuntime = s.initDatabaseConnections
+	}
+	runtime, err := initRuntime(task)
+	if err != nil {
 		return fmt.Errorf("failed to initialize database connections: %w", err)
 	}
+	// 同一任务重复启动时，先回收旧 runtime 再替换，避免连接泄漏
+	if oldRuntime, exists := s.runtimes[taskID]; exists {
+		oldRuntime.Close()
+	}
+	s.runtimes[taskID] = runtime
 
 	task.Start()
 
@@ -524,25 +565,28 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 	// 注意：使用新的 context，而不是 HTTP 请求的 context
 	// 因为 HTTP 请求完成后 context 会被取消
 	syncCtx := context.Background()
-	go s.executeSync(syncCtx, taskID)
+	execSync := s.executeSyncFn
+	if execSync == nil {
+		execSync = s.executeSync
+	}
+	go execSync(syncCtx, taskID, runtime)
 
 	return nil
 }
 
 // initDatabaseConnections 初始化数据库连接（每次任务启动都重建，确保连接指向正确的库）
-func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
+func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskRuntime, error) {
 	var err error
-
-	// 每次任务启动都重置连接，防止不同任务复用错误的连接
-	if s.sourceDB != nil {
-		s.sourceDB.Close()
-		s.sourceDB = nil
+	var sourceDB *sql.DB
+	var targetDB *sql.DB
+	cleanup := func() {
+		if sourceDB != nil {
+			sourceDB.Close()
+		}
+		if targetDB != nil && targetDB != sourceDB {
+			targetDB.Close()
+		}
 	}
-	if s.targetDB != nil {
-		s.targetDB.Close()
-		s.targetDB = nil
-	}
-	s.analyzer = nil
 
 	// 确定源数据库配置
 	sourceConfig := task.Config.SourceDB
@@ -558,7 +602,7 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
 	}
 
 	if sourceConfig == nil {
-		return fmt.Errorf("source database config is required")
+		return nil, fmt.Errorf("source database config is required")
 	}
 
 	// 确定目标数据库配置
@@ -590,107 +634,101 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) error {
 	}
 
 	// 连接源数据库
-	if s.sourceDB == nil {
-		srcCompress := s.config != nil && s.config.Datasource.Compress
-		sourceDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s",
-			sourceConfig.Username,
-			sourceConfig.Password,
-			sourceConfig.Host,
-			sourceConfig.Port,
-			sourceConfig.Database,
-			config.MySQLTCPParams(srcCompress),
-		)
-		s.sourceDB, err = sql.Open("mysql", sourceDSN)
-		if err != nil {
-			return fmt.Errorf("failed to connect source database: %w", err)
-		}
-
-		// 测试连接
-		if err = s.sourceDB.Ping(); err != nil {
-			s.sourceDB.Close()
-			s.sourceDB = nil
-			return fmt.Errorf("failed to ping source database: %w", err)
-		}
-		config.ApplySyncMySQLPool(s.sourceDB, syncTuneFrom(s.config), true, fmt.Sprintf("task %s source", task.Config.ID))
-
-		log.Printf("[Task %s] Source database connected: %s:%d/%s", task.Config.ID, sourceConfig.Host, sourceConfig.Port, sourceConfig.Database)
+	srcCompress := s.config != nil && s.config.Datasource.Compress
+	sourceDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s",
+		sourceConfig.Username,
+		sourceConfig.Password,
+		sourceConfig.Host,
+		sourceConfig.Port,
+		sourceConfig.Database,
+		config.MySQLTCPParams(srcCompress),
+	)
+	sourceDB, err = sql.Open("mysql", sourceDSN)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect source database: %w", err)
 	}
+
+	// 测试连接
+	if err = sourceDB.Ping(); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to ping source database: %w", err)
+	}
+	config.ApplySyncMySQLPool(sourceDB, syncTuneFrom(s.config), true, fmt.Sprintf("task %s source", task.Config.ID))
+
+	log.Printf("[Task %s] Source database connected: %s:%d/%s", task.Config.ID, sourceConfig.Host, sourceConfig.Port, sourceConfig.Database)
 
 	// 连接目标数据库
-	if s.targetDB == nil {
-		tgtCompress := s.config != nil && s.config.Target.Compress
-		// 先连接到MySQL服务器（不指定数据库）以便能够创建数据库
-		targetDSNNoDB := fmt.Sprintf("%s:%s@tcp(%s:%d)/?%s",
-			targetConfig.Username,
-			targetConfig.Password,
-			targetConfig.Host,
-			targetConfig.Port,
-			config.MySQLTCPParams(tgtCompress),
-		)
+	tgtCompress := s.config != nil && s.config.Target.Compress
+	// 先连接到MySQL服务器（不指定数据库）以便能够创建数据库
+	targetDSNNoDB := fmt.Sprintf("%s:%s@tcp(%s:%d)/?%s",
+		targetConfig.Username,
+		targetConfig.Password,
+		targetConfig.Host,
+		targetConfig.Port,
+		config.MySQLTCPParams(tgtCompress),
+	)
 
-		targetDBNoDB, err := sql.Open("mysql", targetDSNNoDB)
-		if err == nil {
-			// 尝试创建数据库（如果不存在）
-			_, err = targetDBNoDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetConfig.Database))
-			if err != nil {
-				log.Printf("Warning: Failed to create target database: %v", err)
-			} else {
-				log.Printf("Target database '%s' created or already exists", targetConfig.Database)
-			}
-			targetDBNoDB.Close()
-		}
-
-		// 连接到目标数据库
-		targetDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s",
-			targetConfig.Username,
-			targetConfig.Password,
-			targetConfig.Host,
-			targetConfig.Port,
-			targetConfig.Database,
-			config.MySQLTCPParams(tgtCompress),
-		)
-		s.targetDB, err = sql.Open("mysql", targetDSN)
+	targetDBNoDB, err := sql.Open("mysql", targetDSNNoDB)
+	if err == nil {
+		// 尝试创建数据库（如果不存在）
+		_, err = targetDBNoDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetConfig.Database))
 		if err != nil {
-			return fmt.Errorf("failed to connect target database: %w", err)
+			log.Printf("Warning: Failed to create target database: %v", err)
+		} else {
+			log.Printf("Target database '%s' created or already exists", targetConfig.Database)
 		}
-
-		// 测试连接
-		if err = s.targetDB.Ping(); err != nil {
-			s.targetDB.Close()
-			s.targetDB = nil
-			return fmt.Errorf("failed to ping target database: %w", err)
-		}
-		config.ApplySyncMySQLPool(s.targetDB, syncTuneFrom(s.config), false, fmt.Sprintf("task %s target", task.Config.ID))
-
-		log.Printf("[Task %s] Target database connected: %s:%d/%s", task.Config.ID, targetConfig.Host, targetConfig.Port, targetConfig.Database)
+		targetDBNoDB.Close()
 	}
+
+	// 连接到目标数据库
+	targetDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s",
+		targetConfig.Username,
+		targetConfig.Password,
+		targetConfig.Host,
+		targetConfig.Port,
+		targetConfig.Database,
+		config.MySQLTCPParams(tgtCompress),
+	)
+	targetDB, err = sql.Open("mysql", targetDSN)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to connect target database: %w", err)
+	}
+
+	// 测试连接
+	if err = targetDB.Ping(); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to ping target database: %w", err)
+	}
+	config.ApplySyncMySQLPool(targetDB, syncTuneFrom(s.config), false, fmt.Sprintf("task %s target", task.Config.ID))
+
+	log.Printf("[Task %s] Target database connected: %s:%d/%s", task.Config.ID, targetConfig.Host, targetConfig.Port, targetConfig.Database)
 
 	// 初始化元数据分析器（如果还没有创建）
-	if s.analyzer == nil {
-		schemaDetector := infrastructure.NewSchemaDetector(s.sourceDB)
-		s.analyzer = service.NewIdentityAnalyzerService(schemaDetector)
+	schemaDetector := infrastructure.NewSchemaDetector(sourceDB)
+	analyzer := service.NewIdentityAnalyzerService(schemaDetector)
 
-		// 检查binlog_row_image设置
-		binlogImage, err := schemaDetector.CheckBinlogRowImage()
-		if err != nil {
-			log.Printf("Warning: Failed to check binlog_row_image: %v", err)
-		} else {
-			log.Printf("binlog_row_image = %s", binlogImage)
-			if binlogImage != "FULL" {
-				log.Println("Warning: binlog_row_image is not FULL. Incremental sync for no-PK tables may not work correctly.")
-			}
+	// 检查binlog_row_image设置
+	binlogImage, err := schemaDetector.CheckBinlogRowImage()
+	if err != nil {
+		log.Printf("Warning: Failed to check binlog_row_image: %v", err)
+	} else {
+		log.Printf("binlog_row_image = %s", binlogImage)
+		if binlogImage != "FULL" {
+			log.Println("Warning: binlog_row_image is not FULL. Incremental sync for no-PK tables may not work correctly.")
 		}
 	}
 
-	// 初始化只读管理器（每次都重新创建，确保使用新的数据库连接）
-	s.readOnlyManager = readonly.NewReadOnlyManager(s.targetDB)
-	s.enableReadOnly = true
-
-	return nil
+	return &taskRuntime{
+		sourceDB:        sourceDB,
+		targetDB:        targetDB,
+		analyzer:        analyzer,
+		readOnlyManager: readonly.NewReadOnlyManager(targetDB),
+	}, nil
 }
 
 // executeSync 执行同步任务
-func (s *TaskService) executeSync(ctx context.Context, taskID string) {
+func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *taskRuntime) {
 	s.mu.RLock()
 	task, exists := s.tasks[taskID]
 	s.mu.RUnlock()
@@ -704,9 +742,9 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string) {
 	log.Printf("[Task %s] Starting sync, mode: %s, tables: %v", taskID, task.Config.Mode, task.Config.Tables)
 
 	// 在同步开始前，若任务开启了只读管理，临时关闭目标库只读以允许数据写入
-	if enableReadOnly && s.readOnlyManager != nil {
+	if enableReadOnly && runtime != nil && runtime.readOnlyManager != nil {
 		log.Printf("[Task %s] 正在临时关闭目标实例只读以进行同步...", taskID)
-		if err := s.readOnlyManager.SetReadOnly(); err != nil {
+		if err := runtime.readOnlyManager.SetReadOnly(); err != nil {
 			log.Printf("[Task %s] 警告: 关闭只读失败: %v", taskID, err)
 			// 记录错误但继续执行同步
 		} else {
@@ -716,9 +754,9 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string) {
 
 	// 确保在函数退出时恢复只读状态
 	defer func() {
-		if enableReadOnly && s.readOnlyManager != nil {
+		if enableReadOnly && runtime != nil && runtime.readOnlyManager != nil {
 			log.Printf("[Task %s] 正在恢复目标实例只读状态...", taskID)
-			if err := s.readOnlyManager.RestoreReadOnly(); err != nil {
+			if err := runtime.readOnlyManager.RestoreReadOnly(); err != nil {
 				log.Printf("[Task %s] 警告: 恢复只读状态失败: %v", taskID, err)
 			} else {
 				log.Printf("[Task %s] 目标实例用户权限已恢复", taskID)
@@ -730,13 +768,20 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string) {
 	mode := strings.ToUpper(string(task.Config.Mode))
 	switch mode {
 	case "FULL":
-		s.executeFullSync(ctx, task)
+		if err := s.executeFullSync(ctx, task, runtime); err != nil {
+			if s.isTaskStopped(taskID) {
+				return
+			}
+			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, err.Error())
+		}
 	case "INCREMENTAL":
-		s.executeIncrementalSync(ctx, task)
+		s.executeIncrementalSync(ctx, task, runtime)
 	case "ALL":
 		// 先全量后增量
-		if err := s.executeFullSync(ctx, task); err == nil {
-			s.executeIncrementalSync(ctx, task)
+		if err := s.executeFullSync(ctx, task, runtime); err == nil {
+			s.executeIncrementalSync(ctx, task, runtime)
+		} else if !s.isTaskStopped(taskID) {
+			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, err.Error())
 		}
 	default:
 		s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, "unknown sync mode: "+string(task.Config.Mode))
@@ -744,8 +789,11 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string) {
 }
 
 // executeFullSync 执行全量同步（支持多库）
-func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.SyncTask) error {
+func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime) error {
 	taskID := task.Config.ID
+	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil || runtime.analyzer == nil {
+		return fmt.Errorf("task runtime is not initialized")
+	}
 
 	// 构建 (sourceSchema, targetSchema) 对列表
 	type dbPair struct{ src, dst string }
@@ -805,7 +853,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			continue
 		}
 		if len(tables) == 0 {
-			allTables, err := s.analyzer.GetAllTables(p.src)
+			allTables, err := runtime.analyzer.GetAllTables(p.src)
 			if err != nil {
 				log.Printf("[Task %s] Failed to get tables for %s: %v", taskID, p.src, err)
 				continue
@@ -815,11 +863,11 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			}
 		}
 		for _, tableName := range tables {
-			identity, err := s.analyzer.AnalyzeTable(p.src, tableName)
+			identity, err := runtime.analyzer.AnalyzeTable(p.src, tableName)
 			if err != nil {
 				continue
 			}
-			r := reader.NewReader(s.sourceDB, p.src, tableName, identity)
+			r := reader.NewReader(runtime.sourceDB, p.src, tableName, identity)
 			count, err := r.GetTotalCount(ctx)
 			if err != nil {
 				continue
@@ -837,7 +885,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		if task.Config.SyncLevel == taskEntity.SyncLevelTable && len(task.Config.Tables) > 0 && len(tablesBySource[p.src]) == 0 {
 			continue
 		}
-		if err := s.syncDatabasePair(ctx, task, p.src, p.dst, tablesBySource[p.src]); err != nil {
+		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src]); err != nil {
 			return err
 		}
 	}
@@ -902,14 +950,14 @@ func adjustReadLimitForWideColumns(base int64, identity *entity.TableIdentity) i
 }
 
 // syncDatabasePair 同步单个源库到目标库（含全部或指定表）
-func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, sourceSchema, targetSchema string, specifiedTables []string) error {
+func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string) error {
 	taskID := task.Config.ID
 
 	// 确定要同步的表
 	tables := append([]string{}, specifiedTables...)
 	if len(tables) == 0 {
 		log.Printf("[Task %s] 库级别同步：正在获取数据库 %s 的所有表...", taskID, sourceSchema)
-		allTables, err := s.analyzer.GetAllTables(sourceSchema)
+		allTables, err := runtime.analyzer.GetAllTables(sourceSchema)
 		if err != nil {
 			errMsg := fmt.Sprintf("Failed to get tables for database %s: %v", sourceSchema, err)
 			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
@@ -937,13 +985,13 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			return fmt.Errorf("task stopped")
 		}
 		log.Printf("[Task %s] 确保目标表: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
-		identity, err := s.analyzer.AnalyzeTable(sourceSchema, tableName)
+		identity, err := runtime.analyzer.AnalyzeTable(sourceSchema, tableName)
 		if err != nil {
 			errMsg := fmt.Sprintf("Failed to analyze table %s: %v", tableName, err)
 			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 			return fmt.Errorf("%s", errMsg)
 		}
-		if err := s.ensureTargetTable(sourceSchema, targetSchema, tableName, identity); err != nil {
+		if err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, identity); err != nil {
 			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s: %v", targetSchema, tableName, err)
 			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 			return fmt.Errorf("%s", errMsg)
@@ -980,7 +1028,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			var savedIndexes []map[string]interface{}
 			if task.Config.OptimizeIndex {
 				log.Printf("[Task %s] Dropping non-primary indexes for table %s...", taskID, tableName)
-				indexes, err := s.dropNonPrimaryKeyIndexes(targetSchema, tableName)
+				indexes, err := s.dropNonPrimaryKeyIndexes(runtime, targetSchema, tableName)
 				if err != nil {
 					log.Printf("[Task %s] Warning: Failed to drop indexes for %s: %v", taskID, tableName, err)
 				} else {
@@ -1023,7 +1071,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			var minPK, maxPK int64
 			if canParallelRange {
-				if err := s.sourceDB.QueryRowContext(ctx,
+				if err := runtime.sourceDB.QueryRowContext(ctx,
 					fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
 						identity.IdentifyCols[0], identity.IdentifyCols[0], sourceSchema, tableName),
 				).Scan(&minPK, &maxPK); err != nil || maxPK < minPK {
@@ -1037,14 +1085,14 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			var sampleBoundaries []interface{}
 			if canParallelSample {
 				var totalRows int64
-				if qErr := s.sourceDB.QueryRowContext(ctx,
+				if qErr := runtime.sourceDB.QueryRowContext(ctx,
 					fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", sourceSchema, tableName),
 				).Scan(&totalRows); qErr != nil || totalRows < int64(intraWorkers)*2 {
 					canParallelSample = false
 					log.Printf("[Task %s] Skipping sample parallel for %s.%s", taskID, sourceSchema, tableName)
 				} else {
 					var bErr error
-					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, sourceSchema, tableName, identity.IdentifyCols[0], totalRows, intraWorkers)
+					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime, sourceSchema, tableName, identity.IdentifyCols[0], totalRows, intraWorkers)
 					if bErr != nil {
 						canParallelSample = false
 						log.Printf("[Task %s] Boundary sampling failed for %s.%s: %v", taskID, sourceSchema, tableName, bErr)
@@ -1055,7 +1103,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			// === 执行同步 ===
 			if identity.Strategy == entity.FullColumnsStrategy {
 				// 无主键表：单协程流式读取 + 事务批量提交
-				conn, err := s.targetDB.Conn(ctx)
+				conn, err := runtime.targetDB.Conn(ctx)
 				if err != nil {
 					errMsg := fmt.Sprintf("Failed to get write connection for %s: %v", tableName, err)
 					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
@@ -1108,7 +1156,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					return nil
 				}
 
-				dr := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+				dr := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
 				for {
 					if s.isTaskStopped(taskID) {
 						return
@@ -1155,7 +1203,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				var atomicProcessed int64
 				var workerSnapshotConns []*sql.Conn
 				if task.Config.EnableConsistentSnapshot {
-					conns, err := s.prepareConsistentSnapshotReaders(ctx, intraWorkers)
+					conns, err := s.prepareConsistentSnapshotReaders(ctx, runtime, intraWorkers)
 					if err != nil {
 						errMsg := fmt.Sprintf("Failed to prepare parallel consistent snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
 						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
@@ -1203,7 +1251,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							}
 						}()
 
-						readSource := sourceQueryer(s.sourceDB)
+						readSource := sourceQueryer(runtime.sourceDB)
 						if len(workerSnapshotConns) == intraWorkers {
 							readSource = workerSnapshotConns[wIdx]
 						}
@@ -1226,7 +1274,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 						startBoundary := interface{}(workerStart - 1)
 						endBoundary := interface{}(workerEnd)
 
-						conn, err := s.targetDB.Conn(ctx)
+						conn, err := runtime.targetDB.Conn(ctx)
 						if err != nil {
 							syncErrChan <- fmt.Errorf("w%d conn: %v", wIdx, err)
 							return
@@ -1395,7 +1443,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							endBoundary = sampleBoundaries[wIdx]
 						}
 
-						conn, err := s.targetDB.Conn(ctx)
+						conn, err := runtime.targetDB.Conn(ctx)
 						if err != nil {
 							syncErrChan <- fmt.Errorf("w%d conn: %v", wIdx, err)
 							return
@@ -1445,7 +1493,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							return nil
 						}
 
-						wReader := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+						wReader := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
 						lastID := startBoundary
 						for {
 							if s.isTaskStopped(taskID) {
@@ -1511,7 +1559,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			} else {
 				// 复合主键/回退：Keyset Pagination 顺序读取 + 事务批量提交
-				conn, err := s.targetDB.Conn(ctx)
+				conn, err := runtime.targetDB.Conn(ctx)
 				if err != nil {
 					errMsg := fmt.Sprintf("Failed to get write connection for %s: %v", tableName, err)
 					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
@@ -1564,7 +1612,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					return nil
 				}
 
-				dr := reader.NewReader(s.sourceDB, sourceSchema, tableName, identity)
+				dr := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
 				var lastID interface{}
 				for {
 					if s.isTaskStopped(taskID) {
@@ -1617,7 +1665,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if task.Config.OptimizeIndex && len(savedIndexes) > 0 {
 				log.Printf("[Task %s] Restoring indexes for table %s...", taskID, tableName)
-				if err := s.restoreIndexes(targetSchema, tableName, savedIndexes); err != nil {
+				if err := s.restoreIndexes(runtime, targetSchema, tableName, savedIndexes); err != nil {
 					log.Printf("[Task %s] Warning: Failed to restore indexes for %s: %v", taskID, tableName, err)
 				} else {
 					log.Printf("[Task %s] Restored indexes for table %s", taskID, tableName)
@@ -1638,8 +1686,13 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 }
 
 // executeIncrementalSync 执行增量同步
-func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEntity.SyncTask) {
+func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime) {
 	taskID := task.Config.ID
+	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil || runtime.analyzer == nil {
+		log.Printf("[Task %s] Error: runtime is nil, cannot start incremental sync", taskID)
+		s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, "task runtime is nil")
+		return
+	}
 
 	// 获取配置信息
 	cfg := s.config
@@ -1698,9 +1751,9 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	// 创建增量同步服务
 	incrSync := syncApp.NewIncrementalSyncService(
-		s.sourceDB,
-		s.targetDB,
-		s.analyzer,
+		runtime.sourceDB,
+		runtime.targetDB,
+		runtime.analyzer,
 		s.checkpointManager,
 	)
 
@@ -1734,24 +1787,30 @@ func generateServerID(taskID string) uint32 {
 }
 
 // withDDL 在只读目标库上安全执行 DDL：若 readOnlyManager 存在则临时关闭 read_only 再恢复，否则直接执行
-func (s *TaskService) withDDL(fn func() error) error {
-	if s.readOnlyManager != nil {
-		return s.readOnlyManager.WithWriteAccess(fn)
+func (s *TaskService) withDDL(runtime *taskRuntime, fn func() error) error {
+	if runtime != nil && runtime.readOnlyManager != nil {
+		return runtime.readOnlyManager.WithWriteAccess(fn)
 	}
 	return fn()
 }
 
 // ensureTargetTable 确保目标表存在
-func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName string, identity *entity.TableIdentity) error {
+func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targetSchema, tableName string, identity *entity.TableIdentity) error {
+	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil {
+		return fmt.Errorf("task runtime is not initialized")
+	}
+	targetDB := runtime.targetDB
+	sourceDB := runtime.sourceDB
+
 	// 首先确保目标数据库存在：先用 SELECT 查询（只读操作），避免在 read_only 目标库上无谓执行 DDL
 	var dbExists string
-	err := s.targetDB.QueryRow(
+	err := targetDB.QueryRow(
 		"SELECT schema_name FROM information_schema.schemata WHERE schema_name = ?", targetSchema,
 	).Scan(&dbExists)
 	if err == sql.ErrNoRows {
 		// 数据库不存在，临时解除只读后创建
-		if err = s.withDDL(func() error {
-			_, e := s.targetDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetSchema))
+		if err = s.withDDL(runtime, func() error {
+			_, e := targetDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetSchema))
 			return e
 		}); err != nil {
 			return fmt.Errorf("failed to create target database %s: %v", targetSchema, err)
@@ -1764,7 +1823,7 @@ func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName st
 
 	// 检查目标表是否存在
 	var tableNameCheck string
-	err = s.targetDB.QueryRow(
+	err = targetDB.QueryRow(
 		fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name = '%s'", targetSchema, tableName),
 	).Scan(&tableNameCheck)
 
@@ -1783,9 +1842,9 @@ func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName st
 	log.Printf("[Task] Creating target table %s.%s (from %s.%s)", targetSchema, tableName, sourceSchema, tableName)
 
 	// 方法1：尝试使用源数据库连接在目标库创建表（源和目标在同一服务器时有效）
-	if s.sourceDB != nil {
-		tryErr := s.withDDL(func() error {
-			_, e := s.sourceDB.Exec(fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
+	if sourceDB != nil {
+		tryErr := s.withDDL(runtime, func() error {
+			_, e := sourceDB.Exec(fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
 				targetSchema, tableName, sourceSchema, tableName))
 			return e
 		})
@@ -1798,7 +1857,7 @@ func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName st
 
 	// 方法2：获取源表的CREATE TABLE语句并在目标数据库执行
 	var createSQL string
-	err = s.sourceDB.QueryRow(
+	err = sourceDB.QueryRow(
 		fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", sourceSchema, tableName),
 	).Scan(&tableName, &createSQL)
 	if err != nil {
@@ -1808,8 +1867,8 @@ func (s *TaskService) ensureTargetTable(sourceSchema, targetSchema, tableName st
 	createSQL = fmt.Sprintf("CREATE TABLE `%s`.`%s` %s", targetSchema, tableName,
 		extractTableDefinition(createSQL))
 
-	if err = s.withDDL(func() error {
-		_, e := s.targetDB.Exec(createSQL)
+	if err = s.withDDL(runtime, func() error {
+		_, e := targetDB.Exec(createSQL)
 		return e
 	}); err != nil {
 		return fmt.Errorf("failed to create target table %s.%s: %v", targetSchema, tableName, err)
@@ -1836,7 +1895,10 @@ func extractTableDefinition(createSQL string) string {
 }
 
 // 并发采样边界计算：统一处理所有主键类型
-func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, schema, table, pkCol string, totalRows int64, n int) ([]interface{}, error) {
+func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *taskRuntime, schema, table, pkCol string, totalRows int64, n int) ([]interface{}, error) {
+	if runtime == nil || runtime.sourceDB == nil {
+		return nil, fmt.Errorf("task runtime source db is not initialized")
+	}
 	if totalRows < int64(n)*2 {
 		// 数据量太少，不值得并行
 		return nil, fmt.Errorf("insufficient rows for parallel processing: %d", totalRows)
@@ -1855,7 +1917,7 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, schema, ta
 		}
 
 		var pk interface{}
-		err := s.sourceDB.QueryRowContext(ctx,
+		err := runtime.sourceDB.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` LIMIT 1 OFFSET ?",
 				pkCol, schema, table, pkCol),
 			offset,
@@ -1915,12 +1977,15 @@ func min(a, b int) int {
 	return b
 }
 
-func (s *TaskService) prepareConsistentSnapshotReaders(ctx context.Context, workers int) ([]*sql.Conn, error) {
+func (s *TaskService) prepareConsistentSnapshotReaders(ctx context.Context, runtime *taskRuntime, workers int) ([]*sql.Conn, error) {
+	if runtime == nil || runtime.sourceDB == nil {
+		return nil, fmt.Errorf("task runtime source db is not initialized")
+	}
 	if workers < 1 {
 		return nil, fmt.Errorf("invalid workers: %d", workers)
 	}
 
-	lockConn, err := s.sourceDB.Conn(ctx)
+	lockConn, err := runtime.sourceDB.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get lock connection failed: %w", err)
 	}
@@ -1943,7 +2008,7 @@ func (s *TaskService) prepareConsistentSnapshotReaders(ctx context.Context, work
 	}
 
 	for i := 0; i < workers; i++ {
-		conn, err := s.sourceDB.Conn(ctx)
+		conn, err := runtime.sourceDB.Conn(ctx)
 		if err != nil {
 			cleanup()
 			return nil, fmt.Errorf("get worker snapshot connection %d failed: %w", i, err)
@@ -2157,6 +2222,10 @@ func (s *TaskService) PauseTask(taskID string) error {
 		incrSync.Stop()
 		delete(s.incrementalSyncs, taskID)
 	}
+	if runtime, exists := s.runtimes[taskID]; exists {
+		runtime.Close()
+		delete(s.runtimes, taskID)
+	}
 
 	// 保存状态
 	if err := s.storage.Save(task); err != nil {
@@ -2338,6 +2407,10 @@ func (s *TaskService) Close() error {
 		incrSync.Stop()
 		delete(s.incrementalSyncs, taskID)
 	}
+	for taskID, runtime := range s.runtimes {
+		runtime.Close()
+		delete(s.runtimes, taskID)
+	}
 
 	// 2. 保存所有任务状态
 	for taskID, task := range s.tasks {
@@ -2353,19 +2426,7 @@ func (s *TaskService) Close() error {
 		}
 	}
 
-	// 3. 关闭数据库连接
-	if s.sourceDB != nil {
-		if err := s.sourceDB.Close(); err != nil {
-			log.Printf("Error closing source database: %v", err)
-		}
-	}
-	if s.targetDB != nil && s.targetDB != s.sourceDB {
-		if err := s.targetDB.Close(); err != nil {
-			log.Printf("Error closing target database: %v", err)
-		}
-	}
-
-	// 4. 关闭审计日志器
+	// 3. 关闭审计日志器
 	if s.auditLogger != nil {
 		if err := s.auditLogger.Close(); err != nil {
 			log.Printf("Failed to close audit logger: %v", err)
@@ -2377,12 +2438,16 @@ func (s *TaskService) Close() error {
 }
 
 // dropNonPrimaryKeyIndexes 删除非主键索引
-func (s *TaskService) dropNonPrimaryKeyIndexes(schema, tableName string) ([]map[string]interface{}, error) {
+func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tableName string) ([]map[string]interface{}, error) {
+	if runtime == nil || runtime.targetDB == nil {
+		return nil, fmt.Errorf("task runtime target db is not initialized")
+	}
+	targetDB := runtime.targetDB
 	var savedIndexes []map[string]interface{}
 
 	// 查询所有索引
 	query := fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", schema, tableName)
-	rows, err := s.targetDB.Query(query)
+	rows, err := targetDB.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to show indexes: %v", err)
 	}
@@ -2424,7 +2489,7 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(schema, tableName string) ([]map[
 	// 删除非主键索引
 	for indexName := range indexesToDrop {
 		dropQuery := fmt.Sprintf("ALTER TABLE `%s`.`%s` DROP INDEX `%s`", schema, tableName, indexName)
-		_, err := s.targetDB.Exec(dropQuery)
+		_, err := targetDB.Exec(dropQuery)
 		if err != nil {
 			log.Printf("Warning: failed to drop index %s: %v", indexName, err)
 			continue
@@ -2436,7 +2501,11 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(schema, tableName string) ([]map[
 }
 
 // restoreIndexes 恢复索引
-func (s *TaskService) restoreIndexes(schema, tableName string, indexes []map[string]interface{}) error {
+func (s *TaskService) restoreIndexes(runtime *taskRuntime, schema, tableName string, indexes []map[string]interface{}) error {
+	if runtime == nil || runtime.targetDB == nil {
+		return fmt.Errorf("task runtime target db is not initialized")
+	}
+	targetDB := runtime.targetDB
 	if len(indexes) == 0 {
 		return nil
 	}
@@ -2492,7 +2561,7 @@ func (s *TaskService) restoreIndexes(schema, tableName string, indexes []map[str
 				uniqueIndexName, schema, tableName, strings.Join(columns, ", "))
 		}
 
-		_, err := s.targetDB.Exec(createSQL)
+		_, err := targetDB.Exec(createSQL)
 		if err != nil {
 			log.Printf("Warning: failed to create index %s: %v", uniqueIndexName, err)
 			continue

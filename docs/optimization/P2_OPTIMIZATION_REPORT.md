@@ -43,7 +43,7 @@ Validating target database: localhost:3307/target_db
   Target database connected successfully ✓
 Validating Redis: localhost:6379
   Redis connected successfully ✓
-HTTP server will listen on 0.0.0.0:8081 ✓
+HTTP server will listen on 0.0.0.0:8080 ✓
 Configuration validation passed ✓
 `
 
@@ -175,7 +175,7 @@ docker-compose down
 **使用方式**:
 `ash
 # 访问指标端点
-curl http://localhost:8081/metrics
+curl http://localhost:8080/metrics
 
 # 输出示例
 # HELP mysql_sync_tasks_total Total number of sync tasks
@@ -320,20 +320,20 @@ docker-compose ps
 # mysql-source   docker-entrypoint.sh mysqld   Up      0.0.0.0:3306->3306/tcp
 # mysql-target   docker-entrypoint.sh mysqld   Up      0.0.0.0:3307->3306/tcp
 # redis          docker-entrypoint.sh redis... Up      0.0.0.0:6379->6379/tcp
-# app            ./mysql-to-async              Up      0.0.0.0:8081->8081/tcp
+# app            ./mysql-to-async              Up      0.0.0.0:8080->8080/tcp
 `
 
 ### 3. Prometheus监控
 
 `ash
 # 访问指标
-curl http://localhost:8081/metrics
+curl http://localhost:8080/metrics
 
 # 配置Prometheus
 scrape_configs:
   - job_name: 'mysql-sync'
     static_configs:
-      - targets: ['localhost:8081']
+      - targets: ['localhost:8080']
 `
 
 ### 4. 运行测试

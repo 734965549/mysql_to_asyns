@@ -121,6 +121,7 @@ go test -v ./...
 | TestUpdateTask | 测试更新任务 |
 | TestDeleteTask | 测试删除任务 |
 | TestStartTask | 测试启动任务 |
+| TestStartTask_ConcurrentRuntimeIsolation | 测试并发启动两个任务时 runtime 隔离 |
 | TestPauseTask | 测试暂停任务 |
 | TestTaskStatus | 测试任务状态转换 |
 
@@ -235,6 +236,16 @@ jobs:
 ### Q: 如何测试需要数据库连接的代码？
 
 A: 使用 `sqlmock` 模拟数据库连接，或者使用 Docker 容器运行临时数据库实例。
+
+### Q: 如何测试 `StartTask` 并发场景且不依赖真实 MySQL？
+
+A: `TaskService` 提供了用于测试的注入点，可在单元测试中替换启动链路中的外部依赖：
+
+- `initRuntimeFn`：替代真实数据库初始化，返回测试 runtime；
+- `executeSyncFn`：替代异步同步执行函数，仅用于捕获启动行为；
+- 然后在测试中并发调用 `StartTask`，断言 `runtimes[taskID]` 存在且不同任务对应不同 runtime 实例。
+
+这种方式可以稳定验证并发行为，不受本地 MySQL、网络或权限影响。
 
 ### Q: 如何测试私有方法？
 

@@ -1,37 +1,48 @@
-# 构建阶段
-FROM golang:1.24-alpine AS builder
+FROM golang:1.24-alpine AS backend-builder
 
 WORKDIR /app
 
-# 安装依赖
 RUN apk add --no-cache git
 
-# 复制go mod文件
 COPY go.mod go.sum ./
 RUN go mod download
 
-# 复制源代码
 COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o mysql-to-async .
 
-# 构建应用
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mysql-to-async .
 
-# 运行阶段
-FROM alpine:latest
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /frontend
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+
+COPY web/ ./
+RUN npm run build
+
+
+FROM alpine:3.20 AS backend
 
 RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-# 复制构建产物
-COPY --from=builder /app/mysql-to-async .
-COPY --from=builder /app/etc ./etc
+COPY --from=backend-builder /app/mysql-to-async ./
+COPY --from=backend-builder /app/etc ./etc
 
-# 创建必要的目录
 RUN mkdir -p /app/data /app/logs/audit
 
-# 暴露端口
-EXPOSE 8081
+EXPOSE 8080
 
-# 运行应用
 CMD ["./mysql-to-async"]
+
+
+FROM nginx:1.27-alpine AS frontend
+
+COPY docker/nginx/default.conf /etc/nginx/conf.d/default.conf
+COPY --from=frontend-builder /frontend/dist /usr/share/nginx/html
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]

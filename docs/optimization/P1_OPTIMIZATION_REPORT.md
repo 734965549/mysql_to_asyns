@@ -181,11 +181,11 @@ cat data/task_abc123.json
 
 `ash
 # 简单检查
-curl http://localhost:8081/health
+curl http://localhost:8080/health
 # {"status":"ok"}
 
 # 详细检查
-curl http://localhost:8081/api/health
+curl http://localhost:8080/api/health
 # {
 #   "status": "ok",
 #   "timestamp": "2026-03-20T20:30:45Z",

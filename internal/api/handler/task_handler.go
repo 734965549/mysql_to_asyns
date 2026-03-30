@@ -151,7 +151,17 @@ func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 	taskID := c.Param("id") // 获取任务ID参数
 
 	if err := h.taskService.StartTask(c.Request.Context(), taskID); err != nil { // 启动任务
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()}) // 返回错误
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "task not found"):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "already running"):
+			c.JSON(http.StatusConflict, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "failed to initialize database connections"):
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		}
 		return
 	}
 

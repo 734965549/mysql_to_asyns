@@ -188,7 +188,7 @@ docker-compose up -d
 docker-compose logs -f app
 
 # 3. 访问服务
-open http://localhost:8081
+open http://localhost:8080
 
 # 4. 停止服务
 docker-compose down
@@ -198,17 +198,17 @@ docker-compose down
 
 `ash
 # 访问健康检查
-curl http://localhost:8081/health
-curl http://localhost:8081/api/health
+curl http://localhost:8080/health
+curl http://localhost:8080/api/health
 
 # 访问Prometheus指标
-curl http://localhost:8081/metrics
+curl http://localhost:8080/metrics
 
 # 配置Prometheus
 scrape_configs:
   - job_name: 'mysql-sync'
     static_configs:
-      - targets: ['localhost:8081']
+      - targets: ['localhost:8080']
 `
 
 ---

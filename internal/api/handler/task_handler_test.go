@@ -205,9 +205,8 @@ func TestStartTask(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
-	// 鍙兘鍥犱负娌℃湁鏁版嵁搴撹繛鎺ヨ€屽け璐ワ紝浣嗚嚦灏戝簲璇ヨ兘鎵惧埌浠诲姟
-	// 当前实现中，StartTask 任意错误都会映射为 404（包括数据库初始化失败）
-	if w.Code != http.StatusOK && w.Code != http.StatusNotFound {
+	// 可能因为没有数据库连接导致启动失败；当前实现会返回 500
+	if w.Code != http.StatusOK && w.Code != http.StatusInternalServerError {
 		t.Errorf("unexpected status code: %d", w.Code)
 	}
 }

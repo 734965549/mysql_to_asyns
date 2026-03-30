@@ -50,12 +50,14 @@ services:
     networks:
       - mysql-sync-network
 
-  # MySQL-to-Async应用
+  # MySQL-to-Async后端应用
   app:
-    build: .
+    build:
+      context: .
+      target: backend
     container_name: mysql-to-async
-    ports:
-      - "8081:8081"
+    expose:
+      - "8080"
     volumes:
       - ./etc:/app/etc
       - ./data:/app/data
@@ -66,6 +68,20 @@ services:
       - mysql-source
       - mysql-target
       - redis
+    networks:
+      - mysql-sync-network
+    restart: unless-stopped
+
+  # 前端Nginx（托管构建后的静态资源，并反向代理 /api 到后端）
+  web:
+    build:
+      context: .
+      target: frontend
+    container_name: mysql-to-async-web
+    ports:
+      - "80:80"
+    depends_on:
+      - app
     networks:
       - mysql-sync-network
     restart: unless-stopped

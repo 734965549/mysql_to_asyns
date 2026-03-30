@@ -9,6 +9,59 @@
 cp etc/application.toml.example etc/application.toml
 ```
 
+## 环境变量配置（推荐 K8s / 容器部署）
+
+支持使用环境变量覆盖配置文件（前缀：`MYSQL_TO_ASYNC_`）。
+
+- 有配置文件：先读取 `application.toml`，再用环境变量覆盖。
+- 无配置文件：程序使用默认配置并读取环境变量（适合 K8s 挂载 `ConfigMap/Secret`）。
+
+常用变量示例：
+
+```bash
+MYSQL_TO_ASYNC_HTTP_HOST=0.0.0.0
+MYSQL_TO_ASYNC_HTTP_PORT=8080
+
+MYSQL_TO_ASYNC_DATASOURCE_HOST=mysql-source
+MYSQL_TO_ASYNC_DATASOURCE_PORT=3306
+MYSQL_TO_ASYNC_DATASOURCE_DATABASE=source_db
+MYSQL_TO_ASYNC_DATASOURCE_USERNAME=sync_user
+MYSQL_TO_ASYNC_DATASOURCE_PASSWORD=sync_password
+
+MYSQL_TO_ASYNC_TARGET_HOST=mysql-target
+MYSQL_TO_ASYNC_TARGET_PORT=3306
+MYSQL_TO_ASYNC_TARGET_DATABASE=target_db
+MYSQL_TO_ASYNC_TARGET_USERNAME=sync_user
+MYSQL_TO_ASYNC_TARGET_PASSWORD=sync_password
+
+MYSQL_TO_ASYNC_REDIS_HOST=redis
+MYSQL_TO_ASYNC_REDIS_PORT=6379
+MYSQL_TO_ASYNC_REDIS_DB=0
+
+MYSQL_TO_ASYNC_STORAGE_MODE=file
+MYSQL_TO_ASYNC_STORAGE_DATA_DIR=/app/data
+```
+
+K8s Deployment 片段示例：
+
+```yaml
+env:
+  - name: MYSQL_TO_ASYNC_HTTP_HOST
+    value: "0.0.0.0"
+  - name: MYSQL_TO_ASYNC_HTTP_PORT
+    value: "8080"
+  - name: MYSQL_TO_ASYNC_DATASOURCE_HOST
+    valueFrom:
+      configMapKeyRef:
+        name: mysql-to-async-config
+        key: datasource_host
+  - name: MYSQL_TO_ASYNC_DATASOURCE_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: mysql-to-async-secret
+        key: datasource_password
+```
+
 ## 配置项详解
 
 ### 基础配置
@@ -18,7 +71,7 @@ cp etc/application.toml.example etc/application.toml
 ```toml
 [http]
   host = "127.0.0.1"    # HTTP服务监听地址
-  port = 8081            # HTTP服务端口
+  port = 8080            # HTTP服务端口
 ```
 
 #### [datasource] - 源数据库默认配置
@@ -300,7 +353,7 @@ tail -f logs/mysql-to-async.log
 ### 性能指标
 可以通过API获取任务指标：
 ```bash
-curl http://localhost:8081/api/tasks/:id/metrics
+curl http://localhost:8080/api/tasks/:id/metrics
 ```
 
 返回包含：

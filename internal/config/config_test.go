@@ -71,6 +71,57 @@ db = 0
 	}
 }
 
+func TestApplyEnvOverrides(t *testing.T) {
+	cfg := &Config{}
+
+	t.Setenv("MYSQL_TO_ASYNC_HTTP_HOST", "0.0.0.0")
+	t.Setenv("MYSQL_TO_ASYNC_HTTP_PORT", "8080")
+	t.Setenv("MYSQL_TO_ASYNC_DATASOURCE_HOST", "mysql-source")
+	t.Setenv("MYSQL_TO_ASYNC_DATASOURCE_PORT", "3306")
+	t.Setenv("MYSQL_TO_ASYNC_DATASOURCE_DATABASE", "source_db")
+	t.Setenv("MYSQL_TO_ASYNC_DATASOURCE_USERNAME", "sync_user")
+	t.Setenv("MYSQL_TO_ASYNC_DATASOURCE_PASSWORD", "sync_password")
+	t.Setenv("MYSQL_TO_ASYNC_DATASOURCE_DEBUG", "false")
+	t.Setenv("MYSQL_TO_ASYNC_TARGET_HOST", "mysql-target")
+	t.Setenv("MYSQL_TO_ASYNC_TARGET_PORT", "3306")
+	t.Setenv("MYSQL_TO_ASYNC_STORAGE_MODE", "file")
+	t.Setenv("MYSQL_TO_ASYNC_STORAGE_DATA_DIR", "/app/data")
+	t.Setenv("MYSQL_TO_ASYNC_REDIS_HOST", "redis")
+	t.Setenv("MYSQL_TO_ASYNC_REDIS_PORT", "6379")
+	t.Setenv("MYSQL_TO_ASYNC_REDIS_DB", "1")
+
+	err := ApplyEnvOverrides(cfg)
+	if err != nil {
+		t.Fatalf("ApplyEnvOverrides failed: %v", err)
+	}
+
+	if cfg.Http.Host != "0.0.0.0" || cfg.Http.Port != 8080 {
+		t.Fatalf("unexpected http config: %+v", cfg.Http)
+	}
+	if cfg.Datasource.Host != "mysql-source" || cfg.Datasource.Port != 3306 {
+		t.Fatalf("unexpected datasource config: %+v", cfg.Datasource)
+	}
+	if cfg.Target.Host != "mysql-target" || cfg.Target.Port != 3306 {
+		t.Fatalf("unexpected target config: %+v", cfg.Target)
+	}
+	if cfg.Storage.Mode != "file" || cfg.Storage.DataDir != "/app/data" {
+		t.Fatalf("unexpected storage config: %+v", cfg.Storage)
+	}
+	if cfg.Redis.Host != "redis" || cfg.Redis.Port != 6379 || cfg.Redis.DB != 1 {
+		t.Fatalf("unexpected redis config: %+v", cfg.Redis)
+	}
+}
+
+func TestApplyEnvOverrides_InvalidInt(t *testing.T) {
+	cfg := &Config{}
+	t.Setenv("MYSQL_TO_ASYNC_HTTP_PORT", "abc")
+
+	err := ApplyEnvOverrides(cfg)
+	if err == nil {
+		t.Fatal("expected error for invalid env int value")
+	}
+}
+
 func TestDatasourceConfig_GetDSN(t *testing.T) {
 	cfg := DatasourceConfig{
 		Host:     "localhost",

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-to-async
+  labels:
+    app: mysql-to-async
+spec:
+  type: NodePort
+  selector:
+    app: mysql-to-async
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080

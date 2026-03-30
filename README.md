@@ -40,6 +40,7 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 - **智能表识别**：自动识别主键、唯一键，选择最优同步策略
 - **数据一致性保障**：支持INSERT、UPDATE、DELETE事件同步
 - **自定义数据库配置**：每个任务可配置独立的源和目标数据库
+- **任务级 Runtime 隔离**：每个任务独立维护 source/target DB、analyzer、readOnlyManager，支持并发启动
 - **库级别同步**：支持整个数据库的批量同步
 - **表级别同步**：支持指定表的精确同步
 
@@ -167,9 +168,28 @@ npm run dev
 
 访问 http://localhost:5173 打开Web管理界面。
 
+#### 5. Docker Compose 一键启动（前后端 + 依赖）
+
+`Dockerfile` 已支持多阶段多目标构建：
+
+- `backend`：Go 后端服务（监听 `8080`）；
+- `frontend`：Nginx 托管前端 `npm run build` 产物，并反向代理 `/api` 到后端。
+
+启动命令：
+
+```bash
+docker compose up -d --build
+```
+
+访问地址：
+
+- 前端页面：`http://localhost`
+- API 入口（通过 Nginx 代理）：`http://localhost/api`
+- 后端容器内部端口：`app:8080`（compose 网络内）
+
 ## API 接口文档
 
-服务启动后，默认监听端口 8081。API基础路径：http://localhost:8081/api
+服务启动后，默认监听端口 8080。API基础路径：http://localhost:8080/api
 
 ### 任务管理
 
@@ -303,7 +323,7 @@ GET /api/config/default
 ### 示例1：全量同步
 
 ```bash
-curl -X POST http://localhost:8081/api/tasks \
+curl -X POST http://localhost:8080/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "全量迁移订单数据",
@@ -322,7 +342,7 @@ curl -X POST http://localhost:8081/api/tasks \
 ### 示例2：增量同步
 
 ```bash
-curl -X POST http://localhost:8081/api/tasks \
+curl -X POST http://localhost:8080/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "实时同步用户表",
@@ -338,7 +358,7 @@ curl -X POST http://localhost:8081/api/tasks \
 ### 示例3：全量+增量组合
 
 ``bash
-curl -X POST http://localhost:8081/api/tasks \
+curl -X POST http://localhost:8080/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "完整数据同步",
@@ -733,6 +753,11 @@ go tool cover -html=coverage.out
 - 添加必要的注释
 
 ## 更新日志
+
+### v1.1.1 (2026-03-30)
+- ✨ **并发能力增强**: `TaskService` 改为任务级 runtime 隔离，移除单任务运行限制
+- ✨ **可测性优化**: `StartTask` 增加测试注入点，支持并发启动场景稳定单测
+- ✅ **新增测试**: 增加并发启动双任务隔离测试 `TestStartTask_ConcurrentRuntimeIsolation`
 
 ### v1.1.0 (2026-03-25)
 - ✨ **性能优化**: 单表分片并行处理，大表同步速度提升2-4倍

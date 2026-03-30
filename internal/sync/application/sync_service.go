@@ -275,6 +275,16 @@ func (h *syncEventHandler) OnEvent(event *binlog.BinlogEvent) error {
 		err = h.handleDelete(event, w, identity, targetSchema)
 	}
 
+	// 保存位点
+	if err == nil {
+		ctx := context.Background()
+		if cpErr := h.service.checkpointMgr.SavePosition(ctx, h.taskID, event.Position); cpErr != nil {
+			err = fmt.Errorf("save checkpoint failed: %w", cpErr)
+			log.Printf("[Task %s] Failed to save checkpoint for %s.%s at %s:%d: %v",
+				h.taskID, event.Schema, event.Table, event.Position.Name, event.Position.Pos, cpErr)
+		}
+	}
+
 	// 记录审计日志
 	auditLog := &AuditLog{
 		TaskID:    h.taskID,
@@ -287,12 +297,6 @@ func (h *syncEventHandler) OnEvent(event *binlog.BinlogEvent) error {
 		auditLog.Error = err.Error()
 	}
 	h.service.addAuditLog(auditLog)
-
-	// 保存位点
-	if err == nil {
-		ctx := context.Background()
-		h.service.checkpointMgr.SavePosition(ctx, h.taskID, event.Position)
-	}
 
 	return err
 }

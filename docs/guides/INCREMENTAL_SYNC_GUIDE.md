@@ -265,7 +265,7 @@ binlog_row_image=FULL
 
 ```bash
 # 1. 创建增量同步任务
-curl -X POST http://localhost:8081/api/tasks \
+curl -X POST http://localhost:8080/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "订单表增量同步",
@@ -280,16 +280,16 @@ curl -X POST http://localhost:8081/api/tasks \
 # 响应：{"config": {"id": "task_abc123", ...}}
 
 # 2. 启动任务
-curl -X POST http://localhost:8081/api/tasks/task_abc123/start
+curl -X POST http://localhost:8080/api/tasks/task_abc123/start
 
 # 3. 查看状态
-curl http://localhost:8081/api/tasks/task_abc123/metrics
+curl http://localhost:8080/api/tasks/task_abc123/metrics
 
 # 4. 暂停任务
-curl -X POST http://localhost:8081/api/tasks/task_abc123/pause
+curl -X POST http://localhost:8080/api/tasks/task_abc123/pause
 
 # 5. 查看所有任务
-curl http://localhost:8081/api/tasks
+curl http://localhost:8080/api/tasks
 ```
 
 ## 相关API接口
