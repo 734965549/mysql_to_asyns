@@ -10,6 +10,7 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 - **实时增量同步**：基于 Binlog 的实时数据捕获，延迟小于1秒
 - **断点续传**：Redis 持久化位点，服务重启后自动恢复
 - **无主键表同步**：智能识别策略，全列匹配保障数据一致性
+- **多目标端同步 (Multi-Sink)**：增量同步支持同时写入 MySQL、Kafka、HTTP Webhook
 - **Web 管理界面**：可视化任务管理，实时监控同步进度
 - **只读保护机制**：同步期间自动锁定目标库，防止数据冲突
 
@@ -34,6 +35,7 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 - **无主键表支持**：针对无主键表提供全列匹配策略
 - **审计日志**：记录所有同步操作的审计日志
 - **只读保护**：同步期间自动设置目标库只读模式
+- **多目标端 (Multi-Sink)**：增量同步支持 MySQL / Kafka / HTTP Webhook 多目标同时写入
 
 ### 高级特性
 
@@ -227,6 +229,7 @@ Content-Type: application/json
 | worker_count | int | 否 | 工作线程数，默认4 |
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
 | enable_consistent_snapshot | bool | 否 | 全量阶段启用并发一致性快照（任务级参数，默认false） |
+| sink_configs | array | 否 | 多目标端配置，详见 [Multi-Sink API 文档](docs/api/SINK_API.md) |
 
 **`enable_consistent_snapshot` 说明：**
 - 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`），不是 `application.toml` 全局配置。
@@ -372,6 +375,57 @@ curl -X POST http://localhost:8080/api/tasks \
   }'
 ``
 
+### 示例4：增量同步到 Kafka
+
+```bash
+curl -X POST http://localhost:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "用户变更推送Kafka",
+    "mode": "INCREMENTAL",
+    "source_schema": "production",
+    "tables": ["users"],
+    "sink_configs": [
+      {
+        "type": "KAFKA",
+        "options": {
+          "brokers": ["kafka:9092"],
+          "topic": "user_cdc",
+          "key_mode": "pk"
+        }
+      }
+    ]
+  }'
+```
+
+### 示例5：多目标端同时写入（MySQL + Webhook）
+
+```bash
+curl -X POST http://localhost:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "订单双写",
+    "mode": "INCREMENTAL",
+    "source_schema": "production",
+    "tables": ["orders", "order_items"],
+    "sink_configs": [
+      {
+        "type": "MYSQL",
+        "options": {"target_schema": "orders_backup"}
+      },
+      {
+        "type": "HTTP_WEBHOOK",
+        "options": {
+          "url": "https://analytics.example.com/ingest",
+          "headers": {"X-API-Key": "secret"}
+        }
+      }
+    ]
+  }'
+```
+
+> **提示**：完整的 Multi-Sink 配置参数说明请参阅 [Multi-Sink API 文档](docs/api/SINK_API.md)。
+
 ## 架构设计
 
 ### 项目结构
@@ -395,13 +449,18 @@ mysql-to-async/
 │   │   │   └── service/         # 元数据分析服务
 │   │   └── infrastructure/      # Schema检测器
 │   ├── sync/                    # 同步核心模块
-│   │   ├── application/         # 增量同步服务
+│   │   ├── application/         # 增量同步服务 + EventNormalizer
 │   │   ├── domain/
-│   │   │   └── strategy/        # 匹配策略
+│   │   │   ├── strategy/        # 匹配策略
+│   │   │   └── sink/            # Sink/ChangeEvent 领域接口
 │   │   └── infrastructure/
 │   │       ├── reader/          # 数据读取器
 │   │       ├── writer/          # 数据写入器
-│   │       └── readonly/        # 只读管理器
+│   │       ├── readonly/        # 只读管理器
+│   │       └── sink/            # Sink 实现 + SinkFactory
+│   │           ├── mysql/       # MySQLSink
+│   │           ├── kafka/       # KafkaSink
+│   │           └── webhook/     # WebhookSink
 │   └── task/                    # 任务管理
 │       ├── application/service/ # 任务服务
 │       └── domain/entity/       # 任务实体
@@ -436,6 +495,15 @@ mysql-to-async/
 - Redis持久化存储（推荐）
 - 内存存储（备用）
 - 支持断点续传
+
+#### 6. Multi-Sink 引擎
+- **Sink 接口**：统一的 `Open → Write → Flush → Close` 生命周期
+- **ChangeEvent**：标准化增量事件模型，解耦 Binlog 协议细节
+- **EventNormalizer**：将 BinlogEvent 转换为 ChangeEvent 列表
+- **SinkFactory**：根据配置动态创建 Sink 实例
+- **MySQLSink**：封装已有 writer，保持行为一致
+- **KafkaSink**：基于 segmentio/kafka-go，同步写入保障 At-Least-Once
+- **WebhookSink**：HTTP POST + 线性退避重试
 
 ## 同步模式详解
 
@@ -753,6 +821,18 @@ go tool cover -html=coverage.out
 - 添加必要的注释
 
 ## 更新日志
+
+### v1.2.0 (2026-04-01)
+- ✨ **Multi-Sink 多目标端同步**: 增量同步支持同时写入 MySQL、Kafka、HTTP Webhook
+- ✨ **Sink 抽象接口**: 统一 `Open → Write → Flush → Close` 生命周期
+- ✨ **ChangeEvent 标准事件模型**: 解耦 Binlog 协议细节，对外暴露统一语义
+- ✨ **EventNormalizer**: BinlogEvent → ChangeEvent 标准化转换
+- ✨ **SinkFactory**: 根据配置动态创建 Sink 实例
+- ✨ **KafkaSink**: 基于 segmentio/kafka-go，同步写入保障 At-Least-Once
+- ✨ **WebhookSink**: HTTP POST + 线性退避重试，自定义 Headers
+- ✨ **向后兼容**: 不传 `sink_configs` 时自动使用默认 MySQL Sink
+- ✅ **新增测试**: EventNormalizer、SinkFactory、KafkaSink、WebhookSink、API handler 单元测试
+- 📝 **API 文档**: 新增 [Multi-Sink API 文档](docs/api/SINK_API.md)
 
 ### v1.1.1 (2026-03-30)
 - ✨ **并发能力增强**: `TaskService` 改为任务级 runtime 隔离，移除单任务运行限制

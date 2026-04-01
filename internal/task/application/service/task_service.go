@@ -16,17 +16,19 @@ import (
 	"sync/atomic"   // 原子操作
 	"time"          // 时间处理
 
-	"mysql-to-async/internal/audit"                         // 审计日志包
-	"mysql-to-async/internal/checkpoint"                    // 检查点管理包
-	"mysql-to-async/internal/config"                        // 配置管理包
-	"mysql-to-async/internal/metadata/domain/entity"        // 元数据实体包
-	"mysql-to-async/internal/metadata/domain/service"       // 元数据服务包
-	"mysql-to-async/internal/metadata/infrastructure"       // 元数据基础设施包
-	syncApp "mysql-to-async/internal/sync/application"      // 同步应用包
-	"mysql-to-async/internal/sync/infrastructure/reader"    // 同步读取器包
-	"mysql-to-async/internal/sync/infrastructure/readonly"  // 只读管理包
-	"mysql-to-async/internal/sync/infrastructure/writer"    // 同步写入器包
-	taskEntity "mysql-to-async/internal/task/domain/entity" // 任务实体包
+	"mysql-to-async/internal/audit"                              // 审计日志包
+	"mysql-to-async/internal/checkpoint"                         // 检查点管理包
+	"mysql-to-async/internal/config"                             // 配置管理包
+	"mysql-to-async/internal/metadata/domain/entity"             // 元数据实体包
+	"mysql-to-async/internal/metadata/domain/service"            // 元数据服务包
+	"mysql-to-async/internal/metadata/infrastructure"            // 元数据基础设施包
+	syncApp "mysql-to-async/internal/sync/application"           // 同步应用包
+	sinkDomain "mysql-to-async/internal/sync/domain/sink"        // Sink 域接口
+	"mysql-to-async/internal/sync/infrastructure/reader"         // 同步读取器包
+	"mysql-to-async/internal/sync/infrastructure/readonly"       // 只读管理包
+	sinkInfra "mysql-to-async/internal/sync/infrastructure/sink" // Sink 工厂
+	"mysql-to-async/internal/sync/infrastructure/writer"         // 同步写入器包
+	taskEntity "mysql-to-async/internal/task/domain/entity"      // 任务实体包
 
 	"github.com/redis/go-redis/v9" // Redis 客户端
 )
@@ -1749,12 +1751,20 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 		ServerID:        generateServerID(taskID),
 	}
 
-	// 创建增量同步服务
+	// 根据任务配置构建 Sink 列表
+	sinks, err := s.buildSinks(ctx, task, runtime, targetSchema)
+	if err != nil {
+		log.Printf("[Task %s] Failed to build sinks: %v", taskID, err)
+		s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, err.Error())
+		return
+	}
+
+	// 创建增量同步服务（面向 Sink 接口）
 	incrSync := syncApp.NewIncrementalSyncService(
 		runtime.sourceDB,
-		runtime.targetDB,
 		runtime.analyzer,
 		s.checkpointManager,
+		sinks,
 	)
 
 	// 保存到映射中
@@ -1770,6 +1780,49 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 	}
 
 	log.Printf("[Task %s] Incremental sync started successfully", taskID)
+}
+
+// buildSinks 根据任务配置构建 Sink 列表
+// 向后兼容：如果任务未配置 SinkConfigs，则默认创建 MySQL Sink
+func (s *TaskService) buildSinks(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, targetSchema string) ([]sinkDomain.Sink, error) {
+	factory := sinkInfra.NewSinkFactory()
+
+	sinkConfigs := task.Config.SinkConfigs
+
+	// 向后兼容：无 SinkConfigs 时默认 MySQL Sink
+	if len(sinkConfigs) == 0 {
+		opts := map[string]interface{}{
+			"target_schema":    targetSchema,
+			"target_databases": task.Config.TargetDatabases,
+			"batch_size":       task.Config.BatchSize,
+		}
+		sinkConfigs = []taskEntity.SinkConfig{
+			{Type: "MYSQL", Options: opts},
+		}
+		log.Printf("[Task %s] No sink_configs specified, defaulting to MYSQL sink", task.Config.ID)
+	}
+
+	var sinks []sinkDomain.Sink
+	for i, sc := range sinkConfigs {
+		infraCfg := &sinkInfra.SinkConfig{
+			Type:    sinkInfra.SinkType(sc.Type),
+			Options: sc.Options,
+		}
+
+		deps := &sinkInfra.SinkDeps{
+			TargetDB: runtime.targetDB,
+			Analyzer: runtime.analyzer,
+		}
+
+		sk, err := factory.CreateSink(ctx, infraCfg, deps)
+		if err != nil {
+			return nil, fmt.Errorf("create sink[%d] type=%s failed: %w", i, sc.Type, err)
+		}
+		sinks = append(sinks, sk)
+		log.Printf("[Task %s] Sink[%d] type=%s created", task.Config.ID, i, sc.Type)
+	}
+
+	return sinks, nil
 }
 
 // generateServerID 生成唯一的ServerID用于binlog订阅

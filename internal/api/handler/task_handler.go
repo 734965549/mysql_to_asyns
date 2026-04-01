@@ -62,6 +62,13 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	EnableConsistentSnapshot bool                   `json:"enable_consistent_snapshot"` // 是否启用全量一致性快照
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`        // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`        // 目标数据库配置（可选）
+	SinkConfigs              []SinkConfigRequest    `json:"sink_configs,omitempty"`     // 多目标端配置（可选）
+}
+
+// SinkConfigRequest 目标端配置请求
+type SinkConfigRequest struct {
+	Type    string                 `json:"type" binding:"required"` // 目标类型：MYSQL, KAFKA, HTTP_WEBHOOK
+	Options map[string]interface{} `json:"options"`                 // 目标端选项
 }
 
 // CreateTask 创建任务方法
@@ -119,23 +126,24 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 	}
 
 	taskCfg := taskEntity.TaskConfig{ // 创建任务配置
-		ID:                       generateID(),                  // 生成任务ID
-		Name:                     req.Name,                      // 设置任务名称
-		SyncLevel:                syncLevel,                     // 设置同步级别
-		SourceSchema:             req.SourceSchema,              // 设置源模式
-		TargetSchema:             req.TargetSchema,              // 设置目标模式
-		SourceDatabases:          req.SourceDatabases,           // 设置源数据库列表
-		TargetDatabase:           req.TargetDatabase,            // 设置目标数据库
-		TargetDatabases:          req.TargetDatabases,           // 设置目标数据库列表
-		Tables:                   req.Tables,                    // 设置表列表
-		Mode:                     taskEntity.SyncMode(req.Mode), // 设置同步模式
-		BatchSize:                req.BatchSize,                 // 设置批处理大小
-		WorkerCount:              req.WorkerCount,               // 设置工作线程数
-		IntraTableWorkerCount:    req.IntraTableWorkerCount,     // 设置表内工作线程数
-		EnableLimitOne:           req.EnableLimitOne,            // 设置LIMIT 1优化开关
-		EnableConsistentSnapshot: req.EnableConsistentSnapshot,  // 设置一致性快照开关
-		SourceDB:                 sourceDB,                      // 设置源数据库配置
-		TargetDB:                 targetDB,                      // 设置目标数据库配置
+		ID:                       generateID(),                        // 生成任务ID
+		Name:                     req.Name,                            // 设置任务名称
+		SyncLevel:                syncLevel,                           // 设置同步级别
+		SourceSchema:             req.SourceSchema,                    // 设置源模式
+		TargetSchema:             req.TargetSchema,                    // 设置目标模式
+		SourceDatabases:          req.SourceDatabases,                 // 设置源数据库列表
+		TargetDatabase:           req.TargetDatabase,                  // 设置目标数据库
+		TargetDatabases:          req.TargetDatabases,                 // 设置目标数据库列表
+		Tables:                   req.Tables,                          // 设置表列表
+		Mode:                     taskEntity.SyncMode(req.Mode),       // 设置同步模式
+		BatchSize:                req.BatchSize,                       // 设置批处理大小
+		WorkerCount:              req.WorkerCount,                     // 设置工作线程数
+		IntraTableWorkerCount:    req.IntraTableWorkerCount,           // 设置表内工作线程数
+		EnableLimitOne:           req.EnableLimitOne,                  // 设置LIMIT 1优化开关
+		EnableConsistentSnapshot: req.EnableConsistentSnapshot,        // 设置一致性快照开关
+		SourceDB:                 sourceDB,                            // 设置源数据库配置
+		TargetDB:                 targetDB,                            // 设置目标数据库配置
+		SinkConfigs:              convertSinkConfigs(req.SinkConfigs), // 设置目标端配置
 	}
 	task, err := h.taskService.CreateTask(taskCfg) // 创建任务
 	if err != nil {                                // 如果创建失败
@@ -455,6 +463,11 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 		}
 	}
 
+	// 更新目标端配置
+	if len(req.SinkConfigs) > 0 {
+		task.Config.SinkConfigs = convertSinkConfigs(req.SinkConfigs)
+	}
+
 	if err := h.taskService.UpdateTask(task); err != nil { // 更新任务
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}) // 返回错误
 		return
@@ -504,6 +517,22 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	EnableConsistentSnapshot *bool                  `json:"enable_consistent_snapshot,omitempty"` // 是否启用全量一致性快照（可选）
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                  // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                  // 目标数据库配置（可选）
+	SinkConfigs              []SinkConfigRequest    `json:"sink_configs,omitempty"`               // 多目标端配置（可选）
+}
+
+// convertSinkConfigs 将请求中的 SinkConfigRequest 转换为实体层的 SinkConfig
+func convertSinkConfigs(reqs []SinkConfigRequest) []taskEntity.SinkConfig {
+	if len(reqs) == 0 {
+		return nil
+	}
+	result := make([]taskEntity.SinkConfig, len(reqs))
+	for i, r := range reqs {
+		result[i] = taskEntity.SinkConfig{
+			Type:    r.Type,
+			Options: r.Options,
+		}
+	}
+	return result
 }
 
 // generateID 生成唯一ID函数

@@ -275,6 +275,174 @@ func TestNewTaskHandler(t *testing.T) {
 	}
 }
 
+func TestCreateTask_WithSinkConfigs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	taskSvc := newTestTaskService()
+	analyzer := &MockIdentityAnalyzer{}
+	handler := NewTaskHandler(taskSvc, analyzer)
+
+	router := gin.New()
+	router.POST("/api/tasks", handler.CreateTask)
+
+	taskConfig := map[string]interface{}{
+		"name":          "Sink Test Task",
+		"mode":          "INCREMENTAL",
+		"source_schema": "src",
+		"target_schema": "tgt",
+		"tables":        []string{"t1"},
+		"sink_configs": []map[string]interface{}{
+			{
+				"type": "KAFKA",
+				"options": map[string]interface{}{
+					"brokers": []string{"localhost:9092"},
+					"topic":   "cdc_events",
+				},
+			},
+			{
+				"type": "HTTP_WEBHOOK",
+				"options": map[string]interface{}{
+					"url":    "http://example.com/hook",
+					"method": "POST",
+				},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(taskConfig)
+	req := httptest.NewRequest("POST", "/api/tasks", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d, body: %s", w.Code, w.Body.String())
+	}
+
+	var result taskEntity.SyncTask
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+	if len(result.Config.SinkConfigs) != 2 {
+		t.Fatalf("expected 2 sink_configs, got %d", len(result.Config.SinkConfigs))
+	}
+	if result.Config.SinkConfigs[0].Type != "KAFKA" {
+		t.Errorf("expected first sink type KAFKA, got %s", result.Config.SinkConfigs[0].Type)
+	}
+	if result.Config.SinkConfigs[1].Type != "HTTP_WEBHOOK" {
+		t.Errorf("expected second sink type HTTP_WEBHOOK, got %s", result.Config.SinkConfigs[1].Type)
+	}
+}
+
+func TestCreateTask_WithoutSinkConfigs_BackwardCompatible(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	taskSvc := newTestTaskService()
+	analyzer := &MockIdentityAnalyzer{}
+	handler := NewTaskHandler(taskSvc, analyzer)
+
+	router := gin.New()
+	router.POST("/api/tasks", handler.CreateTask)
+
+	taskConfig := map[string]interface{}{
+		"name":          "No Sink Task",
+		"mode":          "FULL",
+		"source_schema": "src",
+	}
+
+	body, _ := json.Marshal(taskConfig)
+	req := httptest.NewRequest("POST", "/api/tasks", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d, body: %s", w.Code, w.Body.String())
+	}
+
+	var result taskEntity.SyncTask
+	json.Unmarshal(w.Body.Bytes(), &result)
+	if len(result.Config.SinkConfigs) != 0 {
+		t.Errorf("expected empty sink_configs for backward compat, got %d", len(result.Config.SinkConfigs))
+	}
+}
+
+func TestUpdateTask_WithSinkConfigs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	taskSvc := newTestTaskService()
+	analyzer := &MockIdentityAnalyzer{}
+
+	taskSvc.CreateTask(taskEntity.TaskConfig{
+		ID:   "test_sink_update",
+		Name: "Test Task",
+	})
+
+	handler := NewTaskHandler(taskSvc, analyzer)
+
+	router := gin.New()
+	router.PUT("/api/tasks/:id", handler.UpdateTask)
+
+	updateData := map[string]interface{}{
+		"sink_configs": []map[string]interface{}{
+			{
+				"type":    "MYSQL",
+				"options": map[string]interface{}{"target_schema": "new_tgt"},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(updateData)
+	req := httptest.NewRequest("PUT", "/api/tasks/test_sink_update", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+	}
+
+	var result taskEntity.SyncTask
+	json.Unmarshal(w.Body.Bytes(), &result)
+	if len(result.Config.SinkConfigs) != 1 {
+		t.Fatalf("expected 1 sink_config after update, got %d", len(result.Config.SinkConfigs))
+	}
+	if result.Config.SinkConfigs[0].Type != "MYSQL" {
+		t.Errorf("expected sink type MYSQL, got %s", result.Config.SinkConfigs[0].Type)
+	}
+}
+
+func TestConvertSinkConfigs(t *testing.T) {
+	// nil input
+	if result := convertSinkConfigs(nil); result != nil {
+		t.Errorf("expected nil for nil input, got %v", result)
+	}
+
+	// empty input
+	if result := convertSinkConfigs([]SinkConfigRequest{}); result != nil {
+		t.Errorf("expected nil for empty input, got %v", result)
+	}
+
+	// normal input
+	reqs := []SinkConfigRequest{
+		{Type: "KAFKA", Options: map[string]interface{}{"brokers": []string{"b1"}}},
+		{Type: "HTTP_WEBHOOK", Options: map[string]interface{}{"url": "http://x"}},
+	}
+	result := convertSinkConfigs(reqs)
+	if len(result) != 2 {
+		t.Fatalf("expected 2, got %d", len(result))
+	}
+	if result[0].Type != "KAFKA" {
+		t.Errorf("expected KAFKA, got %s", result[0].Type)
+	}
+	if result[1].Type != "HTTP_WEBHOOK" {
+		t.Errorf("expected HTTP_WEBHOOK, got %s", result[1].Type)
+	}
+}
+
 func TestUpdateTask(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
