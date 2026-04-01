@@ -63,13 +63,6 @@ type TaskConfig struct { // 定义任务配置结构体
 	EnableConsistentSnapshot bool            `json:"enable_consistent_snapshot"` // 全量阶段使用一致性快照读取（牺牲部分并行度换取一致性）
 	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`        // 源数据库配置（可选，覆盖配置文件）
 	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`        // 目标数据库配置（可选，覆盖配置文件）
-	SinkConfigs              []SinkConfig    `json:"sink_configs,omitempty"`     // 多目标端配置（可选，为空时默认 MySQL Sink 向后兼容）
-}
-
-// SinkConfig 目标端配置
-type SinkConfig struct {
-	Type    string                 `json:"type"`    // 目标类型：MYSQL, KAFKA, HTTP_WEBHOOK
-	Options map[string]interface{} `json:"options"` // 目标端选项（不同类型有不同选项）
 }
 
 // ProcessContext 处理上下文
