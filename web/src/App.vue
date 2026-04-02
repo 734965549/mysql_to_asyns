@@ -1503,9 +1503,13 @@ async function saveConfig() {
 
       await refreshDatabases();
     } else {
-      const err = await res.json();
-
-      Message.error("更新配置失败: " + err.error);
+      const text = await res.text();
+      try {
+        const err = JSON.parse(text);
+        Message.error("更新配置失败: " + err.error);
+      } catch {
+        Message.error("更新配置失败: " + text);
+      }
     }
   } catch (e) {
     Message.error("更新配置失败: " + e.message);

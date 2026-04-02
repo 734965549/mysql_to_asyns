@@ -243,6 +243,12 @@ func (h *TaskHandler) UpdateGlobalConfig(c *gin.Context) { // 更新全局配置
 		return
 	}
 
+	// 保留前端不会发送的敏感/内部字段（如加密密钥、同步调优参数）
+	if config.GlobalConfig != nil {
+		req.Security = config.GlobalConfig.Security
+		req.Sync = config.GlobalConfig.Sync
+	}
+
 	// 更新内存中的配置
 	*config.GlobalConfig = req // 更新全局配置
 

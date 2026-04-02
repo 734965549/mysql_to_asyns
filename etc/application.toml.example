@@ -59,6 +59,12 @@
   # username = "root"
   # password = "123456"
 
+[security]
+  # 密码加密密钥（AES-256），用于加密存储到数据库/文件中的任务密码
+  # 建议 32 字节（不足自动补齐，超过截断）；留空则不加密
+  # 也可通过环境变量 MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY 设置
+  # encrypt_key = "your-32-byte-secret-key-here!!!!"
+
 [redis]
   # Redis配置（可选）
   # 用于保存增量同步的Checkpoint位点

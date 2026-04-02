@@ -149,13 +149,15 @@ type MySQLTaskStorage struct {
 
 	mu sync.RWMutex // 读写锁，保护并发访问
 
+	encryptKey string // 密码加密密钥（为空则不加密）
+
 }
 
 // NewMySQLTaskStorage 创建 MySQL 任务存储（dsn 不含数据库名，dbName 为目标库名）
 
-func NewMySQLTaskStorage(db *sql.DB) *MySQLTaskStorage {
+func NewMySQLTaskStorage(db *sql.DB, encryptKey string) *MySQLTaskStorage {
 
-	s := &MySQLTaskStorage{db: db} // 创建存储实例
+	s := &MySQLTaskStorage{db: db, encryptKey: encryptKey} // 创建存储实例
 
 	if err := s.initTable(); err != nil { // 初始化数据表
 
@@ -169,7 +171,7 @@ func NewMySQLTaskStorage(db *sql.DB) *MySQLTaskStorage {
 
 // NewMySQLTaskStorageFromConfig 通过配置创建 MySQL 任务存储，自动建库建表
 
-func NewMySQLTaskStorageFromConfig(cfg *config.StorageConfig) (*MySQLTaskStorage, error) {
+func NewMySQLTaskStorageFromConfig(cfg *config.StorageConfig, encryptKey string) (*MySQLTaskStorage, error) {
 
 	// 先用不带数据库名的 DSN 连接，创建数据库
 
@@ -217,7 +219,7 @@ func NewMySQLTaskStorageFromConfig(cfg *config.StorageConfig) (*MySQLTaskStorage
 
 	}
 
-	return NewMySQLTaskStorage(db), nil // 创建并返回存储实例
+	return NewMySQLTaskStorage(db, encryptKey), nil // 创建并返回存储实例
 
 }
 
@@ -312,6 +314,26 @@ func (s *MySQLTaskStorage) Save(task *taskEntity.SyncTask) error {
 	s.mu.Lock() // 获取写锁
 
 	defer s.mu.Unlock() // 延迟释放写锁
+
+	// 加密密码：先备份明文，加密后序列化，再还原明文（避免污染内存中的任务对象）
+	var origSourcePwd, origTargetPwd string
+	if task.Config.SourceDB != nil {
+		origSourcePwd = task.Config.SourceDB.Password
+	}
+	if task.Config.TargetDB != nil {
+		origTargetPwd = task.Config.TargetDB.Password
+	}
+	if err := task.EncryptPasswords(s.encryptKey); err != nil {
+		return fmt.Errorf("encrypt passwords: %w", err)
+	}
+	defer func() { // 还原明文密码
+		if task.Config.SourceDB != nil {
+			task.Config.SourceDB.Password = origSourcePwd
+		}
+		if task.Config.TargetDB != nil {
+			task.Config.TargetDB.Password = origTargetPwd
+		}
+	}()
 
 	data, err := json.Marshal(task) // 序列化任务
 
@@ -411,6 +433,10 @@ func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 
 			}
 
+			if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil { // 解密密码
+				log.Printf("Warning: failed to decrypt task passwords: %v", decErr)
+			}
+
 			fallbackTasks = append(fallbackTasks, &task) // 添加到任务列表
 
 		}
@@ -445,6 +471,10 @@ func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 
 		task.Config.StorageID = storageID // 设置存储ID
 
+		if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil { // 解密密码
+			log.Printf("Warning: failed to decrypt task passwords: %v", decErr)
+		}
+
 		tasks = append(tasks, &task) // 添加到任务列表
 
 	}
@@ -475,13 +505,13 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 	if cfg.Storage.Mode == "mysql" { // 检查存储模式是否为MySQL
 
-		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage) // 创建MySQL存储
+		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage, cfg.Security.EncryptKey) // 创建MySQL存储
 
 		if err != nil {
 
 			log.Printf("Warning: failed to initialize MySQL storage: %v, falling back to file storage", err) // 打印警告日志
 
-			ts.storage = NewFileTaskStorage("data") // 降级为文件存储
+			ts.storage = NewFileTaskStorage("data", cfg.Security.EncryptKey) // 降级为文件存储
 
 		} else {
 
@@ -493,7 +523,7 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 	} else {
 
-		ts.storage = NewFileTaskStorage("data") // 使用文件存储
+		ts.storage = NewFileTaskStorage("data", cfg.Security.EncryptKey) // 使用文件存储
 
 		log.Println("Using file task storage") // 打印日志
 
@@ -606,13 +636,13 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 
 	if cfg.Storage.Mode == "mysql" {
 
-		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage)
+		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage, cfg.Security.EncryptKey)
 
 		if err != nil {
 
 			log.Printf("Warning: failed to initialize MySQL storage: %v, falling back to file storage", err)
 
-			ts.storage = NewFileTaskStorage("data")
+			ts.storage = NewFileTaskStorage("data", cfg.Security.EncryptKey)
 
 		} else {
 
@@ -622,7 +652,7 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 
 	} else {
 
-		ts.storage = NewFileTaskStorage("data")
+		ts.storage = NewFileTaskStorage("data", cfg.Security.EncryptKey)
 
 	}
 
@@ -4110,11 +4140,13 @@ type FileTaskStorage struct {
 	dataDir string
 
 	mu sync.RWMutex
+
+	encryptKey string // 密码加密密钥（为空则不加密）
 }
 
 // NewFileTaskStorage 创建文件任务存储
 
-func NewFileTaskStorage(dataDir string) *FileTaskStorage {
+func NewFileTaskStorage(dataDir string, encryptKeys ...string) *FileTaskStorage {
 
 	// 确保数据目录存在
 
@@ -4124,7 +4156,12 @@ func NewFileTaskStorage(dataDir string) *FileTaskStorage {
 
 	}
 
-	return &FileTaskStorage{dataDir: dataDir}
+	var ek string
+	if len(encryptKeys) > 0 {
+		ek = encryptKeys[0]
+	}
+
+	return &FileTaskStorage{dataDir: dataDir, encryptKey: ek}
 
 }
 
@@ -4143,6 +4180,26 @@ func (s *FileTaskStorage) Save(task *taskEntity.SyncTask) error {
 		return fmt.Errorf("failed to create data directory: %w", err)
 
 	}
+
+	// 加密密码：先备份明文，加密后序列化，再还原明文（避免污染内存中的任务对象）
+	var origSourcePwd, origTargetPwd string
+	if task.Config.SourceDB != nil {
+		origSourcePwd = task.Config.SourceDB.Password
+	}
+	if task.Config.TargetDB != nil {
+		origTargetPwd = task.Config.TargetDB.Password
+	}
+	if err := task.EncryptPasswords(s.encryptKey); err != nil {
+		return fmt.Errorf("encrypt passwords: %w", err)
+	}
+	defer func() {
+		if task.Config.SourceDB != nil {
+			task.Config.SourceDB.Password = origSourcePwd
+		}
+		if task.Config.TargetDB != nil {
+			task.Config.TargetDB.Password = origTargetPwd
+		}
+	}()
 
 	// 序列化任务
 
@@ -4250,6 +4307,10 @@ func (s *FileTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 
 			continue
 
+		}
+
+		if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil { // 解密密码
+			log.Printf("Warning: failed to decrypt task passwords in file %s: %v", file.Name(), decErr)
 		}
 
 		tasks = append(tasks, &task)
@@ -4573,7 +4634,7 @@ func (s *TaskService) ReinitStorage(cfg *config.Config) error {
 
 	if cfg.Storage.Mode == "mysql" {
 
-		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage)
+		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage, cfg.Security.EncryptKey)
 
 		if err != nil {
 
@@ -4595,7 +4656,7 @@ func (s *TaskService) ReinitStorage(cfg *config.Config) error {
 
 		}
 
-		newStorage = NewFileTaskStorage(dataDir)
+		newStorage = NewFileTaskStorage(dataDir, cfg.Security.EncryptKey)
 
 		log.Println("Storage backend switched to file")
 
