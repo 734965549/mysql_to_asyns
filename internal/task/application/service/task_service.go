@@ -4,6 +4,7 @@ package service
 
 import (
 	"context" // 上下文管理
+	"sort"
 
 	"database/sql" // 数据库操作
 
@@ -18,6 +19,8 @@ import (
 	"path/filepath" // 文件路径操作
 
 	"runtime/debug" // 运行时调试信息
+
+	// 排序
 
 	"strconv" // 字符串数字转换
 
@@ -3869,6 +3872,42 @@ func comparePKValues(a, b interface{}) int {
 
 }
 
+// dbScanToString 将数据库扫描结果（interface{}）安全转换为字符串
+func dbScanToString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case []byte:
+		return string(val)
+	case string:
+		return val
+	case int64:
+		return strconv.FormatInt(val, 10)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// dbScanToInt 将数据库扫描结果（interface{}）安全转换为整数
+func dbScanToInt(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+	switch val := v.(type) {
+	case int64:
+		return int(val)
+	case []byte:
+		n, _ := strconv.Atoi(string(val))
+		return n
+	case string:
+		n, _ := strconv.Atoi(val)
+		return n
+	default:
+		return 0
+	}
+}
+
 // isRetryableLockError 检查是否为可重试的 MySQL 锁错误（1205 Lock wait timeout / 1213 Deadlock）
 func isRetryableLockError(err error) bool {
 	if err == nil {
@@ -4459,8 +4498,6 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 	targetDB := runtime.targetDB
 
-	var savedIndexes []map[string]interface{}
-
 	// 查询所有索引
 
 	query := fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", schema, tableName)
@@ -4475,80 +4512,120 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 	defer rows.Close()
 
-	// 记录需要删除的索引（非主键索引）
+	cols, err := rows.Columns()
 
-	indexesToDrop := make(map[string]bool)
+	if err != nil {
+
+		return nil, fmt.Errorf("failed to get index columns: %v", err)
+
+	}
+
+	// 按 Key_name 分组收集索引信息（正确处理多列复合索引）
+	type indexColumn struct {
+		Column     string
+		SeqInIndex int
+		SubPart    string
+	}
+	type indexMeta struct {
+		NonUnique int
+		IndexType string
+		Columns   []indexColumn
+	}
+	indexMap := make(map[string]*indexMeta)
 
 	for rows.Next() {
 
-		var indexName, columnName string
+		// 动态扫描所有列（兼容 MySQL 5.7 / 8.0+ 列数差异）
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
 
-		var nonUnique int
+		if err := rows.Scan(ptrs...); err != nil {
 
-		var seqInIndex, collation, cardinality, subPart, packed, null int
-
-		var indexType, comment string
-
-		var indexComment sql.NullString
-
-		err := rows.Scan(&indexName, &columnName, &nonUnique, &seqInIndex, &collation,
-
-			&cardinality, &subPart, &packed, &null, &indexType, &comment, &indexComment)
-
-		if err != nil {
-
-			log.Printf("Warning: failed to scan index: %v", err)
+			log.Printf("Warning: failed to scan index row: %v", err)
 
 			continue
 
 		}
 
-		// 跳过主键索引
+		// SHOW INDEX 列顺序（固定）：
+		// 0:Table, 1:Non_unique, 2:Key_name, 3:Seq_in_index, 4:Column_name,
+		// 5:Collation, 6:Cardinality, 7:Sub_part, 8:Packed, 9:Null,
+		// 10:Index_type, 11:Comment, 12:Index_comment [, 13:Visible, 14:Expression]
+		keyName := dbScanToString(vals[2])
 
-		if indexName == "PRIMARY" {
+		if keyName == "PRIMARY" {
 
 			continue
 
 		}
 
-		// 记录索引信息（避免重复）
+		nonUnique := dbScanToInt(vals[1])
+		seqInIndex := dbScanToInt(vals[3])
+		columnName := dbScanToString(vals[4])
+		subPart := dbScanToString(vals[7])
+		indexType := dbScanToString(vals[10])
 
-		if _, exists := indexesToDrop[indexName]; !exists {
-
-			indexesToDrop[indexName] = true
-
-			savedIndexes = append(savedIndexes, map[string]interface{}{
-
-				"name": indexName,
-
-				"column": columnName,
-
-				"non_unique": nonUnique,
-
-				"type": indexType,
-			})
-
+		meta, exists := indexMap[keyName]
+		if !exists {
+			meta = &indexMeta{NonUnique: nonUnique, IndexType: indexType}
+			indexMap[keyName] = meta
 		}
+		meta.Columns = append(meta.Columns, indexColumn{
+			Column: columnName, SeqInIndex: seqInIndex, SubPart: subPart,
+		})
 
+	}
+
+	if len(indexMap) == 0 {
+
+		return nil, nil
+
+	}
+
+	// 构建保存的索引信息（用于恢复）
+	var savedIndexes []map[string]interface{}
+	for name, meta := range indexMap {
+		// 按 Seq_in_index 排序列
+		sort.Slice(meta.Columns, func(i, j int) bool {
+			return meta.Columns[i].SeqInIndex < meta.Columns[j].SeqInIndex
+		})
+		// 构建列定义字符串（含前缀长度）
+		var colDefs []string
+		for _, c := range meta.Columns {
+			if c.SubPart != "" && c.SubPart != "0" {
+				colDefs = append(colDefs, fmt.Sprintf("`%s`(%s)", c.Column, c.SubPart))
+			} else {
+				colDefs = append(colDefs, fmt.Sprintf("`%s`", c.Column))
+			}
+		}
+		savedIndexes = append(savedIndexes, map[string]interface{}{
+			"name":       name,
+			"non_unique": meta.NonUnique,
+			"type":       meta.IndexType,
+			"columns":    strings.Join(colDefs, ", "),
+		})
 	}
 
 	// 删除非主键索引
 
-	for indexName := range indexesToDrop {
+	for name := range indexMap {
 
-		dropQuery := fmt.Sprintf("ALTER TABLE `%s`.`%s` DROP INDEX `%s`", schema, tableName, indexName)
+		dropQuery := fmt.Sprintf("ALTER TABLE `%s`.`%s` DROP INDEX `%s`", schema, tableName, name)
 
 		_, err := targetDB.Exec(dropQuery)
 
 		if err != nil {
 
-			log.Printf("Warning: failed to drop index %s: %v", indexName, err)
+			log.Printf("Warning: failed to drop index %s: %v", name, err)
 
 			continue
 
 		}
 
-		log.Printf("Dropped index %s from table %s.%s", indexName, schema, tableName)
+		log.Printf("Dropped index %s from table %s.%s", name, schema, tableName)
 
 	}
 
@@ -4576,103 +4653,56 @@ func (s *TaskService) restoreIndexes(runtime *taskRuntime, schema, tableName str
 
 	log.Printf("[Task] Restoring %d indexes for table %s.%s...", len(indexes), schema, tableName)
 
-	// 为每个索引重新创建
-
 	for _, indexInfo := range indexes {
 
 		indexName, ok := indexInfo["name"].(string)
-
-		if !ok {
-
+		if !ok || indexName == "" {
 			continue
-
 		}
 
-		// 获取该索引的所有列
-
-		var columns []string
-
-		for _, idx := range indexes {
-
-			if idx["name"] == indexName {
-
-				if col, ok := idx["column"].(string); ok {
-
-					columns = append(columns, fmt.Sprintf("`%s`", col))
-
-				}
-
-			}
-
-		}
-
-		if len(columns) == 0 {
-
+		// columns 已在 dropNonPrimaryKeyIndexes 中预构建好（含前缀长度）
+		columns, ok := indexInfo["columns"].(string)
+		if !ok || columns == "" {
 			continue
-
 		}
 
-		// 构建索引名（确保唯一）
-
-		uniqueIndexName := indexName
-
-		for _, idx := range indexes {
-
-			if idx["name"] == indexName {
-
-				if _, exists := idx["used"]; !exists {
-
-					idx["used"] = true
-
-					break
-
-				}
-
-				uniqueIndexName = fmt.Sprintf("%s_%d", indexName, time.Now().UnixNano())
-
-			}
-
+		nonUnique := 1
+		if v, ok := indexInfo["non_unique"].(int); ok {
+			nonUnique = v
 		}
 
-		// 判断索引类型
-
-		nonUnique, ok := indexInfo["non_unique"].(int)
-
-		if !ok {
-
-			nonUnique = 1
-
+		indexType := ""
+		if v, ok := indexInfo["type"].(string); ok {
+			indexType = v
 		}
 
-		// 构建CREATE INDEX语句
-
+		// 构建 CREATE INDEX 语句（区分 UNIQUE / FULLTEXT / SPATIAL / 普通索引）
 		var createSQL string
-
 		if nonUnique == 0 {
-
 			createSQL = fmt.Sprintf("CREATE UNIQUE INDEX `%s` ON `%s`.`%s` (%s)",
-
-				uniqueIndexName, schema, tableName, strings.Join(columns, ", "))
-
+				indexName, schema, tableName, columns)
+		} else if strings.EqualFold(indexType, "FULLTEXT") {
+			createSQL = fmt.Sprintf("CREATE FULLTEXT INDEX `%s` ON `%s`.`%s` (%s)",
+				indexName, schema, tableName, columns)
+		} else if strings.EqualFold(indexType, "SPATIAL") {
+			createSQL = fmt.Sprintf("CREATE SPATIAL INDEX `%s` ON `%s`.`%s` (%s)",
+				indexName, schema, tableName, columns)
 		} else {
-
 			createSQL = fmt.Sprintf("CREATE INDEX `%s` ON `%s`.`%s` (%s)",
-
-				uniqueIndexName, schema, tableName, strings.Join(columns, ", "))
-
+				indexName, schema, tableName, columns)
 		}
 
 		_, err := targetDB.Exec(createSQL)
 
 		if err != nil {
 
-			log.Printf("Warning: failed to create index %s: %v", uniqueIndexName, err)
+			log.Printf("Warning: failed to create index %s: %v (SQL: %s)", indexName, err, createSQL)
 
 			continue
 
 		}
 
-		log.Printf("Created index %s on table %s.%s", uniqueIndexName, schema, tableName)
+		log.Printf("Created index %s on table %s.%s", indexName, schema, tableName)
 
 	}
 
