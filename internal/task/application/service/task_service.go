@@ -1884,6 +1884,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			const txCommitEveryN = 40 // 每 40 批 commit 一次，减少 fsync 频率、提高吞吐
 
+			const txCommitEveryNParallel = 5 // 并行 worker 每 5 批 commit，减少锁持有时间，避免 lock wait timeout
+
+			const parallelWriteMaxRetries = 3 // 并行写入遇到锁超时/死锁时最大重试次数
+
 			legacyCap, hardMax := s.intraTableConcurrencyCaps()
 
 			intraWorkers := taskEntity.EffectiveIntraTableWorkers(task.Config.IntraTableWorkerCount, workerCount, legacyCap, hardMax)
@@ -2310,6 +2314,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 						}
 
 						conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
+						conn.ExecContext(ctx, "SET SESSION innodb_lock_wait_timeout=300")
 
 						defer func() {
 
@@ -2339,45 +2344,63 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						doWrite := func(rows []map[string]interface{}, mark string) error {
 
-							if curTx == nil {
+							for attempt := 0; ; attempt++ {
 
-								var e error
+								if curTx == nil {
 
-								curTx, e = conn.BeginTx(ctx, nil)
+									var e error
 
-								if e != nil {
+									curTx, e = conn.BeginTx(ctx, nil)
 
-									return fmt.Errorf("w%d begin tx at %s: %v", wIdx, mark, e)
+									if e != nil {
+
+										return fmt.Errorf("w%d begin tx at %s: %v", wIdx, mark, e)
+
+									}
+
+									txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+
+									if s.auditLogger != nil {
+
+										txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+
+									}
+
+									txBatchN = 0
+
+									txStartMark = mark
 
 								}
 
-								txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+								if e := txW.WriteBatch(ctx, rows); e != nil {
 
-								if s.auditLogger != nil {
+									curTx.Rollback()
 
-									txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+									curTx = nil
+
+									if isRetryableLockError(e) && attempt < parallelWriteMaxRetries {
+										backoff := time.Duration(1+attempt) * time.Second
+										log.Printf("[Task %s] w%d lock contention at %s, retry %d/%d after %v: %v",
+											taskID, wIdx, mark, attempt+1, parallelWriteMaxRetries, backoff, e)
+										select {
+										case <-ctx.Done():
+											return ctx.Err()
+										case <-time.After(backoff):
+										}
+										continue
+									}
+
+									return fmt.Errorf("w%d write at %s (tx from %s) rolled back: %v", wIdx, mark, txStartMark, e)
 
 								}
 
-								txBatchN = 0
-
-								txStartMark = mark
-
-							}
-
-							if e := txW.WriteBatch(ctx, rows); e != nil {
-
-								curTx.Rollback()
-
-								curTx = nil
-
-								return fmt.Errorf("w%d write at %s (tx from %s) rolled back: %v", wIdx, mark, txStartMark, e)
+								break
 
 							}
 
 							txBatchN++
 
-							if txBatchN >= txCommitEveryN {
+							if txBatchN >= txCommitEveryNParallel {
 
 								if e := curTx.Commit(); e != nil {
 
@@ -2620,6 +2643,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 						}
 
 						conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
+						conn.ExecContext(ctx, "SET SESSION innodb_lock_wait_timeout=300")
 
 						defer func() {
 
@@ -2649,45 +2673,63 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						doWrite := func(rows []map[string]interface{}, mark string) error {
 
-							if curTx == nil {
+							for attempt := 0; ; attempt++ {
 
-								var e error
+								if curTx == nil {
 
-								curTx, e = conn.BeginTx(ctx, nil)
+									var e error
 
-								if e != nil {
+									curTx, e = conn.BeginTx(ctx, nil)
 
-									return fmt.Errorf("w%d begin tx at %s: %v", wIdx, mark, e)
+									if e != nil {
+
+										return fmt.Errorf("w%d begin tx at %s: %v", wIdx, mark, e)
+
+									}
+
+									txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+
+									if s.auditLogger != nil {
+
+										txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+
+									}
+
+									txBatchN = 0
+
+									txStartMark = mark
 
 								}
 
-								txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+								if e := txW.WriteBatch(ctx, rows); e != nil {
 
-								if s.auditLogger != nil {
+									curTx.Rollback()
 
-									txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+									curTx = nil
+
+									if isRetryableLockError(e) && attempt < parallelWriteMaxRetries {
+										backoff := time.Duration(1+attempt) * time.Second
+										log.Printf("[Task %s] w%d lock contention at %s, retry %d/%d after %v: %v",
+											taskID, wIdx, mark, attempt+1, parallelWriteMaxRetries, backoff, e)
+										select {
+										case <-ctx.Done():
+											return ctx.Err()
+										case <-time.After(backoff):
+										}
+										continue
+									}
+
+									return fmt.Errorf("w%d write at %s (tx from %s) rolled back: %v", wIdx, mark, txStartMark, e)
 
 								}
 
-								txBatchN = 0
-
-								txStartMark = mark
-
-							}
-
-							if e := txW.WriteBatch(ctx, rows); e != nil {
-
-								curTx.Rollback()
-
-								curTx = nil
-
-								return fmt.Errorf("w%d write at %s (tx from %s) rolled back: %v", wIdx, mark, txStartMark, e)
+								break
 
 							}
 
 							txBatchN++
 
-							if txBatchN >= txCommitEveryN {
+							if txBatchN >= txCommitEveryNParallel {
 
 								if e := curTx.Commit(); e != nil {
 
@@ -3825,6 +3867,18 @@ func comparePKValues(a, b interface{}) int {
 
 	}
 
+}
+
+// isRetryableLockError 检查是否为可重试的 MySQL 锁错误（1205 Lock wait timeout / 1213 Deadlock）
+func isRetryableLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "Error 1205") ||
+		strings.Contains(s, "Error 1213") ||
+		strings.Contains(s, "Lock wait timeout") ||
+		strings.Contains(s, "Deadlock found")
 }
 
 // isNumericPKColumn 检查单列主键是否为整数类型（支持表内并行范围分片）
