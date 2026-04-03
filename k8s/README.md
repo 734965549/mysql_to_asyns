@@ -14,11 +14,12 @@
 
 1. `deployment.yaml` 中镜像地址
    - `image: your-registry/mysql-to-async:latest`
-2. `secret.yaml` 中密码账号
+2. `secret.yaml` 中密码账号及加密密钥
    - `MYSQL_TO_ASYNC_DATASOURCE_USERNAME`
    - `MYSQL_TO_ASYNC_DATASOURCE_PASSWORD`
    - `MYSQL_TO_ASYNC_TARGET_USERNAME`
    - `MYSQL_TO_ASYNC_TARGET_PASSWORD`
+   - `MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY`（任务密码 AES-256-GCM 加密密钥，建议 32 字节；留空则不加密）
 3. 如有需要，调整 `configmap.yaml` 中数据库名、Redis 地址等参数
 
 ## 2. 应用清单

@@ -116,6 +116,11 @@ const SINK_TYPES = [
 function getDefaultSinkOptions(type) {
   if (type === "MYSQL") {
     return {
+      host: "",
+      port: 3306,
+      username: "",
+      password: "",
+      database: "",
       target_schema: "",
       batch_size: 1000,
     };
@@ -2625,10 +2630,12 @@ watch(
                     </a-collapse-item>
                   </a-collapse>
 
-                  <!-- 目标端配置 -->
+                  <!-- 目标端配置：非 MySQL 目标始终显示；MySQL 目标仅增量/全量+增量时显示 -->
                   <div
                     v-if="
-                      taskForm.mode === 'INCREMENTAL' || taskForm.mode === 'ALL'
+                      targetType !== 'MYSQL' ||
+                      taskForm.mode === 'INCREMENTAL' ||
+                      taskForm.mode === 'ALL'
                     "
                     style="margin-top: 20px"
                   >
@@ -2871,9 +2878,68 @@ watch(
                         <!-- MySQL Options -->
                         <template v-if="sc.type === 'MYSQL'">
                           <a-row :gutter="16">
-                            <a-col :span="12">
+                            <a-col :span="8">
                               <a-form-item
-                                label="目标数据库"
+                                label="主机地址"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-input
+                                  v-model="sc.options.host"
+                                  placeholder="192.168.1.100"
+                                />
+                              </a-form-item>
+                            </a-col>
+                            <a-col :span="4">
+                              <a-form-item
+                                label="端口"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-input-number
+                                  v-model="sc.options.port"
+                                  :min="1"
+                                  :max="65535"
+                                  style="width: 100%"
+                                />
+                              </a-form-item>
+                            </a-col>
+                            <a-col :span="6">
+                              <a-form-item
+                                label="用户名"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-input
+                                  v-model="sc.options.username"
+                                  placeholder="root"
+                                />
+                              </a-form-item>
+                            </a-col>
+                            <a-col :span="6">
+                              <a-form-item
+                                label="密码"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-input-password
+                                  v-model="sc.options.password"
+                                  placeholder="密码"
+                                />
+                              </a-form-item>
+                            </a-col>
+                          </a-row>
+                          <a-row :gutter="16">
+                            <a-col :span="8">
+                              <a-form-item
+                                label="数据库名"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-input
+                                  v-model="sc.options.database"
+                                  placeholder="目标数据库"
+                                />
+                              </a-form-item>
+                            </a-col>
+                            <a-col :span="8">
+                              <a-form-item
+                                label="目标 Schema"
                                 style="margin-bottom: 8px"
                               >
                                 <a-input
@@ -2882,7 +2948,7 @@ watch(
                                 />
                               </a-form-item>
                             </a-col>
-                            <a-col :span="12">
+                            <a-col :span="8">
                               <a-form-item
                                 label="批量大小"
                                 style="margin-bottom: 8px"

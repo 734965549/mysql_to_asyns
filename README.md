@@ -70,6 +70,8 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 
 - **只读保护**：同步期间自动设置目标库只读模式
 
+- **密码加密存储**：任务配置中的数据库密码使用 AES-256-GCM 加密后持久化，防止明文泄露
+
 
 
 ### 高级特性
@@ -261,6 +263,11 @@ cd mysql-to-async
   db = 0
 
 
+
+[security]
+  # 任务密码加密密钥（AES-256），建议 32 字节；留空则不加密
+  # 也可通过环境变量 MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY 设置
+  encrypt_key = "your-32-byte-secret-key-here!!!!"
 
 [log]
 
@@ -814,7 +821,9 @@ mysql-to-async/
 
 ├── pkg/                         # 公共包
 
-│   └── binlog/                  # Binlog订阅器
+│   ├── binlog/                  # Binlog订阅器
+
+│   └── crypto/                  # AES-GCM 密码加密工具
 
 └── web/                         # 前端界面(Vue3)
 
@@ -1507,6 +1516,18 @@ go tool cover -html=coverage.out
 
 
 ## 更新日志
+
+
+
+### v1.2.0 (2026-04-02)
+
+- 🔒 **密码加密存储**：任务中 source_db / target_db 的密码在持久化到数据库或文件时，使用 AES-256-GCM 加密，防止明文泄露
+
+- 🔒 **安全配置**：新增 `[security]` 配置节，支持通过配置文件或环境变量 `MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY` 设置加密密钥
+
+- 🔒 **向后兼容**：未设置密钥时行为不变（明文存储）；已有明文旧数据在加载时自动兼容
+
+- 🐛 修复前端更新配置时覆盖 `security` / `sync` 等后端专用字段的问题
 
 
 
