@@ -273,14 +273,14 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s ASC LIMIT ?", // 构建查询
 				columns, r.schema, r.table, colList) // 排序并限制
 			args = []interface{}{limit} // 设置参数
-		} else { // 如果有上次ID
-			lastIDs, ok := lastID.([]interface{}) // 类型断言
-			if !ok {                              // 如果类型不匹配
-				return nil, fmt.Errorf("复合主键 lastID 必须是 []interface{}，实际: %T", lastID) // 返回错误
-			}
+		} else if lastIDs, ok := lastID.([]interface{}); ok { // 完整复合主键值
 			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE (%s) > (%s) ORDER BY %s ASC LIMIT ?", // 构建查询
 				columns, r.schema, r.table, colList, placeholders, colList) // 使用行构造器比较
 			args = append(append([]interface{}{}, lastIDs...), limit) // 设置参数
+		} else { // 单值：仅按第一主键列过滤（并行采样边界起始定位）
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` > ? ORDER BY %s ASC LIMIT ?", // 构建查询
+				columns, r.schema, r.table, pkCols[0], colList) // 按首列定位
+			args = []interface{}{lastID, limit} // 设置参数
 		}
 	}
 

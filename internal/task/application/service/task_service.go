@@ -1917,7 +1917,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				identity.Strategy != entity.FullColumnsStrategy &&
 
-				len(identity.IdentifyCols) == 1 &&
+				len(identity.IdentifyCols) >= 1 &&
 
 				intraWorkers > 1
 
@@ -1936,7 +1936,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					canParallelSample = identity.Strategy != entity.FullColumnsStrategy &&
 
-						len(identity.IdentifyCols) == 1 && intraWorkers > 1
+						len(identity.IdentifyCols) >= 1 && intraWorkers > 1
 
 					log.Printf("[Task %s] Cannot get numeric PK range for %s.%s, trying sample parallel", taskID, sourceSchema, tableName)
 
@@ -1963,7 +1963,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					var bErr error
 
-					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime, sourceSchema, tableName, identity.IdentifyCols[0], totalRows, intraWorkers)
+					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime, sourceSchema, tableName, identity.IdentifyCols, totalRows, intraWorkers)
 
 					if bErr != nil {
 
@@ -2587,7 +2587,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			} else if canParallelSample {
 
-				// 字符串单列主键：采样边界 + 表内并行 keyset + 每 worker 独立事务批量提交
+				// 非数值单列主键 / 复合主键：采样边界 + 表内并行 keyset + 每 worker 独立事务批量提交
 
 				pkCol := identity.IdentifyCols[0]
 
@@ -2778,17 +2778,15 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							}
 
-							// 非最后一个 worker：裁剪超出 endBoundary 的行
+							// 非最后一个 worker：裁剪超出 endBoundary 的行（支持复合主键完整比较）
 
 							if endBoundary != nil {
-
-								endStr := fmt.Sprintf("%v", endBoundary)
 
 								cutIdx := len(batchRows)
 
 								for j, row := range batchRows {
 
-									if fmt.Sprintf("%v", row[pkCol]) > endStr {
+									if comparePKWithBoundary(identity.IdentifyCols, row, endBoundary) > 0 {
 
 										cutIdx = j
 
@@ -2808,9 +2806,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							}
 
-							lastRowPK := batchRows[len(batchRows)-1][pkCol]
+							lastRow := batchRows[len(batchRows)-1]
+							firstPKVal := lastRow[pkCol]
 
-							mark := fmt.Sprintf("%s.%s:w%d:pk=%v", sourceSchema, tableName, wIdx, lastRowPK)
+							mark := fmt.Sprintf("%s.%s:w%d:pk=%v", sourceSchema, tableName, wIdx, firstPKVal)
 
 							if err := doWrite(batchRows, mark); err != nil {
 
@@ -2826,9 +2825,19 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							s.incrementTaskProgress(taskID, n, mark)
 
-							lastID = lastRowPK
+							// 更新 lastID：复合主键需要传完整的 []interface{} 给 ReadBatchByKeys
+							if len(identity.IdentifyCols) == 1 {
+								lastID = firstPKVal
+							} else {
+								compositePK := make([]interface{}, len(identity.IdentifyCols))
+								for ci, col := range identity.IdentifyCols {
+									compositePK[ci] = lastRow[col]
+								}
+								lastID = compositePK
+							}
 
-							if endBoundary != nil && fmt.Sprintf("%v", lastRowPK) >= fmt.Sprintf("%v", endBoundary) {
+							// 边界检查：使用完整复合主键比较（采样边界已包含所有主键列）
+							if endBoundary != nil && comparePKWithBoundary(identity.IdentifyCols, lastRow, endBoundary) >= 0 {
 
 								break
 
@@ -2878,7 +2887,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			} else {
 
-				// 复合主键/回退：Keyset Pagination 顺序读取 + 事务批量提交
+				// 回退（单worker / 采样失败）：Keyset Pagination 顺序读取 + 事务批量提交
 
 				conn, err := runtime.targetDB.Conn(ctx)
 
@@ -3479,9 +3488,9 @@ func extractTableDefinition(createSQL string) string {
 
 }
 
-// 并发采样边界计算：统一处理所有主键类型
+// 并发采样边界计算：统一处理单列和复合主键
 
-func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *taskRuntime, schema, table, pkCol string, totalRows int64, n int) ([]interface{}, error) {
+func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *taskRuntime, schema, table string, pkCols []string, totalRows int64, n int) ([]interface{}, error) {
 
 	if runtime == nil || runtime.sourceDB == nil {
 
@@ -3496,6 +3505,13 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *t
 		return nil, fmt.Errorf("insufficient rows for parallel processing: %d", totalRows)
 
 	}
+
+	// 构建 SELECT 和 ORDER BY 列列表
+	var quotedCols []string
+	for _, col := range pkCols {
+		quotedCols = append(quotedCols, fmt.Sprintf("`%s`", col))
+	}
+	colList := strings.Join(quotedCols, ", ")
 
 	boundaries := make([]interface{}, n-1)
 
@@ -3515,24 +3531,37 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *t
 
 		}
 
-		var pk interface{}
-
-		err := runtime.sourceDB.QueryRowContext(ctx,
-
-			fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` LIMIT 1 OFFSET ?",
-
-				pkCol, schema, table, pkCol),
-
-			offset,
-		).Scan(&pk)
-
-		if err != nil {
-
-			return nil, fmt.Errorf("sample point %d failed: %v", i, err)
-
+		if len(pkCols) == 1 {
+			// 单列主键：返回单值
+			var pk interface{}
+			err := runtime.sourceDB.QueryRowContext(ctx,
+				fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
+					colList, schema, table, colList),
+				offset,
+			).Scan(&pk)
+			if err != nil {
+				return nil, fmt.Errorf("sample point %d failed: %v", i, err)
+			}
+			samples[i] = pk
+		} else {
+			// 复合主键：返回 []interface{} 包含所有列值
+			vals := make([]interface{}, len(pkCols))
+			ptrs := make([]interface{}, len(pkCols))
+			for j := range vals {
+				ptrs[j] = &vals[j]
+			}
+			err := runtime.sourceDB.QueryRowContext(ctx,
+				fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
+					colList, schema, table, colList),
+				offset,
+			).Scan(ptrs...)
+			if err != nil {
+				return nil, fmt.Errorf("sample point %d failed: %v", i, err)
+			}
+			result := make([]interface{}, len(vals))
+			copy(result, vals)
+			samples[i] = result
 		}
-
-		samples[i] = pk
 
 	}
 
@@ -3548,7 +3577,7 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *t
 
 			for i := 1; i < len(samples); i++ {
 
-				if fmt.Sprintf("%v", samples[i]) != fmt.Sprintf("%v", samples[0]) {
+				if boundaryToString(samples[i]) != boundaryToString(samples[0]) {
 
 					boundaries[0] = samples[i]
 
@@ -3584,7 +3613,7 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *t
 
 				for sampleIdx < len(samples) &&
 
-					fmt.Sprintf("%v", samples[sampleIdx]) == fmt.Sprintf("%v", prevBoundary) {
+					boundaryToString(samples[sampleIdx]) == boundaryToString(prevBoundary) {
 
 					sampleIdx++
 
@@ -3602,9 +3631,9 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *t
 
 	}
 
-	log.Printf("Dynamic boundary sampling: totalRows=%d, workers=%d, boundaries=%v",
+	log.Printf("Dynamic boundary sampling: totalRows=%d, workers=%d, pkCols=%v, boundaries=%v",
 
-		totalRows, n, boundaries)
+		totalRows, n, pkCols, boundaries)
 
 	return boundaries, nil
 
@@ -3906,6 +3935,55 @@ func dbScanToInt(v interface{}) int {
 	default:
 		return 0
 	}
+}
+
+// boundaryToString 将边界值转换为可比较的字符串（支持单值和复合主键 []interface{}）
+func boundaryToString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	if vals, ok := v.([]interface{}); ok {
+		parts := make([]string, len(vals))
+		for i, val := range vals {
+			parts[i] = fmt.Sprintf("%v", val)
+		}
+		return strings.Join(parts, "\x00")
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// comparePKWithBoundary 比较一行数据的主键值与边界值，返回 -1 / 0 / +1
+// 支持单列边界（interface{}）和复合主键边界（[]interface{}）
+func comparePKWithBoundary(pkCols []string, row map[string]interface{}, boundary interface{}) int {
+	if boundary == nil {
+		return -1
+	}
+	if boundaryVals, ok := boundary.([]interface{}); ok {
+		for i, col := range pkCols {
+			if i >= len(boundaryVals) {
+				break
+			}
+			rowStr := fmt.Sprintf("%v", row[col])
+			bndStr := fmt.Sprintf("%v", boundaryVals[i])
+			if rowStr < bndStr {
+				return -1
+			}
+			if rowStr > bndStr {
+				return 1
+			}
+		}
+		return 0
+	}
+	// 单值边界：与第一列比较
+	rowStr := fmt.Sprintf("%v", row[pkCols[0]])
+	bndStr := fmt.Sprintf("%v", boundary)
+	if rowStr < bndStr {
+		return -1
+	}
+	if rowStr > bndStr {
+		return 1
+	}
+	return 0
 }
 
 // isRetryableLockError 检查是否为可重试的 MySQL 锁错误（1205 Lock wait timeout / 1213 Deadlock）
