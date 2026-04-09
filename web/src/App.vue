@@ -3857,6 +3857,101 @@ watch(
           </a-descriptions-item>
         </a-descriptions>
 
+        <!-- 源端和目标端配置 -->
+
+        <a-descriptions
+          title="源数据库配置"
+          :column="2"
+          bordered
+          style="margin-top: 20px"
+        >
+          <a-descriptions-item label="主机地址">
+            {{ selectedTaskForDetail.config.source_db?.host || configForm.datasource?.host || '-' }}
+          </a-descriptions-item>
+
+          <a-descriptions-item label="端口">
+            {{ selectedTaskForDetail.config.source_db?.port || configForm.datasource?.port || '-' }}
+          </a-descriptions-item>
+
+          <a-descriptions-item label="用户名">
+            {{ selectedTaskForDetail.config.source_db?.username || configForm.datasource?.username || '-' }}
+          </a-descriptions-item>
+
+          <a-descriptions-item label="密码">
+            ******
+          </a-descriptions-item>
+        </a-descriptions>
+
+        <template
+          v-if="
+            !selectedTaskForDetail.config.sink_configs ||
+            selectedTaskForDetail.config.sink_configs.length === 0
+          "
+        >
+          <a-descriptions
+            title="目标数据库配置 (MySQL)"
+            :column="2"
+            bordered
+            style="margin-top: 20px"
+          >
+            <a-descriptions-item label="主机地址">
+              {{ selectedTaskForDetail.config.target_db?.host || configForm.target?.host || '-' }}
+            </a-descriptions-item>
+
+            <a-descriptions-item label="端口">
+              {{ selectedTaskForDetail.config.target_db?.port || configForm.target?.port || '-' }}
+            </a-descriptions-item>
+
+            <a-descriptions-item label="用户名">
+              {{ selectedTaskForDetail.config.target_db?.username || configForm.target?.username || '-' }}
+            </a-descriptions-item>
+
+            <a-descriptions-item label="密码">
+              ******
+            </a-descriptions-item>
+          </a-descriptions>
+        </template>
+        <template v-else>
+          <div
+            v-for="(sink, index) in selectedTaskForDetail.config.sink_configs"
+            :key="index"
+          >
+            <a-descriptions
+              :title="`目标端配置 (${sink.type})`"
+              :column="2"
+              bordered
+              style="margin-top: 20px"
+            >
+              <template v-if="sink.type === 'MYSQL'">
+                <a-descriptions-item label="主机地址">{{ sink.options?.host || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="端口">{{ sink.options?.port || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="用户名">{{ sink.options?.username || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="密码">******</a-descriptions-item>
+              </template>
+
+              <template v-if="sink.type === 'KAFKA'">
+                <a-descriptions-item label="Brokers">
+                  {{
+                    Array.isArray(sink.options?.brokers)
+                      ? sink.options.brokers.join(', ')
+                      : sink.options?.brokers || '-'
+                  }}
+                </a-descriptions-item>
+                <a-descriptions-item label="Topic">{{ sink.options?.topic || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Batch Size">{{ sink.options?.batch_size || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Required Acks">{{ sink.options?.required_acks || '-' }}</a-descriptions-item>
+              </template>
+
+              <template v-if="sink.type === 'HTTP_WEBHOOK'">
+                <a-descriptions-item label="URL">{{ sink.options?.url || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Method">{{ sink.options?.method || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Timeout (ms)">{{ sink.options?.timeout_ms || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Retry Times">{{ sink.options?.retry_times || '-' }}</a-descriptions-item>
+              </template>
+            </a-descriptions>
+          </div>
+        </template>
+
         <!-- 执行状态 -->
 
         <a-descriptions
