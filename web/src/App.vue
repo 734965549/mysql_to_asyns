@@ -1378,11 +1378,12 @@ function getProgress(task) {
 
   const processed = Math.max(0, task.context.processed_rows || 0);
 
-  // 计算百分比，并限制在 0-100 之间
+  // 计算百分比，并限制在 0-100 之间，保留两位小数
+  let percent = (processed / task.context.total_rows) * 100;
+  percent = Math.min(100, Math.max(0, percent));
 
-  const percent = (processed / task.context.total_rows) * 100;
-
-  return Math.min(100, Math.max(0, Math.round(percent)));
+  // 如果正好是整数直接返回，否则保留两位小数
+  return Number(percent.toFixed(2));
 }
 
 // 监听同步级别变化
@@ -3395,16 +3396,24 @@ watch(
                     class="task-progress"
                   >
                     <a-progress
-                      :percent="getProgress(task)"
-                      :stroke-width="8"
+                      :percent="getProgress(task) / 100"
+                      :stroke-width="12"
                       status="normal"
-                      style="flex: 1"
+                      :show-text="false"
+                      style="flex: 1; margin: 0"
+                      size="large"
+                      color="var(--color-primary-light-4)"
+                      track-color="var(--color-fill-2)"
+                      animation
                     />
-
-                    <span class="progress-text">
-                      {{ task.context.processed_rows || 0 }} /
-                      {{ task.context.total_rows || 0 }}
-                    </span>
+                    
+                    <div class="progress-details">
+                      <span class="progress-text">
+                        已处理: {{ task.context.processed_rows || 0 }} / 
+                        {{ task.context.total_rows || 0 }}
+                      </span>
+                      <span class="progress-percent-text">{{ getProgress(task) }}%</span>
+                    </div>
                   </div>
 
                   <!-- 操作按钮 -->
@@ -3865,7 +3874,7 @@ watch(
           </a-descriptions-item>
 
           <a-descriptions-item label="进度">
-            {{ selectedTaskForDetail.context.progress_percent.toFixed(1) }}%
+            {{ getProgress(selectedTaskForDetail) }}%
           </a-descriptions-item>
 
           <a-descriptions-item label="已处理行数">
@@ -4342,22 +4351,27 @@ watch(
 
 .task-progress {
   display: flex;
-
-  align-items: center;
-
-  gap: 12px;
-
+  flex-direction: column;
+  gap: 8px;
   margin-bottom: 16px;
+}
+
+.progress-details {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
 }
 
 .progress-text {
   font-size: 12px;
+  color: var(--color-text-3);
+}
 
-  color: #86909c;
-
-  min-width: 100px;
-
-  text-align: right;
+.progress-percent-text {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-primary-light-4);
 }
 
 .task-actions {
