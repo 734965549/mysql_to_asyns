@@ -3422,10 +3422,21 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 	}
 
 	// 方法2：获取源表的CREATE TABLE语句并在目标数据库执行
+	// 使用独立连接并临时去掉 ANSI_QUOTES，确保 DDL 输出用反引号而非双引号
 
 	var createSQL string
 
-	err = sourceDB.QueryRow(
+	ddlConn, connErr := sourceDB.Conn(context.Background())
+	if connErr != nil {
+		return fmt.Errorf("failed to get source connection for DDL: %v", connErr)
+	}
+	defer ddlConn.Close()
+
+	// 去掉 ANSI_QUOTES，避免 SHOW CREATE TABLE 输出双引号列名导致目标库执行失败
+	_, _ = ddlConn.ExecContext(context.Background(),
+		"SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'ANSI_QUOTES', '')")
+
+	err = ddlConn.QueryRowContext(context.Background(),
 
 		fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", sourceSchema, tableName),
 	).Scan(&tableName, &createSQL)
