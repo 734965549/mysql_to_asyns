@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,6 +37,37 @@ func (m *mockAnalyzer) GetAllTables(schema string) ([]entity.TableInfo, error) {
 
 func (m *mockAnalyzer) GetAllDatabases() ([]string, error) {
 	return []string{"test", "test_target"}, nil
+}
+
+func TestStripNonPrimaryIndexesFromCreateSQL(t *testing.T) {
+	createSQL := "CREATE TABLE `users` (\n" +
+		"  `id` bigint NOT NULL,\n" +
+		"  `email` varchar(255) NOT NULL,\n" +
+		"  `name` varchar(255) DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  UNIQUE KEY `uk_email` (`email`),\n" +
+		"  KEY `idx_name` (`name`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+	stripped := stripNonPrimaryIndexesFromCreateSQL(createSQL)
+
+	assert.Contains(t, stripped, "PRIMARY KEY (`id`)")
+	assert.NotContains(t, stripped, "UNIQUE KEY `uk_email`")
+	assert.NotContains(t, stripped, "KEY `idx_name`")
+	assert.False(t, strings.Contains(stripped, ",\n) ENGINE"))
+}
+
+func TestStripNonPrimaryIndexesFromCreateSQL_KeepPrimaryOnlyDDLValid(t *testing.T) {
+	createSQL := "CREATE TABLE `orders` (\n" +
+		"  `id` bigint NOT NULL,\n" +
+		"  `tenant_id` bigint NOT NULL,\n" +
+		"  PRIMARY KEY (`id`,`tenant_id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+	stripped := stripNonPrimaryIndexesFromCreateSQL(createSQL)
+
+	assert.Equal(t, createSQL, stripped)
+	assert.Contains(t, stripped, "PRIMARY KEY (`id`,`tenant_id`)")
 }
 
 // newTestTaskService 创建一个使用自定义数据目录的测试任务服务

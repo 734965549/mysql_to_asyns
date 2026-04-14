@@ -1753,6 +1753,8 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 		name string
 
 		identity *entity.TableIdentity
+
+		savedIndexes []map[string]interface{}
 	}
 
 	log.Printf("[Task %s] 阶段1: 同步 %d 个表结构...", taskID, len(tables))
@@ -1781,7 +1783,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		if err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, identity); err != nil {
+		savedIndexes, err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, task.Config.OptimizeIndex)
+
+		if err != nil {
 
 			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s: %v", targetSchema, tableName, err)
 
@@ -1793,7 +1797,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		log.Printf("[Task %s] Target table %s.%s is ready", taskID, targetSchema, tableName)
 
-		ready = append(ready, tableReady{tableName, identity})
+		ready = append(ready, tableReady{name: tableName, identity: identity, savedIndexes: savedIndexes})
 
 	}
 
@@ -1811,7 +1815,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		wg.Add(1)
 
-		go func(tableName string, identity *entity.TableIdentity) {
+		go func(tableName string, identity *entity.TableIdentity, preparedIndexes []map[string]interface{}) {
 
 			defer wg.Done()
 
@@ -1839,9 +1843,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			log.Printf("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
 
-			var savedIndexes []map[string]interface{}
+			savedIndexes := append([]map[string]interface{}(nil), preparedIndexes...)
 
-			if task.Config.OptimizeIndex {
+			if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
 
 				log.Printf("[Task %s] Dropping non-primary indexes for table %s...", taskID, tableName)
 
@@ -2592,13 +2596,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				pkCol := identity.IdentifyCols[0]
 
 				log.Printf("[Task %s] Table %s.%s: parallel sample sync pk=%s workers=%d",
-
 					taskID, sourceSchema, tableName, pkCol, intraWorkers)
 
 				var syncWg sync.WaitGroup
 
 				syncErrChan := make(chan error, intraWorkers)
-
 				var atomicProcessed int64
 
 				for w := 0; w < intraWorkers; w++ {
@@ -3109,7 +3111,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			log.Printf("[Task %s] Table %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, tableProcessedRows)
 
-		}(r.name, r.identity)
+		}(r.name, r.identity, r.savedIndexes)
 
 	}
 
@@ -3317,11 +3319,11 @@ func (s *TaskService) withDDL(runtime *taskRuntime, fn func() error) error {
 
 // ensureTargetTable 确保目标表存在
 
-func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targetSchema, tableName string, identity *entity.TableIdentity) error {
+func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targetSchema, tableName string, optimizeIndex bool) ([]map[string]interface{}, error) {
 
 	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil {
 
-		return fmt.Errorf("task runtime is not initialized")
+		return nil, fmt.Errorf("task runtime is not initialized")
 
 	}
 
@@ -3350,7 +3352,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		}); err != nil {
 
-			return fmt.Errorf("failed to create target database %s: %v", targetSchema, err)
+			return nil, fmt.Errorf("failed to create target database %s: %v", targetSchema, err)
 
 		}
 
@@ -3358,7 +3360,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	} else if err != nil {
 
-		return fmt.Errorf("failed to check target database %s: %v", targetSchema, err)
+		return nil, fmt.Errorf("failed to check target database %s: %v", targetSchema, err)
 
 	}
 
@@ -3379,7 +3381,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		log.Printf("[Task] Target table %s.%s already exists, skipping creation", targetSchema, tableName)
 
-		return nil
+		return nil, nil
 
 	}
 
@@ -3387,7 +3389,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		// 查询出错
 
-		return fmt.Errorf("failed to check target table %s.%s: %v", targetSchema, tableName, err)
+		return nil, fmt.Errorf("failed to check target table %s.%s: %v", targetSchema, tableName, err)
 
 	}
 
@@ -3397,7 +3399,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	// 方法1：尝试使用源数据库连接在目标库创建表（源和目标在同一服务器时有效）
 
-	if sourceDB != nil {
+	if sourceDB != nil && !optimizeIndex {
 
 		tryErr := s.withDDL(runtime, func() error {
 
@@ -3413,7 +3415,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 			log.Printf("[Task] Successfully created target table %s.%s (using source DB connection)", targetSchema, tableName)
 
-			return nil
+			return nil, nil
 
 		}
 
@@ -3428,7 +3430,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	ddlConn, connErr := sourceDB.Conn(context.Background())
 	if connErr != nil {
-		return fmt.Errorf("failed to get source connection for DDL: %v", connErr)
+		return nil, fmt.Errorf("failed to get source connection for DDL: %v", connErr)
 	}
 	defer ddlConn.Close()
 
@@ -3443,7 +3445,23 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	if err != nil {
 
-		return fmt.Errorf("failed to get CREATE TABLE statement for %s.%s: %v", sourceSchema, tableName, err)
+		return nil, fmt.Errorf("failed to get CREATE TABLE statement for %s.%s: %v", sourceSchema, tableName, err)
+
+	}
+
+	var savedIndexes []map[string]interface{}
+
+	if optimizeIndex {
+
+		savedIndexes, err = loadNonPrimaryKeyIndexes(sourceDB, sourceSchema, tableName)
+
+		if err != nil {
+
+			return nil, fmt.Errorf("failed to load source indexes for %s.%s: %v", sourceSchema, tableName, err)
+
+		}
+
+		createSQL = stripNonPrimaryIndexesFromCreateSQL(createSQL)
 
 	}
 
@@ -3459,13 +3477,13 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	}); err != nil {
 
-		return fmt.Errorf("failed to create target table %s.%s: %v", targetSchema, tableName, err)
+		return nil, fmt.Errorf("failed to create target table %s.%s: %v", targetSchema, tableName, err)
 
 	}
 
 	log.Printf("[Task] Successfully created target table %s.%s (using CREATE TABLE statement)", targetSchema, tableName)
 
-	return nil
+	return savedIndexes, nil
 
 }
 
@@ -3496,6 +3514,75 @@ func extractTableDefinition(createSQL string) string {
 	// 提取表定义部分（包括表选项）
 
 	return createSQL[startIdx:]
+
+}
+
+func stripNonPrimaryIndexesFromCreateSQL(createSQL string) string {
+
+	lines := strings.Split(createSQL, "\n")
+
+	filtered := make([]string, 0, len(lines))
+
+	for i, line := range lines {
+
+		trimmed := strings.TrimSpace(line)
+
+		if i > 0 && i < len(lines)-1 && isSecondaryIndexDefinitionLine(trimmed) {
+
+			continue
+
+		}
+
+		filtered = append(filtered, line)
+
+	}
+
+	for i := 1; i < len(filtered); i++ {
+
+		if strings.HasPrefix(strings.TrimSpace(filtered[i]), ")") {
+
+			filtered[i-1] = trimTrailingComma(filtered[i-1])
+
+		}
+
+	}
+
+	return strings.Join(filtered, "\n")
+
+}
+
+func isSecondaryIndexDefinitionLine(line string) bool {
+
+	upper := strings.ToUpper(strings.TrimSuffix(strings.TrimSpace(line), ","))
+
+	switch {
+
+	case strings.HasPrefix(upper, "UNIQUE KEY "),
+		strings.HasPrefix(upper, "UNIQUE INDEX "),
+		strings.HasPrefix(upper, "FULLTEXT KEY "),
+		strings.HasPrefix(upper, "FULLTEXT INDEX "),
+		strings.HasPrefix(upper, "SPATIAL KEY "),
+		strings.HasPrefix(upper, "SPATIAL INDEX "),
+		strings.HasPrefix(upper, "KEY "),
+		strings.HasPrefix(upper, "INDEX "):
+		return !strings.HasPrefix(upper, "PRIMARY KEY ")
+	default:
+		return false
+	}
+
+}
+
+func trimTrailingComma(line string) string {
+
+	trimmed := strings.TrimRight(line, " \t")
+
+	if strings.HasSuffix(trimmed, ",") {
+
+		trimmed = strings.TrimSuffix(trimmed, ",")
+
+	}
+
+	return trimmed
 
 }
 
@@ -4575,23 +4662,15 @@ func (s *TaskService) Close() error {
 
 }
 
-// dropNonPrimaryKeyIndexes 删除非主键索引
+func loadNonPrimaryKeyIndexes(db *sql.DB, schema, tableName string) ([]map[string]interface{}, error) {
 
-func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tableName string) ([]map[string]interface{}, error) {
+	if db == nil {
 
-	if runtime == nil || runtime.targetDB == nil {
-
-		return nil, fmt.Errorf("task runtime target db is not initialized")
+		return nil, fmt.Errorf("db is not initialized")
 
 	}
 
-	targetDB := runtime.targetDB
-
-	// 查询所有索引
-
-	query := fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", schema, tableName)
-
-	rows, err := targetDB.Query(query)
+	rows, err := db.Query(fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", schema, tableName))
 
 	if err != nil {
 
@@ -4601,6 +4680,12 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 	defer rows.Close()
 
+	return scanNonPrimaryKeyIndexes(rows)
+
+}
+
+func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) {
+
 	cols, err := rows.Columns()
 
 	if err != nil {
@@ -4609,24 +4694,26 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 	}
 
-	// 按 Key_name 分组收集索引信息（正确处理多列复合索引）
 	type indexColumn struct {
 		Column     string
 		SeqInIndex int
 		SubPart    string
 	}
+
 	type indexMeta struct {
 		NonUnique int
 		IndexType string
 		Columns   []indexColumn
 	}
+
 	indexMap := make(map[string]*indexMeta)
 
 	for rows.Next() {
 
-		// 动态扫描所有列（兼容 MySQL 5.7 / 8.0+ 列数差异）
 		vals := make([]interface{}, len(cols))
+
 		ptrs := make([]interface{}, len(cols))
+
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}
@@ -4639,10 +4726,6 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 		}
 
-		// SHOW INDEX 列顺序（固定）：
-		// 0:Table, 1:Non_unique, 2:Key_name, 3:Seq_in_index, 4:Column_name,
-		// 5:Collation, 6:Cardinality, 7:Sub_part, 8:Packed, 9:Null,
-		// 10:Index_type, 11:Comment, 12:Index_comment [, 13:Visible, 14:Expression]
 		keyName := dbScanToString(vals[2])
 
 		if keyName == "PRIMARY" {
@@ -4658,13 +4741,19 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 		indexType := dbScanToString(vals[10])
 
 		meta, exists := indexMap[keyName]
+
 		if !exists {
 			meta = &indexMeta{NonUnique: nonUnique, IndexType: indexType}
 			indexMap[keyName] = meta
 		}
-		meta.Columns = append(meta.Columns, indexColumn{
-			Column: columnName, SeqInIndex: seqInIndex, SubPart: subPart,
-		})
+
+		meta.Columns = append(meta.Columns, indexColumn{Column: columnName, SeqInIndex: seqInIndex, SubPart: subPart})
+
+	}
+
+	if err := rows.Err(); err != nil {
+
+		return nil, fmt.Errorf("failed to read index rows: %v", err)
 
 	}
 
@@ -4674,15 +4763,26 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 	}
 
-	// 构建保存的索引信息（用于恢复）
-	var savedIndexes []map[string]interface{}
-	for name, meta := range indexMap {
-		// 按 Seq_in_index 排序列
+	indexNames := make([]string, 0, len(indexMap))
+
+	for name := range indexMap {
+		indexNames = append(indexNames, name)
+	}
+
+	sort.Strings(indexNames)
+
+	savedIndexes := make([]map[string]interface{}, 0, len(indexNames))
+
+	for _, name := range indexNames {
+
+		meta := indexMap[name]
+
 		sort.Slice(meta.Columns, func(i, j int) bool {
 			return meta.Columns[i].SeqInIndex < meta.Columns[j].SeqInIndex
 		})
-		// 构建列定义字符串（含前缀长度）
+
 		var colDefs []string
+
 		for _, c := range meta.Columns {
 			if c.SubPart != "" && c.SubPart != "0" {
 				colDefs = append(colDefs, fmt.Sprintf("`%s`(%s)", c.Column, c.SubPart))
@@ -4690,17 +4790,55 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 				colDefs = append(colDefs, fmt.Sprintf("`%s`", c.Column))
 			}
 		}
+
 		savedIndexes = append(savedIndexes, map[string]interface{}{
 			"name":       name,
 			"non_unique": meta.NonUnique,
 			"type":       meta.IndexType,
 			"columns":    strings.Join(colDefs, ", "),
 		})
+
+	}
+
+	return savedIndexes, nil
+
+}
+
+// dropNonPrimaryKeyIndexes 删除非主键索引
+
+func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tableName string) ([]map[string]interface{}, error) {
+
+	if runtime == nil || runtime.targetDB == nil {
+
+		return nil, fmt.Errorf("task runtime target db is not initialized")
+
+	}
+
+	targetDB := runtime.targetDB
+
+	savedIndexes, err := loadNonPrimaryKeyIndexes(targetDB, schema, tableName)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+	if len(savedIndexes) == 0 {
+
+		return nil, nil
+
 	}
 
 	// 删除非主键索引
 
-	for name := range indexMap {
+	for _, indexInfo := range savedIndexes {
+
+		name, ok := indexInfo["name"].(string)
+
+		if !ok || name == "" {
+			continue
+		}
 
 		dropQuery := fmt.Sprintf("ALTER TABLE `%s`.`%s` DROP INDEX `%s`", schema, tableName, name)
 
