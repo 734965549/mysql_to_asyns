@@ -2,8 +2,9 @@ package config // 声明当前文件属于config包，用于配置管理
 
 import ( // 导入外部包
 	"database/sql" // 导入database/sql包，用于数据库操作
-	"log" // 导入log包，用于日志输出
 	"time" // 导入time包，用于时间处理
+
+	"mysql-to-async/pkg/logger" // 导入自定义日志包，用于日志输出
 )
 
 // ApplySyncMySQLPool 为同步/元数据使用的 *sql.DB 设置连接池函数。max_open 未配置时默认 256，避免驱动默认 max_idle 过小导致高并发时频繁建连。
@@ -42,6 +43,6 @@ func ApplySyncMySQLPool(db *sql.DB, tune *SyncTuneConfig, source bool, logLabel 
 	}
 	db.SetConnMaxLifetime(time.Duration(lifeSec) * time.Second) // 设置连接最大存活时间
 	if logLabel != "" { // 如果有日志标签
-		log.Printf("[%s] MySQL pool: max_open=%d max_idle=%d conn_max_lifetime=%ds", logLabel, maxOpen, maxIdle, lifeSec) // 输出连接池配置日志
+		logger.Info("[%s] MySQL pool: max_open=%d max_idle=%d conn_max_lifetime=%ds", logLabel, maxOpen, maxIdle, lifeSec) // 输出连接池配置日志
 	}
 }

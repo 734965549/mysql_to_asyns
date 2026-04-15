@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"mysql-to-async/pkg/logger"
 	"sync"
 )
 
@@ -36,7 +36,7 @@ func (m *ReadOnlyManager) SetReadOnly() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	log.Println("[ReadOnlyManager] 开始设置目标实例为只读模式...")
+	logger.Info("[ReadOnlyManager] 开始设置目标实例为只读模式...")
 
 	originalState, err := m.getReadOnlyState()
 	if err != nil {
@@ -44,7 +44,7 @@ func (m *ReadOnlyManager) SetReadOnly() error {
 	}
 	m.originalState = originalState
 
-	log.Printf("[ReadOnlyManager] 当前状态: read_only=%v super_read_only=%v",
+	logger.Info("[ReadOnlyManager] 当前状态: read_only=%v super_read_only=%v",
 		originalState.ReadOnly, originalState.SuperReadOnly)
 
 	// 先关 super_read_only（必须先关，否则 read_only 操作本身也会被拦截）
@@ -58,7 +58,7 @@ func (m *ReadOnlyManager) SetReadOnly() error {
 		return fmt.Errorf("设置 read_only 失败: %v", err)
 	}
 
-	log.Println("[ReadOnlyManager] 目标实例: super_read_only=OFF read_only=ON，SUPER 用户可写入同步数据")
+	logger.Info("[ReadOnlyManager] 目标实例: super_read_only=OFF read_only=ON，SUPER 用户可写入同步数据")
 	return nil
 }
 
@@ -68,11 +68,11 @@ func (m *ReadOnlyManager) RestoreReadOnly() error {
 	defer m.mu.Unlock()
 
 	if m.originalState == nil {
-		log.Println("[ReadOnlyManager] 没有保存的只读状态，跳过恢复")
+		logger.Info("[ReadOnlyManager] 没有保存的只读状态，跳过恢复")
 		return nil
 	}
 
-	log.Println("[ReadOnlyManager] 开始恢复目标实例的读写状态...")
+	logger.Info("[ReadOnlyManager] 开始恢复目标实例的读写状态...")
 
 	var err error
 	// 恢复顺序：先恢复 read_only，再恢复 super_read_only
@@ -92,7 +92,7 @@ func (m *ReadOnlyManager) RestoreReadOnly() error {
 		return fmt.Errorf("恢复 super_read_only 失败: %v", err)
 	}
 
-	log.Printf("[ReadOnlyManager] 已恢复: read_only=%v super_read_only=%v",
+	logger.Info("[ReadOnlyManager] 已恢复: read_only=%v super_read_only=%v",
 		m.originalState.ReadOnly, m.originalState.SuperReadOnly)
 
 	m.originalState = nil
@@ -107,7 +107,7 @@ func (m *ReadOnlyManager) WithWriteAccess(fn func() error) error {
 
 	state, err := m.getReadOnlyState()
 	if err != nil {
-		log.Printf("[ReadOnlyManager] 警告：无法查询只读状态，直接执行写操作: %v", err)
+		logger.Warn("[ReadOnlyManager] 无法查询只读状态，直接执行写操作: %v", err)
 		return fn()
 	}
 
@@ -127,17 +127,17 @@ func (m *ReadOnlyManager) WithWriteAccess(fn func() error) error {
 			return fmt.Errorf("临时关闭 read_only 失败: %v", err)
 		}
 	}
-	log.Println("[ReadOnlyManager] 已临时开放写权限以执行 DDL")
+	logger.Info("[ReadOnlyManager] 已临时开放写权限以执行 DDL")
 
 	defer func() {
 		// 恢复：先 read_only=ON，再 super_read_only（如果原本就没有则保持 OFF）
 		if state.ReadOnly {
 			if _, e := m.targetDB.Exec("SET GLOBAL read_only = 1"); e != nil {
-				log.Printf("[ReadOnlyManager] 警告：恢复 read_only 失败: %v", e)
+				logger.Warn("[ReadOnlyManager] 恢复 read_only 失败: %v", e)
 			}
 		}
 		// DDL 后 super_read_only 保持 OFF（由 SetReadOnly 统一管理），不在此恢复
-		log.Println("[ReadOnlyManager] DDL 完成，read_only 已恢复")
+		logger.Info("[ReadOnlyManager] DDL 完成，read_only 已恢复")
 	}()
 
 	return fn()

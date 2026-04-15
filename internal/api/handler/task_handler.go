@@ -1,24 +1,25 @@
 package handler // 声明当前文件属于handler包，用于处理HTTP请求
 
-import ( // 导入外部包和内部模块
-	"context"      // 导入context包，用于处理请求超时和取消
-	"crypto/rand"  // 导入crypto/rand包，用于生成随机数
-	"database/sql" // 导入database/sql包，用于数据库操作
-	"encoding/hex" // 导入encoding/hex包，用于十六进制编码
-	"fmt"          // 导入fmt包，用于格式化输入输出
-	"net/http"     // 导入net/http包，用于HTTP服务器
-	"strings"      // 导入strings包，用于字符串操作
-	"time"         // 导入time包，用于时间处理
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
 
-	"github.com/gin-gonic/gin"         // 导入Gin框架，用于构建HTTP API
-	_ "github.com/go-sql-driver/mysql" // 导入MySQL驱动，下划线表示仅导入init函数
+	"github.com/gin-gonic/gin"
+	_ "github.com/go-sql-driver/mysql"
 
-	"mysql-to-async/internal/config"                                  // 导入配置模块
-	"mysql-to-async/internal/metadata/domain/service"                 // 导入元数据领域服务
-	metadataService "mysql-to-async/internal/metadata/domain/service" // 导入元数据领域服务，设置别名
-	"mysql-to-async/internal/metadata/infrastructure"                 // 导入元数据基础设施
-	taskService "mysql-to-async/internal/task/application/service"    // 导入任务应用服务
-	taskEntity "mysql-to-async/internal/task/domain/entity"           // 导入任务实体
+	"mysql-to-async/internal/config"
+	"mysql-to-async/internal/metadata/domain/service"
+	metadataService "mysql-to-async/internal/metadata/domain/service"
+	"mysql-to-async/internal/metadata/infrastructure"
+	taskService "mysql-to-async/internal/task/application/service"
+	taskEntity "mysql-to-async/internal/task/domain/entity"
+	"mysql-to-async/pkg/logger"
 )
 
 // TaskHandler 任务处理器结构体
@@ -247,39 +248,166 @@ func (h *TaskHandler) UpdateGlobalConfig(c *gin.Context) { // 更新全局配置
 		return
 	}
 
-	// 保留前端不会发送的敏感/内部字段（如加密密钥、同步调优参数）
-	if config.GlobalConfig != nil {
-		req.Security = config.GlobalConfig.Security
-		req.Sync = config.GlobalConfig.Sync
+	oldCfg := config.GlobalConfig
+	if oldCfg == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Config not loaded"})
+		return
 	}
 
-	// 更新内存中的配置
-	*config.GlobalConfig = req // 更新全局配置
+	// 保留前端不会发送的敏感/内部字段（如加密密钥、同步调优参数）
+	req.Security = oldCfg.Security
+	req.Sync = oldCfg.Sync
 
 	// 保存到文件
-	if err := config.SaveConfig("etc/application.toml", config.GlobalConfig); err != nil { // 保存配置到文件
+	if err := config.SaveConfig("etc/application.toml", &req); err != nil { // 保存配置到文件
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save config: " + err.Error()}) // 返回错误
 		return
 	}
 
+	// 更新内存中的配置
+	*oldCfg = req // 更新全局配置
+
 	// 动态重初始化存储后端（如从 file 切换到 mysql 时会自动建表）
+	hotReloaded := []string{}
+	warnings := []string{}
+
 	storageMsg := ""                                                         // 定义存储消息变量
 	if err := h.taskService.ReinitStorage(config.GlobalConfig); err != nil { // 重初始化存储
 		storageMsg = fmt.Sprintf("Warning: storage reinitialization failed: %v", err) // 设置错误消息
+		warnings = append(warnings, storageMsg)
 	} else if req.Storage.Mode == "mysql" { // 如果是MySQL存储模式
 		storageMsg = "MySQL storage initialized, sys_sync_tasks table ensured" // 设置成功消息
+		hotReloaded = append(hotReloaded, "storage")
+	} else {
+		hotReloaded = append(hotReloaded, "storage")
 	}
 
-	resp := gin.H{"message": "Configuration updated successfully"} // 创建响应
-	if storageMsg != "" {                                          // 如果有存储消息
-		resp["storage"] = storageMsg // 添加存储消息
+	checkpointMsg := ""
+	if err := h.taskService.ReinitCheckpointManager(config.GlobalConfig); err != nil {
+		checkpointMsg = fmt.Sprintf("Warning: checkpoint manager reinitialization failed: %v", err)
+		warnings = append(warnings, checkpointMsg)
+	} else if req.Redis.Host != "" {
+		checkpointMsg = "Redis checkpoint manager initialized"
+		hotReloaded = append(hotReloaded, "redis")
+	} else {
+		checkpointMsg = "In-memory checkpoint manager initialized"
+		hotReloaded = append(hotReloaded, "redis")
+	}
+
+	logMsg := ""
+	logCfg := buildLoggerConfig(&req.Log)
+	if err := logger.ReconfigureGlobal(logCfg); err != nil {
+		logMsg = fmt.Sprintf("Warning: logger reconfigure failed: %v", err)
+		warnings = append(warnings, logMsg)
+	} else {
+		logMsg = fmt.Sprintf("Logger reconfigured: level=%s, console=%v, file=%v", logCfg.Level, logCfg.Console, logCfg.File)
+		hotReloaded = append(hotReloaded, "logger")
+	}
+
+	resp := gin.H{"message": "Configuration updated successfully"}
+	if storageMsg != "" {
+		resp["storage"] = storageMsg
+	}
+	if checkpointMsg != "" {
+		resp["redis"] = checkpointMsg
+	}
+	if logMsg != "" {
+		resp["logger"] = logMsg
+	}
+	if len(hotReloaded) > 0 {
+		resp["hotReloaded"] = hotReloaded
+	}
+	if len(warnings) > 0 {
+		resp["warnings"] = warnings
 	}
 	c.JSON(http.StatusOK, resp) // 返回响应
 }
 
+// buildLoggerConfig 从应用层 LogConfig 构建 logger.Config
+func buildLoggerConfig(lc *config.LogConfig) *logger.Config {
+	cfg := &logger.Config{
+		Level:       lc.Level,
+		Console:     lc.Console.Enable,
+		File:        lc.File.Enable,
+		EnableColor: !lc.Console.NoColor,
+	}
+	if cfg.Level == "" {
+		cfg.Level = "info"
+	}
+	if !cfg.Console && !cfg.File {
+		cfg.Console = true
+		cfg.EnableColor = true
+	}
+	return cfg
+}
+
+// UpdateLogConfigRequest 日志配置热更新请求
+type UpdateLogConfigRequest struct {
+	Level   string                `json:"level"`
+	Console *config.ConsoleConfig `json:"console,omitempty"`
+	File    *config.FileConfig    `json:"file,omitempty"`
+}
+
+// GetLogConfig 获取当前运行时生效的日志配置
+func (h *TaskHandler) GetLogConfig(c *gin.Context) {
+	lc := logger.GetGlobalConfig()
+	if lc == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Logger not initialized"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"level":        lc.Level,
+		"console":      lc.Console,
+		"file":         lc.File,
+		"enable_color": lc.EnableColor,
+	})
+}
+
+// UpdateLogConfig 独立的日志配置热加载接口——只修改日志级别和输出，不影响其他配置
+func (h *TaskHandler) UpdateLogConfig(c *gin.Context) {
+	var req UpdateLogConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	cfg := config.GlobalConfig
+	if cfg == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Config not loaded"})
+		return
+	}
+
+	if req.Level != "" {
+		cfg.Log.Level = req.Level
+	}
+	if req.Console != nil {
+		cfg.Log.Console = *req.Console
+	}
+	if req.File != nil {
+		cfg.Log.File = *req.File
+	}
+
+	logCfg := buildLoggerConfig(&cfg.Log)
+	if err := logger.ReconfigureGlobal(logCfg); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Logger reconfigure failed: " + err.Error()})
+		return
+	}
+
+	if err := config.SaveConfig("etc/application.toml", cfg); err != nil {
+		logger.Warn("日志配置已热加载但持久化失败: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "日志配置已热加载",
+		"level":   logCfg.Level,
+		"console": logCfg.Console,
+		"file":    logCfg.File,
+	})
+}
+
 // MetadataHandler 元数据处理器结构体
-type MetadataHandler struct { // 定义元数据处理器结构体
-	analyzer metadataService.IdentityAnalyzer // 元数据分析器实例
+type MetadataHandler struct {
+	analyzer metadataService.IdentityAnalyzer
 }
 
 // NewMetadataHandler 创建元数据处理器函数

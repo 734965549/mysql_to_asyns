@@ -3,7 +3,7 @@ package binlog // 声明当前文件属于binlog包，用于MySQL binlog订阅�
 import ( // 导入外部包
 	"context" // 导入context包，用于处理请求超时和取消
 	"fmt" // 导入fmt包，用于格式化输入输出
-	"log" // 导入log包，用于日志输出
+	"mysql-to-async/pkg/logger" // 导入log包，用于日志输出
 	"sync" // 导入sync包，用于并发控制
 	"time" // 导入time包，用于时间处理
 
@@ -146,7 +146,7 @@ func (s *Subscriber) Start(ctx context.Context, position mysql.Position) error {
 		go s.canal.RunFrom(pos) // 在goroutine中从最新位置开始同步
 	}
 
-	log.Printf("Binlog subscriber started from position: %v", position) // 输出启动日志
+	logger.Info("Binlog subscriber started from position: %v", position) // 输出启动日志
 	return nil // 返回nil表示成功
 }
 
@@ -166,7 +166,7 @@ func (s *Subscriber) Stop() { // 停止binlog订阅
 		s.canal.Close() // 关闭canal
 	}
 	s.running = false // 设置运行状态为false
-	log.Println("Binlog subscriber stopped") // 输出停止日志
+	logger.Info("Binlog subscriber stopped") // 输出停止日志
 }
 
 // GetPosition 获取当前位置方法
@@ -184,7 +184,7 @@ func (s *Subscriber) dispatchEvent(event *BinlogEvent) error { // 分发事件�
 
 	for _, handler := range s.handlers { // 遍历所有处理器
 		if err := handler.OnEvent(event); err != nil { // 调用处理器处理事件
-			log.Printf("Handler error: %v", err) // 输出错误日志
+			logger.Error("Handler error: %v", err) // 输出错误日志
 			return err // 返回错误
 		}
 	}
@@ -252,7 +252,7 @@ func (h *binlogHandler) String() string { // 获取处理器名称
 
 // OnRotate 处理binlog文件切换方法
 func (h *binlogHandler) OnRotate(header *replication.EventHeader, rotateEvent *replication.RotateEvent) error { // 处理binlog文件切换事件
-	log.Printf("Binlog rotate: %s:%d", string(rotateEvent.NextLogName), rotateEvent.Position) // 输出binlog切换日志
+	logger.Info("Binlog rotate: %s:%d", string(rotateEvent.NextLogName), rotateEvent.Position) // 输出binlog切换日志
 	return nil // 返回nil
 }
 

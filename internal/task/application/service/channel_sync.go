@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"mysql-to-async/internal/sync/infrastructure/reader"
 	"mysql-to-async/internal/sync/infrastructure/writer"
 	taskEntity "mysql-to-async/internal/task/domain/entity"
+	"mysql-to-async/pkg/logger"
 )
 
 // BatchTask 批次任务结构
@@ -194,7 +194,7 @@ func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task
 			}
 
 			if len(batch) == 0 {
-				log.Printf("[Task %s] Channel sync: reached end of data for %s.%s", taskID, sourceSchema, tableName)
+				logger.Info("[Task %s] Channel sync: reached end of data for %s.%s", taskID, sourceSchema, tableName)
 				break
 			}
 
@@ -205,7 +205,7 @@ func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task
 			// 添加批次到channel
 			err = channelSync.AddBatch(batchID, batch, firstPK, lastPK, mark)
 			if err != nil {
-				log.Printf("[Task %s] Warning: %v", taskID, err)
+				logger.Warn("[Task %s] %v", taskID, err)
 				// 如果channel满了，等待一下再重试
 				select {
 				case <-ctx.Done():
@@ -244,7 +244,7 @@ func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task
 
 	// 更新最终进度
 	processed, total := channelSync.GetProgress()
-	log.Printf("[Task %s] Channel sync completed for %s.%s: %d/%d rows processed", taskID, sourceSchema, tableName, processed, total)
+	logger.Info("[Task %s] Channel sync completed for %s.%s: %d/%d rows processed", taskID, sourceSchema, tableName, processed, total)
 
 	return nil
 }
@@ -311,7 +311,7 @@ func (cse *ChannelSyncExecutor) processBatchTask(ctx context.Context, task *task
 	}
 
 	// 写入批次数据
-	log.Printf("[Task %s] Worker %d processing batch %d: %d rows (PK %v -> %v)",
+	logger.Info("[Task %s] Worker %d processing batch %d: %d rows (PK %v -> %v)",
 		taskID, batchTask.WorkerID, batchTask.BatchID, len(batchTask.Data), batchTask.StartPK, batchTask.EndPK)
 
 	if err := doWrite(batchTask.Data, batchTask.Mark); err != nil {

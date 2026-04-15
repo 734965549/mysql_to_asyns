@@ -1524,6 +1524,39 @@ async function saveConfig() {
   }
 }
 
+const logApplying = ref(false);
+
+async function applyLogConfig() {
+  logApplying.value = true;
+  try {
+    const res = await fetch(`${API_BASE}/config/log`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        level: configForm.value.log.level,
+        console: configForm.value.log.console,
+        file: configForm.value.log.file,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      Message.success(`日志配置已热加载生效 — 级别: ${data.level?.toUpperCase()}, 控制台: ${data.console ? '开' : '关'}, 文件: ${data.file ? '开' : '关'}`);
+    } else {
+      const text = await res.text();
+      try {
+        const err = JSON.parse(text);
+        Message.error("日志热加载失败: " + err.error);
+      } catch {
+        Message.error("日志热加载失败: " + text);
+      }
+    }
+  } catch (e) {
+    Message.error("日志热加载失败: " + e.message);
+  } finally {
+    logApplying.value = false;
+  }
+}
+
 // 处理浏览器返回按钒
 
 function handlePopState() {
@@ -3550,10 +3583,13 @@ watch(
                   </a-form-item>
                 </a-col>
 
-                <!-- 日志配置 -->
+                <!-- 日志配置（支持热加载） -->
 
                 <a-col :span="12">
-                  <a-typography-title :heading="6">日志配置</a-typography-title>
+                  <a-typography-title :heading="6">
+                    日志配置
+                    <a-tag color="green" size="small" style="margin-left: 8px; vertical-align: middle">热加载</a-tag>
+                  </a-typography-title>
 
                   <a-form-item label="日志级别">
                     <a-select v-model="configForm.log.level">
@@ -3577,6 +3613,22 @@ watch(
                         开启文件持久化输出 (File)
                       </a-checkbox>
                     </a-space>
+                  </a-form-item>
+
+                  <a-form-item>
+                    <a-button
+                      type="primary"
+                      status="success"
+                      :loading="logApplying"
+                      @click="applyLogConfig"
+                      style="width: 100%"
+                    >
+                      <template #icon><icon-sync /></template>
+                      立即应用日志配置（无需重启）
+                    </a-button>
+                    <div style="margin-top: 4px; color: #86909c; font-size: 12px">
+                      修改日志级别或输出开关后点击此按钮，配置即刻生效并持久化到配置文件
+                    </div>
                   </a-form-item>
 
                   <a-typography-title :heading="6" style="margin-top: 20px"

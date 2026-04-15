@@ -7,8 +7,6 @@ import (
 
 	"fmt"
 
-	"log"
-
 	"mysql-to-async/internal/checkpoint"
 
 	"mysql-to-async/internal/metadata/domain/entity"
@@ -18,6 +16,8 @@ import (
 	"mysql-to-async/internal/sync/infrastructure/writer"
 
 	"mysql-to-async/pkg/binlog"
+
+	"mysql-to-async/pkg/logger"
 
 	"sync"
 
@@ -224,7 +224,7 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 
 	if err != nil {
 
-		log.Printf("Warning: failed to get checkpoint: %v", err)
+		logger.Warn("failed to get checkpoint: %v", err)
 
 	}
 
@@ -319,7 +319,7 @@ func (s *IncrementalSyncService) processAuditLogs() {
 
 		if !auditLog.Success {
 
-			log.Printf("[AUDIT] Sync failed - Task: %s, Table: %s, Event: %s, Error: %s",
+			logger.Error("[AUDIT] Sync failed - Task: %s, Table: %s, Event: %s, Error: %s",
 
 				auditLog.TaskID, auditLog.TableName, auditLog.EventType, auditLog.Error)
 
@@ -479,7 +479,7 @@ func (h *syncEventHandler) OnEvent(event *binlog.BinlogEvent) error {
 
 			err = fmt.Errorf("save checkpoint failed: %w", cpErr)
 
-			log.Printf("[Task %s] Failed to save checkpoint for %s.%s at %s:%d: %v",
+			logger.Error("[Task %s] Failed to save checkpoint for %s.%s at %s:%d: %v",
 
 				h.taskID, event.Schema, event.Table, event.Position.Name, event.Position.Pos, cpErr)
 

@@ -12,7 +12,7 @@ import (
 
 	"fmt" // 格式化输出
 
-	"log" // 日志记录
+	"mysql-to-async/pkg/logger" // 日志记录
 
 	"os" // 操作系统接口
 
@@ -76,6 +76,8 @@ type TaskService struct {
 
 	storage TaskStorage // 任务存储接口
 
+	storageCloser func() error
+
 	sourceDB *sql.DB // 源数据库连接
 
 	targetDB *sql.DB // 目标数据库连接
@@ -87,6 +89,8 @@ type TaskService struct {
 	enableReadOnly bool // 是否启用只读限制
 
 	checkpointManager checkpoint.Manager // 位点管理器
+
+	checkpointCloser func() error
 
 	incrementalSyncs map[string]*syncApp.IncrementalSyncService // 增量同步服务映射
 
@@ -164,7 +168,7 @@ func NewMySQLTaskStorage(db *sql.DB, encryptKey string) *MySQLTaskStorage {
 
 	if err := s.initTable(); err != nil { // 初始化数据表
 
-		log.Printf("Warning: failed to initialize task storage table: %v", err) // 打印警告日志
+		logger.Warn("Warning: failed to initialize task storage table: %v", err) // 打印警告日志
 
 	}
 
@@ -268,7 +272,7 @@ func (s *MySQLTaskStorage) initTable() error { // 初始化数据表
 
 		if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST"); err != nil {
 
-			log.Printf("Warning: failed to add pk_id column: %v", err) // 打印警告日志
+			logger.Warn("Warning: failed to add pk_id column: %v", err) // 打印警告日志
 
 		}
 
@@ -284,7 +288,7 @@ func (s *MySQLTaskStorage) initTable() error { // 初始化数据表
 
 		if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"); err != nil {
 
-			log.Printf("Warning: failed to add created_at column: %v", err) // 打印警告日志
+			logger.Warn("Warning: failed to add created_at column: %v", err) // 打印警告日志
 
 		}
 
@@ -300,7 +304,7 @@ func (s *MySQLTaskStorage) initTable() error { // 初始化数据表
 
 		if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD UNIQUE KEY uk_task_id (id)"); err != nil {
 
-			log.Printf("Warning: failed to add uk_task_id index: %v", err) // 打印警告日志
+			logger.Warn("Warning: failed to add uk_task_id index: %v", err) // 打印警告日志
 
 		}
 
@@ -430,14 +434,14 @@ func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 
 			if unmarshalErr := json.Unmarshal(data, &task); unmarshalErr != nil { // 反序列化任务
 
-				log.Printf("Warning: failed to unmarshal task: %v", unmarshalErr) // 打印警告日志
+				logger.Warn("Warning: failed to unmarshal task: %v", unmarshalErr) // 打印警告日志
 
 				continue // 跳过错误行
 
 			}
 
 			if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil { // 解密密码
-				log.Printf("Warning: failed to decrypt task passwords: %v", decErr)
+				logger.Warn("Warning: failed to decrypt task passwords: %v", decErr)
 			}
 
 			fallbackTasks = append(fallbackTasks, &task) // 添加到任务列表
@@ -475,7 +479,7 @@ func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 		task.Config.StorageID = storageID // 设置存储ID
 
 		if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil { // 解密密码
-			log.Printf("Warning: failed to decrypt task passwords: %v", decErr)
+			logger.Warn("Warning: failed to decrypt task passwords: %v", decErr)
 		}
 
 		tasks = append(tasks, &task) // 添加到任务列表
@@ -483,6 +487,79 @@ func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 	}
 
 	return tasks, nil // 返回任务列表
+
+}
+
+func newTaskStorageFromConfig(cfg *config.Config) (TaskStorage, func() error, string, error) {
+
+	encryptKey := ""
+
+	if cfg != nil {
+
+		encryptKey = cfg.Security.EncryptKey
+
+	}
+
+	if cfg != nil && cfg.Storage.Mode == "mysql" {
+
+		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage, encryptKey)
+
+		if err != nil {
+
+			return nil, nil, "", err
+
+		}
+
+		return storage, storage.db.Close, "mysql", nil
+
+	}
+
+	dataDir := "data"
+
+	if cfg != nil && cfg.Storage.DataDir != "" {
+
+		dataDir = cfg.Storage.DataDir
+
+	}
+
+	return NewFileTaskStorage(dataDir, encryptKey), nil, "file", nil
+
+}
+
+func newCheckpointManagerFromConfig(cfg *config.Config) (checkpoint.Manager, func() error, string, error) {
+
+	if cfg != nil && cfg.Redis.Host != "" {
+
+		rdb := redis.NewClient(&redis.Options{
+
+			Addr: fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
+
+			Password: cfg.Redis.Password,
+
+			DB: cfg.Redis.DB,
+		})
+
+		return checkpoint.NewRedisCheckpointManager(rdb, "dts:checkpoint"), rdb.Close, "redis", nil
+
+	}
+
+	return checkpoint.NewMemoryCheckpointManager(), nil, "memory", nil
+
+}
+
+func closeResource(closer func() error, resourceName string) {
+
+	if closer == nil {
+
+		return
+
+	}
+
+	if err := closer(); err != nil {
+
+		logger.Warn("Warning: failed to close %s: %v", resourceName, err)
+
+	}
 
 }
 
@@ -506,61 +583,47 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 	// 初始化存储后端
 
-	if cfg.Storage.Mode == "mysql" { // 检查存储模式是否为MySQL
+	storage, storageCloser, storageType, err := newTaskStorageFromConfig(cfg)
 
-		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage, cfg.Security.EncryptKey) // 创建MySQL存储
+	if err != nil {
+
+		logger.Warn("Warning: failed to initialize storage: %v, falling back to file storage", err)
+
+		storage, storageCloser, storageType, err = newTaskStorageFromConfig(&config.Config{Storage: config.StorageConfig{Mode: "file"}})
 
 		if err != nil {
 
-			log.Printf("Warning: failed to initialize MySQL storage: %v, falling back to file storage", err) // 打印警告日志
-
-			ts.storage = NewFileTaskStorage("data", cfg.Security.EncryptKey) // 降级为文件存储
-
-		} else {
-
-			ts.storage = storage // 使用MySQL存储
-
-			log.Println("Using MySQL task storage") // 打印日志
+			logger.Fatal("%v", err)
 
 		}
 
-	} else {
-
-		ts.storage = NewFileTaskStorage("data", cfg.Security.EncryptKey) // 使用文件存储
-
-		log.Println("Using file task storage") // 打印日志
-
 	}
+
+	ts.storage = storage
+	ts.storageCloser = storageCloser
+	logger.Info("Using %s task storage", storageType)
 
 	// 初始化位点管理器
 
-	if cfg != nil && cfg.Redis.Host != "" { // 检查Redis配置
+	checkpointManager, checkpointCloser, checkpointType, err := newCheckpointManagerFromConfig(cfg)
 
-		// 使用Redis位点管理器
+	if err != nil {
 
-		rdb := redis.NewClient(&redis.Options{ // 创建Redis客户端
+		logger.Warn("Warning: failed to initialize checkpoint manager: %v, falling back to memory checkpoint manager", err)
 
-			Addr: fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port), // 设置地址
+		checkpointManager, checkpointCloser, checkpointType, err = newCheckpointManagerFromConfig(nil)
 
-			Password: cfg.Redis.Password, // 设置密码
+		if err != nil {
 
-			DB: cfg.Redis.DB, // 设置数据库
+			logger.Fatal("%v", err)
 
-		})
-
-		ts.checkpointManager = checkpoint.NewRedisCheckpointManager(rdb, "dts:checkpoint") // 创建Redis检查点管理器
-
-		log.Println("Using Redis checkpoint manager") // 打印日志
-
-	} else {
-
-		// 使用内存位点管理器
-
-		ts.checkpointManager = checkpoint.NewMemoryCheckpointManager() // 创建内存检查点管理器
-
-		log.Println("Using in-memory checkpoint manager") // 打印日志
+		}
 
 	}
+
+	ts.checkpointManager = checkpointManager
+	ts.checkpointCloser = checkpointCloser
+	logger.Info("Using %s checkpoint manager", checkpointType)
 
 	// 加载已保存的任务
 
@@ -603,6 +666,7 @@ func NewTaskServiceWithDB(sourceDB, targetDB *sql.DB, analyzer service.IdentityA
 	// 初始化位点管理器（默认使用内存）
 
 	ts.checkpointManager = checkpoint.NewMemoryCheckpointManager() // 创建内存检查点管理器
+	ts.checkpointCloser = nil
 
 	ts.loadTasks() // 加载任务
 
@@ -637,27 +701,25 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 
 	// 初始化存储后端
 
-	if cfg.Storage.Mode == "mysql" {
+	storage, storageCloser, storageType, err := newTaskStorageFromConfig(cfg)
 
-		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage, cfg.Security.EncryptKey)
+	if err != nil {
+
+		logger.Warn("Warning: failed to initialize storage: %v, falling back to file storage", err)
+
+		storage, storageCloser, storageType, err = newTaskStorageFromConfig(&config.Config{Storage: config.StorageConfig{Mode: "file"}})
 
 		if err != nil {
 
-			log.Printf("Warning: failed to initialize MySQL storage: %v, falling back to file storage", err)
-
-			ts.storage = NewFileTaskStorage("data", cfg.Security.EncryptKey)
-
-		} else {
-
-			ts.storage = storage
+			logger.Fatal("%v", err)
 
 		}
 
-	} else {
-
-		ts.storage = NewFileTaskStorage("data", cfg.Security.EncryptKey)
-
 	}
+
+	ts.storage = storage
+	ts.storageCloser = storageCloser
+	logger.Info("Using %s task storage", storageType)
 
 	// 初始化只读管理器
 
@@ -665,32 +727,25 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 
 	// 初始化位点管理器
 
-	if cfg.Redis.Host != "" {
+	checkpointManager, checkpointCloser, checkpointType, err := newCheckpointManagerFromConfig(cfg)
 
-		// 使用Redis位点管理器
+	if err != nil {
 
-		rdb := redis.NewClient(&redis.Options{
+		logger.Warn("Warning: failed to initialize checkpoint manager: %v, falling back to memory checkpoint manager", err)
 
-			Addr: fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
+		checkpointManager, checkpointCloser, checkpointType, err = newCheckpointManagerFromConfig(nil)
 
-			Password: cfg.Redis.Password,
+		if err != nil {
 
-			DB: cfg.Redis.DB,
-		})
+			logger.Fatal("%v", err)
 
-		ts.checkpointManager = checkpoint.NewRedisCheckpointManager(rdb, "dts:checkpoint")
-
-		log.Println("Using Redis checkpoint manager")
-
-	} else {
-
-		// 使用内存位点管理器
-
-		ts.checkpointManager = checkpoint.NewMemoryCheckpointManager()
-
-		log.Println("Using in-memory checkpoint manager")
+		}
 
 	}
+
+	ts.checkpointManager = checkpointManager
+	ts.checkpointCloser = checkpointCloser
+	logger.Info("Using %s checkpoint manager", checkpointType)
 
 	ts.loadTasks()
 
@@ -888,7 +943,7 @@ func (s *TaskService) DeleteTask(taskID string) error {
 
 	if incrSync, exists := s.incrementalSyncs[taskID]; exists {
 
-		log.Printf("[Task %s] Stopping incremental sync service before deletion", taskID)
+		logger.Info("[Task %s] Stopping incremental sync service before deletion", taskID)
 
 		incrSync.Stop()
 
@@ -920,7 +975,7 @@ func (s *TaskService) DeleteTask(taskID string) error {
 
 		if err := s.checkpointManager.Delete(context.Background(), taskID); err != nil {
 
-			log.Printf("[Task %s] Failed to delete checkpoint: %v", taskID, err)
+			logger.Error("[Task %s] Failed to delete checkpoint: %v", taskID, err)
 
 		}
 
@@ -1174,7 +1229,7 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 
 	config.ApplySyncMySQLPool(sourceDB, syncTuneFrom(s.config), true, fmt.Sprintf("task %s source", task.Config.ID))
 
-	log.Printf("[Task %s] Source database connected: %s:%d/%s", task.Config.ID, sourceConfig.Host, sourceConfig.Port, sourceConfig.Database)
+	logger.Info("[Task %s] Source database connected: %s:%d/%s", task.Config.ID, sourceConfig.Host, sourceConfig.Port, sourceConfig.Database)
 
 	// 连接目标数据库
 
@@ -1205,11 +1260,11 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 
 		if err != nil {
 
-			log.Printf("Warning: Failed to create target database: %v", err)
+			logger.Warn("Warning: Failed to create target database: %v", err)
 
 		} else {
 
-			log.Printf("Target database '%s' created or already exists", targetConfig.Database)
+			logger.Info("Target database '%s' created or already exists", targetConfig.Database)
 
 		}
 
@@ -1256,7 +1311,7 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 
 	config.ApplySyncMySQLPool(targetDB, syncTuneFrom(s.config), false, fmt.Sprintf("task %s target", task.Config.ID))
 
-	log.Printf("[Task %s] Target database connected: %s:%d/%s", task.Config.ID, targetConfig.Host, targetConfig.Port, targetConfig.Database)
+	logger.Info("[Task %s] Target database connected: %s:%d/%s", task.Config.ID, targetConfig.Host, targetConfig.Port, targetConfig.Database)
 
 	// 初始化元数据分析器（如果还没有创建）
 
@@ -1270,15 +1325,15 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 
 	if err != nil {
 
-		log.Printf("Warning: Failed to check binlog_row_image: %v", err)
+		logger.Warn("Warning: Failed to check binlog_row_image: %v", err)
 
 	} else {
 
-		log.Printf("binlog_row_image = %s", binlogImage)
+		logger.Info("binlog_row_image = %s", binlogImage)
 
 		if binlogImage != "FULL" {
 
-			log.Println("Warning: binlog_row_image is not FULL. Incremental sync for no-PK tables may not work correctly.")
+			logger.Warn("Warning: binlog_row_image is not FULL. Incremental sync for no-PK tables may not work correctly.")
 
 		}
 
@@ -1315,23 +1370,23 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 
 	enableReadOnly := task.Config.EnableReadOnly
 
-	log.Printf("[Task %s] Starting sync, mode: %s, tables: %v", taskID, task.Config.Mode, task.Config.Tables)
+	logger.Info("[Task %s] Starting sync, mode: %s, tables: %v", taskID, task.Config.Mode, task.Config.Tables)
 
 	// 在同步开始前，若任务开启了只读管理，临时关闭目标库只读以允许数据写入
 
 	if enableReadOnly && runtime != nil && runtime.readOnlyManager != nil {
 
-		log.Printf("[Task %s] 正在临时关闭目标实例只读以进行同步...", taskID)
+		logger.Info("[Task %s] 正在临时关闭目标实例只读以进行同步...", taskID)
 
 		if err := runtime.readOnlyManager.SetReadOnly(); err != nil {
 
-			log.Printf("[Task %s] 警告: 关闭只读失败: %v", taskID, err)
+			logger.Warn("[Task %s] 警告: 关闭只读失败: %v", taskID, err)
 
 			// 记录错误但继续执行同步
 
 		} else {
 
-			log.Printf("[Task %s] 目标实例只读已临时关闭，同步结束后自动恢复", taskID)
+			logger.Info("[Task %s] 目标实例只读已临时关闭，同步结束后自动恢复", taskID)
 
 		}
 
@@ -1343,15 +1398,15 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 
 		if enableReadOnly && runtime != nil && runtime.readOnlyManager != nil {
 
-			log.Printf("[Task %s] 正在恢复目标实例只读状态...", taskID)
+			logger.Info("[Task %s] 正在恢复目标实例只读状态...", taskID)
 
 			if err := runtime.readOnlyManager.RestoreReadOnly(); err != nil {
 
-				log.Printf("[Task %s] 警告: 恢复只读状态失败: %v", taskID, err)
+				logger.Warn("[Task %s] 警告: 恢复只读状态失败: %v", taskID, err)
 
 			} else {
 
-				log.Printf("[Task %s] 目标实例用户权限已恢复", taskID)
+				logger.Info("[Task %s] 目标实例用户权限已恢复", taskID)
 
 			}
 
@@ -1525,7 +1580,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 			if err != nil {
 
-				log.Printf("[Task %s] Failed to get tables for %s: %v", taskID, p.src, err)
+				logger.Error("[Task %s] Failed to get tables for %s: %v", taskID, p.src, err)
 
 				continue
 
@@ -1593,7 +1648,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 	s.completeTask(taskID)
 
-	log.Printf("[Task %s] Full sync completed, total rows: %d", taskID, totalRows)
+	logger.Info("[Task %s] Full sync completed, total rows: %d", taskID, totalRows)
 
 	return nil
 
@@ -1715,7 +1770,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 	if len(tables) == 0 {
 
-		log.Printf("[Task %s] 库级别同步：正在获取数据库 %s 的所有表...", taskID, sourceSchema)
+		logger.Info("[Task %s] 库级别同步：正在获取数据库 %s 的所有表...", taskID, sourceSchema)
 
 		allTables, err := runtime.analyzer.GetAllTables(sourceSchema)
 
@@ -1735,7 +1790,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		log.Printf("[Task %s] 找到 %d 个表: %v", taskID, len(tables), tables)
+		logger.Info("[Task %s] 找到 %d 个表: %v", taskID, len(tables), tables)
 
 	}
 
@@ -1757,7 +1812,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 		savedIndexes []map[string]interface{}
 	}
 
-	log.Printf("[Task %s] 阶段1: 同步 %d 个表结构...", taskID, len(tables))
+	logger.Info("[Task %s] 阶段1: 同步 %d 个表结构...", taskID, len(tables))
 
 	ready := make([]tableReady, 0, len(tables))
 
@@ -1769,7 +1824,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		log.Printf("[Task %s] 确保目标表: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
+		logger.Info("[Task %s] 确保目标表: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
 
 		identity, err := runtime.analyzer.AnalyzeTable(sourceSchema, tableName)
 
@@ -1795,13 +1850,13 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		log.Printf("[Task %s] Target table %s.%s is ready", taskID, targetSchema, tableName)
+		logger.Info("[Task %s] Target table %s.%s is ready", taskID, targetSchema, tableName)
 
 		ready = append(ready, tableReady{name: tableName, identity: identity, savedIndexes: savedIndexes})
 
 	}
 
-	log.Printf("[Task %s] 阶段1完成：%d 个表结构就绪，开始同步数据...", taskID, len(ready))
+	logger.Info("[Task %s] 阶段1完成：%d 个表结构就绪，开始同步数据...", taskID, len(ready))
 
 	// === 阶段2：并发同步所有表数据 ===
 
@@ -1823,7 +1878,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				if r := recover(); r != nil {
 
-					log.Printf("[Task %s] Critical: Table %s sync panicked: %v\n%s", taskID, tableName, r, debug.Stack())
+					logger.Error("[Task %s] Critical: Table %s sync panicked: %v\n%s", taskID, tableName, r, debug.Stack())
 
 					errChan <- fmt.Errorf("table %s panic: %v", tableName, r)
 
@@ -1841,25 +1896,25 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			}
 
-			log.Printf("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
+			logger.Info("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
 
 			savedIndexes := append([]map[string]interface{}(nil), preparedIndexes...)
 
 			if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
 
-				log.Printf("[Task %s] Dropping non-primary indexes for table %s...", taskID, tableName)
+				logger.Info("[Task %s] Dropping non-primary indexes for table %s...", taskID, tableName)
 
 				indexes, err := s.dropNonPrimaryKeyIndexes(runtime, targetSchema, tableName)
 
 				if err != nil {
 
-					log.Printf("[Task %s] Warning: Failed to drop indexes for %s: %v", taskID, tableName, err)
+					logger.Warn("[Task %s] Warning: Failed to drop indexes for %s: %v", taskID, tableName, err)
 
 				} else {
 
 					savedIndexes = indexes
 
-					log.Printf("[Task %s] Dropped %d indexes from %s", taskID, len(savedIndexes), tableName)
+					logger.Info("[Task %s] Dropped %d indexes from %s", taskID, len(savedIndexes), tableName)
 
 				}
 
@@ -1871,7 +1926,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if task.Config.BatchSize > 0 && int64(task.Config.BatchSize) != readLimit {
 
-				log.Printf("[Task %s] Table %s.%s: batch_size=%d capped to read limit %d per round-trip",
+				logger.Info("[Task %s] Table %s.%s: batch_size=%d capped to read limit %d per round-trip",
 
 					taskID, sourceSchema, tableName, task.Config.BatchSize, readLimit)
 
@@ -1883,7 +1938,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if readLimit != readLimitBefore {
 
-				log.Printf("[Task %s] Table %s.%s: wide columns (json/blob/text) detected, read batch %d -> %d rows per round-trip",
+				logger.Info("[Task %s] Table %s.%s: wide columns (json/blob/text) detected, read batch %d -> %d rows per round-trip",
 
 					taskID, sourceSchema, tableName, readLimitBefore, readLimit)
 
@@ -1901,7 +1956,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if task.Config.IntraTableWorkerCount > 0 {
 
-				log.Printf("[Task %s] Table %s.%s: intra_table_worker_count effective=%d (table-level worker_count=%d)",
+				logger.Info("[Task %s] Table %s.%s: intra_table_worker_count effective=%d (table-level worker_count=%d)",
 
 					taskID, sourceSchema, tableName, intraWorkers, workerCount)
 
@@ -1942,7 +1997,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						len(identity.IdentifyCols) >= 1 && intraWorkers > 1
 
-					log.Printf("[Task %s] Cannot get numeric PK range for %s.%s, trying sample parallel", taskID, sourceSchema, tableName)
+					logger.Info("[Task %s] Cannot get numeric PK range for %s.%s, trying sample parallel", taskID, sourceSchema, tableName)
 
 				}
 
@@ -1961,7 +2016,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					canParallelSample = false
 
-					log.Printf("[Task %s] Skipping sample parallel for %s.%s", taskID, sourceSchema, tableName)
+					logger.Info("[Task %s] Skipping sample parallel for %s.%s", taskID, sourceSchema, tableName)
 
 				} else {
 
@@ -1973,7 +2028,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						canParallelSample = false
 
-						log.Printf("[Task %s] Boundary sampling failed for %s.%s: %v", taskID, sourceSchema, tableName, bErr)
+						logger.Info("[Task %s] Boundary sampling failed for %s.%s: %v", taskID, sourceSchema, tableName, bErr)
 
 					}
 
@@ -1993,7 +2048,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					errMsg := fmt.Sprintf("Failed to get write connection for %s: %v", tableName, err)
 
-					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -2105,7 +2160,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -2127,7 +2182,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						errMsg := fmt.Sprintf("Write failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -2149,7 +2204,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						errMsg := fmt.Sprintf("Final commit failed for `%s`.`%s` (from %s): %v", sourceSchema, tableName, txStartMark, err)
 
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -2167,7 +2222,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				// 真正的keyset分页：每个worker从上一个worker的结束位置开始
 
-				log.Printf("[Task %s] Table %s.%s: parallel keyset sync workers=%d",
+				logger.Info("[Task %s] Table %s.%s: parallel keyset sync workers=%d",
 
 					taskID, sourceSchema, tableName, intraWorkers)
 
@@ -2187,7 +2242,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						errMsg := fmt.Sprintf("Failed to prepare parallel consistent snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -2212,7 +2267,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							errMsg := fmt.Sprintf("Failed to get numeric PK range in snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
-							log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+							logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 							s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -2224,7 +2279,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					}
 
-					log.Printf("[Task %s] Table %s.%s: parallel consistent snapshot enabled with %d workers",
+					logger.Info("[Task %s] Table %s.%s: parallel consistent snapshot enabled with %d workers",
 
 						taskID, sourceSchema, tableName, intraWorkers)
 
@@ -2248,7 +2303,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				chunkSize := (span + int64(intraWorkers) - 1) / int64(intraWorkers)
 
-				log.Printf("[Task %s] Table %s.%s: numeric range split min=%d max=%d workers=%d chunk=%d",
+				logger.Info("[Task %s] Table %s.%s: numeric range split min=%d max=%d workers=%d chunk=%d",
 
 					taskID, sourceSchema, tableName, minPK, maxPK, intraWorkers, chunkSize)
 
@@ -2387,7 +2442,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 									if isRetryableLockError(e) && attempt < parallelWriteMaxRetries {
 										backoff := time.Duration(1+attempt) * time.Second
-										log.Printf("[Task %s] w%d lock contention at %s, retry %d/%d after %v: %v",
+										logger.Info("[Task %s] w%d lock contention at %s, retry %d/%d after %v: %v",
 											taskID, wIdx, mark, attempt+1, parallelWriteMaxRetries, backoff, e)
 										select {
 										case <-ctx.Done():
@@ -2451,7 +2506,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							if len(batch) == 0 {
 
-								log.Printf("[Task %s] w%d reached end of data at %v", taskID, wIdx, lastID)
+								logger.Info("[Task %s] w%d reached end of data at %v", taskID, wIdx, lastID)
 
 								break
 
@@ -2493,7 +2548,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 								if cutIdx < len(batch) {
 
-									log.Printf("[Task %s] w%d cutting %d rows that exceed boundary %v", taskID, wIdx, len(batch)-cutIdx, endBoundary)
+									logger.Info("[Task %s] w%d cutting %d rows that exceed boundary %v", taskID, wIdx, len(batch)-cutIdx, endBoundary)
 
 									batch = batch[:cutIdx]
 
@@ -2513,7 +2568,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							lastPK := batch[len(batch)-1][identity.IdentifyCols[0]]
 
-							log.Printf("[Task %s] w%d processing batch: %s (%d rows) from %v to %v",
+							logger.Info("[Task %s] w%d processing batch: %s (%d rows) from %v to %v",
 
 								taskID, wIdx, rangeMark, len(batch), firstPK, lastPK)
 
@@ -2541,7 +2596,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							if endBoundary != nil && comparePKValues(lastID, endBoundary) >= 0 {
 
-								log.Printf("[Task %s] w%d reached boundary %v at %v", taskID, wIdx, endBoundary, lastID)
+								logger.Info("[Task %s] w%d reached boundary %v at %v", taskID, wIdx, endBoundary, lastID)
 
 								break
 
@@ -2577,7 +2632,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					errMsg := fmt.Sprintf("Parallel range sync failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
-					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -2595,7 +2650,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				pkCol := identity.IdentifyCols[0]
 
-				log.Printf("[Task %s] Table %s.%s: parallel sample sync pk=%s workers=%d",
+				logger.Info("[Task %s] Table %s.%s: parallel sample sync pk=%s workers=%d",
 					taskID, sourceSchema, tableName, pkCol, intraWorkers)
 
 				var syncWg sync.WaitGroup
@@ -2714,7 +2769,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 									if isRetryableLockError(e) && attempt < parallelWriteMaxRetries {
 										backoff := time.Duration(1+attempt) * time.Second
-										log.Printf("[Task %s] w%d lock contention at %s, retry %d/%d after %v: %v",
+										logger.Info("[Task %s] w%d lock contention at %s, retry %d/%d after %v: %v",
 											taskID, wIdx, mark, attempt+1, parallelWriteMaxRetries, backoff, e)
 										select {
 										case <-ctx.Done():
@@ -2875,7 +2930,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					errMsg := fmt.Sprintf("Parallel sample sync failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
-					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -2897,7 +2952,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					errMsg := fmt.Sprintf("Failed to get write connection for %s: %v", tableName, err)
 
-					log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -3011,7 +3066,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						errMsg := fmt.Sprintf("Failed to read batch for `%s`.`%s` via keyset: %v", sourceSchema, tableName, err)
 
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -3055,7 +3110,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						errMsg := fmt.Sprintf("Write failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -3077,7 +3132,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						errMsg := fmt.Sprintf("Final commit failed for `%s`.`%s` (from %s): %v", sourceSchema, tableName, txStartMark, err)
 
-						log.Printf("[Task %s] ERROR: %s", taskID, errMsg)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
@@ -3095,21 +3150,21 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if task.Config.OptimizeIndex && len(savedIndexes) > 0 {
 
-				log.Printf("[Task %s] Restoring indexes for table %s...", taskID, tableName)
+				logger.Info("[Task %s] Restoring indexes for table %s...", taskID, tableName)
 
 				if err := s.restoreIndexes(runtime, targetSchema, tableName, savedIndexes); err != nil {
 
-					log.Printf("[Task %s] Warning: Failed to restore indexes for %s: %v", taskID, tableName, err)
+					logger.Warn("[Task %s] Warning: Failed to restore indexes for %s: %v", taskID, tableName, err)
 
 				} else {
 
-					log.Printf("[Task %s] Restored indexes for table %s", taskID, tableName)
+					logger.Info("[Task %s] Restored indexes for table %s", taskID, tableName)
 
 				}
 
 			}
 
-			log.Printf("[Task %s] Table %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, tableProcessedRows)
+			logger.Info("[Task %s] Table %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, tableProcessedRows)
 
 		}(r.name, r.identity, r.savedIndexes)
 
@@ -3137,7 +3192,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil || runtime.analyzer == nil {
 
-		log.Printf("[Task %s] Error: runtime is nil, cannot start incremental sync", taskID)
+		logger.Error("[Task %s] Error: runtime is nil, cannot start incremental sync", taskID)
 
 		s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, "task runtime is nil")
 
@@ -3151,7 +3206,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	if cfg == nil {
 
-		log.Printf("[Task %s] Error: config is nil, cannot start incremental sync", taskID)
+		logger.Error("[Task %s] Error: config is nil, cannot start incremental sync", taskID)
 
 		s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, "config is nil")
 
@@ -3199,7 +3254,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	}
 
-	log.Printf("[Task %s] Starting incremental sync for schema: %s, tables: %v", taskID, sourceSchema, task.Config.Tables)
+	logger.Info("[Task %s] Starting incremental sync for schema: %s, tables: %v", taskID, sourceSchema, task.Config.Tables)
 
 	// 确定目标 schema（与 executeFullSync 保持一致）
 
@@ -3265,7 +3320,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	if err := incrSync.Start(ctx, taskID, syncConfig); err != nil {
 
-		log.Printf("[Task %s] Failed to start incremental sync: %v", taskID, err)
+		logger.Error("[Task %s] Failed to start incremental sync: %v", taskID, err)
 
 		s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, err.Error())
 
@@ -3273,7 +3328,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	}
 
-	log.Printf("[Task %s] Incremental sync started successfully", taskID)
+	logger.Info("[Task %s] Incremental sync started successfully", taskID)
 
 }
 
@@ -3356,7 +3411,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		}
 
-		log.Printf("[Task] Target database '%s' created", targetSchema)
+		logger.Info("[Task] Target database '%s' created", targetSchema)
 
 	} else if err != nil {
 
@@ -3379,7 +3434,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		// 表已存在，不需要创建
 
-		log.Printf("[Task] Target table %s.%s already exists, skipping creation", targetSchema, tableName)
+		logger.Info("[Task] Target table %s.%s already exists, skipping creation", targetSchema, tableName)
 
 		return nil, nil
 
@@ -3395,7 +3450,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	// 表不存在，创建它
 
-	log.Printf("[Task] Creating target table %s.%s (from %s.%s)", targetSchema, tableName, sourceSchema, tableName)
+	logger.Info("[Task] Creating target table %s.%s (from %s.%s)", targetSchema, tableName, sourceSchema, tableName)
 
 	// 方法1：尝试使用源数据库连接在目标库创建表（源和目标在同一服务器时有效）
 
@@ -3413,13 +3468,13 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		if tryErr == nil {
 
-			log.Printf("[Task] Successfully created target table %s.%s (using source DB connection)", targetSchema, tableName)
+			logger.Info("[Task] Successfully created target table %s.%s (using source DB connection)", targetSchema, tableName)
 
 			return nil, nil
 
 		}
 
-		log.Printf("[Task] Failed to create table using source DB connection: %v", tryErr)
+		logger.Error("[Task] Failed to create table using source DB connection: %v", tryErr)
 
 	}
 
@@ -3481,7 +3536,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	}
 
-	log.Printf("[Task] Successfully created target table %s.%s (using CREATE TABLE statement)", targetSchema, tableName)
+	logger.Info("[Task] Successfully created target table %s.%s (using CREATE TABLE statement)", targetSchema, tableName)
 
 	return savedIndexes, nil
 
@@ -3729,7 +3784,7 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *t
 
 	}
 
-	log.Printf("Dynamic boundary sampling: totalRows=%d, workers=%d, pkCols=%v, boundaries=%v",
+	logger.Info("Dynamic boundary sampling: totalRows=%d, workers=%d, pkCols=%v, boundaries=%v",
 
 		totalRows, n, pkCols, boundaries)
 
@@ -4276,7 +4331,7 @@ func (s *TaskService) PauseTask(taskID string) error {
 
 	if incrSync, exists := s.incrementalSyncs[taskID]; exists {
 
-		log.Printf("[Task %s] Stopping incremental sync service", taskID)
+		logger.Info("[Task %s] Stopping incremental sync service", taskID)
 
 		incrSync.Stop()
 
@@ -4421,7 +4476,7 @@ func NewFileTaskStorage(dataDir string, encryptKeys ...string) *FileTaskStorage 
 
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 
-		log.Printf("Warning: failed to create data directory: %v", err)
+		logger.Warn("Warning: failed to create data directory: %v", err)
 
 	}
 
@@ -4562,7 +4617,7 @@ func (s *FileTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 
 		if err != nil {
 
-			log.Printf("Warning: failed to read task file %s: %v", file.Name(), err)
+			logger.Warn("Warning: failed to read task file %s: %v", file.Name(), err)
 
 			continue
 
@@ -4572,14 +4627,14 @@ func (s *FileTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 
 		if err := json.Unmarshal(data, &task); err != nil {
 
-			log.Printf("Warning: failed to unmarshal task file %s: %v", file.Name(), err)
+			logger.Warn("Warning: failed to unmarshal task file %s: %v", file.Name(), err)
 
 			continue
 
 		}
 
 		if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil { // 解密密码
-			log.Printf("Warning: failed to decrypt task passwords in file %s: %v", file.Name(), decErr)
+			logger.Warn("Warning: failed to decrypt task passwords in file %s: %v", file.Name(), decErr)
 		}
 
 		tasks = append(tasks, &task)
@@ -4598,13 +4653,13 @@ func (s *TaskService) Close() error {
 
 	defer s.mu.Unlock()
 
-	log.Println("Closing task service...")
+	logger.Info("Closing task service...")
 
 	// 1. 停止所有增量同步服务
 
 	for taskID, incrSync := range s.incrementalSyncs {
 
-		log.Printf("[Task %s] Stopping incremental sync service", taskID)
+		logger.Info("[Task %s] Stopping incremental sync service", taskID)
 
 		incrSync.Stop()
 
@@ -4630,7 +4685,7 @@ func (s *TaskService) Close() error {
 
 			task.Pause()
 
-			log.Printf("[Task %s] Task paused due to service shutdown", taskID)
+			logger.Info("[Task %s] Task paused due to service shutdown", taskID)
 
 		}
 
@@ -4638,11 +4693,17 @@ func (s *TaskService) Close() error {
 
 		if err := s.storage.Save(task); err != nil {
 
-			log.Printf("[Task %s] Failed to save task state: %v", taskID, err)
+			logger.Info("[Task %s] Failed to save task state: %v", taskID, err)
 
 		}
 
 	}
+
+	closeResource(s.checkpointCloser, "checkpoint manager")
+	s.checkpointCloser = nil
+
+	closeResource(s.storageCloser, "task storage")
+	s.storageCloser = nil
 
 	// 3. 关闭审计日志器
 
@@ -4650,13 +4711,13 @@ func (s *TaskService) Close() error {
 
 		if err := s.auditLogger.Close(); err != nil {
 
-			log.Printf("Failed to close audit logger: %v", err)
+			logger.Info("Failed to close audit logger: %v", err)
 
 		}
 
 	}
 
-	log.Println("Task service closed successfully")
+	logger.Info("Task service closed successfully")
 
 	return nil
 
@@ -4720,7 +4781,7 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 
 		if err := rows.Scan(ptrs...); err != nil {
 
-			log.Printf("Warning: failed to scan index row: %v", err)
+			logger.Warn("Warning: failed to scan index row: %v", err)
 
 			continue
 
@@ -4846,13 +4907,13 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 		if err != nil {
 
-			log.Printf("Warning: failed to drop index %s: %v", name, err)
+			logger.Warn("Warning: failed to drop index %s: %v", name, err)
 
 			continue
 
 		}
 
-		log.Printf("Dropped index %s from table %s.%s", name, schema, tableName)
+		logger.Info("Dropped index %s from table %s.%s", name, schema, tableName)
 
 	}
 
@@ -4878,7 +4939,7 @@ func (s *TaskService) restoreIndexes(runtime *taskRuntime, schema, tableName str
 
 	}
 
-	log.Printf("[Task] Restoring %d indexes for table %s.%s...", len(indexes), schema, tableName)
+	logger.Info("[Task] Restoring %d indexes for table %s.%s...", len(indexes), schema, tableName)
 
 	for _, indexInfo := range indexes {
 
@@ -4923,13 +4984,13 @@ func (s *TaskService) restoreIndexes(runtime *taskRuntime, schema, tableName str
 
 		if err != nil {
 
-			log.Printf("Warning: failed to create index %s: %v (SQL: %s)", indexName, err, createSQL)
+			logger.Warn("Warning: failed to create index %s: %v (SQL: %s)", indexName, err, createSQL)
 
 			continue
 
 		}
 
-		log.Printf("Created index %s on table %s.%s", indexName, schema, tableName)
+		logger.Info("Created index %s on table %s.%s", indexName, schema, tableName)
 
 	}
 
@@ -4941,43 +5002,57 @@ func (s *TaskService) restoreIndexes(runtime *taskRuntime, schema, tableName str
 
 func (s *TaskService) ReinitStorage(cfg *config.Config) error {
 
-	var newStorage TaskStorage
+	newStorage, newStorageCloser, storageType, err := newTaskStorageFromConfig(cfg)
 
-	if cfg.Storage.Mode == "mysql" {
+	if err != nil {
 
-		storage, err := NewMySQLTaskStorageFromConfig(&cfg.Storage, cfg.Security.EncryptKey)
-
-		if err != nil {
-
-			return err
-
-		}
-
-		newStorage = storage
-
-		log.Println("Storage backend switched to MySQL")
-
-	} else {
-
-		dataDir := cfg.Storage.DataDir
-
-		if dataDir == "" {
-
-			dataDir = "data"
-
-		}
-
-		newStorage = NewFileTaskStorage(dataDir, cfg.Security.EncryptKey)
-
-		log.Println("Storage backend switched to file")
+		return err
 
 	}
 
 	s.mu.Lock()
 
+	oldStorageCloser := s.storageCloser
 	s.storage = newStorage
+	s.storageCloser = newStorageCloser
+	if cfg != nil {
+		s.config = cfg
+	}
 
 	s.mu.Unlock()
+
+	closeResource(oldStorageCloser, "task storage")
+	logger.Info("Storage backend switched to %s", storageType)
+
+	return nil
+
+}
+
+// ReinitCheckpointManager 动态切换位点管理器
+
+func (s *TaskService) ReinitCheckpointManager(cfg *config.Config) error {
+
+	newCheckpointManager, newCheckpointCloser, checkpointType, err := newCheckpointManagerFromConfig(cfg)
+
+	if err != nil {
+
+		return err
+
+	}
+
+	s.mu.Lock()
+
+	oldCheckpointCloser := s.checkpointCloser
+	s.checkpointManager = newCheckpointManager
+	s.checkpointCloser = newCheckpointCloser
+	if cfg != nil {
+		s.config = cfg
+	}
+
+	s.mu.Unlock()
+
+	closeResource(oldCheckpointCloser, "checkpoint manager")
+	logger.Info("Checkpoint manager switched to %s", checkpointType)
 
 	return nil
 

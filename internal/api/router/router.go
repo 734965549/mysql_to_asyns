@@ -69,9 +69,13 @@ func SetupRouter(taskSvc *taskService.TaskService, analyzer service.IdentityAnal
 		} // 分组结束
 
 		// 配置
-		api.GET("/config/default", taskHandler.GetDefaultConfig) // 获取默认配置路由：GET /api/config/default
-		api.POST("/config/update", taskHandler.UpdateGlobalConfig) // 更新全局配置路由：POST /api/config/update
-		api.POST("/config/test-connection", taskHandler.TestConnection) // 测试数据库连接路由：POST /api/config/test-connection
+		api.GET("/config/default", taskHandler.GetDefaultConfig)
+		api.POST("/config/update", taskHandler.UpdateGlobalConfig)
+		api.POST("/config/test-connection", taskHandler.TestConnection)
+
+		// 日志配置热加载
+		api.GET("/config/log", taskHandler.GetLogConfig)
+		api.POST("/config/log", taskHandler.UpdateLogConfig)
 
 		// 元数据
 		metadata := api.Group("/metadata") // 创建元数据路由分组

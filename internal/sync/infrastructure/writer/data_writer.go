@@ -4,7 +4,7 @@ import ( // 导入外部包和标准库
 	"context" // 导入context包，用于上下文管理
 	"database/sql" // 导入database/sql包，用于数据库操作
 	"fmt" // 导入fmt包，用于格式化输入输出
-	"log" // 导入log包，用于日志输出
+	"mysql-to-async/pkg/logger" // 导入log包，用于日志输出
 	"mysql-to-async/internal/audit" // 导入审计包
 	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
 	"sync" // 导入sync包，用于并发控制
@@ -161,7 +161,7 @@ func (w *BatchWriter) Update(ctx context.Context, row map[string]interface{}) er
 		if w.auditLogger != nil { // 如果有审计日志器
 			w.auditLogger.LogDataUpdate(w.taskID, w.schema, w.tableName, true, "no rows matched (data drift)", row) // 记录警告
 		}
-		log.Printf("[Task %s] Warning: UPDATE matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
+		logger.Warn("[Task %s] UPDATE matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
 	} else { // 否则
 		// 记录成功审计日志
 		if w.auditLogger != nil { // 如果有审计日志器
@@ -192,7 +192,7 @@ func (w *BatchWriter) UpdateWithBeforeImage(ctx context.Context, row, beforeImag
 		if w.auditLogger != nil { // 如果有审计日志器
 			w.auditLogger.LogDataUpdate(w.taskID, w.schema, w.tableName, true, "no rows matched (data drift)", row) // 记录警告
 		}
-		log.Printf("[Task %s] Warning: UPDATE (with before image) matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
+		logger.Warn("[Task %s] UPDATE (with before image) matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
 	} else { // 否则
 		if w.auditLogger != nil { // 如果有审计日志器
 			w.auditLogger.LogDataUpdate(w.taskID, w.schema, w.tableName, true, "", nil) // 记录成功日志
@@ -225,7 +225,7 @@ func (w *BatchWriter) Delete(ctx context.Context, row map[string]interface{}) er
 		if w.auditLogger != nil { // 如果有审计日志器
 			w.auditLogger.LogDataDelete(w.taskID, w.schema, w.tableName, true, "no rows matched (data drift)") // 记录警告
 		}
-		log.Printf("[Task %s] Warning: DELETE matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
+		logger.Warn("[Task %s] DELETE matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
 	} else { // 否则
 		// 记录成功审计日志
 		if w.auditLogger != nil { // 如果有审计日志器

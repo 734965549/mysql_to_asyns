@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"mysql-to-async/internal/checkpoint"
 	"mysql-to-async/internal/config"
 	"mysql-to-async/internal/metadata/domain/entity"
 	taskEntity "mysql-to-async/internal/task/domain/entity"
@@ -166,6 +167,65 @@ func TestSetEnableReadOnly(t *testing.T) {
 	// 测试设置为 true
 	ts.SetEnableReadOnly(true)
 	assert.True(t, ts.GetEnableReadOnly())
+}
+
+func TestReinitStorage_FileMode(t *testing.T) {
+	dataDir := "./test_task_service_reinit_storage_old"
+	newDataDir := "./test_task_service_reinit_storage_new"
+	defer os.RemoveAll(dataDir)
+	defer os.RemoveAll(newDataDir)
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Mode: "file", DataDir: dataDir},
+	}
+
+	ts := NewTaskService(cfg)
+	require.NotNil(t, ts)
+
+	fileStorage, ok := ts.storage.(*FileTaskStorage)
+	require.True(t, ok)
+	assert.Equal(t, dataDir, fileStorage.dataDir)
+
+	newCfg := &config.Config{
+		Storage: config.StorageConfig{Mode: "file", DataDir: newDataDir},
+	}
+
+	err := ts.ReinitStorage(newCfg)
+	require.NoError(t, err)
+
+	fileStorage, ok = ts.storage.(*FileTaskStorage)
+	require.True(t, ok)
+	assert.Equal(t, newDataDir, fileStorage.dataDir)
+	assert.Equal(t, newCfg, ts.config)
+	assert.DirExists(t, newDataDir)
+	assert.NoError(t, ts.Close())
+}
+
+func TestReinitCheckpointManager_MemoryMode(t *testing.T) {
+	dataDir := "./test_task_service_reinit_checkpoint"
+	defer os.RemoveAll(dataDir)
+
+	ts := NewTaskService(&config.Config{
+		Storage: config.StorageConfig{Mode: "file", DataDir: dataDir},
+		Redis:   config.RedisConfig{},
+	})
+	require.NotNil(t, ts)
+
+	_, ok := ts.checkpointManager.(*checkpoint.MemoryCheckpointManager)
+	require.True(t, ok)
+
+	newCfg := &config.Config{
+		Storage: config.StorageConfig{Mode: "file", DataDir: dataDir},
+		Redis:   config.RedisConfig{},
+	}
+
+	err := ts.ReinitCheckpointManager(newCfg)
+	require.NoError(t, err)
+
+	_, ok = ts.checkpointManager.(*checkpoint.MemoryCheckpointManager)
+	require.True(t, ok)
+	assert.Equal(t, newCfg, ts.config)
+	assert.NoError(t, ts.Close())
 }
 
 func TestCreateTask(t *testing.T) {
