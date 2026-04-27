@@ -116,6 +116,7 @@ type CursorReader struct { // 定义无主键表流式读取器结构体
 	identity *entity.TableIdentity // 表标识信息
 	rows     *sql.Rows             // 流式游标，第一次 ReadBatch 时打开
 	colNames []string              // 列名缓存
+	done     bool                  // 标记游标已耗尽，防止重复打开
 }
 
 // NewCursorReader 创建流式读取器函数
@@ -131,16 +132,19 @@ func NewCursorReader(db queryExecutor, schema, table string, identity *entity.Ta
 // ReadBatch 批量读取数据方法（流式：第一次调用打开游标，后续调用继续从游标读取）
 // offset 参数在流式模式下忽略（已由游标位置隐含）
 func (r *CursorReader) ReadBatch(ctx context.Context, _ /* offset */, limit int64) ([]map[string]interface{}, error) { // 批量读取数据
+	if r.done { // 游标已耗尽，直接返回空结果
+		return nil, nil
+	}
 	limit = normalizeSelectLimit(limit) // 规范化限制值
 	if r.rows == nil {                  // 如果游标未打开
 		var colParts []string                    // 创建列部分列表
 		for _, col := range r.identity.Columns { // 遍历所有列
 			colParts = append(colParts, selectExprForColumn(col)) // 添加列表达式
 		}
-		// 添加 LIMIT 子句，避免一次性加载整表到内存
-		query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` LIMIT ?", strings.Join(colParts, ", "), r.schema, r.table) // 构建查询
-		rows, err := r.db.QueryContext(ctx, query, limit)                                                         // 执行查询
-		if err != nil {                                                                                           // 如果查询失败
+		// 不加 LIMIT：游标通过 Next() 逐行消费，批量大小由外层 limit 参数控制
+		query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`", strings.Join(colParts, ", "), r.schema, r.table) // 构建全表查询
+		rows, err := r.db.QueryContext(ctx, query)                                                        // 执行查询
+		if err != nil {                                                                                   // 如果查询失败
 			return nil, fmt.Errorf("打开流式游标失败: %v, SQL: %s", err, query) // 返回错误
 		}
 		r.rows = rows                    // 保存游标
@@ -158,6 +162,7 @@ func (r *CursorReader) ReadBatch(ctx context.Context, _ /* offset */, limit int6
 			}
 			_ = r.rows.Close() // 关闭游标
 			r.rows = nil       // 清空游标
+			r.done = true      // 标记已完成，防止重新打开游标
 			break              // 退出循环
 		}
 		values := make([]interface{}, len(r.colNames))    // 创建值列表
