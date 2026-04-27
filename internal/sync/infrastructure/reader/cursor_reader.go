@@ -104,8 +104,10 @@ type DataReader interface { // 定义数据读取器接口
 	ReadBatch(ctx context.Context, offset, limit int64) ([]map[string]interface{}, error) // 批量读取数据
 	// ReadBatchByKeys 批量读取数据（基于主键范围，优化深分页）方法
 	ReadBatchByKeys(ctx context.Context, lastID interface{}, limit int64) ([]map[string]interface{}, error) // 基于主键批量读取
-	// GetTotalCount 获取总行数方法
+	// GetTotalCount 获取总行数方法（精确，可能慢）
 	GetTotalCount(ctx context.Context) (int64, error) // 获取总行数
+	// GetEstimatedCount 通过 information_schema 快速获取估算行数（毫秒级，有误差）
+	GetEstimatedCount(ctx context.Context) (int64, error) // 获取估算行数
 }
 
 // CursorReader 无主键表流式读取器（单次全表扫描，避免 OFFSET 深翻页）
@@ -193,6 +195,14 @@ func (r *CursorReader) GetTotalCount(ctx context.Context) (int64, error) { // �
 	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", r.schema, r.table) // 构建查询
 	err := r.db.QueryRowContext(ctx, query).Scan(&count)                      // 执行查询
 	return count, err                                                         // 返回计数和错误
+}
+
+// GetEstimatedCount 通过 information_schema 快速获取估算行数
+func (r *CursorReader) GetEstimatedCount(ctx context.Context) (int64, error) {
+	var count int64
+	query := "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+	err := r.db.QueryRowContext(ctx, query, r.schema, r.table).Scan(&count)
+	return count, err
 }
 
 // scanRows 扫描行数据方法
@@ -347,6 +357,14 @@ func (r *RangeShardingReader) GetTotalCount(ctx context.Context) (int64, error) 
 	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", r.schema, r.table) // 构建查询
 	err := r.db.QueryRowContext(ctx, query).Scan(&count)                      // 执行查询
 	return count, err                                                         // 返回计数和错误
+}
+
+// GetEstimatedCount 通过 information_schema 快速获取估算行数
+func (r *RangeShardingReader) GetEstimatedCount(ctx context.Context) (int64, error) {
+	var count int64
+	query := "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+	err := r.db.QueryRowContext(ctx, query, r.schema, r.table).Scan(&count)
+	return count, err
 }
 
 // scanRows 扫描行数据方法

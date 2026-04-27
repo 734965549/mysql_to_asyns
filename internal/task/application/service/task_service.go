@@ -1560,9 +1560,17 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 	}
 
-	// 计算所有库的总行数
+	// 快速估算所有库的总行数（使用 information_schema，毫秒级返回）
 
-	var totalRows int64
+	var estimatedRows int64
+
+	type tableEntry struct {
+		schema   string
+		table    string
+		identity *entity.TableIdentity
+	}
+
+	var allTableEntries []tableEntry
 
 	for _, p := range pairs {
 
@@ -1604,9 +1612,11 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 			}
 
+			allTableEntries = append(allTableEntries, tableEntry{schema: p.src, table: tableName, identity: identity})
+
 			r := reader.NewReader(runtime.sourceDB, p.src, tableName, identity)
 
-			count, err := r.GetTotalCount(ctx)
+			count, err := r.GetEstimatedCount(ctx)
 
 			if err != nil {
 
@@ -1614,13 +1624,36 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 			}
 
-			totalRows += count
+			estimatedRows += count
 
 		}
 
 	}
 
-	s.updateTaskTotalRows(taskID, totalRows)
+	// 先用估算值快速启动，让前端立即看到进度
+	s.updateTaskTotalRows(taskID, estimatedRows)
+
+	logger.Info("[Task %s] Fast estimated total rows: %d (via information_schema)", taskID, estimatedRows)
+
+	// 后台异步获取精确行数，完成后更新（不阻塞同步启动）
+	go func() {
+		var preciseTotal int64
+		for _, entry := range allTableEntries {
+			if s.isTaskStopped(taskID) {
+				return
+			}
+			r := reader.NewReader(runtime.sourceDB, entry.schema, entry.table, entry.identity)
+			count, err := r.GetTotalCount(context.Background())
+			if err != nil {
+				continue
+			}
+			preciseTotal += count
+		}
+		if !s.isTaskStopped(taskID) {
+			s.updateTaskTotalRows(taskID, preciseTotal)
+			logger.Info("[Task %s] Precise total rows updated: %d (via COUNT(*))", taskID, preciseTotal)
+		}
+	}()
 
 	// 依次同步每个库（库间串行，库内表间并行）
 
@@ -1648,7 +1681,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 	s.completeTask(taskID)
 
-	logger.Info("[Task %s] Full sync completed, total rows: %d", taskID, totalRows)
+	logger.Info("[Task %s] Full sync completed, estimated rows: %d", taskID, estimatedRows)
 
 	return nil
 
