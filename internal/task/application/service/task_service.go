@@ -3452,13 +3452,24 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	logger.Info("[Task] Creating target table %s.%s (from %s.%s)", targetSchema, tableName, sourceSchema, tableName)
 
-	// 方法1：尝试使用源数据库连接在目标库创建表（源和目标在同一服务器时有效）
+	// 获取一个专用目标连接，临时关闭外键检查，避免因父表尚未创建而导致 DDL 失败
+	tgtDDLConn, tgtConnErr := targetDB.Conn(context.Background())
+	if tgtConnErr != nil {
+		return nil, fmt.Errorf("failed to get target connection for DDL: %v", tgtConnErr)
+	}
+	defer func() {
+		tgtDDLConn.ExecContext(context.Background(), "SET SESSION FOREIGN_KEY_CHECKS=1")
+		tgtDDLConn.Close()
+	}()
+	tgtDDLConn.ExecContext(context.Background(), "SET SESSION FOREIGN_KEY_CHECKS=0")
+
+	// 方法1：尝试在已禁用外键检查的目标连接上用 CREATE TABLE ... LIKE 创建表（源和目标在同一服务器时有效）
 
 	if sourceDB != nil && !optimizeIndex {
 
 		tryErr := s.withDDL(runtime, func() error {
 
-			_, e := sourceDB.Exec(fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
+			_, e := tgtDDLConn.ExecContext(context.Background(), fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
 
 				targetSchema, tableName, sourceSchema, tableName))
 
@@ -3468,13 +3479,13 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		if tryErr == nil {
 
-			logger.Info("[Task] Successfully created target table %s.%s (using source DB connection)", targetSchema, tableName)
+			logger.Info("[Task] Successfully created target table %s.%s (using CREATE TABLE LIKE)", targetSchema, tableName)
 
 			return nil, nil
 
 		}
 
-		logger.Error("[Task] Failed to create table using source DB connection: %v", tryErr)
+		logger.Error("[Task] Failed to create table using CREATE TABLE LIKE: %v", tryErr)
 
 	}
 
@@ -3524,9 +3535,10 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		extractTableDefinition(createSQL))
 
+	// 在已关闭外键检查的专用连接上执行 DDL
 	if err = s.withDDL(runtime, func() error {
 
-		_, e := targetDB.Exec(createSQL)
+		_, e := tgtDDLConn.ExecContext(context.Background(), createSQL)
 
 		return e
 

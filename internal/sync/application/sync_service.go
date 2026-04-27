@@ -33,6 +33,8 @@ type IncrementalSyncService struct {
 
 	targetDB *sql.DB
 
+	writeConn *sql.Conn // 专用写入连接，已禁用外键检查
+
 	analyzer service.IdentityAnalyzer
 
 	checkpointMgr checkpoint.Manager
@@ -149,6 +151,18 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 
 	}
 
+	// 获取专用写入连接并关闭外键检查，避免有外键的表在增量同步时报错
+	writeConn, err := s.targetDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get write connection: %w", err)
+	}
+	s.writeConn = writeConn
+	if _, err := writeConn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0"); err != nil {
+		writeConn.Close()
+		s.writeConn = nil
+		return fmt.Errorf("failed to disable foreign key checks: %w", err)
+	}
+
 	// 初始化表的标识信息和写入器
 
 	for srcDB, tgtDB := range dbMapping {
@@ -189,11 +203,11 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 
 			key := fmt.Sprintf("%s.%s", srcDB, tableName)
 
-			// 创建写入器（使用TargetSchema确保数据写入正确的目标库）
+			// 创建写入器（使用专用连接确保外键检查已关闭）
 
-			bw := writer.NewBufferedWriterWithSchema(
+			bw := writer.NewBufferedWriterWithConn(
 
-				s.targetDB,
+				writeConn,
 
 				identity,
 
@@ -287,6 +301,13 @@ func (s *IncrementalSyncService) Stop() {
 
 		w.Close()
 
+	}
+
+	// 恢复外键检查并关闭写入连接
+	if s.writeConn != nil {
+		s.writeConn.ExecContext(context.Background(), "SET SESSION FOREIGN_KEY_CHECKS=1")
+		s.writeConn.Close()
+		s.writeConn = nil
 	}
 
 	// 安全关闭审计通道
@@ -536,7 +557,7 @@ func (h *syncEventHandler) handleInsert(event *binlog.BinlogEvent, w *writer.Buf
 
 func (h *syncEventHandler) handleUpdate(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity, targetSchema string) error {
 
-	batchWriter := writer.NewBatchWriterWithSchema(h.service.targetDB, identity, 1000, targetSchema)
+	batchWriter := writer.NewBatchWriterWithConn(h.service.writeConn, identity, 1000, targetSchema)
 
 	for i, row := range event.Rows {
 
@@ -572,7 +593,7 @@ func (h *syncEventHandler) handleUpdate(event *binlog.BinlogEvent, w *writer.Buf
 
 func (h *syncEventHandler) handleDelete(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity, targetSchema string) error {
 
-	batchWriter := writer.NewBatchWriterWithSchema(h.service.targetDB, identity, 1000, targetSchema)
+	batchWriter := writer.NewBatchWriterWithConn(h.service.writeConn, identity, 1000, targetSchema)
 
 	for _, row := range event.Rows {
 
