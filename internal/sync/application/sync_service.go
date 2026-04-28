@@ -152,12 +152,12 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 	}
 
 	// 获取专用写入连接并关闭外键检查，避免有外键的表在增量同步时报错
-	writeConn, err := s.targetDB.Conn(ctx)
+	writeConn, err := s.targetDB.Conn(s.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get write connection: %w", err)
 	}
 	s.writeConn = writeConn
-	if _, err := writeConn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0"); err != nil {
+	if _, err := writeConn.ExecContext(s.ctx, "SET SESSION FOREIGN_KEY_CHECKS=0"); err != nil {
 		writeConn.Close()
 		s.writeConn = nil
 		return fmt.Errorf("failed to disable foreign key checks: %w", err)
@@ -234,8 +234,7 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 
 	// 获取保存的位点
 
-	pos, err := s.checkpointMgr.GetPosition(ctx, taskID)
-
+	pos, err := s.checkpointMgr.GetPosition(s.ctx, taskID)
 	if err != nil {
 
 		logger.Warn("failed to get checkpoint: %v", err)
@@ -275,7 +274,7 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 
 	// 启动订阅
 
-	return s.subscriber.Start(ctx, pos)
+	return s.subscriber.Start(s.ctx, pos)
 
 }
 

@@ -86,6 +86,53 @@ func newDefaultConfig() *config.Config {
 	}
 }
 
+func TestResolveSourceSchema(t *testing.T) {
+	t.Run("prefers task source db database", func(t *testing.T) {
+		ts := NewTaskService(&config.Config{
+			Storage:    config.StorageConfig{Mode: "file", DataDir: t.TempDir()},
+			Datasource: config.DatasourceConfig{Database: "config_db"},
+		})
+		defer ts.Close()
+
+		task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+			ID:           "task-source-db",
+			SourceSchema: "task_schema",
+			SourceDB: &taskEntity.DatabaseConfig{
+				Database: "source_db_override",
+			},
+		})
+
+		assert.Equal(t, "source_db_override", ts.resolveSourceSchema(task))
+	})
+
+	t.Run("falls back to task source schema", func(t *testing.T) {
+		ts := NewTaskService(&config.Config{
+			Storage:    config.StorageConfig{Mode: "file", DataDir: t.TempDir()},
+			Datasource: config.DatasourceConfig{Database: "config_db"},
+		})
+		defer ts.Close()
+
+		task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+			ID:           "task-schema",
+			SourceSchema: "task_schema",
+		})
+
+		assert.Equal(t, "task_schema", ts.resolveSourceSchema(task))
+	})
+
+	t.Run("falls back to config datasource database", func(t *testing.T) {
+		ts := NewTaskService(&config.Config{
+			Storage:    config.StorageConfig{Mode: "file", DataDir: t.TempDir()},
+			Datasource: config.DatasourceConfig{Database: "config_db"},
+		})
+		defer ts.Close()
+
+		task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "config-fallback"})
+
+		assert.Equal(t, "config_db", ts.resolveSourceSchema(task))
+	})
+}
+
 func TestNewTaskService(t *testing.T) {
 	dataDir := "./test_task_service"
 	defer os.RemoveAll(dataDir)

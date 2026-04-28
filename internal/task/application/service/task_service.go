@@ -54,6 +54,9 @@ import (
 
 	taskEntity "mysql-to-async/internal/task/domain/entity" // 任务实体包
 
+	// MySQL binlog 位置
+
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/redis/go-redis/v9" // Redis 客户端
 )
 
@@ -1085,6 +1088,42 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 
 }
 
+func (s *TaskService) resolveSourceSchema(task *taskEntity.SyncTask) string {
+
+	if task != nil && task.Config.SourceDB != nil {
+
+		if dbName := strings.TrimSpace(task.Config.SourceDB.Database); dbName != "" {
+
+			return dbName
+
+		}
+
+	}
+
+	if task != nil {
+
+		if schema := strings.TrimSpace(task.Config.SourceSchema); schema != "" {
+
+			return schema
+
+		}
+
+	}
+
+	if s != nil && s.config != nil {
+
+		if schema := strings.TrimSpace(s.config.Datasource.Database); schema != "" {
+
+			return schema
+
+		}
+
+	}
+
+	return ""
+
+}
+
 // initDatabaseConnections 初始化数据库连接（每次任务启动都重建，确保连接指向正确的库）
 
 func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskRuntime, error) {
@@ -1113,6 +1152,8 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 
 	// 确定源数据库配置
 
+	resolvedSourceSchema := s.resolveSourceSchema(task)
+
 	sourceConfig := task.Config.SourceDB
 
 	if sourceConfig == nil && s.config != nil {
@@ -1125,7 +1166,7 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 
 			Port: s.config.Datasource.Port,
 
-			Database: task.Config.SourceSchema,
+			Database: resolvedSourceSchema,
 
 			Username: s.config.Datasource.Username,
 
@@ -1137,6 +1178,22 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 	if sourceConfig == nil {
 
 		return nil, fmt.Errorf("source database config is required")
+
+	}
+
+	if strings.TrimSpace(sourceConfig.Database) == "" {
+
+		clonedSourceConfig := *sourceConfig
+
+		clonedSourceConfig.Database = resolvedSourceSchema
+
+		sourceConfig = &clonedSourceConfig
+
+	}
+
+	if strings.TrimSpace(sourceConfig.Database) == "" {
+
+		return nil, fmt.Errorf("source schema is required")
 
 	}
 
@@ -1171,7 +1228,7 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 
 		if targetSchema == "" {
 
-			targetSchema = sourceConfig.Database
+			targetSchema = resolvedSourceSchema
 
 		}
 
@@ -1502,11 +1559,11 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		// 单库模式（兼容旧逻辑）
 
-		src := task.Config.SourceSchema
+		resolvedSourceSchema := s.resolveSourceSchema(task)
 
-		if src == "" {
+		if resolvedSourceSchema == "" {
 
-			src = "test"
+			return fmt.Errorf("source schema is required for single-database sync")
 
 		}
 
@@ -1514,11 +1571,11 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		if dst == "" {
 
-			dst = src
+			dst = resolvedSourceSchema
 
 		}
 
-		pairs = append(pairs, dbPair{src, dst})
+		pairs = append(pairs, dbPair{resolvedSourceSchema, dst})
 
 	}
 
@@ -1531,6 +1588,10 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		if defaultSource == "" && len(task.Config.SourceDatabases) > 0 {
 
 			defaultSource = task.Config.SourceDatabases[0]
+
+		} else if defaultSource == "" {
+
+			defaultSource = s.resolveSourceSchema(task)
 
 		}
 
@@ -1655,6 +1716,86 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		}
 	}()
 
+	// === 全局一致性快照：在任何数据读取之前统一建立 ===
+	var globalSnapshot *globalSnapshotState
+	if task.Config.EnableConsistentSnapshot {
+		workerCount := task.Config.WorkerCount
+		if workerCount <= 0 {
+			workerCount = 4
+		}
+		legacyCap, hardMax := s.intraTableConcurrencyCaps()
+		intraWorkers := taskEntity.EffectiveIntraTableWorkers(task.Config.IntraTableWorkerCount, workerCount, legacyCap, hardMax)
+
+		// 计算每张表需要的快照连接数
+		var snapshotEntries []struct {
+			schema   string
+			table    string
+			numConns int
+		}
+		for _, entry := range allTableEntries {
+			n := 1 // 默认单连接
+			// 有可用主键且 intraWorkers > 1 时分配多连接（并行路径会用到）
+			if entry.identity.Strategy != entity.FullColumnsStrategy && len(entry.identity.IdentifyCols) >= 1 && intraWorkers > 1 {
+				n = intraWorkers
+			}
+			snapshotEntries = append(snapshotEntries, struct {
+				schema   string
+				table    string
+				numConns int
+			}{schema: entry.schema, table: entry.table, numConns: n})
+		}
+
+		logger.Info("[Task %s] Preparing global consistent snapshot for %d tables...", taskID, len(snapshotEntries))
+		var err error
+		globalSnapshot, err = s.prepareGlobalSnapshot(ctx, runtime, snapshotEntries)
+		if err != nil {
+			errMsg := fmt.Sprintf("Failed to prepare global consistent snapshot: %v", err)
+			logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
+			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		defer s.releaseGlobalSnapshot(globalSnapshot)
+	}
+
+	// === 记录 binlog 位点，供后续增量同步使用 ===
+	// 无论是否启用一致性快照，都在全量同步开始前记录 binlog 位点，
+	// 确保后续增量同步可以从正确位置开始，不会丢失全量期间的变更。
+	// 位点存储到 Redis（如果有配置）或程序内存（兜底）。
+	{
+		var binlogPos mysql.Position
+		if globalSnapshot != nil {
+			// 使用全局快照中 FTWRL 期间获取的精确位点
+			binlogPos = globalSnapshot.binlogPos
+		} else {
+			// 未启用快照时，直接查询当前 master 位点作为增量起点
+			var binlogFile, binlogDoDB, binlogIgnoreDB, executedGtidSet string
+			var pos uint32
+			err := runtime.sourceDB.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
+				&binlogFile, &pos, &binlogDoDB, &binlogIgnoreDB, &executedGtidSet,
+			)
+			if err != nil {
+				// 尝试 4 列格式（MySQL 5.6 及以下）
+				err = runtime.sourceDB.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
+					&binlogFile, &pos, &binlogDoDB, &binlogIgnoreDB,
+				)
+			}
+			if err != nil {
+				logger.Warn("[Task %s] Warning: failed to query master binlog position: %v", taskID, err)
+			} else {
+				binlogPos = mysql.Position{Name: binlogFile, Pos: pos}
+			}
+		}
+
+		if binlogPos.Name != "" {
+			if err := s.checkpointManager.SavePosition(ctx, taskID, binlogPos); err != nil {
+				logger.Warn("[Task %s] Warning: failed to save binlog position for incremental sync: %v", taskID, err)
+			} else {
+				logger.Info("[Task %s] Binlog position saved for incremental sync: %s:%d",
+					taskID, binlogPos.Name, binlogPos.Pos)
+			}
+		}
+	}
+
 	// 依次同步每个库（库间串行，库内表间并行）
 
 	for _, p := range pairs {
@@ -1671,7 +1812,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		}
 
-		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src]); err != nil {
+		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], globalSnapshot); err != nil {
 
 			return err
 
@@ -1793,7 +1934,7 @@ func adjustReadLimitForWideColumns(base int64, identity *entity.TableIdentity) i
 
 // syncDatabasePair 同步单个源库到目标库（含全部或指定表）
 
-func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string) error {
+func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, snapshot *globalSnapshotState) error {
 
 	taskID := task.Config.ID
 
@@ -1927,6 +2068,16 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				return
 
+			}
+
+			// 从全局快照中获取本表的预分配快照连接
+			tableKey := sourceSchema + "." + tableName
+			var tableSnapshotConns []*sql.Conn
+			if snapshot != nil {
+				if conns, ok := snapshot.tableConns[tableKey]; ok {
+					tableSnapshotConns = conns
+					logger.Info("[Task %s] Table %s: using %d pre-allocated global snapshot connections", taskID, tableKey, len(conns))
+				}
 			}
 
 			logger.Info("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
@@ -2177,7 +2328,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
-				dr := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
+				// 优先使用全局快照连接读取，保证一致性
+				var fullColReadSource sourceQueryer = runtime.sourceDB
+				if len(tableSnapshotConns) > 0 {
+					fullColReadSource = tableSnapshotConns[0]
+				}
+				dr := reader.NewReader(fullColReadSource, sourceSchema, tableName, identity)
 
 				for {
 
@@ -2265,56 +2421,33 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				var atomicProcessed int64
 
-				var workerSnapshotConns []*sql.Conn
+				// 使用全局快照的预分配连接（不再各表自行 FTWRL）
+				workerSnapshotConns := tableSnapshotConns
 
-				if task.Config.EnableConsistentSnapshot {
+				if len(workerSnapshotConns) > 0 {
 
-					conns, err := s.prepareConsistentSnapshotReaders(ctx, runtime, intraWorkers)
+					if err := workerSnapshotConns[0].QueryRowContext(ctx,
 
-					if err != nil {
+						fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
 
-						errMsg := fmt.Sprintf("Failed to prepare parallel consistent snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
+							identity.IdentifyCols[0], identity.IdentifyCols[0], sourceSchema, tableName),
+					).Scan(&minPK, &maxPK); err != nil || maxPK < minPK {
+
+						errMsg := fmt.Sprintf("Failed to get numeric PK range in snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
 						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
 						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 
-						errChan <- err
+						errChan <- fmt.Errorf("snapshot range failed: %w", err)
 
 						return
 
 					}
 
-					workerSnapshotConns = conns
+					logger.Info("[Task %s] Table %s.%s: using global snapshot connections (%d workers)",
 
-					defer s.releaseConsistentSnapshotReaders(workerSnapshotConns)
-
-					if len(workerSnapshotConns) > 0 {
-
-						if err := workerSnapshotConns[0].QueryRowContext(ctx,
-
-							fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
-
-								identity.IdentifyCols[0], identity.IdentifyCols[0], sourceSchema, tableName),
-						).Scan(&minPK, &maxPK); err != nil || maxPK < minPK {
-
-							errMsg := fmt.Sprintf("Failed to get numeric PK range in snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
-
-							logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
-
-							s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
-
-							errChan <- fmt.Errorf("snapshot range failed: %w", err)
-
-							return
-
-						}
-
-					}
-
-					logger.Info("[Task %s] Table %s.%s: parallel consistent snapshot enabled with %d workers",
-
-						taskID, sourceSchema, tableName, intraWorkers)
+						taskID, sourceSchema, tableName, len(workerSnapshotConns))
 
 				}
 
@@ -2360,7 +2493,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						readSource := sourceQueryer(runtime.sourceDB)
 
-						if len(workerSnapshotConns) == intraWorkers {
+						if wIdx < len(workerSnapshotConns) {
 
 							readSource = workerSnapshotConns[wIdx]
 
@@ -2840,7 +2973,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}
 
-						wReader := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
+						// 优先使用全局快照连接
+						var sampleReadSource sourceQueryer = runtime.sourceDB
+						if wIdx < len(tableSnapshotConns) {
+							sampleReadSource = tableSnapshotConns[wIdx]
+						}
+						wReader := reader.NewReader(sampleReadSource, sourceSchema, tableName, identity)
 
 						lastID := startBoundary
 
@@ -3081,7 +3219,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
-				dr := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
+				// 优先使用全局快照连接读取，保证一致性
+				var fallbackReadSource sourceQueryer = runtime.sourceDB
+				if len(tableSnapshotConns) > 0 {
+					fallbackReadSource = tableSnapshotConns[0]
+				}
+				dr := reader.NewReader(fallbackReadSource, sourceSchema, tableName, identity)
 
 				var lastID interface{}
 
@@ -3249,6 +3392,8 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	// 获取源数据库配置
 
+	resolvedSourceSchema := s.resolveSourceSchema(task)
+
 	sourceHost := cfg.Datasource.Host
 
 	sourcePort := cfg.Datasource.Port
@@ -3256,8 +3401,6 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 	sourceUsername := cfg.Datasource.Username
 
 	sourcePassword := cfg.Datasource.Password
-
-	sourceSchema := task.Config.SourceSchema
 
 	// 如果任务配置中有自定义源数据库，使用任务配置
 
@@ -3271,23 +3414,19 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 		sourcePassword = task.Config.SourceDB.Password
 
-		if task.Config.SourceDB.Database != "" {
+	}
 
-			sourceSchema = task.Config.SourceDB.Database
+	if resolvedSourceSchema == "" && len(task.Config.SourceDatabases) == 0 {
 
-		}
+		logger.Error("[Task %s] Error: source schema is required for single-database incremental sync", taskID)
+
+		s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, "source schema is required for single-database incremental sync")
+
+		return
 
 	}
 
-	// 如果没有指定schema，使用默认值
-
-	if sourceSchema == "" {
-
-		sourceSchema = "test"
-
-	}
-
-	logger.Info("[Task %s] Starting incremental sync for schema: %s, tables: %v", taskID, sourceSchema, task.Config.Tables)
+	logger.Info("[Task %s] Starting incremental sync for schema: %s, tables: %v", taskID, resolvedSourceSchema, task.Config.Tables)
 
 	// 确定目标 schema（与 executeFullSync 保持一致）
 
@@ -3295,7 +3434,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	if targetSchema == "" {
 
-		targetSchema = sourceSchema
+		targetSchema = resolvedSourceSchema
 
 	}
 
@@ -3313,7 +3452,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 		SourcePassword: sourcePassword,
 
-		SourceSchema: sourceSchema,
+		SourceSchema: resolvedSourceSchema,
 
 		TargetSchema: targetSchema,
 
@@ -3847,6 +3986,139 @@ func min(a, b int) int {
 
 	return b
 
+}
+
+// globalSnapshotState 全局一致性快照状态，在全量同步开始前统一建立，确保所有表读取到同一时刻的数据，
+// 并记录 binlog 位点以便后续增量同步从正确位置开始。
+type globalSnapshotState struct {
+	binlogPos  mysql.Position         // FTWRL 期间通过 SHOW MASTER STATUS 获取的 binlog 位点
+	tableConns map[string][]*sql.Conn // "schema.table" → 预创建的快照连接
+}
+
+// prepareGlobalSnapshot 在全量同步开始前一次性建立全局一致性快照：
+//  1. FLUSH TABLES WITH READ LOCK（阻止所有写入）
+//  2. SHOW MASTER STATUS 记录 binlog 位点
+//  3. 为每张表创建 N 个快照连接（START TRANSACTION WITH CONSISTENT SNAPSHOT）
+//  4. UNLOCK TABLES
+//
+// 所有快照连接在同一个 FTWRL 窗口内建立，因此看到完全一致的数据视图。
+func (s *TaskService) prepareGlobalSnapshot(
+	ctx context.Context,
+	runtime *taskRuntime,
+	tableEntries []struct {
+		schema   string
+		table    string
+		numConns int
+	},
+) (*globalSnapshotState, error) {
+
+	if runtime == nil || runtime.sourceDB == nil {
+		return nil, fmt.Errorf("task runtime source db is not initialized")
+	}
+
+	// 1. 获取锁连接
+	lockConn, err := runtime.sourceDB.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get lock connection failed: %w", err)
+	}
+
+	// 2. FLUSH TABLES WITH READ LOCK
+	if _, err := lockConn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
+		lockConn.Close()
+		return nil, fmt.Errorf("acquire global read lock failed: %w", err)
+	}
+
+	// 3. SHOW MASTER STATUS 获取 binlog 位点
+	var binlogFile, binlogDoDB, binlogIgnoreDB, executedGtidSet string
+	var binlogPos uint32
+	if err := lockConn.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
+		&binlogFile, &binlogPos, &binlogDoDB, &binlogIgnoreDB, &executedGtidSet,
+	); err != nil {
+		// 尝试 4 列格式（MySQL 5.6 及以下）
+		if err2 := lockConn.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
+			&binlogFile, &binlogPos, &binlogDoDB, &binlogIgnoreDB,
+		); err2 != nil {
+			lockConn.ExecContext(context.Background(), "UNLOCK TABLES")
+			lockConn.Close()
+			return nil, fmt.Errorf("show master status failed (5col: %v, 4col: %v)", err, err2)
+		}
+	}
+
+	state := &globalSnapshotState{
+		binlogPos:  mysql.Position{Name: binlogFile, Pos: binlogPos},
+		tableConns: make(map[string][]*sql.Conn),
+	}
+
+	// cleanup 在出错时回滚并关闭所有已创建的快照连接
+	cleanup := func() {
+		for _, conns := range state.tableConns {
+			for _, c := range conns {
+				if c != nil {
+					c.ExecContext(context.Background(), "ROLLBACK")
+					c.Close()
+				}
+			}
+		}
+		lockConn.ExecContext(context.Background(), "UNLOCK TABLES")
+		lockConn.Close()
+	}
+
+	// 4. 为每张表创建快照连接
+	for _, entry := range tableEntries {
+		key := entry.schema + "." + entry.table
+		n := entry.numConns
+		if n < 1 {
+			n = 1
+		}
+		conns := make([]*sql.Conn, 0, n)
+		for i := 0; i < n; i++ {
+			conn, err := runtime.sourceDB.Conn(ctx)
+			if err != nil {
+				cleanup()
+				return nil, fmt.Errorf("get snapshot connection for %s[%d] failed: %w", key, i, err)
+			}
+			if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+				conn.Close()
+				cleanup()
+				return nil, fmt.Errorf("set isolation for %s[%d] failed: %w", key, i, err)
+			}
+			if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"); err != nil {
+				conn.Close()
+				cleanup()
+				return nil, fmt.Errorf("start snapshot for %s[%d] failed: %w", key, i, err)
+			}
+			conns = append(conns, conn)
+		}
+		state.tableConns[key] = conns
+	}
+
+	// 5. UNLOCK TABLES — 所有快照连接已建立，写入可恢复
+	if _, err := lockConn.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("unlock tables failed: %w", err)
+	}
+	lockConn.Close()
+
+	logger.Info("[GlobalSnapshot] Established: binlog=%s:%d, tables=%d",
+		binlogFile, binlogPos, len(state.tableConns))
+
+	return state, nil
+}
+
+// releaseGlobalSnapshot 释放全局快照的所有连接
+func (s *TaskService) releaseGlobalSnapshot(state *globalSnapshotState) {
+	if state == nil {
+		return
+	}
+	for key, conns := range state.tableConns {
+		for _, c := range conns {
+			if c != nil {
+				c.ExecContext(context.Background(), "ROLLBACK")
+				c.Close()
+			}
+		}
+		logger.Info("[GlobalSnapshot] Released %d connections for %s", len(conns), key)
+	}
 }
 
 func (s *TaskService) prepareConsistentSnapshotReaders(ctx context.Context, runtime *taskRuntime, workers int) ([]*sql.Conn, error) {
