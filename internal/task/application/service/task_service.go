@@ -111,6 +111,8 @@ type taskRuntime struct {
 	analyzer service.IdentityAnalyzer
 
 	readOnlyManager *readonly.ReadOnlyManager
+
+	cancel context.CancelFunc
 }
 
 func (r *taskRuntime) Close() {
@@ -118,6 +120,12 @@ func (r *taskRuntime) Close() {
 	if r == nil {
 
 		return
+
+	}
+
+	if r.cancel != nil {
+
+		r.cancel()
 
 	}
 
@@ -1072,7 +1080,9 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 
 	// 因为 HTTP 请求完成后 context 会被取消
 
-	syncCtx := context.Background()
+	syncCtx, syncCancel := context.WithCancel(context.Background())
+
+	runtime.cancel = syncCancel
 
 	execSync := s.executeSyncFn
 
@@ -1481,13 +1491,11 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 
 		if err := s.executeFullSync(ctx, task, runtime); err != nil {
 
-			if s.isTaskStopped(taskID) {
+			s.failTaskUnlessCancelled(ctx, taskID, err.Error())
 
-				return
+		} else {
 
-			}
-
-			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, err.Error())
+			s.completeTask(taskID)
 
 		}
 
@@ -1503,9 +1511,9 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 
 			s.executeIncrementalSync(ctx, task, runtime)
 
-		} else if !s.isTaskStopped(taskID) {
+		} else {
 
-			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, err.Error())
+			s.failTaskUnlessCancelled(ctx, taskID, err.Error())
 
 		}
 
@@ -1751,7 +1759,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		if err != nil {
 			errMsg := fmt.Sprintf("Failed to prepare global consistent snapshot: %v", err)
 			logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
-			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 			return fmt.Errorf("%s", errMsg)
 		}
 		defer s.releaseGlobalSnapshot(globalSnapshot)
@@ -1819,8 +1827,6 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		}
 
 	}
-
-	s.completeTask(taskID)
 
 	logger.Info("[Task %s] Full sync completed, estimated rows: %d", taskID, estimatedRows)
 
@@ -1952,7 +1958,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			errMsg := fmt.Sprintf("Failed to get tables for database %s: %v", sourceSchema, err)
 
-			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 			return fmt.Errorf("%s", errMsg)
 
@@ -2006,7 +2012,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			errMsg := fmt.Sprintf("Failed to analyze table %s: %v", tableName, err)
 
-			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 			return fmt.Errorf("%s", errMsg)
 
@@ -2018,7 +2024,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s: %v", targetSchema, tableName, err)
 
-			s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 			return fmt.Errorf("%s", errMsg)
 
@@ -2234,7 +2240,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 					errChan <- err
 
@@ -2351,7 +2357,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 						errChan <- err
 
@@ -2373,7 +2379,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 						errChan <- err
 
@@ -2395,7 +2401,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 						errChan <- err
 
@@ -2437,7 +2443,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 						errChan <- fmt.Errorf("snapshot range failed: %w", err)
 
@@ -2800,7 +2806,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 					errChan <- err
 
@@ -3103,7 +3109,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 					errChan <- err
 
@@ -3125,7 +3131,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-					s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 					errChan <- err
 
@@ -3244,7 +3250,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 						errChan <- err
 
@@ -3288,7 +3294,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 						errChan <- err
 
@@ -3310,7 +3316,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
 
-						s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
+						s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
 						errChan <- err
 
@@ -3494,7 +3500,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 		logger.Error("[Task %s] Failed to start incremental sync: %v", taskID, err)
 
-		s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, err.Error())
+		s.failTaskUnlessCancelled(ctx, taskID, err.Error())
 
 		return
 
@@ -4606,6 +4612,16 @@ func (s *TaskService) updateTaskStatus(taskID string, status taskEntity.TaskStat
 
 	}
 
+}
+
+// failTaskUnlessCancelled 仅当不是主动取消/暂停时才标记 FAILED。
+// 暂停或停止会先 cancel ctx，DB 调用返回 context.Canceled 属于正常中断，不应记为失败。
+func (s *TaskService) failTaskUnlessCancelled(ctx context.Context, taskID, errMsg string) {
+	if ctx.Err() != nil || s.isTaskStopped(taskID) {
+		logger.Info("[Task %s] Ignoring error during shutdown: %s", taskID, errMsg)
+		return
+	}
+	s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 }
 
 // completeTask 完成任务
