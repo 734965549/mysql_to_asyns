@@ -1734,28 +1734,15 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		legacyCap, hardMax := s.intraTableConcurrencyCaps()
 		intraWorkers := taskEntity.EffectiveIntraTableWorkers(task.Config.IntraTableWorkerCount, workerCount, legacyCap, hardMax)
 
-		// 计算每张表需要的快照连接数
-		var snapshotEntries []struct {
-			schema   string
-			table    string
-			numConns int
-		}
-		for _, entry := range allTableEntries {
-			n := 1 // 默认单连接
-			// 有可用主键且 intraWorkers > 1 时分配多连接（并行路径会用到）
-			if entry.identity.Strategy != entity.FullColumnsStrategy && len(entry.identity.IdentifyCols) >= 1 && intraWorkers > 1 {
-				n = intraWorkers
-			}
-			snapshotEntries = append(snapshotEntries, struct {
-				schema   string
-				table    string
-				numConns int
-			}{schema: entry.schema, table: entry.table, numConns: n})
+		// 全局共享连接池大小 = intraWorkers（所有表共享，不再按表预分配）
+		poolSize := intraWorkers
+		if poolSize > 32 {
+			poolSize = 32
 		}
 
-		logger.Info("[Task %s] Preparing global consistent snapshot for %d tables...", taskID, len(snapshotEntries))
+		logger.Info("[Task %s] Preparing global consistent snapshot pool (size=%d) for %d tables...", taskID, poolSize, len(allTableEntries))
 		var err error
-		globalSnapshot, err = s.prepareGlobalSnapshot(ctx, runtime, snapshotEntries)
+		globalSnapshot, err = s.prepareGlobalSnapshot(ctx, runtime, poolSize)
 		if err != nil {
 			errMsg := fmt.Sprintf("Failed to prepare global consistent snapshot: %v", err)
 			logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
@@ -2076,14 +2063,8 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			}
 
-			// 从全局快照中获取本表的预分配快照连接
-			tableKey := sourceSchema + "." + tableName
-			var tableSnapshotConns []*sql.Conn
 			if snapshot != nil {
-				if conns, ok := snapshot.tableConns[tableKey]; ok {
-					tableSnapshotConns = conns
-					logger.Info("[Task %s] Table %s: using %d pre-allocated global snapshot connections", taskID, tableKey, len(conns))
-				}
+				logger.Info("[Task %s] Table %s.%s: will borrow snapshot connections from global pool (size=%d)", taskID, sourceSchema, tableName, snapshot.poolSize)
 			}
 
 			logger.Info("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
@@ -2174,7 +2155,22 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if canParallelRange {
 
-				if err := runtime.sourceDB.QueryRowContext(ctx,
+				// 优先使用快照连接查询 MIN/MAX，保证一致性
+				var rangeQuerySource sourceQueryer = runtime.sourceDB
+				var rangeQueryConn *sql.Conn
+				if snapshot != nil {
+					if c, err := snapshot.Borrow(ctx); err == nil {
+						rangeQuerySource = c
+						rangeQueryConn = c
+					} else {
+						errMsg := fmt.Sprintf("borrow snapshot conn for PK range query on %s.%s: %v", sourceSchema, tableName, err)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
+						errChan <- fmt.Errorf("%s", errMsg)
+						return
+					}
+				}
+
+				if err := rangeQuerySource.QueryRowContext(ctx,
 
 					fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
 
@@ -2191,15 +2187,34 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
+				if rangeQueryConn != nil {
+					snapshot.Return(rangeQueryConn)
+				}
+
 			}
 
 			var sampleBoundaries []interface{}
 
 			if canParallelSample {
 
+				// 优先使用快照连接进行采样查询，保证一致性
+				var sampleQuerySource sourceQueryer = runtime.sourceDB
+				var sampleQueryConn *sql.Conn
+				if snapshot != nil {
+					if c, err := snapshot.Borrow(ctx); err == nil {
+						sampleQuerySource = c
+						sampleQueryConn = c
+					} else {
+						errMsg := fmt.Sprintf("borrow snapshot conn for sample query on %s.%s: %v", sourceSchema, tableName, err)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
+						errChan <- fmt.Errorf("%s", errMsg)
+						return
+					}
+				}
+
 				var totalRows int64
 
-				if qErr := runtime.sourceDB.QueryRowContext(ctx,
+				if qErr := sampleQuerySource.QueryRowContext(ctx,
 
 					fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", sourceSchema, tableName),
 				).Scan(&totalRows); qErr != nil || totalRows < int64(intraWorkers)*2 {
@@ -2212,7 +2227,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					var bErr error
 
-					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime, sourceSchema, tableName, identity.IdentifyCols, totalRows, intraWorkers)
+					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, sampleQuerySource, sourceSchema, tableName, identity.IdentifyCols, totalRows, intraWorkers)
 
 					if bErr != nil {
 
@@ -2222,6 +2237,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					}
 
+				}
+
+				if sampleQueryConn != nil {
+					snapshot.Return(sampleQueryConn)
 				}
 
 			}
@@ -2336,8 +2355,16 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				// 优先使用全局快照连接读取，保证一致性
 				var fullColReadSource sourceQueryer = runtime.sourceDB
-				if len(tableSnapshotConns) > 0 {
-					fullColReadSource = tableSnapshotConns[0]
+				if snapshot != nil {
+					sc, err := snapshot.Borrow(ctx)
+					if err != nil {
+						errMsg := fmt.Sprintf("borrow snapshot conn for full-columns read on %s.%s: %v", sourceSchema, tableName, err)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
+						errChan <- fmt.Errorf("%s", errMsg)
+						return
+					}
+					fullColReadSource = sc
+					defer snapshot.Return(sc)
 				}
 				dr := reader.NewReader(fullColReadSource, sourceSchema, tableName, identity)
 
@@ -2427,35 +2454,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				var atomicProcessed int64
 
-				// 使用全局快照的预分配连接（不再各表自行 FTWRL）
-				workerSnapshotConns := tableSnapshotConns
-
-				if len(workerSnapshotConns) > 0 {
-
-					if err := workerSnapshotConns[0].QueryRowContext(ctx,
-
-						fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
-
-							identity.IdentifyCols[0], identity.IdentifyCols[0], sourceSchema, tableName),
-					).Scan(&minPK, &maxPK); err != nil || maxPK < minPK {
-
-						errMsg := fmt.Sprintf("Failed to get numeric PK range in snapshot for `%s`.`%s`: %v", sourceSchema, tableName, err)
-
-						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
-
-						s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-
-						errChan <- fmt.Errorf("snapshot range failed: %w", err)
-
-						return
-
-					}
-
-					logger.Info("[Task %s] Table %s.%s: using global snapshot connections (%d workers)",
-
-						taskID, sourceSchema, tableName, len(workerSnapshotConns))
-
-				}
+				// minPK / maxPK 已在策略检测阶段（快照读）获取，此处直接复用
 
 				// 数值主键按 min/max 等分，避免采样边界导致有效 worker 塌缩
 
@@ -2499,11 +2498,21 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						readSource := sourceQueryer(runtime.sourceDB)
 
-						if wIdx < len(workerSnapshotConns) {
-
-							readSource = workerSnapshotConns[wIdx]
-
+						var borrowedConn *sql.Conn
+						if snapshot != nil {
+							c, err := snapshot.Borrow(ctx)
+							if err != nil {
+								syncErrChan <- fmt.Errorf("w%d borrow snapshot conn: %w", wIdx, err)
+								return
+							}
+							borrowedConn = c
+							readSource = c
 						}
+						defer func() {
+							if borrowedConn != nil {
+								snapshot.Return(borrowedConn)
+							}
+						}()
 
 						// 创建reader
 
@@ -2981,9 +2990,21 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						// 优先使用全局快照连接
 						var sampleReadSource sourceQueryer = runtime.sourceDB
-						if wIdx < len(tableSnapshotConns) {
-							sampleReadSource = tableSnapshotConns[wIdx]
+						var sampleBorrowedConn *sql.Conn
+						if snapshot != nil {
+							c, err := snapshot.Borrow(ctx)
+							if err != nil {
+								syncErrChan <- fmt.Errorf("w%d borrow snapshot conn: %w", wIdx, err)
+								return
+							}
+							sampleBorrowedConn = c
+							sampleReadSource = c
 						}
+						defer func() {
+							if sampleBorrowedConn != nil {
+								snapshot.Return(sampleBorrowedConn)
+							}
+						}()
 						wReader := reader.NewReader(sampleReadSource, sourceSchema, tableName, identity)
 
 						lastID := startBoundary
@@ -3227,8 +3248,16 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				// 优先使用全局快照连接读取，保证一致性
 				var fallbackReadSource sourceQueryer = runtime.sourceDB
-				if len(tableSnapshotConns) > 0 {
-					fallbackReadSource = tableSnapshotConns[0]
+				if snapshot != nil {
+					sc, err := snapshot.Borrow(ctx)
+					if err != nil {
+						errMsg := fmt.Sprintf("borrow snapshot conn for keyset read on %s.%s: %v", sourceSchema, tableName, err)
+						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
+						errChan <- fmt.Errorf("%s", errMsg)
+						return
+					}
+					fallbackReadSource = sc
+					defer snapshot.Return(sc)
 				}
 				dr := reader.NewReader(fallbackReadSource, sourceSchema, tableName, identity)
 
@@ -3833,11 +3862,11 @@ func trimTrailingComma(line string) string {
 
 // 并发采样边界计算：统一处理单列和复合主键
 
-func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *taskRuntime, schema, table string, pkCols []string, totalRows int64, n int) ([]interface{}, error) {
+func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource sourceQueryer, schema, table string, pkCols []string, totalRows int64, n int) ([]interface{}, error) {
 
-	if runtime == nil || runtime.sourceDB == nil {
+	if readSource == nil {
 
-		return nil, fmt.Errorf("task runtime source db is not initialized")
+		return nil, fmt.Errorf("read source is not initialized")
 
 	}
 
@@ -3877,7 +3906,7 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *t
 		if len(pkCols) == 1 {
 			// 单列主键：返回单值
 			var pk interface{}
-			err := runtime.sourceDB.QueryRowContext(ctx,
+			err := readSource.QueryRowContext(ctx,
 				fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
 					colList, schema, table, colList),
 				offset,
@@ -3893,7 +3922,7 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, runtime *t
 			for j := range vals {
 				ptrs[j] = &vals[j]
 			}
-			err := runtime.sourceDB.QueryRowContext(ctx,
+			err := readSource.QueryRowContext(ctx,
 				fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
 					colList, schema, table, colList),
 				offset,
@@ -3996,30 +4025,67 @@ func min(a, b int) int {
 
 // globalSnapshotState 全局一致性快照状态，在全量同步开始前统一建立，确保所有表读取到同一时刻的数据，
 // 并记录 binlog 位点以便后续增量同步从正确位置开始。
+// 采用全局共享连接池（channel），所有表复用固定数量的快照连接，避免按表预分配导致连接数爆炸。
 type globalSnapshotState struct {
-	binlogPos  mysql.Position         // FTWRL 期间通过 SHOW MASTER STATUS 获取的 binlog 位点
-	tableConns map[string][]*sql.Conn // "schema.table" → 预创建的快照连接
+	binlogPos mysql.Position // FTWRL 期间通过 SHOW MASTER STATUS 获取的 binlog 位点
+	pool      chan *sql.Conn // 全局共享快照连接池
+	allConns  []*sql.Conn    // 所有快照连接（用于释放时统一关闭）
+	poolSize  int            // 连接池大小
+}
+
+// Borrow 从全局快照连接池中借出一个连接，阻塞直到有可用连接或 ctx 取消
+func (g *globalSnapshotState) Borrow(ctx context.Context) (*sql.Conn, error) {
+	if g == nil || g.pool == nil {
+		return nil, fmt.Errorf("snapshot pool not initialized")
+	}
+	select {
+	case conn := <-g.pool:
+		return conn, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// Return 归还一个快照连接到池中
+func (g *globalSnapshotState) Return(conn *sql.Conn) {
+	if g == nil || g.pool == nil || conn == nil {
+		return
+	}
+	select {
+	case g.pool <- conn:
+	default:
+		// pool 已满（不应发生），关闭多余连接
+		conn.ExecContext(context.Background(), "ROLLBACK")
+		conn.Close()
+	}
+}
+
+// ReturnAll 归还多个快照连接到池中
+func (g *globalSnapshotState) ReturnAll(conns []*sql.Conn) {
+	for _, c := range conns {
+		g.Return(c)
+	}
 }
 
 // prepareGlobalSnapshot 在全量同步开始前一次性建立全局一致性快照：
 //  1. FLUSH TABLES WITH READ LOCK（阻止所有写入）
 //  2. SHOW MASTER STATUS 记录 binlog 位点
-//  3. 为每张表创建 N 个快照连接（START TRANSACTION WITH CONSISTENT SNAPSHOT）
+//  3. 创建 poolSize 个全局共享快照连接（START TRANSACTION WITH CONSISTENT SNAPSHOT）
 //  4. UNLOCK TABLES
 //
 // 所有快照连接在同一个 FTWRL 窗口内建立，因此看到完全一致的数据视图。
+// 表任务通过 Borrow/Return 复用这些连接，而非按表预分配。
 func (s *TaskService) prepareGlobalSnapshot(
 	ctx context.Context,
 	runtime *taskRuntime,
-	tableEntries []struct {
-		schema   string
-		table    string
-		numConns int
-	},
+	poolSize int,
 ) (*globalSnapshotState, error) {
 
 	if runtime == nil || runtime.sourceDB == nil {
 		return nil, fmt.Errorf("task runtime source db is not initialized")
+	}
+	if poolSize < 1 {
+		poolSize = 4
 	}
 
 	// 1. 获取锁连接
@@ -4051,51 +4117,43 @@ func (s *TaskService) prepareGlobalSnapshot(
 	}
 
 	state := &globalSnapshotState{
-		binlogPos:  mysql.Position{Name: binlogFile, Pos: binlogPos},
-		tableConns: make(map[string][]*sql.Conn),
+		binlogPos: mysql.Position{Name: binlogFile, Pos: binlogPos},
+		pool:      make(chan *sql.Conn, poolSize),
+		allConns:  make([]*sql.Conn, 0, poolSize),
+		poolSize:  poolSize,
 	}
 
 	// cleanup 在出错时回滚并关闭所有已创建的快照连接
 	cleanup := func() {
-		for _, conns := range state.tableConns {
-			for _, c := range conns {
-				if c != nil {
-					c.ExecContext(context.Background(), "ROLLBACK")
-					c.Close()
-				}
+		for _, c := range state.allConns {
+			if c != nil {
+				c.ExecContext(context.Background(), "ROLLBACK")
+				c.Close()
 			}
 		}
 		lockConn.ExecContext(context.Background(), "UNLOCK TABLES")
 		lockConn.Close()
 	}
 
-	// 4. 为每张表创建快照连接
-	for _, entry := range tableEntries {
-		key := entry.schema + "." + entry.table
-		n := entry.numConns
-		if n < 1 {
-			n = 1
+	// 4. 创建 poolSize 个全局共享快照连接
+	for i := 0; i < poolSize; i++ {
+		conn, err := runtime.sourceDB.Conn(ctx)
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("get snapshot connection [%d] failed: %w", i, err)
 		}
-		conns := make([]*sql.Conn, 0, n)
-		for i := 0; i < n; i++ {
-			conn, err := runtime.sourceDB.Conn(ctx)
-			if err != nil {
-				cleanup()
-				return nil, fmt.Errorf("get snapshot connection for %s[%d] failed: %w", key, i, err)
-			}
-			if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-				conn.Close()
-				cleanup()
-				return nil, fmt.Errorf("set isolation for %s[%d] failed: %w", key, i, err)
-			}
-			if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"); err != nil {
-				conn.Close()
-				cleanup()
-				return nil, fmt.Errorf("start snapshot for %s[%d] failed: %w", key, i, err)
-			}
-			conns = append(conns, conn)
+		if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			conn.Close()
+			cleanup()
+			return nil, fmt.Errorf("set isolation [%d] failed: %w", i, err)
 		}
-		state.tableConns[key] = conns
+		if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"); err != nil {
+			conn.Close()
+			cleanup()
+			return nil, fmt.Errorf("start snapshot [%d] failed: %w", i, err)
+		}
+		state.allConns = append(state.allConns, conn)
+		state.pool <- conn
 	}
 
 	// 5. UNLOCK TABLES — 所有快照连接已建立，写入可恢复
@@ -4105,8 +4163,8 @@ func (s *TaskService) prepareGlobalSnapshot(
 	}
 	lockConn.Close()
 
-	logger.Info("[GlobalSnapshot] Established: binlog=%s:%d, tables=%d",
-		binlogFile, binlogPos, len(state.tableConns))
+	logger.Info("[GlobalSnapshot] Established: binlog=%s:%d, poolSize=%d",
+		binlogFile, binlogPos, poolSize)
 
 	return state, nil
 }
@@ -4116,15 +4174,22 @@ func (s *TaskService) releaseGlobalSnapshot(state *globalSnapshotState) {
 	if state == nil {
 		return
 	}
-	for key, conns := range state.tableConns {
-		for _, c := range conns {
-			if c != nil {
-				c.ExecContext(context.Background(), "ROLLBACK")
-				c.Close()
-			}
+	// 排空 pool channel
+	for {
+		select {
+		case <-state.pool:
+		default:
+			goto drained
 		}
-		logger.Info("[GlobalSnapshot] Released %d connections for %s", len(conns), key)
 	}
+drained:
+	for _, c := range state.allConns {
+		if c != nil {
+			c.ExecContext(context.Background(), "ROLLBACK")
+			c.Close()
+		}
+	}
+	logger.Info("[GlobalSnapshot] Released %d connections", len(state.allConns))
 }
 
 func (s *TaskService) prepareConsistentSnapshotReaders(ctx context.Context, runtime *taskRuntime, workers int) ([]*sql.Conn, error) {

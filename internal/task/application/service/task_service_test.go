@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"mysql-to-async/internal/audit"
 	"mysql-to-async/internal/checkpoint"
 	"mysql-to-async/internal/config"
 	"mysql-to-async/internal/metadata/domain/entity"
@@ -594,6 +595,197 @@ func TestStartTask_ConcurrentRuntimeIsolation(t *testing.T) {
 	require.True(t, ok2)
 	assert.Equal(t, taskEntity.TaskStatusRunning, task1.Context.Status)
 	assert.Equal(t, taskEntity.TaskStatusRunning, task2.Context.Status)
+}
+
+func TestStartTask_SuccessPath(t *testing.T) {
+	dataDir := t.TempDir()
+
+	ts := newTestTaskService(dataDir)
+	ts.runtimes = make(map[string]*taskRuntime)
+
+	_, err := ts.CreateTask(taskEntity.TaskConfig{
+		ID:   "task_success",
+		Name: "Success Path Task",
+		Mode: taskEntity.SyncModeFull,
+	})
+	require.NoError(t, err)
+
+	// Inject fake runtime init
+	fakeRuntime := &taskRuntime{}
+	ts.initRuntimeFn = func(task *taskEntity.SyncTask) (*taskRuntime, error) {
+		return fakeRuntime, nil
+	}
+
+	// Capture executeSync call
+	type execCall struct {
+		taskID  string
+		runtime *taskRuntime
+	}
+	execCh := make(chan execCall, 1)
+	ts.executeSyncFn = func(ctx context.Context, taskID string, rt *taskRuntime) {
+		execCh <- execCall{taskID: taskID, runtime: rt}
+	}
+
+	// Act
+	beforeStart := time.Now().Add(-time.Millisecond)
+	err = ts.StartTask(context.Background(), "task_success")
+	require.NoError(t, err)
+
+	// Assert: runtime is stored
+	ts.mu.RLock()
+	storedRT := ts.runtimes["task_success"]
+	ts.mu.RUnlock()
+	assert.Same(t, fakeRuntime, storedRT, "runtime should be stored in runtimes map")
+
+	// Assert: task status changed to Running with StartTime set
+	task, ok := ts.GetTask("task_success")
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusRunning, task.Context.Status)
+	assert.False(t, task.Context.StartTime.IsZero(), "StartTime should be set")
+	assert.True(t, task.Context.StartTime.After(beforeStart), "StartTime should be recent")
+
+	// Assert: cancel function is wired on runtime
+	assert.NotNil(t, fakeRuntime.cancel, "runtime.cancel should be set by StartTask")
+
+	// Assert: executeSync was triggered asynchronously with correct args
+	select {
+	case call := <-execCh:
+		assert.Equal(t, "task_success", call.taskID)
+		assert.Same(t, fakeRuntime, call.runtime)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for executeSync to be called")
+	}
+}
+
+func TestStartTask_SuccessPath_ExecuteSyncGetsIndependentContext(t *testing.T) {
+	dataDir := t.TempDir()
+
+	ts := newTestTaskService(dataDir)
+	ts.runtimes = make(map[string]*taskRuntime)
+
+	_, err := ts.CreateTask(taskEntity.TaskConfig{ID: "task_ctx", Name: "Ctx Task"})
+	require.NoError(t, err)
+
+	ts.initRuntimeFn = func(_ *taskEntity.SyncTask) (*taskRuntime, error) {
+		return &taskRuntime{}, nil
+	}
+
+	// Capture the context passed to executeSync
+	ctxCh := make(chan context.Context, 1)
+	ts.executeSyncFn = func(ctx context.Context, _ string, _ *taskRuntime) {
+		ctxCh <- ctx
+	}
+
+	// Use a cancellable "HTTP request" context
+	httpCtx, httpCancel := context.WithCancel(context.Background())
+	err = ts.StartTask(httpCtx, "task_ctx")
+	require.NoError(t, err)
+
+	// Cancel the HTTP context — executeSync's context should remain alive
+	httpCancel()
+
+	select {
+	case syncCtx := <-ctxCh:
+		assert.NoError(t, syncCtx.Err(), "executeSync context should NOT be cancelled when HTTP ctx is cancelled")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for executeSync")
+	}
+}
+
+func TestStartTask_SuccessPath_OldRuntimeClosed(t *testing.T) {
+	dataDir := t.TempDir()
+
+	ts := newTestTaskService(dataDir)
+	ts.runtimes = make(map[string]*taskRuntime)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "task_restart", Name: "Restart Task"})
+	require.NoError(t, err)
+
+	// Simulate a pre-existing runtime with a cancel func to verify Close() is called
+	oldCancelled := false
+	oldRuntime := &taskRuntime{
+		cancel: func() { oldCancelled = true },
+	}
+	ts.runtimes["task_restart"] = oldRuntime
+
+	newRuntime := &taskRuntime{}
+	ts.initRuntimeFn = func(_ *taskEntity.SyncTask) (*taskRuntime, error) {
+		return newRuntime, nil
+	}
+	ts.executeSyncFn = func(_ context.Context, _ string, _ *taskRuntime) {}
+
+	// Task must not be Running to pass the guard
+	task.Context.Status = taskEntity.TaskStatusPaused
+
+	err = ts.StartTask(context.Background(), "task_restart")
+	require.NoError(t, err)
+
+	// Old runtime should have been closed (cancel called)
+	assert.True(t, oldCancelled, "old runtime cancel should be called during Close()")
+
+	// New runtime replaces old
+	ts.mu.RLock()
+	assert.Same(t, newRuntime, ts.runtimes["task_restart"])
+	ts.mu.RUnlock()
+}
+
+func TestStartTask_SuccessPath_AuditLoggerCalled(t *testing.T) {
+	dataDir := t.TempDir()
+
+	ts := newTestTaskService(dataDir)
+	ts.runtimes = make(map[string]*taskRuntime)
+
+	_, err := ts.CreateTask(taskEntity.TaskConfig{ID: "task_audit", Name: "Audit Task"})
+	require.NoError(t, err)
+
+	ts.initRuntimeFn = func(_ *taskEntity.SyncTask) (*taskRuntime, error) {
+		return &taskRuntime{}, nil
+	}
+	ts.executeSyncFn = func(_ context.Context, _ string, _ *taskRuntime) {}
+
+	// Wire up a real audit logger to a temp dir, then query it
+	auditDir := t.TempDir()
+	ts.auditLogger = audit.NewAuditLogger(auditDir)
+	defer ts.auditLogger.Close()
+
+	err = ts.StartTask(context.Background(), "task_audit")
+	require.NoError(t, err)
+
+	events, err := ts.auditLogger.Query(audit.QueryOptions{TaskID: "task_audit"})
+	require.NoError(t, err)
+	require.NotEmpty(t, events, "audit logger should have recorded a task-resumed event")
+}
+
+func TestStartTask_SuccessPath_StorageSaveCalled(t *testing.T) {
+	dataDir := t.TempDir()
+
+	ts := newTestTaskService(dataDir)
+	ts.runtimes = make(map[string]*taskRuntime)
+
+	_, err := ts.CreateTask(taskEntity.TaskConfig{ID: "task_save", Name: "Save Task"})
+	require.NoError(t, err)
+
+	ts.initRuntimeFn = func(_ *taskEntity.SyncTask) (*taskRuntime, error) {
+		return &taskRuntime{}, nil
+	}
+	ts.executeSyncFn = func(_ context.Context, _ string, _ *taskRuntime) {}
+
+	err = ts.StartTask(context.Background(), "task_save")
+	require.NoError(t, err)
+
+	// Reload from storage to confirm the Running state was persisted
+	loaded, err := ts.storage.LoadAll()
+	require.NoError(t, err)
+
+	var found bool
+	for _, lt := range loaded {
+		if lt.Config.ID == "task_save" {
+			found = true
+			assert.Equal(t, taskEntity.TaskStatusRunning, lt.Context.Status,
+				"persisted task should have Running status")
+		}
+	}
+	assert.True(t, found, "task_save should exist in storage")
 }
 
 func TestPauseTask(t *testing.T) {
