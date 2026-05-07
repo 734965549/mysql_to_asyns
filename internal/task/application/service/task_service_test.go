@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -1180,4 +1182,711 @@ func TestTaskService_ConcurrentOperations(t *testing.T) {
 	// 验证所有任务都已创建
 	tasks := ts.GetAllTasks()
 	assert.Equal(t, 10, len(tasks))
+}
+
+// ==================== syncReadBatchLimit ====================
+
+func TestSyncReadBatchLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		batchSize int
+		expected  int64
+	}{
+		{"zero returns default 1000", 0, 1000},
+		{"negative returns default 1000", -1, 1000},
+		{"small positive returns as-is", 500, 500},
+		{"default boundary", 1000, 1000},
+		{"large value capped at 100000", 200000, 100000},
+		{"exact hard max", 100000, 100000},
+		{"one", 1, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := syncReadBatchLimit(tt.batchSize)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// ==================== adjustReadLimitForWideColumns ====================
+
+func TestAdjustReadLimitForWideColumns(t *testing.T) {
+	t.Run("nil identity returns base", func(t *testing.T) {
+		assert.Equal(t, int64(1000), adjustReadLimitForWideColumns(1000, nil))
+	})
+
+	t.Run("empty columns returns base", func(t *testing.T) {
+		identity := &entity.TableIdentity{Columns: []entity.ColumnMeta{}}
+		assert.Equal(t, int64(1000), adjustReadLimitForWideColumns(1000, identity))
+	})
+
+	t.Run("no heavy columns returns base", func(t *testing.T) {
+		identity := &entity.TableIdentity{
+			Columns: []entity.ColumnMeta{
+				{Name: "id", DataType: "bigint"},
+				{Name: "name", DataType: "varchar(255)"},
+			},
+		}
+		assert.Equal(t, int64(1000), adjustReadLimitForWideColumns(1000, identity))
+	})
+
+	t.Run("one json column reduces limit", func(t *testing.T) {
+		identity := &entity.TableIdentity{
+			Columns: []entity.ColumnMeta{
+				{Name: "id", DataType: "bigint"},
+				{Name: "data", DataType: "json"},
+			},
+		}
+		result := adjustReadLimitForWideColumns(1000, identity)
+		assert.True(t, result < 1000)
+		assert.True(t, result >= 25)
+	})
+
+	t.Run("multiple heavy columns reduce more", func(t *testing.T) {
+		identity := &entity.TableIdentity{
+			Columns: []entity.ColumnMeta{
+				{Name: "id", DataType: "bigint"},
+				{Name: "data", DataType: "json"},
+				{Name: "content", DataType: "longtext"},
+				{Name: "avatar", DataType: "blob"},
+			},
+		}
+		result := adjustReadLimitForWideColumns(1000, identity)
+		assert.True(t, result < 500)
+		assert.True(t, result >= 25)
+	})
+
+	t.Run("small base does not go below 25", func(t *testing.T) {
+		identity := &entity.TableIdentity{
+			Columns: []entity.ColumnMeta{
+				{Name: "data", DataType: "longblob"},
+				{Name: "content", DataType: "mediumtext"},
+				{Name: "extra", DataType: "tinyblob"},
+			},
+		}
+		result := adjustReadLimitForWideColumns(50, identity)
+		assert.Equal(t, int64(25), result)
+	})
+
+	t.Run("various blob/text types recognized", func(t *testing.T) {
+		for _, dt := range []string{"json", "blob", "tinyblob", "mediumblob", "longblob", "text", "tinytext", "mediumtext", "longtext"} {
+			identity := &entity.TableIdentity{
+				Columns: []entity.ColumnMeta{
+					{Name: "id", DataType: "int"},
+					{Name: "col", DataType: dt},
+				},
+			}
+			result := adjustReadLimitForWideColumns(1000, identity)
+			assert.True(t, result < 1000, "data type %s should be recognized as heavy", dt)
+		}
+	})
+}
+
+// ==================== extractTableDefinition ====================
+
+func TestExtractTableDefinition(t *testing.T) {
+	t.Run("normal create table", func(t *testing.T) {
+		sql := "CREATE TABLE `users` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB"
+		result := extractTableDefinition(sql)
+		assert.True(t, strings.HasPrefix(result, "("))
+		assert.Contains(t, result, "PRIMARY KEY")
+		assert.Contains(t, result, "ENGINE=InnoDB")
+	})
+
+	t.Run("no parentheses returns original", func(t *testing.T) {
+		sql := "SOMETHING WEIRD"
+		assert.Equal(t, sql, extractTableDefinition(sql))
+	})
+
+	t.Run("only opening paren", func(t *testing.T) {
+		sql := "CREATE TABLE `t` (incomplete"
+		result := extractTableDefinition(sql)
+		assert.Equal(t, sql, result)
+	})
+}
+
+// ==================== isSecondaryIndexDefinitionLine ====================
+
+func TestIsSecondaryIndexDefinitionLine(t *testing.T) {
+	tests := []struct {
+		line     string
+		expected bool
+	}{
+		{"  UNIQUE KEY `uk_email` (`email`),", true},
+		{"  UNIQUE INDEX `ui_email` (`email`),", true},
+		{"  KEY `idx_name` (`name`),", true},
+		{"  INDEX `idx_name` (`name`),", true},
+		{"  FULLTEXT KEY `ft_content` (`content`),", true},
+		{"  FULLTEXT INDEX `ft_content` (`content`),", true},
+		{"  SPATIAL KEY `sp_geo` (`geo`),", true},
+		{"  SPATIAL INDEX `sp_geo` (`geo`),", true},
+		{"  PRIMARY KEY (`id`),", false},
+		{"  `id` bigint NOT NULL,", false},
+		{"  ) ENGINE=InnoDB", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.line, func(t *testing.T) {
+			assert.Equal(t, tt.expected, isSecondaryIndexDefinitionLine(tt.line))
+		})
+	}
+}
+
+// ==================== trimTrailingComma ====================
+
+func TestTrimTrailingComma(t *testing.T) {
+	assert.Equal(t, "  PRIMARY KEY (`id`)", trimTrailingComma("  PRIMARY KEY (`id`),"))
+	assert.Equal(t, "  PRIMARY KEY (`id`)", trimTrailingComma("  PRIMARY KEY (`id`)"))
+	assert.Equal(t, "", trimTrailingComma(","))
+	assert.Equal(t, "", trimTrailingComma(""))
+	assert.Equal(t, "abc", trimTrailingComma("abc,  "))
+}
+
+// ==================== toInt64PK ====================
+
+func TestToInt64PK(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    interface{}
+		expected int64
+		ok       bool
+	}{
+		{"int", int(42), 42, true},
+		{"int8", int8(8), 8, true},
+		{"int16", int16(16), 16, true},
+		{"int32", int32(32), 32, true},
+		{"int64", int64(64), 64, true},
+		{"uint", uint(10), 10, true},
+		{"uint8", uint8(8), 8, true},
+		{"uint16", uint16(16), 16, true},
+		{"uint32", uint32(32), 32, true},
+		{"uint64 small", uint64(100), 100, true},
+		{"uint64 overflow", uint64(^uint64(0)), 0, false},
+		{"string numeric", "12345", 12345, true},
+		{"string non-numeric", "abc", 0, false},
+		{"[]byte numeric", []byte("999"), 999, true},
+		{"[]byte non-numeric", []byte("xyz"), 0, false},
+		{"nil", nil, 0, false},
+		{"float64", float64(3.14), 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, ok := toInt64PK(tt.input)
+			assert.Equal(t, tt.ok, ok)
+			if ok {
+				assert.Equal(t, tt.expected, result)
+			}
+		})
+	}
+}
+
+// ==================== comparePKValues ====================
+
+func TestComparePKValues(t *testing.T) {
+	// int64 comparison
+	assert.Equal(t, -1, comparePKValues(int64(1), int64(2)))
+	assert.Equal(t, 0, comparePKValues(int64(5), int64(5)))
+	assert.Equal(t, 1, comparePKValues(int64(10), int64(3)))
+
+	// string comparison
+	assert.Equal(t, -1, comparePKValues("abc", "def"))
+	assert.Equal(t, 0, comparePKValues("same", "same"))
+	assert.Equal(t, 1, comparePKValues("z", "a"))
+
+	// mixed: both convertible to int64
+	assert.Equal(t, 0, comparePKValues(int64(42), "42"))
+
+	// fallback to string comparison
+	assert.Equal(t, -1, comparePKValues(nil, "something"))
+}
+
+// ==================== comparePKWithBoundary ====================
+
+func TestComparePKWithBoundary(t *testing.T) {
+	t.Run("nil boundary returns -1", func(t *testing.T) {
+		row := map[string]interface{}{"id": int64(1)}
+		assert.Equal(t, -1, comparePKWithBoundary([]string{"id"}, row, nil))
+	})
+
+	t.Run("single column boundary less (string comparison)", func(t *testing.T) {
+		row := map[string]interface{}{"id": "10"}
+		// comparePKWithBoundary uses fmt.Sprintf("%v",...) string comparison
+		assert.Equal(t, -1, comparePKWithBoundary([]string{"id"}, row, "20"))
+	})
+
+	t.Run("single column boundary equal", func(t *testing.T) {
+		row := map[string]interface{}{"id": "10"}
+		assert.Equal(t, 0, comparePKWithBoundary([]string{"id"}, row, "10"))
+	})
+
+	t.Run("single column boundary greater", func(t *testing.T) {
+		row := map[string]interface{}{"id": "30"}
+		assert.Equal(t, 1, comparePKWithBoundary([]string{"id"}, row, "20"))
+	})
+
+	t.Run("single column uses string repr of int64", func(t *testing.T) {
+		// fmt.Sprintf("%v", int64(5)) = "5", fmt.Sprintf("%v", int64(10)) = "10"
+		// "5" > "10" lexicographically, so result is 1 (not -1)
+		row := map[string]interface{}{"id": int64(5)}
+		assert.Equal(t, 1, comparePKWithBoundary([]string{"id"}, row, int64(10)))
+	})
+
+	t.Run("composite boundary less on first col", func(t *testing.T) {
+		row := map[string]interface{}{"a": "1", "b": "5"}
+		boundary := []interface{}{"2", "3"}
+		assert.Equal(t, -1, comparePKWithBoundary([]string{"a", "b"}, row, boundary))
+	})
+
+	t.Run("composite boundary equal", func(t *testing.T) {
+		row := map[string]interface{}{"a": "2", "b": "3"}
+		boundary := []interface{}{"2", "3"}
+		assert.Equal(t, 0, comparePKWithBoundary([]string{"a", "b"}, row, boundary))
+	})
+
+	t.Run("composite boundary greater on second col", func(t *testing.T) {
+		row := map[string]interface{}{"a": "2", "b": "9"}
+		boundary := []interface{}{"2", "3"}
+		assert.Equal(t, 1, comparePKWithBoundary([]string{"a", "b"}, row, boundary))
+	})
+}
+
+// ==================== boundaryToString ====================
+
+func TestBoundaryToString(t *testing.T) {
+	assert.Equal(t, "", boundaryToString(nil))
+	assert.Equal(t, "42", boundaryToString(42))
+	assert.Equal(t, "hello", boundaryToString("hello"))
+	// composite
+	result := boundaryToString([]interface{}{"a", "b", "c"})
+	assert.Equal(t, "a\x00b\x00c", result)
+}
+
+// ==================== isRetryableLockError ====================
+
+func TestIsRetryableLockError(t *testing.T) {
+	assert.False(t, isRetryableLockError(nil))
+	assert.False(t, isRetryableLockError(fmt.Errorf("some random error")))
+	assert.True(t, isRetryableLockError(fmt.Errorf("Error 1205: Lock wait timeout exceeded")))
+	assert.True(t, isRetryableLockError(fmt.Errorf("Error 1213: Deadlock found when trying to get lock")))
+	assert.True(t, isRetryableLockError(fmt.Errorf("Lock wait timeout")))
+	assert.True(t, isRetryableLockError(fmt.Errorf("Deadlock found")))
+}
+
+// ==================== isNumericPKColumn ====================
+
+func TestIsNumericPKColumn(t *testing.T) {
+	identity := &entity.TableIdentity{
+		Columns: []entity.ColumnMeta{
+			{Name: "id", DataType: "bigint"},
+			{Name: "name", DataType: "varchar"},
+			{Name: "age", DataType: "int"},
+			{Name: "code", DataType: "smallint"},
+			{Name: "tiny", DataType: "tinyint"},
+			{Name: "mid", DataType: "mediumint"},
+		},
+	}
+
+	assert.True(t, isNumericPKColumn(identity, "id"))
+	assert.False(t, isNumericPKColumn(identity, "name"))
+	assert.True(t, isNumericPKColumn(identity, "age"))
+	assert.True(t, isNumericPKColumn(identity, "code"))
+	assert.True(t, isNumericPKColumn(identity, "tiny"))
+	assert.True(t, isNumericPKColumn(identity, "mid"))
+	assert.False(t, isNumericPKColumn(identity, "nonexistent"))
+}
+
+// ==================== dbScanToString ====================
+
+func TestDbScanToString(t *testing.T) {
+	assert.Equal(t, "", dbScanToString(nil))
+	assert.Equal(t, "hello", dbScanToString([]byte("hello")))
+	assert.Equal(t, "world", dbScanToString("world"))
+	assert.Equal(t, "42", dbScanToString(int64(42)))
+	assert.Equal(t, "3.14", dbScanToString(3.14))
+}
+
+// ==================== dbScanToInt ====================
+
+func TestDbScanToInt(t *testing.T) {
+	assert.Equal(t, 0, dbScanToInt(nil))
+	assert.Equal(t, 42, dbScanToInt(int64(42)))
+	assert.Equal(t, 99, dbScanToInt([]byte("99")))
+	assert.Equal(t, 7, dbScanToInt("7"))
+	assert.Equal(t, 0, dbScanToInt("abc"))
+	assert.Equal(t, 0, dbScanToInt(3.14))
+}
+
+// ==================== syncTuneFrom ====================
+
+func TestSyncTuneFrom(t *testing.T) {
+	t.Run("nil config returns nil", func(t *testing.T) {
+		assert.Nil(t, syncTuneFrom(nil))
+	})
+
+	t.Run("non-nil config returns sync config pointer", func(t *testing.T) {
+		cfg := &config.Config{
+			Sync: config.SyncTuneConfig{
+				IntraTableLegacyCap: 8,
+				IntraTableHardMax:   32,
+			},
+		}
+		result := syncTuneFrom(cfg)
+		require.NotNil(t, result)
+		assert.Equal(t, 8, result.IntraTableLegacyCap)
+		assert.Equal(t, 32, result.IntraTableHardMax)
+	})
+}
+
+// ==================== intraTableConcurrencyCaps ====================
+
+func TestIntraTableConcurrencyCaps(t *testing.T) {
+	t.Run("nil config returns defaults", func(t *testing.T) {
+		ts := &TaskService{config: nil}
+		legacy, hard := ts.intraTableConcurrencyCaps()
+		assert.Equal(t, 16, legacy)
+		assert.Equal(t, 64, hard)
+	})
+
+	t.Run("zero sync config returns defaults", func(t *testing.T) {
+		ts := &TaskService{config: &config.Config{}}
+		legacy, hard := ts.intraTableConcurrencyCaps()
+		assert.Equal(t, 16, legacy)
+		assert.Equal(t, 64, hard)
+	})
+
+	t.Run("custom values override defaults", func(t *testing.T) {
+		ts := &TaskService{config: &config.Config{
+			Sync: config.SyncTuneConfig{
+				IntraTableLegacyCap: 8,
+				IntraTableHardMax:   32,
+			},
+		}}
+		legacy, hard := ts.intraTableConcurrencyCaps()
+		assert.Equal(t, 8, legacy)
+		assert.Equal(t, 32, hard)
+	})
+
+	t.Run("only legacy cap set", func(t *testing.T) {
+		ts := &TaskService{config: &config.Config{
+			Sync: config.SyncTuneConfig{
+				IntraTableLegacyCap: 4,
+			},
+		}}
+		legacy, hard := ts.intraTableConcurrencyCaps()
+		assert.Equal(t, 4, legacy)
+		assert.Equal(t, 64, hard)
+	})
+}
+
+// ==================== failTaskUnlessCancelled ====================
+
+func TestFailTaskUnlessCancelled(t *testing.T) {
+	t.Run("marks task failed when context active and task running", func(t *testing.T) {
+		ts := newTestTaskService(t.TempDir())
+		task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "ft1", Name: "T1"})
+		task.Start() // must be running, otherwise isTaskStopped returns true
+
+		ctx := context.Background()
+		ts.failTaskUnlessCancelled(ctx, "ft1", "some error")
+
+		task, _ = ts.GetTask("ft1")
+		assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+		assert.Equal(t, "some error", task.Context.ErrorStack)
+	})
+
+	t.Run("ignores error when context cancelled", func(t *testing.T) {
+		ts := newTestTaskService(t.TempDir())
+		task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "ft2", Name: "T2"})
+		task.Start()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		ts.failTaskUnlessCancelled(ctx, "ft2", "should be ignored")
+
+		task, _ = ts.GetTask("ft2")
+		assert.Equal(t, taskEntity.TaskStatusRunning, task.Context.Status)
+		assert.Empty(t, task.Context.ErrorStack)
+	})
+
+	t.Run("ignores error when task already stopped", func(t *testing.T) {
+		ts := newTestTaskService(t.TempDir())
+		ts.CreateTask(taskEntity.TaskConfig{ID: "ft3", Name: "T3"})
+		// task is in Pending status (not running), so isTaskStopped returns true
+
+		ctx := context.Background()
+		ts.failTaskUnlessCancelled(ctx, "ft3", "should be ignored")
+
+		task, _ := ts.GetTask("ft3")
+		assert.Equal(t, taskEntity.TaskStatusPending, task.Context.Status)
+	})
+}
+
+// ==================== taskRuntime.Close ====================
+
+func TestTaskRuntimeClose(t *testing.T) {
+	t.Run("nil runtime does not panic", func(t *testing.T) {
+		var r *taskRuntime
+		assert.NotPanics(t, func() { r.Close() })
+	})
+
+	t.Run("calls cancel and closes DBs", func(t *testing.T) {
+		cancelCalled := false
+
+		sourceDB, _, err := sqlmock.New()
+		require.NoError(t, err)
+
+		targetDB, _, err := sqlmock.New()
+		require.NoError(t, err)
+
+		r := &taskRuntime{
+			sourceDB: sourceDB,
+			targetDB: targetDB,
+			cancel:   func() { cancelCalled = true },
+		}
+
+		r.Close()
+		assert.True(t, cancelCalled)
+	})
+
+	t.Run("does not double-close when source equals target", func(t *testing.T) {
+		db, _, err := sqlmock.New()
+		require.NoError(t, err)
+
+		r := &taskRuntime{
+			sourceDB: db,
+			targetDB: db,
+		}
+		assert.NotPanics(t, func() { r.Close() })
+	})
+
+	t.Run("nil cancel does not panic", func(t *testing.T) {
+		r := &taskRuntime{}
+		assert.NotPanics(t, func() { r.Close() })
+	})
+}
+
+// ==================== closeResource ====================
+
+func TestCloseResource(t *testing.T) {
+	t.Run("nil closer does not panic", func(t *testing.T) {
+		assert.NotPanics(t, func() { closeResource(nil, "test") })
+	})
+
+	t.Run("successful close", func(t *testing.T) {
+		called := false
+		closer := func() error {
+			called = true
+			return nil
+		}
+		closeResource(closer, "test")
+		assert.True(t, called)
+	})
+
+	t.Run("error close does not panic", func(t *testing.T) {
+		closer := func() error {
+			return fmt.Errorf("close error")
+		}
+		assert.NotPanics(t, func() { closeResource(closer, "test") })
+	})
+}
+
+// ==================== withDDL ====================
+
+func TestWithDDL(t *testing.T) {
+	t.Run("nil runtime executes fn directly", func(t *testing.T) {
+		ts := &TaskService{}
+		called := false
+		err := ts.withDDL(nil, func() error {
+			called = true
+			return nil
+		})
+		assert.NoError(t, err)
+		assert.True(t, called)
+	})
+
+	t.Run("nil readOnlyManager executes fn directly", func(t *testing.T) {
+		ts := &TaskService{}
+		rt := &taskRuntime{readOnlyManager: nil}
+		called := false
+		err := ts.withDDL(rt, func() error {
+			called = true
+			return nil
+		})
+		assert.NoError(t, err)
+		assert.True(t, called)
+	})
+
+	t.Run("fn error propagated", func(t *testing.T) {
+		ts := &TaskService{}
+		err := ts.withDDL(nil, func() error {
+			return fmt.Errorf("ddl error")
+		})
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "ddl error")
+	})
+}
+
+// ==================== min ====================
+
+func TestMin(t *testing.T) {
+	assert.Equal(t, 3, min(3, 5))
+	assert.Equal(t, 3, min(5, 3))
+	assert.Equal(t, 4, min(4, 4))
+	assert.Equal(t, -1, min(-1, 0))
+}
+
+// ==================== globalSnapshotState Borrow/Return ====================
+
+func TestGlobalSnapshotState_BorrowReturn(t *testing.T) {
+	t.Run("nil state returns error", func(t *testing.T) {
+		var g *globalSnapshotState
+		_, err := g.Borrow(context.Background())
+		assert.Error(t, err)
+	})
+
+	t.Run("nil pool returns error", func(t *testing.T) {
+		g := &globalSnapshotState{}
+		_, err := g.Borrow(context.Background())
+		assert.Error(t, err)
+	})
+
+	t.Run("cancelled context returns error", func(t *testing.T) {
+		g := &globalSnapshotState{pool: make(chan *sql.Conn, 1)}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := g.Borrow(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("return nil on nil state does not panic", func(t *testing.T) {
+		var g *globalSnapshotState
+		assert.NotPanics(t, func() { g.Return(nil) })
+	})
+
+	t.Run("return nil conn does not panic", func(t *testing.T) {
+		g := &globalSnapshotState{pool: make(chan *sql.Conn, 1)}
+		assert.NotPanics(t, func() { g.Return(nil) })
+	})
+
+	t.Run("ReturnAll handles nil", func(t *testing.T) {
+		g := &globalSnapshotState{pool: make(chan *sql.Conn, 2)}
+		assert.NotPanics(t, func() { g.ReturnAll(nil) })
+		assert.NotPanics(t, func() { g.ReturnAll([]*sql.Conn{nil, nil}) })
+	})
+}
+
+// ==================== resolveSourceSchema edge cases ====================
+
+func TestResolveSourceSchema_Empty(t *testing.T) {
+	t.Run("nil task returns empty from nil config", func(t *testing.T) {
+		ts := &TaskService{}
+		assert.Equal(t, "", ts.resolveSourceSchema(nil))
+	})
+
+	t.Run("empty everything returns empty", func(t *testing.T) {
+		ts := &TaskService{}
+		task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "empty"})
+		assert.Equal(t, "", ts.resolveSourceSchema(task))
+	})
+}
+
+// ==================== FileTaskStorage.Delete edge cases ====================
+
+func TestFileTaskStorage_Delete_NonExistent(t *testing.T) {
+	dataDir := t.TempDir()
+	storage := NewFileTaskStorage(dataDir)
+
+	err := storage.Delete("non_existent_task")
+	assert.NoError(t, err)
+}
+
+func TestFileTaskStorage_Delete_Existing(t *testing.T) {
+	dataDir := t.TempDir()
+	storage := NewFileTaskStorage(dataDir)
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "delete_me", Name: "Delete Me"})
+	err := storage.Save(task)
+	require.NoError(t, err)
+
+	err = storage.Delete("delete_me")
+	assert.NoError(t, err)
+
+	tasks, err := storage.LoadAll()
+	require.NoError(t, err)
+	assert.Empty(t, tasks)
+}
+
+// ==================== FileTaskStorage LoadAll empty dir ====================
+
+func TestFileTaskStorage_LoadAll_EmptyDir(t *testing.T) {
+	dataDir := t.TempDir()
+	storage := NewFileTaskStorage(dataDir)
+
+	tasks, err := storage.LoadAll()
+	assert.NoError(t, err)
+	assert.Empty(t, tasks)
+}
+
+// ==================== FileTaskStorage Save and LoadAll round-trip ====================
+
+func TestFileTaskStorage_SaveAndLoad_RoundTrip(t *testing.T) {
+	dataDir := t.TempDir()
+	storage := NewFileTaskStorage(dataDir)
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:           "round_trip",
+		Name:         "Round Trip Task",
+		SourceSchema: "src",
+		TargetSchema: "tgt",
+		Tables:       []string{"t1", "t2"},
+	})
+
+	err := storage.Save(task)
+	require.NoError(t, err)
+
+	tasks, err := storage.LoadAll()
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "round_trip", tasks[0].Config.ID)
+	assert.Equal(t, "Round Trip Task", tasks[0].Config.Name)
+	assert.Equal(t, "src", tasks[0].Config.SourceSchema)
+	assert.Equal(t, "tgt", tasks[0].Config.TargetSchema)
+	assert.Equal(t, []string{"t1", "t2"}, tasks[0].Config.Tables)
+}
+
+func TestCancelScheduleRestoresPreviousStatus(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "schedule_restore", Name: "Schedule Restore"})
+	require.NoError(t, err)
+
+	task.Pause()
+	require.NoError(t, ts.ScheduleTask(task.Config.ID, time.Now().Add(time.Minute)))
+	assert.Equal(t, taskEntity.TaskStatusScheduled, task.Context.Status)
+	require.NotNil(t, task.Context.ScheduledFromStatus)
+	assert.Equal(t, taskEntity.TaskStatusPaused, *task.Context.ScheduledFromStatus)
+
+	require.NoError(t, ts.CancelSchedule(task.Config.ID))
+	assert.Equal(t, taskEntity.TaskStatusPaused, task.Context.Status)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
+	assert.NoError(t, ts.Close())
+}
+
+func TestCancelScheduleRestoresFailedStatus(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "schedule_restore_failed", Name: "Schedule Restore Failed"})
+	require.NoError(t, err)
+
+	task.Fail(assert.AnError)
+	require.NoError(t, ts.ScheduleTask(task.Config.ID, time.Now().Add(time.Minute)))
+	require.NoError(t, ts.CancelSchedule(task.Config.ID))
+
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
+	assert.NoError(t, ts.Close())
 }

@@ -984,6 +984,79 @@ async function startTask(taskId) {
   }
 }
 
+// 定时启动相关
+const scheduleModalVisible = ref(false);
+const scheduleTaskId = ref("");
+const scheduleTime = ref("");
+
+function openScheduleModal(taskId) {
+  scheduleTaskId.value = taskId;
+  // 默认设置为当前时间后5分钟
+  const d = new Date(Date.now() + 5 * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  scheduleTime.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  scheduleModalVisible.value = true;
+}
+
+async function confirmSchedule() {
+  if (!scheduleTime.value) {
+    Message.warning("请选择定时启动时间");
+    return;
+  }
+  try {
+    const scheduledAt = scheduleTime.value instanceof Date ? scheduleTime.value : new Date(scheduleTime.value);
+    if (isNaN(scheduledAt.getTime())) {
+      Message.error("时间格式不正确");
+      return;
+    }
+    if (scheduledAt <= new Date()) {
+      Message.error("定时启动时间不能早于当前时间");
+      return;
+    }
+    const res = await fetch(`${API_BASE}/tasks/${scheduleTaskId.value}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scheduled_at: scheduledAt.toISOString() }),
+    });
+    if (res.ok) {
+      fetchTasks();
+      Message.success("定时启动已设置");
+      scheduleModalVisible.value = false;
+    } else {
+      const errorMsg = await handleApiError(res, "设置定时启动失败");
+      Message.error(errorMsg);
+    }
+  } catch (e) {
+    Message.error("设置定时启动失败: " + e.message);
+  }
+}
+
+async function cancelSchedule(taskId) {
+  try {
+    const res = await fetch(`${API_BASE}/tasks/${taskId}/cancel-schedule`, {
+      method: "POST",
+    });
+    if (res.ok) {
+      fetchTasks();
+      Message.success("已取消定时启动");
+    } else {
+      const errorMsg = await handleApiError(res, "取消定时启动失败");
+      Message.error(errorMsg);
+    }
+  } catch (e) {
+    Message.error("取消定时启动失败: " + e.message);
+  }
+}
+
+function formatScheduledTime(task) {
+  if (task.context.scheduled_at) {
+    const d = new Date(task.context.scheduled_at);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+  return "";
+}
+
 // 暂停任务
 
 async function pauseTask(taskId) {
@@ -1342,6 +1415,8 @@ function getStatusColor(status) {
     COMPLETED: "green",
 
     FAILED: "red",
+
+    SCHEDULED: "arcoblue",
   };
 
   return colors[status] || "gray";
@@ -1360,6 +1435,8 @@ function getStatusText(status) {
     COMPLETED: "已完成",
 
     FAILED: "失败",
+
+    SCHEDULED: "定时中",
   };
 
   return texts[status] || status;
@@ -3250,6 +3327,13 @@ watch(
                       >
                         {{ getStatusText(task.context.status) }}
                       </a-tag>
+                      <a-tag
+                        v-if="task.context.status === 'SCHEDULED' && task.context.scheduled_at"
+                        color="arcoblue"
+                        size="small"
+                      >
+                        <icon-clock-circle /> {{ formatScheduledTime(task) }}
+                      </a-tag>
                       <!-- 目标端类型 Badge -->
                       <a-tag
                         v-if="
@@ -3477,20 +3561,36 @@ watch(
                       编辑
                     </a-button>
 
-                    <a-button
+                    <a-dropdown-button
                       v-if="
                         task.context.status === 'PENDING' ||
-                        task.context.status === 'PAUSED'
+                        task.context.status === 'PAUSED' ||
+                        task.context.status === 'FAILED'
                       "
                       type="primary"
                       size="small"
                       status="success"
                       @click="startTask(task.config.id)"
                     >
-                      <template #icon><icon-play-arrow /></template>
+                      <icon-play-arrow /> 启动
+                      <template #content>
+                        <a-doption @click="startTask(task.config.id)">立即启动</a-doption>
+                        <a-doption @click="openScheduleModal(task.config.id)">定时启动</a-doption>
+                      </template>
+                    </a-dropdown-button>
 
-                      启动
-                    </a-button>
+                    <template v-if="task.context.status === 'SCHEDULED'">
+                      <a-tooltip :content="'计划启动: ' + formatScheduledTime(task)">
+                        <a-button
+                          size="small"
+                          status="warning"
+                          @click="cancelSchedule(task.config.id)"
+                        >
+                          <template #icon><icon-clock-circle /></template>
+                          取消定时
+                        </a-button>
+                      </a-tooltip>
+                    </template>
 
                     <a-button
                       v-if="task.context.status === 'RUNNING'"
@@ -3504,7 +3604,7 @@ watch(
                     </a-button>
 
                     <a-button
-                      v-if="task.context.status !== 'RUNNING'"
+                      v-if="task.context.status !== 'RUNNING' && task.context.status !== 'SCHEDULED'"
                       size="small"
                       status="danger"
                       @click="deleteTask(task.config.id)"
@@ -4018,6 +4118,9 @@ watch(
             >
               {{ getStatusText(selectedTaskForDetail.context.status) }}
             </a-tag>
+            <span v-if="selectedTaskForDetail.context.status === 'SCHEDULED' && selectedTaskForDetail.context.scheduled_at" style="margin-left: 8px; color: #165DFF; font-size: 13px;">
+              <icon-clock-circle /> {{ formatScheduledTime(selectedTaskForDetail) }}
+            </span>
           </a-descriptions-item>
 
           <a-descriptions-item label="进度">
@@ -4118,10 +4221,11 @@ watch(
               复制新建
             </a-button>
 
-            <a-button
+            <a-dropdown-button
               v-if="
                 selectedTaskForDetail.context.status === 'PENDING' ||
-                selectedTaskForDetail.context.status === 'PAUSED'
+                selectedTaskForDetail.context.status === 'PAUSED' ||
+                selectedTaskForDetail.context.status === 'FAILED'
               "
               type="primary"
               status="success"
@@ -4130,9 +4234,23 @@ watch(
                 detailDrawerVisible = false;
               "
             >
-              <template #icon><icon-play-arrow /></template>
+              <icon-play-arrow /> 启动
+              <template #content>
+                <a-doption @click="startTask(selectedTaskForDetail.config.id); detailDrawerVisible = false;">立即启动</a-doption>
+                <a-doption @click="openScheduleModal(selectedTaskForDetail.config.id); detailDrawerVisible = false;">定时启动</a-doption>
+              </template>
+            </a-dropdown-button>
 
-              启动
+            <a-button
+              v-if="selectedTaskForDetail.context.status === 'SCHEDULED'"
+              status="warning"
+              @click="
+                cancelSchedule(selectedTaskForDetail.config.id);
+                detailDrawerVisible = false;
+              "
+            >
+              <template #icon><icon-clock-circle /></template>
+              取消定时
             </a-button>
 
             <a-button
@@ -4151,6 +4269,32 @@ watch(
         </div>
       </div>
     </a-drawer>
+
+    <!-- 定时启动时间选择弹窗 -->
+    <a-modal
+      v-model:visible="scheduleModalVisible"
+      title="设置定时启动"
+      @ok="confirmSchedule"
+      @cancel="scheduleModalVisible = false"
+      ok-text="确认"
+      cancel-text="取消"
+      :width="420"
+    >
+      <a-form layout="vertical">
+        <a-form-item label="定时启动时间">
+          <a-date-picker
+            v-model="scheduleTime"
+            show-time
+            format="YYYY-MM-DD HH:mm:ss"
+            style="width: 100%"
+            placeholder="请选择启动时间"
+          />
+        </a-form-item>
+        <a-typography-text type="secondary" style="font-size: 12px">
+          任务将在设定的时间自动启动，设置后状态变为"定时中"。
+        </a-typography-text>
+      </a-form>
+    </a-modal>
   </a-layout>
 </template>
 

@@ -2,21 +2,16 @@
 
 import (
 	"bytes"
-
 	"encoding/json"
-
 	"net/http"
-
 	"net/http/httptest"
-
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"mysql-to-async/internal/config"
-
 	metadataEntity "mysql-to-async/internal/metadata/domain/entity"
-
 	taskService "mysql-to-async/internal/task/application/service"
 
 	taskEntity "mysql-to-async/internal/task/domain/entity"
@@ -305,6 +300,129 @@ func TestStartTask(t *testing.T) {
 	if w.Code != http.StatusOK && w.Code != http.StatusInternalServerError {
 
 		t.Errorf("unexpected status code: %d", w.Code)
+
+	}
+
+}
+
+func TestStartTask_InvalidScheduledAtReturnsBadRequest(t *testing.T) {
+
+	gin.SetMode(gin.TestMode)
+
+	taskSvc := newTestTaskService()
+
+	analyzer := &MockIdentityAnalyzer{}
+
+	_, _ = taskSvc.CreateTask(taskEntity.TaskConfig{
+
+		ID: "test_task_start_invalid_schedule",
+
+		Name: "Test Task",
+	})
+
+	handler := NewTaskHandler(taskSvc, analyzer)
+
+	router := gin.New()
+
+	router.POST("/api/tasks/:id/start", handler.StartTask)
+
+	req := httptest.NewRequest("POST", "/api/tasks/test_task_start_invalid_schedule/start", bytes.NewBufferString(`{"scheduled_at":"not-a-time"}`))
+
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+
+		t.Errorf("expected status 400, got %d", w.Code)
+
+	}
+
+	task, exists := taskSvc.GetTask("test_task_start_invalid_schedule")
+
+	if !exists {
+
+		t.Fatal("expected task to exist")
+
+	}
+
+	if task.Context.Status != taskEntity.TaskStatusPending {
+
+		t.Errorf("expected task status PENDING, got %s", task.Context.Status)
+
+	}
+
+}
+
+func TestStartTask_SchedulesFailedTask(t *testing.T) {
+
+	gin.SetMode(gin.TestMode)
+
+	taskSvc := newTestTaskService()
+
+	analyzer := &MockIdentityAnalyzer{}
+
+	task, _ := taskSvc.CreateTask(taskEntity.TaskConfig{
+
+		ID: "test_task_failed_schedule",
+
+		Name: "Failed Schedule Task",
+	})
+
+	task.Context.Status = taskEntity.TaskStatusFailed
+
+	handler := NewTaskHandler(taskSvc, analyzer)
+
+	router := gin.New()
+
+	router.POST("/api/tasks/:id/start", handler.StartTask)
+
+	scheduledAt := time.Now().Add(2 * time.Minute).Format(time.RFC3339)
+	req := httptest.NewRequest("POST", "/api/tasks/test_task_failed_schedule/start", bytes.NewBufferString(`{"scheduled_at":"`+scheduledAt+`"}`))
+
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+
+		t.Errorf("expected status 200, got %d", w.Code)
+
+	}
+
+	updatedTask, exists := taskSvc.GetTask("test_task_failed_schedule")
+
+	if !exists {
+
+		t.Fatal("expected task to exist")
+
+	}
+
+	if updatedTask.Context.Status != taskEntity.TaskStatusScheduled {
+
+		t.Errorf("expected task status SCHEDULED, got %s", updatedTask.Context.Status)
+
+	}
+
+	if updatedTask.Context.ScheduledFromStatus == nil {
+
+		t.Fatal("expected scheduled_from_status to be set")
+
+	}
+
+	if *updatedTask.Context.ScheduledFromStatus != taskEntity.TaskStatusFailed {
+
+		t.Errorf("expected scheduled_from_status FAILED, got %s", *updatedTask.Context.ScheduledFromStatus)
+
+	}
+
+	if updatedTask.Context.ScheduledAt == nil {
+
+		t.Fatal("expected scheduled_at to be set")
 
 	}
 

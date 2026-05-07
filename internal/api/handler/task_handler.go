@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -151,10 +153,41 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 	c.JSON(http.StatusCreated, task) // 返回创建的任务
 }
 
-// StartTask 启动任务方法
+// StartTaskRequest 启动任务请求结构体（可选）
+type StartTaskRequest struct {
+	ScheduledAt *time.Time `json:"scheduled_at,omitempty"` // 定时启动时间（为空表示立即启动）
+}
+
+// StartTask 启动任务方法（支持立即启动和定时启动）
 func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 	taskID := c.Param("id") // 获取任务ID参数
 
+	// 尝试解析请求体中的 scheduled_at（可选，body 为空时立即启动）
+	var req StartTaskRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.ScheduledAt != nil { // 定时启动
+		if req.ScheduledAt.Before(time.Now()) { // 校验时间不能是过去
+			c.JSON(http.StatusBadRequest, gin.H{"error": "定时启动时间不能早于当前时间"})
+			return
+		}
+		if err := h.taskService.ScheduleTask(taskID, *req.ScheduledAt); err != nil {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "task not found") {
+				c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+			}
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Task scheduled", "scheduled_at": req.ScheduledAt})
+		return
+	}
+
+	// 立即启动
 	if err := h.taskService.StartTask(c.Request.Context(), taskID); err != nil { // 启动任务
 		errMsg := err.Error()
 		switch {
@@ -171,6 +204,23 @@ func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Task started"}) // 返回成功消息
+}
+
+// CancelSchedule 取消定时启动方法
+func (h *TaskHandler) CancelSchedule(c *gin.Context) { // 取消定时启动
+	taskID := c.Param("id") // 获取任务ID参数
+
+	if err := h.taskService.CancelSchedule(taskID); err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "task not found") {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Schedule cancelled"}) // 返回成功消息
 }
 
 // PauseTask 暂停任务方法

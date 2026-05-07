@@ -101,6 +101,8 @@ type TaskService struct {
 
 	auditLogger *audit.AuditLogger // 审计日志器
 
+	schedulerStop chan struct{} // 定时调度器停止信号
+
 }
 
 type taskRuntime struct {
@@ -640,6 +642,9 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 	ts.loadTasks() // 加载任务
 
+	// 启动定时调度器
+	ts.StartScheduler()
+
 	return ts // 返回服务实例
 
 }
@@ -680,6 +685,9 @@ func NewTaskServiceWithDB(sourceDB, targetDB *sql.DB, analyzer service.IdentityA
 	ts.checkpointCloser = nil
 
 	ts.loadTasks() // 加载任务
+
+	// 启动定时调度器
+	ts.StartScheduler()
 
 	return ts // 返回服务实例
 
@@ -759,6 +767,9 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 	logger.Info("Using %s checkpoint manager", checkpointType)
 
 	ts.loadTasks()
+
+	// 启动定时调度器
+	ts.StartScheduler()
 
 	return ts
 
@@ -1736,8 +1747,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		// 全局共享连接池大小 = intraWorkers（所有表共享，不再按表预分配）
 		poolSize := intraWorkers
-		if poolSize > 32 {
-			poolSize = 32
+		if poolSize > 16 {
+			poolSize = 16
 		}
 
 		logger.Info("[Task %s] Preparing global consistent snapshot pool (size=%d) for %d tables...", taskID, poolSize, len(allTableEntries))
@@ -4765,6 +4776,129 @@ func (s *TaskService) PauseTask(taskID string) error {
 
 }
 
+// ScheduleTask 设置定时启动
+func (s *TaskService) ScheduleTask(taskID string, scheduledAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+
+	// 只有 PENDING / PAUSED / FAILED 状态的任务才能设置定时启动
+	switch task.Context.Status {
+	case taskEntity.TaskStatusPending, taskEntity.TaskStatusPaused, taskEntity.TaskStatusFailed, taskEntity.TaskStatusScheduled:
+		// 允许
+	default:
+		return fmt.Errorf("cannot schedule task in status %s: %s", task.Context.Status, taskID)
+	}
+
+	task.Schedule(scheduledAt)
+
+	// 保存状态
+	if err := s.storage.Save(task); err != nil {
+		fmt.Printf("保存任务状态失败: %v\n", err)
+	}
+
+	// 记录审计日志
+	if s.auditLogger != nil {
+		s.auditLogger.Log(&audit.Event{
+			TaskID:    taskID,
+			EventType: "TASK_SCHEDULED",
+			Success:   true,
+			Details:   map[string]interface{}{"scheduled_at": scheduledAt.Format(time.RFC3339)},
+		})
+	}
+
+	logger.Info("[Task %s] Scheduled to start at %s", taskID, scheduledAt.Format(time.RFC3339))
+	return nil
+}
+
+// CancelSchedule 取消定时启动
+func (s *TaskService) CancelSchedule(taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+
+	if task.Context.Status != taskEntity.TaskStatusScheduled {
+		return fmt.Errorf("task is not scheduled: %s (current status: %s)", taskID, task.Context.Status)
+	}
+
+	task.CancelSchedule()
+
+	// 保存状态
+	if err := s.storage.Save(task); err != nil {
+		fmt.Printf("保存任务状态失败: %v\n", err)
+	}
+
+	// 记录审计日志
+	if s.auditLogger != nil {
+		s.auditLogger.Log(&audit.Event{
+			TaskID:    taskID,
+			EventType: "TASK_SCHEDULE_CANCELLED",
+			Success:   true,
+		})
+	}
+
+	logger.Info("[Task %s] Schedule cancelled", taskID)
+	return nil
+}
+
+// StartScheduler 启动定时调度器，每秒检查一次是否有到期的定时任务需要启动
+func (s *TaskService) StartScheduler() {
+	s.schedulerStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.schedulerStop:
+				logger.Info("Task scheduler stopped")
+				return
+			case <-ticker.C:
+				s.checkScheduledTasks()
+			}
+		}
+	}()
+	logger.Info("Task scheduler started")
+}
+
+// StopScheduler 停止定时调度器
+func (s *TaskService) StopScheduler() {
+	if s.schedulerStop != nil {
+		close(s.schedulerStop)
+	}
+}
+
+// checkScheduledTasks 检查并启动到期的定时任务
+func (s *TaskService) checkScheduledTasks() {
+	s.mu.RLock()
+	// 收集需要启动的任务ID
+	var toStart []string
+	now := time.Now()
+	for taskID, task := range s.tasks {
+		if task.Context.Status == taskEntity.TaskStatusScheduled &&
+			task.Context.ScheduledAt != nil &&
+			!task.Context.ScheduledAt.After(now) {
+			toStart = append(toStart, taskID)
+		}
+	}
+	s.mu.RUnlock()
+
+	// 逐个启动到期任务
+	for _, taskID := range toStart {
+		logger.Info("[Task %s] Scheduled time reached, starting task...", taskID)
+		if err := s.StartTask(context.Background(), taskID); err != nil {
+			logger.Warn("[Task %s] Failed to start scheduled task: %v", taskID, err)
+		}
+	}
+}
+
 // SkipError 跳过错误
 
 func (s *TaskService) SkipError(taskID string) error {
@@ -5052,6 +5186,9 @@ func (s *TaskService) Close() error {
 	defer s.mu.Unlock()
 
 	logger.Info("Closing task service...")
+
+	// 0. 停止定时调度器
+	s.StopScheduler()
 
 	// 1. 停止所有增量同步服务
 
