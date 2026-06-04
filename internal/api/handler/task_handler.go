@@ -1,24 +1,27 @@
 package handler // 声明当前文件属于handler包，用于处理HTTP请求
 
-import ( // 导入外部包和内部模块
-	"context"      // 导入context包，用于处理请求超时和取消
-	"crypto/rand"  // 导入crypto/rand包，用于生成随机数
-	"database/sql" // 导入database/sql包，用于数据库操作
-	"encoding/hex" // 导入encoding/hex包，用于十六进制编码
-	"fmt"          // 导入fmt包，用于格式化输入输出
-	"net/http"     // 导入net/http包，用于HTTP服务器
-	"strings"      // 导入strings包，用于字符串操作
-	"time"         // 导入time包，用于时间处理
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
 
-	"github.com/gin-gonic/gin"         // 导入Gin框架，用于构建HTTP API
-	_ "github.com/go-sql-driver/mysql" // 导入MySQL驱动，下划线表示仅导入init函数
+	"github.com/gin-gonic/gin"
+	_ "github.com/go-sql-driver/mysql"
 
-	"mysql-to-async/internal/config"                                  // 导入配置模块
-	"mysql-to-async/internal/metadata/domain/service"                 // 导入元数据领域服务
-	metadataService "mysql-to-async/internal/metadata/domain/service" // 导入元数据领域服务，设置别名
-	"mysql-to-async/internal/metadata/infrastructure"                 // 导入元数据基础设施
-	taskService "mysql-to-async/internal/task/application/service"    // 导入任务应用服务
-	taskEntity "mysql-to-async/internal/task/domain/entity"           // 导入任务实体
+	"mysql-to-async/internal/config"
+	"mysql-to-async/internal/metadata/domain/service"
+	metadataService "mysql-to-async/internal/metadata/domain/service"
+	"mysql-to-async/internal/metadata/infrastructure"
+	taskService "mysql-to-async/internal/task/application/service"
+	taskEntity "mysql-to-async/internal/task/domain/entity"
+	"mysql-to-async/pkg/logger"
 )
 
 // TaskHandler 任务处理器结构体
@@ -59,6 +62,8 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	WorkerCount              int                    `json:"worker_count"`               // 工作线程数
 	IntraTableWorkerCount    int                    `json:"intra_table_worker_count"`   // 表内工作线程数
 	EnableLimitOne           bool                   `json:"enable_limit_one"`           // 是否启用LIMIT 1优化
+	OptimizeIndex            bool                   `json:"optimize_index"`             // 索引优化：先删后建
+	EnableReadOnly           bool                   `json:"enable_read_only"`           // 同步前关闭目标只读，同步后恢复
 	EnableConsistentSnapshot bool                   `json:"enable_consistent_snapshot"` // 是否启用全量一致性快照
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`        // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`        // 目标数据库配置（可选）
@@ -133,6 +138,8 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		WorkerCount:              req.WorkerCount,               // 设置工作线程数
 		IntraTableWorkerCount:    req.IntraTableWorkerCount,     // 设置表内工作线程数
 		EnableLimitOne:           req.EnableLimitOne,            // 设置LIMIT 1优化开关
+		OptimizeIndex:            req.OptimizeIndex,             // 设置索引优化开关
+		EnableReadOnly:           req.EnableReadOnly,            // 设置只读管理开关
 		EnableConsistentSnapshot: req.EnableConsistentSnapshot,  // 设置一致性快照开关
 		SourceDB:                 sourceDB,                      // 设置源数据库配置
 		TargetDB:                 targetDB,                      // 设置目标数据库配置
@@ -146,10 +153,41 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 	c.JSON(http.StatusCreated, task) // 返回创建的任务
 }
 
-// StartTask 启动任务方法
+// StartTaskRequest 启动任务请求结构体（可选）
+type StartTaskRequest struct {
+	ScheduledAt *time.Time `json:"scheduled_at,omitempty"` // 定时启动时间（为空表示立即启动）
+}
+
+// StartTask 启动任务方法（支持立即启动和定时启动）
 func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 	taskID := c.Param("id") // 获取任务ID参数
 
+	// 尝试解析请求体中的 scheduled_at（可选，body 为空时立即启动）
+	var req StartTaskRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.ScheduledAt != nil { // 定时启动
+		if req.ScheduledAt.Before(time.Now()) { // 校验时间不能是过去
+			c.JSON(http.StatusBadRequest, gin.H{"error": "定时启动时间不能早于当前时间"})
+			return
+		}
+		if err := h.taskService.ScheduleTask(taskID, *req.ScheduledAt); err != nil {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "task not found") {
+				c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+			} else {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+			}
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Task scheduled", "scheduled_at": req.ScheduledAt})
+		return
+	}
+
+	// 立即启动
 	if err := h.taskService.StartTask(c.Request.Context(), taskID); err != nil { // 启动任务
 		errMsg := err.Error()
 		switch {
@@ -166,6 +204,23 @@ func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Task started"}) // 返回成功消息
+}
+
+// CancelSchedule 取消定时启动方法
+func (h *TaskHandler) CancelSchedule(c *gin.Context) { // 取消定时启动
+	taskID := c.Param("id") // 获取任务ID参数
+
+	if err := h.taskService.CancelSchedule(taskID); err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "task not found") {
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Schedule cancelled"}) // 返回成功消息
 }
 
 // PauseTask 暂停任务方法
@@ -243,33 +298,166 @@ func (h *TaskHandler) UpdateGlobalConfig(c *gin.Context) { // 更新全局配置
 		return
 	}
 
-	// 更新内存中的配置
-	*config.GlobalConfig = req // 更新全局配置
+	oldCfg := config.GlobalConfig
+	if oldCfg == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Config not loaded"})
+		return
+	}
+
+	// 保留前端不会发送的敏感/内部字段（如加密密钥、同步调优参数）
+	req.Security = oldCfg.Security
+	req.Sync = oldCfg.Sync
 
 	// 保存到文件
-	if err := config.SaveConfig("etc/application.toml", config.GlobalConfig); err != nil { // 保存配置到文件
+	if err := config.SaveConfig("etc/application.toml", &req); err != nil { // 保存配置到文件
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save config: " + err.Error()}) // 返回错误
 		return
 	}
 
+	// 更新内存中的配置
+	*oldCfg = req // 更新全局配置
+
 	// 动态重初始化存储后端（如从 file 切换到 mysql 时会自动建表）
+	hotReloaded := []string{}
+	warnings := []string{}
+
 	storageMsg := ""                                                         // 定义存储消息变量
 	if err := h.taskService.ReinitStorage(config.GlobalConfig); err != nil { // 重初始化存储
 		storageMsg = fmt.Sprintf("Warning: storage reinitialization failed: %v", err) // 设置错误消息
+		warnings = append(warnings, storageMsg)
 	} else if req.Storage.Mode == "mysql" { // 如果是MySQL存储模式
 		storageMsg = "MySQL storage initialized, sys_sync_tasks table ensured" // 设置成功消息
+		hotReloaded = append(hotReloaded, "storage")
+	} else {
+		hotReloaded = append(hotReloaded, "storage")
 	}
 
-	resp := gin.H{"message": "Configuration updated successfully"} // 创建响应
-	if storageMsg != "" {                                          // 如果有存储消息
-		resp["storage"] = storageMsg // 添加存储消息
+	checkpointMsg := ""
+	if err := h.taskService.ReinitCheckpointManager(config.GlobalConfig); err != nil {
+		checkpointMsg = fmt.Sprintf("Warning: checkpoint manager reinitialization failed: %v", err)
+		warnings = append(warnings, checkpointMsg)
+	} else if req.Redis.Host != "" {
+		checkpointMsg = "Redis checkpoint manager initialized"
+		hotReloaded = append(hotReloaded, "redis")
+	} else {
+		checkpointMsg = "In-memory checkpoint manager initialized"
+		hotReloaded = append(hotReloaded, "redis")
+	}
+
+	logMsg := ""
+	logCfg := buildLoggerConfig(&req.Log)
+	if err := logger.ReconfigureGlobal(logCfg); err != nil {
+		logMsg = fmt.Sprintf("Warning: logger reconfigure failed: %v", err)
+		warnings = append(warnings, logMsg)
+	} else {
+		logMsg = fmt.Sprintf("Logger reconfigured: level=%s, console=%v, file=%v", logCfg.Level, logCfg.Console, logCfg.File)
+		hotReloaded = append(hotReloaded, "logger")
+	}
+
+	resp := gin.H{"message": "Configuration updated successfully"}
+	if storageMsg != "" {
+		resp["storage"] = storageMsg
+	}
+	if checkpointMsg != "" {
+		resp["redis"] = checkpointMsg
+	}
+	if logMsg != "" {
+		resp["logger"] = logMsg
+	}
+	if len(hotReloaded) > 0 {
+		resp["hotReloaded"] = hotReloaded
+	}
+	if len(warnings) > 0 {
+		resp["warnings"] = warnings
 	}
 	c.JSON(http.StatusOK, resp) // 返回响应
 }
 
+// buildLoggerConfig 从应用层 LogConfig 构建 logger.Config
+func buildLoggerConfig(lc *config.LogConfig) *logger.Config {
+	cfg := &logger.Config{
+		Level:       lc.Level,
+		Console:     lc.Console.Enable,
+		File:        lc.File.Enable,
+		EnableColor: !lc.Console.NoColor,
+	}
+	if cfg.Level == "" {
+		cfg.Level = "info"
+	}
+	if !cfg.Console && !cfg.File {
+		cfg.Console = true
+		cfg.EnableColor = true
+	}
+	return cfg
+}
+
+// UpdateLogConfigRequest 日志配置热更新请求
+type UpdateLogConfigRequest struct {
+	Level   string                `json:"level"`
+	Console *config.ConsoleConfig `json:"console,omitempty"`
+	File    *config.FileConfig    `json:"file,omitempty"`
+}
+
+// GetLogConfig 获取当前运行时生效的日志配置
+func (h *TaskHandler) GetLogConfig(c *gin.Context) {
+	lc := logger.GetGlobalConfig()
+	if lc == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Logger not initialized"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"level":        lc.Level,
+		"console":      lc.Console,
+		"file":         lc.File,
+		"enable_color": lc.EnableColor,
+	})
+}
+
+// UpdateLogConfig 独立的日志配置热加载接口——只修改日志级别和输出，不影响其他配置
+func (h *TaskHandler) UpdateLogConfig(c *gin.Context) {
+	var req UpdateLogConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	cfg := config.GlobalConfig
+	if cfg == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Config not loaded"})
+		return
+	}
+
+	if req.Level != "" {
+		cfg.Log.Level = req.Level
+	}
+	if req.Console != nil {
+		cfg.Log.Console = *req.Console
+	}
+	if req.File != nil {
+		cfg.Log.File = *req.File
+	}
+
+	logCfg := buildLoggerConfig(&cfg.Log)
+	if err := logger.ReconfigureGlobal(logCfg); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Logger reconfigure failed: " + err.Error()})
+		return
+	}
+
+	if err := config.SaveConfig("etc/application.toml", cfg); err != nil {
+		logger.Warn("日志配置已热加载但持久化失败: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "日志配置已热加载",
+		"level":   logCfg.Level,
+		"console": logCfg.Console,
+		"file":    logCfg.File,
+	})
+}
+
 // MetadataHandler 元数据处理器结构体
-type MetadataHandler struct { // 定义元数据处理器结构体
-	analyzer metadataService.IdentityAnalyzer // 元数据分析器实例
+type MetadataHandler struct {
+	analyzer metadataService.IdentityAnalyzer
 }
 
 // NewMetadataHandler 创建元数据处理器函数
@@ -431,7 +619,13 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	}
 	// enable_limit_one 是 bool 类型，直接赋值
 	task.Config.EnableLimitOne = req.EnableLimitOne // 更新LIMIT 1优化开关
-	if req.EnableConsistentSnapshot != nil {        // 如果提供了一致性快照开关
+	if req.OptimizeIndex != nil {                   // 如果提供了索引优化开关
+		task.Config.OptimizeIndex = *req.OptimizeIndex // 更新索引优化开关
+	}
+	if req.EnableReadOnly != nil { // 如果提供了只读管理开关
+		task.Config.EnableReadOnly = *req.EnableReadOnly // 更新只读管理开关
+	}
+	if req.EnableConsistentSnapshot != nil { // 如果提供了一致性快照开关
 		task.Config.EnableConsistentSnapshot = *req.EnableConsistentSnapshot // 更新一致性快照开关
 	}
 
@@ -501,6 +695,8 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	WorkerCount              int                    `json:"worker_count"`                         // 工作线程数
 	IntraTableWorkerCount    *int                   `json:"intra_table_worker_count,omitempty"`   // 表内工作线程数（可选）
 	EnableLimitOne           bool                   `json:"enable_limit_one"`                     // 是否启用LIMIT 1优化
+	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`             // 索引优化（可选）
+	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`           // 只读管理（可选）
 	EnableConsistentSnapshot *bool                  `json:"enable_consistent_snapshot,omitempty"` // 是否启用全量一致性快照（可选）
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                  // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                  // 目标数据库配置（可选）

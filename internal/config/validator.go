@@ -4,11 +4,12 @@ import ( // 导入外部包
 	"context" // 导入context包，用于处理请求超时和取消
 	"database/sql" // 导入database/sql包，用于数据库操作
 	"fmt" // 导入fmt包，用于格式化输入输出
-	"log" // 导入log包，用于日志输出
 	"time" // 导入time包，用于时间处理
 
 	_ "github.com/go-sql-driver/mysql" // 导入MySQL驱动，下划线表示仅导入init函数
 	"github.com/redis/go-redis/v9" // 导入Redis客户端包
+
+	"mysql-to-async/pkg/logger" // 导入自定义日志包，用于日志输出
 )
 
 // Validator 配置验证器结构体
@@ -23,20 +24,20 @@ func NewValidator(cfg *Config) *Validator { // 创建配置验证器实例
 
 // ValidateConfig 验证配置格式（不验证数据库连接）方法
 func (v *Validator) ValidateConfig() error { // 验证配置格式
-	log.Println("Validating configuration format...") // 输出验证开始日志
+	logger.Info("Validating configuration format...") // 输出验证开始日志
 
 	// 验证HTTP配置
 	if err := v.ValidateHTTP(); err != nil { // 验证HTTP配置
 		return fmt.Errorf("http validation failed: %w", err) // 返回错误
 	}
 
-	log.Println("Configuration format validation passed ✓") // 输出验证通过日志
+	logger.Info("Configuration format validation passed ✓") // 输出验证通过日志
 	return nil // 返回nil表示成功
 }
 
 // ValidateAll 验证所有配置方法
 func (v *Validator) ValidateAll() error { // 验证所有配置
-	log.Println("Validating configuration...") // 输出验证开始日志
+	logger.Info("Validating configuration...") // 输出验证开始日志
 
 	// 1. 验证源数据库
 	if err := v.ValidateSourceDatabase(); err != nil { // 验证源数据库配置
@@ -51,7 +52,7 @@ func (v *Validator) ValidateAll() error { // 验证所有配置
 	// 3. 验证Redis（如果配置了）
 	if v.config.Redis.Host != "" { // 如果配置了Redis主机
 		if err := v.ValidateRedis(); err != nil { // 验证Redis配置
-			log.Printf("Warning: Redis validation failed: %v. Incremental sync checkpoints may not be persisted to Redis.", err) // 输出警告日志
+			logger.Warn("Redis validation failed: %v. Incremental sync checkpoints may not be persisted to Redis.", err) // 输出警告日志
 		}
 	}
 
@@ -60,13 +61,13 @@ func (v *Validator) ValidateAll() error { // 验证所有配置
 		return fmt.Errorf("http validation failed: %w", err) // 返回错误
 	}
 
-	log.Println("Configuration validation passed ✓") // 输出验证通过日志
+	logger.Info("Configuration validation passed ✓") // 输出验证通过日志
 	return nil // 返回nil表示成功
 }
 
 // ValidateSourceDatabase 验证源数据库方法
 func (v *Validator) ValidateSourceDatabase() error { // 验证源数据库连接
-	log.Printf("Validating source database: %s:%d/%s", // 输出验证开始日志
+	logger.Info("Validating source database: %s:%d/%s", // 输出验证开始日志
 		v.config.Datasource.Host, // 主机
 		v.config.Datasource.Port, // 端口
 		v.config.Datasource.Database) // 数据库名
@@ -104,18 +105,18 @@ func (v *Validator) ValidateSourceDatabase() error { // 验证源数据库连接
 		return err // 返回错误
 	}
 
-	log.Println("  Source database connected successfully ✓") // 输出成功日志
+	logger.Info("  Source database connected successfully ✓") // 输出成功日志
 	return nil // 返回nil表示成功
 }
 
 // ValidateTargetDatabase 验证目标数据库方法
 func (v *Validator) ValidateTargetDatabase() error { // 验证目标数据库连接
 	if v.config.Target.Host == "" { // 如果未配置目标数据库
-		log.Println("  Target database not configured, using source as target") // 输出提示信息
+		logger.Info("  Target database not configured, using source as target") // 输出提示信息
 		return nil // 返回nil
 	}
 
-	log.Printf("Validating target database: %s:%d/%s", // 输出验证开始日志
+	logger.Info("Validating target database: %s:%d/%s", // 输出验证开始日志
 		v.config.Target.Host, // 主机
 		v.config.Target.Port, // 端口
 		v.config.Target.Database) // 数据库名
@@ -147,18 +148,18 @@ func (v *Validator) ValidateTargetDatabase() error { // 验证目标数据库连
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", // 创建数据库SQL
 			v.config.Target.Database)) // 数据库名
 	if err != nil { // 如果创建失败
-		log.Printf("  Warning: failed to create database: %v", err) // 输出警告日志
+		logger.Warn("  failed to create database: %v", err) // 输出警告日志
 	} else { // 如果创建成功
-		log.Printf("  Database '%s' created or already exists ✓", v.config.Target.Database) // 输出成功日志
+		logger.Info("  Database '%s' created or already exists ✓", v.config.Target.Database) // 输出成功日志
 	}
 
-	log.Println("  Target database connected successfully ✓") // 输出成功日志
+	logger.Info("  Target database connected successfully ✓") // 输出成功日志
 	return nil // 返回nil表示成功
 }
 
 // ValidateRedis 验证Redis连接方法
 func (v *Validator) ValidateRedis() error { // 验证Redis连接
-	log.Printf("Validating Redis: %s:%d", v.config.Redis.Host, v.config.Redis.Port) // 输出验证开始日志
+	logger.Info("Validating Redis: %s:%d", v.config.Redis.Host, v.config.Redis.Port) // 输出验证开始日志
 
 	rdb := redis.NewClient(&redis.Options{ // 创建Redis客户端
 		Addr:     fmt.Sprintf("%s:%d", v.config.Redis.Host, v.config.Redis.Port), // 设置地址
@@ -181,7 +182,7 @@ func (v *Validator) ValidateRedis() error { // 验证Redis连接
 		return fmt.Errorf("failed to write to redis: %w", err) // 返回错误
 	}
 
-	log.Println("  Redis connected successfully ✓") // 输出成功日志
+	logger.Info("  Redis connected successfully ✓") // 输出成功日志
 	return nil // 返回nil表示成功
 }
 
@@ -191,7 +192,7 @@ func (v *Validator) ValidateHTTP() error { // 验证HTTP配置
 		return fmt.Errorf("invalid http port: %d", v.config.Http.Port) // 返回错误
 	}
 
-	log.Printf("HTTP server will listen on %s:%d ✓", v.config.Http.Host, v.config.Http.Port) // 输出成功日志
+	logger.Info("HTTP server will listen on %s:%d ✓", v.config.Http.Host, v.config.Http.Port) // 输出成功日志
 	return nil // 返回nil表示成功
 }
 
@@ -222,12 +223,12 @@ func (v *Validator) checkBinlogConfig(db *sql.DB) error { // 检查MySQL Binlog�
 	err = db.QueryRow("SHOW VARIABLES LIKE 'binlog_row_image'").Scan(&binlogRowImage, &binlogRowImage) // 查询binlog_row_image变量
 	if err != nil { // 如果查询失败
 		// 可能是旧版本MySQL，忽略此检查
-		log.Println("  Warning: binlog_row_image variable not found (might be older MySQL version)") // 输出警告
+		logger.Warn("  binlog_row_image variable not found (might be older MySQL version)") // 输出警告
 	} else if binlogRowImage != "FULL" { // 如果不是FULL模式
-		log.Printf("  Warning: binlog_row_image is %s, recommended to be FULL for no-PK tables", binlogRowImage) // 输出警告
+		logger.Warn("  binlog_row_image is %s, recommended to be FULL for no-PK tables", binlogRowImage) // 输出警告
 	}
 
-	log.Println("  Binlog configuration validated ✓") // 输出成功日志
+	logger.Info("  Binlog configuration validated ✓") // 输出成功日志
 	return nil // 返回nil表示成功
 }
 
@@ -263,16 +264,16 @@ func (v *Validator) checkUserPrivileges(db *sql.DB) error { // 检查MySQL用户
 	}
 
 	if hasReplicationSlave == "" { // 如果没有复制权限
-		log.Println("  Warning: REPLICATION SLAVE privilege not found, incremental sync may not work") // 输出警告
+		logger.Warn("  REPLICATION SLAVE privilege not found, incremental sync may not work") // 输出警告
 	}
 	if hasReplicationClient == "" { // 如果没有复制客户端权限
-		log.Println("  Warning: REPLICATION CLIENT privilege not found, incremental sync may not work") // 输出警告
+		logger.Warn("  REPLICATION CLIENT privilege not found, incremental sync may not work") // 输出警告
 	}
 	if hasSelect == "" { // 如果没有查询权限
-		log.Println("  Warning: SELECT privilege not found") // 输出警告
+		logger.Warn("  SELECT privilege not found") // 输出警告
 	}
 
-	log.Printf("  User privileges validated ✓") // 输出成功日志
+	logger.Info("  User privileges validated ✓") // 输出成功日志
 	return nil // 返回nil表示成功
 }
 

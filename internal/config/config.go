@@ -9,6 +9,11 @@ import ( // 导入外部包
 	"github.com/BurntSushi/toml" // 导入toml包，用于TOML配置文件解析
 )
 
+// SecurityConfig 安全配置结构体
+type SecurityConfig struct { // 定义安全配置结构体
+	EncryptKey string `toml:"encrypt_key" json:"encrypt_key"` // 密码加密密钥（AES-256，建议32字节；为空则不加密）
+}
+
 // Config 全局配置结构体
 type Config struct { // 定义全局配置结构体
 	Http       HttpConfig       `toml:"http"        json:"http"`       // HTTP服务配置
@@ -18,6 +23,7 @@ type Config struct { // 定义全局配置结构体
 	Target     TargetConfig     `toml:"target"      json:"target"`     // 目标数据库配置
 	Storage    StorageConfig    `toml:"storage"     json:"storage"`    // 持久化配置
 	Sync       SyncTuneConfig   `toml:"sync"        json:"sync"`       // 同步调优配置
+	Security   SecurityConfig   `toml:"security"    json:"security"`   // 安全配置
 }
 
 // SyncTuneConfig 同步调优配置结构体（全量同步并发与连接池，按实例 max_connections、CPU、磁盘调整；不设则使用内置默认池大小）
@@ -177,6 +183,8 @@ func ApplyEnvOverrides(cfg *Config) error {
 	setStringFromEnv("MYSQL_TO_ASYNC_STORAGE_DATABASE", &cfg.Storage.Database)
 	setStringFromEnv("MYSQL_TO_ASYNC_STORAGE_USERNAME", &cfg.Storage.Username)
 	setStringFromEnv("MYSQL_TO_ASYNC_STORAGE_PASSWORD", &cfg.Storage.Password)
+
+	setStringFromEnv("MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY", &cfg.Security.EncryptKey)
 
 	setStringFromEnv("MYSQL_TO_ASYNC_LOG_LEVEL", &cfg.Log.Level)
 	if err := setBoolFromEnv("MYSQL_TO_ASYNC_LOG_CONSOLE_ENABLE", &cfg.Log.Console.Enable); err != nil {

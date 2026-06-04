@@ -1,6 +1,8 @@
 package entity // 声明当前文件属于entity包，用于定义数据实体
 
 import ( // 导入外部包和标准库
+
+	"mysql-to-async/pkg/crypto"
 	"time" // 导入time包，用于时间处理
 )
 
@@ -13,6 +15,7 @@ const ( // 定义常量
 	TaskStatusPaused    TaskStatus = "PAUSED"    // 已暂停：任务被暂停
 	TaskStatusCompleted TaskStatus = "COMPLETED" // 已完成：任务执行完成
 	TaskStatusFailed    TaskStatus = "FAILED"    // 失败：任务执行失败
+	TaskStatusScheduled TaskStatus = "SCHEDULED" // 已计划：任务已设定定时启动时间
 )
 
 // SyncMode 同步模式
@@ -67,15 +70,17 @@ type TaskConfig struct { // 定义任务配置结构体
 
 // ProcessContext 处理上下文
 type ProcessContext struct { // 定义处理上下文结构体
-	Status          TaskStatus `json:"status"`           // 任务状态
-	CurrentPosition string     `json:"current_position"` // 当前位点
-	ProgressPercent float64    `json:"progress_percent"` // 进度百分比
-	TotalRows       int64      `json:"total_rows"`       // 总行数
-	ProcessedRows   int64      `json:"processed_rows"`   // 已处理行数
-	StartTime       time.Time  `json:"start_time"`       // 开始时间
-	EndTime         time.Time  `json:"end_time"`         // 结束时间
-	LastUpdateTime  time.Time  `json:"last_update_time"` // 最后更新时间
-	ErrorStack      string     `json:"error_stack"`      // 错误堆栈
+	Status              TaskStatus  `json:"status"`                 // 任务状态
+	CurrentPosition     string      `json:"current_position"`       // 当前位点
+	ProgressPercent     float64     `json:"progress_percent"`       // 进度百分比
+	TotalRows           int64       `json:"total_rows"`             // 总行数
+	ProcessedRows       int64       `json:"processed_rows"`         // 已处理行数
+	StartTime           time.Time   `json:"start_time"`             // 开始时间
+	EndTime             time.Time   `json:"end_time"`               // 结束时间
+	LastUpdateTime      time.Time   `json:"last_update_time"`       // 最后更新时间
+	ErrorStack          string      `json:"error_stack"`            // 错误堆栈
+	ScheduledAt         *time.Time  `json:"scheduled_at,omitempty"` // 定时启动时间（为空表示立即启动）
+	ScheduledFromStatus *TaskStatus `json:"scheduled_from_status,omitempty"`
 }
 
 // SyncTask 同步任务
@@ -99,6 +104,34 @@ func (t *SyncTask) Start() { // 启动任务
 	t.Context.Status = TaskStatusRunning  // 设置状态为执行中
 	t.Context.StartTime = time.Now()      // 记录开始时间
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
+	t.Context.ScheduledAt = nil           // 清除定时启动时间
+	t.Context.ScheduledFromStatus = nil
+}
+
+// Schedule 设置定时启动
+func (t *SyncTask) Schedule(scheduledAt time.Time) { // 设置定时启动
+	if t.Context.Status != TaskStatusScheduled {
+		previousStatus := t.Context.Status
+		t.Context.ScheduledFromStatus = &previousStatus
+	} else if t.Context.ScheduledFromStatus == nil {
+		previousStatus := TaskStatusPending
+		t.Context.ScheduledFromStatus = &previousStatus
+	}
+	t.Context.Status = TaskStatusScheduled // 设置状态为已计划
+	t.Context.ScheduledAt = &scheduledAt   // 记录定时启动时间
+	t.Context.LastUpdateTime = time.Now()  // 更新最后更新时间
+}
+
+// CancelSchedule 取消定时启动
+func (t *SyncTask) CancelSchedule() { // 取消定时启动
+	restoreStatus := TaskStatusPending
+	if t.Context.ScheduledFromStatus != nil {
+		restoreStatus = *t.Context.ScheduledFromStatus
+	}
+	t.Context.Status = restoreStatus
+	t.Context.ScheduledAt = nil
+	t.Context.ScheduledFromStatus = nil
+	t.Context.LastUpdateTime = time.Now()
 }
 
 // Pause 暂停任务方法
@@ -165,6 +198,54 @@ func EffectiveIntraTableWorkers(intraConfigured, tableWorkerCount, legacyCap, ha
 		intra = hardMax // 使用硬封顶
 	}
 	return intra // 返回表内worker数
+}
+
+// EncryptPasswords 将任务中 SourceDB/TargetDB 的密码加密（存储前调用）
+// key 为空时不做任何加密操作
+func (t *SyncTask) EncryptPasswords(key string) error {
+	if key == "" {
+		return nil
+	}
+	k := crypto.NormalizeKey(key)
+	if t.Config.SourceDB != nil && t.Config.SourceDB.Password != "" && !crypto.IsEncrypted(t.Config.SourceDB.Password) {
+		enc, err := crypto.Encrypt(t.Config.SourceDB.Password, k)
+		if err != nil {
+			return err
+		}
+		t.Config.SourceDB.Password = enc
+	}
+	if t.Config.TargetDB != nil && t.Config.TargetDB.Password != "" && !crypto.IsEncrypted(t.Config.TargetDB.Password) {
+		enc, err := crypto.Encrypt(t.Config.TargetDB.Password, k)
+		if err != nil {
+			return err
+		}
+		t.Config.TargetDB.Password = enc
+	}
+	return nil
+}
+
+// DecryptPasswords 将任务中 SourceDB/TargetDB 的密码解密（加载后调用）
+// key 为空时不做任何解密操作；明文旧数据会兼容返回
+func (t *SyncTask) DecryptPasswords(key string) error {
+	if key == "" {
+		return nil
+	}
+	k := crypto.NormalizeKey(key)
+	if t.Config.SourceDB != nil && t.Config.SourceDB.Password != "" {
+		dec, err := crypto.Decrypt(t.Config.SourceDB.Password, k)
+		if err != nil {
+			return err
+		}
+		t.Config.SourceDB.Password = dec
+	}
+	if t.Config.TargetDB != nil && t.Config.TargetDB.Password != "" {
+		dec, err := crypto.Decrypt(t.Config.TargetDB.Password, k)
+		if err != nil {
+			return err
+		}
+		t.Config.TargetDB.Password = dec
+	}
+	return nil
 }
 
 // Checkpoint 位点信息

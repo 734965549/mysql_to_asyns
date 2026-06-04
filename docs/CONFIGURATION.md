@@ -40,6 +40,8 @@ MYSQL_TO_ASYNC_REDIS_DB=0
 
 MYSQL_TO_ASYNC_STORAGE_MODE=file
 MYSQL_TO_ASYNC_STORAGE_DATA_DIR=/app/data
+
+MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY=your-32-byte-secret-key-here!!!!
 ```
 
 K8s Deployment 片段示例：
@@ -60,6 +62,11 @@ env:
       secretKeyRef:
         name: mysql-to-async-secret
         key: datasource_password
+  - name: MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY
+    valueFrom:
+      secretKeyRef:
+        name: mysql-to-async-secret
+        key: security_encrypt_key
 ```
 
 ## 配置项详解
@@ -133,6 +140,21 @@ env:
   - 优点：支持集群部署、数据持久化更好
   - 缺点：需要额外的数据库
   - 系统会自动创建 `sys_sync_tasks` 表
+
+#### [security] - 安全配置
+
+```toml
+[security]
+  encrypt_key = "your-32-byte-secret-key-here!!!!"   # 任务密码加密密钥
+```
+
+**说明**：
+- 用于加密同步任务中 `source_db` 和 `target_db` 的数据库密码，防止密码以明文存储在数据库或文件中
+- 加密算法：AES-256-GCM，密文以 `ENC~` 前缀标识
+- **密钥长度**：建议 32 字节；不足自动补齐，超过截断
+- **留空则不加密**，行为与未配置前完全一致
+- **向后兼容**：加载时自动识别明文密码和 `ENC~` 密文，旧数据无需迁移
+- 也可通过环境变量设置：`MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY`
 
 #### [redis] - Redis配置
 
@@ -405,6 +427,7 @@ curl http://localhost:8080/api/tasks/:id/metrics
 5. **权限控制**：使用最小必要权限的数据库账号
 6. **网络优化**：确保源和目标数据库网络延迟低
 7. **资源评估**：根据服务器硬件资源调整配置
+8. **启用密码加密**：配置 `[security].encrypt_key` 或环境变量，确保任务密码不以明文存储
 
 ## 更多帮助
 

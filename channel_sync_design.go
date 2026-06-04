@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync/atomic"
+
+	"mysql-to-async/pkg/logger"
 )
 
 // BatchTask 批次任务结构
@@ -120,7 +121,7 @@ func ExampleChannelSync() {
 
 	// 启动workers
 	sync.StartWorkers(ctx, func(task *BatchTask) error {
-		log.Printf("Worker %d processing batch %d: %d rows (PK %v -> %v)",
+		logger.Info("Worker %d processing batch %d: %d rows (PK %v -> %v)",
 			task.WorkerID, task.BatchID, len(task.Data), task.StartPK, task.EndPK)
 
 		// 这里执行实际的数据库写入操作
@@ -137,7 +138,7 @@ func ExampleChannelSync() {
 		// 从源数据库读取下一批数据
 		data, nextPK, err := readNextBatch(lastPK, 1000)
 		if err != nil {
-			log.Printf("Read error: %v", err)
+			logger.Error("Read error: %v", err)
 			break
 		}
 
@@ -148,7 +149,7 @@ func ExampleChannelSync() {
 		// 添加到channel
 		err = sync.AddBatch(batchID, data, lastPK, nextPK)
 		if err != nil {
-			log.Printf("Add batch error: %v", err)
+			logger.Error("Add batch error: %v", err)
 			continue
 		}
 
@@ -159,12 +160,12 @@ func ExampleChannelSync() {
 	// 等待完成
 	err := sync.WaitForCompletion(ctx)
 	if err != nil {
-		log.Printf("Sync failed: %v", err)
+		logger.Error("Sync failed: %v", err)
 		return
 	}
 
 	processed, total := sync.GetProgress()
-	log.Printf("Sync completed: %d/%d rows processed", processed, total)
+	logger.Info("Sync completed: %d/%d rows processed", processed, total)
 }
 
 // 模拟数据读取函数

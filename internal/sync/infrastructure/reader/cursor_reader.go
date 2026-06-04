@@ -104,8 +104,10 @@ type DataReader interface { // 定义数据读取器接口
 	ReadBatch(ctx context.Context, offset, limit int64) ([]map[string]interface{}, error) // 批量读取数据
 	// ReadBatchByKeys 批量读取数据（基于主键范围，优化深分页）方法
 	ReadBatchByKeys(ctx context.Context, lastID interface{}, limit int64) ([]map[string]interface{}, error) // 基于主键批量读取
-	// GetTotalCount 获取总行数方法
+	// GetTotalCount 获取总行数方法（精确，可能慢）
 	GetTotalCount(ctx context.Context) (int64, error) // 获取总行数
+	// GetEstimatedCount 通过 information_schema 快速获取估算行数（毫秒级，有误差）
+	GetEstimatedCount(ctx context.Context) (int64, error) // 获取估算行数
 }
 
 // CursorReader 无主键表流式读取器（单次全表扫描，避免 OFFSET 深翻页）
@@ -116,6 +118,7 @@ type CursorReader struct { // 定义无主键表流式读取器结构体
 	identity *entity.TableIdentity // 表标识信息
 	rows     *sql.Rows             // 流式游标，第一次 ReadBatch 时打开
 	colNames []string              // 列名缓存
+	done     bool                  // 标记游标已耗尽，防止重复打开
 }
 
 // NewCursorReader 创建流式读取器函数
@@ -131,16 +134,19 @@ func NewCursorReader(db queryExecutor, schema, table string, identity *entity.Ta
 // ReadBatch 批量读取数据方法（流式：第一次调用打开游标，后续调用继续从游标读取）
 // offset 参数在流式模式下忽略（已由游标位置隐含）
 func (r *CursorReader) ReadBatch(ctx context.Context, _ /* offset */, limit int64) ([]map[string]interface{}, error) { // 批量读取数据
+	if r.done { // 游标已耗尽，直接返回空结果
+		return nil, nil
+	}
 	limit = normalizeSelectLimit(limit) // 规范化限制值
 	if r.rows == nil {                  // 如果游标未打开
 		var colParts []string                    // 创建列部分列表
 		for _, col := range r.identity.Columns { // 遍历所有列
 			colParts = append(colParts, selectExprForColumn(col)) // 添加列表达式
 		}
-		// 添加 LIMIT 子句，避免一次性加载整表到内存
-		query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` LIMIT ?", strings.Join(colParts, ", "), r.schema, r.table) // 构建查询
-		rows, err := r.db.QueryContext(ctx, query, limit)                                                         // 执行查询
-		if err != nil {                                                                                           // 如果查询失败
+		// 不加 LIMIT：游标通过 Next() 逐行消费，批量大小由外层 limit 参数控制
+		query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`", strings.Join(colParts, ", "), r.schema, r.table) // 构建全表查询
+		rows, err := r.db.QueryContext(ctx, query)                                                        // 执行查询
+		if err != nil {                                                                                   // 如果查询失败
 			return nil, fmt.Errorf("打开流式游标失败: %v, SQL: %s", err, query) // 返回错误
 		}
 		r.rows = rows                    // 保存游标
@@ -158,6 +164,7 @@ func (r *CursorReader) ReadBatch(ctx context.Context, _ /* offset */, limit int6
 			}
 			_ = r.rows.Close() // 关闭游标
 			r.rows = nil       // 清空游标
+			r.done = true      // 标记已完成，防止重新打开游标
 			break              // 退出循环
 		}
 		values := make([]interface{}, len(r.colNames))    // 创建值列表
@@ -188,6 +195,14 @@ func (r *CursorReader) GetTotalCount(ctx context.Context) (int64, error) { // �
 	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", r.schema, r.table) // 构建查询
 	err := r.db.QueryRowContext(ctx, query).Scan(&count)                      // 执行查询
 	return count, err                                                         // 返回计数和错误
+}
+
+// GetEstimatedCount 通过 information_schema 快速获取估算行数
+func (r *CursorReader) GetEstimatedCount(ctx context.Context) (int64, error) {
+	var count int64
+	query := "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+	err := r.db.QueryRowContext(ctx, query, r.schema, r.table).Scan(&count)
+	return count, err
 }
 
 // scanRows 扫描行数据方法
@@ -273,14 +288,14 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s ASC LIMIT ?", // 构建查询
 				columns, r.schema, r.table, colList) // 排序并限制
 			args = []interface{}{limit} // 设置参数
-		} else { // 如果有上次ID
-			lastIDs, ok := lastID.([]interface{}) // 类型断言
-			if !ok {                              // 如果类型不匹配
-				return nil, fmt.Errorf("复合主键 lastID 必须是 []interface{}，实际: %T", lastID) // 返回错误
-			}
+		} else if lastIDs, ok := lastID.([]interface{}); ok { // 完整复合主键值
 			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE (%s) > (%s) ORDER BY %s ASC LIMIT ?", // 构建查询
 				columns, r.schema, r.table, colList, placeholders, colList) // 使用行构造器比较
 			args = append(append([]interface{}{}, lastIDs...), limit) // 设置参数
+		} else { // 单值：仅按第一主键列过滤（并行采样边界起始定位）
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` > ? ORDER BY %s ASC LIMIT ?", // 构建查询
+				columns, r.schema, r.table, pkCols[0], colList) // 按首列定位
+			args = []interface{}{lastID, limit} // 设置参数
 		}
 	}
 
@@ -342,6 +357,14 @@ func (r *RangeShardingReader) GetTotalCount(ctx context.Context) (int64, error) 
 	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", r.schema, r.table) // 构建查询
 	err := r.db.QueryRowContext(ctx, query).Scan(&count)                      // 执行查询
 	return count, err                                                         // 返回计数和错误
+}
+
+// GetEstimatedCount 通过 information_schema 快速获取估算行数
+func (r *RangeShardingReader) GetEstimatedCount(ctx context.Context) (int64, error) {
+	var count int64
+	query := "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+	err := r.db.QueryRowContext(ctx, query, r.schema, r.table).Scan(&count)
+	return count, err
 }
 
 // scanRows 扫描行数据方法
