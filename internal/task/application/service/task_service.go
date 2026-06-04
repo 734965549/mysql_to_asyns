@@ -101,6 +101,8 @@ type TaskService struct {
 
 	auditLogger *audit.AuditLogger // 审计日志器
 
+	schedulerMu sync.Mutex // 保护调度器启停状态
+
 	schedulerStop chan struct{} // 定时调度器停止信号
 
 }
@@ -1039,6 +1041,8 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 
 	}
 
+	wasScheduled := task.Context.Status == taskEntity.TaskStatusScheduled
+
 	// 动态创建数据库连接（如果还没有创建或需要更新）
 
 	initRuntime := s.initRuntimeFn
@@ -1068,6 +1072,9 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 	s.runtimes[taskID] = runtime
 
 	task.Start()
+	if !wasScheduled {
+		task.ResetRepeat()
+	}
 
 	// 记录审计日志
 
@@ -1142,6 +1149,86 @@ func (s *TaskService) resolveSourceSchema(task *taskEntity.SyncTask) string {
 	}
 
 	return ""
+
+}
+
+func (s *TaskService) resolveTargetSchema(task *taskEntity.SyncTask, sourceSchema string) string {
+
+	if task != nil {
+
+		if task.Config.TargetDB != nil {
+
+			if dbName := strings.TrimSpace(task.Config.TargetDB.Database); dbName != "" {
+
+				return dbName
+
+			}
+
+		}
+
+		if schema := strings.TrimSpace(task.Config.TargetSchema); schema != "" {
+
+			return schema
+
+		}
+
+	}
+
+	if sourceSchema != "" {
+
+		return sourceSchema
+
+	}
+
+	return s.resolveSourceSchema(task)
+
+}
+
+func (s *TaskService) resolveTableTargetName(task *taskEntity.SyncTask, tableName string, index int) string {
+
+	if task == nil || len(task.Config.TargetTables) == 0 {
+
+		return tableName
+
+	}
+
+	if index < 0 || index >= len(task.Config.TargetTables) {
+
+		return tableName
+
+	}
+
+	if target := strings.TrimSpace(task.Config.TargetTables[index]); target != "" {
+
+		return target
+
+	}
+
+	return tableName
+
+}
+
+func (s *TaskService) resolveSourceTableName(task *taskEntity.SyncTask, index int, fallback string) string {
+
+	if task == nil || len(task.Config.Tables) == 0 {
+
+		return fallback
+
+	}
+
+	if index < 0 || index >= len(task.Config.Tables) {
+
+		return fallback
+
+	}
+
+	if name := strings.TrimSpace(task.Config.Tables[index]); name != "" {
+
+		return name
+
+	}
+
+	return fallback
 
 }
 
@@ -1983,10 +2070,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 	// === 阶段1：串行同步所有表结构（集中 DDL，减少 read_only 切换次数） ===
 
 	type tableReady struct {
-		name string
-
-		identity *entity.TableIdentity
-
+		name         string
+		targetName   string
+		identity     *entity.TableIdentity
 		savedIndexes []map[string]interface{}
 	}
 
@@ -1994,7 +2080,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 	ready := make([]tableReady, 0, len(tables))
 
-	for _, tableName := range tables {
+	for i, tableName := range tables {
 
 		if s.isTaskStopped(taskID) {
 
@@ -2002,7 +2088,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		logger.Info("[Task %s] 确保目标表: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
+		targetTableName := s.resolveTableTargetName(task, tableName, i)
+
+		logger.Info("[Task %s] 确保目标表: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, targetTableName)
 
 		identity, err := runtime.analyzer.AnalyzeTable(sourceSchema, tableName)
 
@@ -2016,11 +2104,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		savedIndexes, err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, task.Config.OptimizeIndex)
+		savedIndexes, err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, task.Config.EnableDropTableBeforeDDL)
 
 		if err != nil {
 
-			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s: %v", targetSchema, tableName, err)
+			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s -> %s.%s: %v", sourceSchema, tableName, targetSchema, targetTableName, err)
 
 			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 
@@ -2028,9 +2116,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		logger.Info("[Task %s] Target table %s.%s is ready", taskID, targetSchema, tableName)
+		logger.Info("[Task %s] Target table %s.%s is ready", taskID, targetSchema, targetTableName)
 
-		ready = append(ready, tableReady{name: tableName, identity: identity, savedIndexes: savedIndexes})
+		ready = append(ready, tableReady{name: tableName, targetName: targetTableName, identity: identity, savedIndexes: savedIndexes})
 
 	}
 
@@ -2048,17 +2136,17 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		wg.Add(1)
 
-		go func(tableName string, identity *entity.TableIdentity, preparedIndexes []map[string]interface{}) {
+		go func(sourceTableName, targetTableName string, identity *entity.TableIdentity, preparedIndexes []map[string]interface{}) {
 
 			defer wg.Done()
 
 			defer func() {
 
-				if r := recover(); r != nil {
+				if recovered := recover(); recovered != nil {
 
-					logger.Error("[Task %s] Critical: Table %s sync panicked: %v\n%s", taskID, tableName, r, debug.Stack())
+					logger.Error("[Task %s] Critical: Table %s sync panicked: %v\n%s", taskID, sourceTableName, recovered, debug.Stack())
 
-					errChan <- fmt.Errorf("table %s panic: %v", tableName, r)
+					errChan <- fmt.Errorf("table %s panic: %v", sourceTableName, recovered)
 
 				}
 
@@ -2075,28 +2163,34 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			}
 
 			if snapshot != nil {
-				logger.Info("[Task %s] Table %s.%s: will borrow snapshot connections from global pool (size=%d)", taskID, sourceSchema, tableName, snapshot.poolSize)
+				logger.Info("[Task %s] Table %s.%s: will borrow snapshot connections from global pool (size=%d)", taskID, sourceSchema, sourceTableName, snapshot.poolSize)
 			}
 
-			logger.Info("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, tableName)
+			logger.Info("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, sourceTableName, targetSchema, targetTableName)
+
+			// Keep the existing sync code readable while making rename semantics explicit:
+			// sourceTableName/tableName are used for reads and progress marks; targetIdentity/targetTableName are used for writes.
+			tableName := sourceTableName
+			targetIdentity := *identity
+			targetIdentity.TableName = targetTableName
 
 			savedIndexes := append([]map[string]interface{}(nil), preparedIndexes...)
 
 			if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
 
-				logger.Info("[Task %s] Dropping non-primary indexes for table %s...", taskID, tableName)
+				logger.Info("[Task %s] Dropping non-primary indexes for table %s...", taskID, sourceTableName)
 
-				indexes, err := s.dropNonPrimaryKeyIndexes(runtime, targetSchema, tableName)
+				indexes, err := s.dropNonPrimaryKeyIndexes(runtime, targetSchema, targetTableName)
 
 				if err != nil {
 
-					logger.Warn("[Task %s] Warning: Failed to drop indexes for %s: %v", taskID, tableName, err)
+					logger.Warn("[Task %s] Warning: Failed to drop indexes for %s: %v", taskID, sourceTableName, err)
 
 				} else {
 
 					savedIndexes = indexes
 
-					logger.Info("[Task %s] Dropped %d indexes from %s", taskID, len(savedIndexes), tableName)
+					logger.Info("[Task %s] Dropped %d indexes from %s", taskID, len(savedIndexes), sourceTableName)
 
 				}
 
@@ -2320,11 +2414,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}
 
-						txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+						txW = writer.NewBatchWriterWithTx(curTx, &targetIdentity, task.Config.BatchSize, targetSchema)
 
 						if s.auditLogger != nil {
 
-							txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+							txW.SetAuditLogger(s.auditLogger, taskID, targetSchema, targetTableName)
 
 						}
 
@@ -2612,11 +2706,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 									}
 
-									txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+									txW = writer.NewBatchWriterWithTx(curTx, &targetIdentity, task.Config.BatchSize, targetSchema)
 
 									if s.auditLogger != nil {
 
-										txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+										txW.SetAuditLogger(s.auditLogger, taskID, targetSchema, targetTableName)
 
 									}
 
@@ -2939,11 +3033,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 									}
 
-									txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+									txW = writer.NewBatchWriterWithTx(curTx, &targetIdentity, task.Config.BatchSize, targetSchema)
 
 									if s.auditLogger != nil {
 
-										txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+										txW.SetAuditLogger(s.auditLogger, taskID, targetSchema, targetTableName)
 
 									}
 
@@ -3213,11 +3307,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}
 
-						txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
+						txW = writer.NewBatchWriterWithTx(curTx, &targetIdentity, task.Config.BatchSize, targetSchema)
 
 						if s.auditLogger != nil {
 
-							txW.SetAuditLogger(s.auditLogger, taskID, sourceSchema, tableName)
+							txW.SetAuditLogger(s.auditLogger, taskID, targetSchema, targetTableName)
 
 						}
 
@@ -3372,23 +3466,23 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if task.Config.OptimizeIndex && len(savedIndexes) > 0 {
 
-				logger.Info("[Task %s] Restoring indexes for table %s...", taskID, tableName)
+				logger.Info("[Task %s] Restoring indexes for target table %s.%s...", taskID, targetSchema, targetTableName)
 
-				if err := s.restoreIndexes(runtime, targetSchema, tableName, savedIndexes); err != nil {
+				if err := s.restoreIndexes(runtime, targetSchema, targetTableName, savedIndexes); err != nil {
 
-					logger.Warn("[Task %s] Warning: Failed to restore indexes for %s: %v", taskID, tableName, err)
+					logger.Warn("[Task %s] Warning: Failed to restore indexes for %s.%s: %v", taskID, targetSchema, targetTableName, err)
 
 				} else {
 
-					logger.Info("[Task %s] Restored indexes for table %s", taskID, tableName)
+					logger.Info("[Task %s] Restored indexes for target table %s.%s", taskID, targetSchema, targetTableName)
 
 				}
 
 			}
 
-			logger.Info("[Task %s] Table %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, tableProcessedRows)
+			logger.Info("[Task %s] Table %s.%s -> %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, targetSchema, targetTableName, tableProcessedRows)
 
-		}(r.name, r.identity, r.savedIndexes)
+		}(r.name, r.targetName, r.identity, r.savedIndexes)
 
 	}
 
@@ -3590,9 +3684,31 @@ func (s *TaskService) withDDL(runtime *taskRuntime, fn func() error) error {
 
 }
 
+func (s *TaskService) dropTargetTableIfNeeded(conn *sql.Conn, schema, tableName string, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	if conn == nil {
+		return fmt.Errorf("target connection is nil")
+	}
+	if strings.TrimSpace(schema) == "" || strings.TrimSpace(tableName) == "" {
+		return nil
+	}
+	_, err := conn.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`", schema, tableName))
+	if err != nil {
+		return fmt.Errorf("failed to drop target table %s.%s: %v", schema, tableName, err)
+	}
+	logger.Info("[Task] Dropped target table %s.%s before DDL", schema, tableName)
+	return nil
+}
+
+func (s *TaskService) applyDropBeforeDDL(conn *sql.Conn, schema, tableName string, enabled bool) error {
+	return s.dropTargetTableIfNeeded(conn, schema, tableName, enabled)
+}
+
 // ensureTargetTable 确保目标表存在
 
-func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targetSchema, tableName string, optimizeIndex bool) ([]map[string]interface{}, error) {
+func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targetSchema, sourceTableName, targetTableName string, optimizeIndex bool, dropBeforeDDL bool) ([]map[string]interface{}, error) {
 
 	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil {
 
@@ -3645,30 +3761,28 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	err = targetDB.QueryRow(
 
-		fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name = '%s'", targetSchema, tableName),
+		fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name = '%s'", targetSchema, targetTableName),
 	).Scan(&tableNameCheck)
 
-	if err == nil {
-
-		// 表已存在，不需要创建
-
-		logger.Info("[Task] Target table %s.%s already exists, skipping creation", targetSchema, tableName)
-
-		return nil, nil
-
-	}
-
-	if err != sql.ErrNoRows {
+	tableExists := err == nil
+	if err != nil && err != sql.ErrNoRows {
 
 		// 查询出错
 
-		return nil, fmt.Errorf("failed to check target table %s.%s: %v", targetSchema, tableName, err)
+		return nil, fmt.Errorf("failed to check target table %s.%s: %v", targetSchema, targetTableName, err)
 
 	}
 
-	// 表不存在，创建它
-
-	logger.Info("[Task] Creating target table %s.%s (from %s.%s)", targetSchema, tableName, sourceSchema, tableName)
+	if tableExists {
+		logger.Info("[Task] Target table %s.%s already exists", targetSchema, targetTableName)
+		if !dropBeforeDDL {
+			logger.Info("[Task] Skipping creation for existing target table %s.%s (drop-before-DDL disabled)", targetSchema, targetTableName)
+			return nil, nil
+		}
+		logger.Info("[Task] drop-before-DDL enabled, target table %s.%s will be recreated", targetSchema, targetTableName)
+	} else {
+		logger.Info("[Task] Creating target table %s.%s (from %s.%s)", targetSchema, targetTableName, sourceSchema, sourceTableName)
+	}
 
 	// 获取一个专用目标连接，临时关闭外键检查，避免因父表尚未创建而导致 DDL 失败
 	tgtDDLConn, tgtConnErr := targetDB.Conn(context.Background())
@@ -3687,9 +3801,13 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		tryErr := s.withDDL(runtime, func() error {
 
+			if err := s.dropTargetTableIfNeeded(tgtDDLConn, targetSchema, targetTableName, dropBeforeDDL); err != nil {
+				return err
+			}
+
 			_, e := tgtDDLConn.ExecContext(context.Background(), fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
 
-				targetSchema, tableName, sourceSchema, tableName))
+				targetSchema, targetTableName, sourceSchema, sourceTableName))
 
 			return e
 
@@ -3697,7 +3815,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		if tryErr == nil {
 
-			logger.Info("[Task] Successfully created target table %s.%s (using CREATE TABLE LIKE)", targetSchema, tableName)
+			logger.Info("[Task] Successfully created target table %s.%s (using CREATE TABLE LIKE)", targetSchema, targetTableName)
 
 			return nil, nil
 
@@ -3722,14 +3840,15 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 	_, _ = ddlConn.ExecContext(context.Background(),
 		"SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'ANSI_QUOTES', '')")
 
+	var showCreateTableName string
 	err = ddlConn.QueryRowContext(context.Background(),
 
-		fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", sourceSchema, tableName),
-	).Scan(&tableName, &createSQL)
+		fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", sourceSchema, sourceTableName),
+	).Scan(&showCreateTableName, &createSQL)
 
 	if err != nil {
 
-		return nil, fmt.Errorf("failed to get CREATE TABLE statement for %s.%s: %v", sourceSchema, tableName, err)
+		return nil, fmt.Errorf("failed to get CREATE TABLE statement for %s.%s: %v", sourceSchema, sourceTableName, err)
 
 	}
 
@@ -3737,11 +3856,11 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	if optimizeIndex {
 
-		savedIndexes, err = loadNonPrimaryKeyIndexes(sourceDB, sourceSchema, tableName)
+		savedIndexes, err = loadNonPrimaryKeyIndexes(sourceDB, sourceSchema, sourceTableName)
 
 		if err != nil {
 
-			return nil, fmt.Errorf("failed to load source indexes for %s.%s: %v", sourceSchema, tableName, err)
+			return nil, fmt.Errorf("failed to load source indexes for %s.%s: %v", sourceSchema, sourceTableName, err)
 
 		}
 
@@ -3749,12 +3868,16 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	}
 
-	createSQL = fmt.Sprintf("CREATE TABLE `%s`.`%s` %s", targetSchema, tableName,
+	createSQL = fmt.Sprintf("CREATE TABLE `%s`.`%s` %s", targetSchema, targetTableName,
 
 		extractTableDefinition(createSQL))
 
 	// 在已关闭外键检查的专用连接上执行 DDL
 	if err = s.withDDL(runtime, func() error {
+
+		if err := s.dropTargetTableIfNeeded(tgtDDLConn, targetSchema, targetTableName, dropBeforeDDL); err != nil {
+			return err
+		}
 
 		_, e := tgtDDLConn.ExecContext(context.Background(), createSQL)
 
@@ -3762,11 +3885,11 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	}); err != nil {
 
-		return nil, fmt.Errorf("failed to create target table %s.%s: %v", targetSchema, tableName, err)
+		return nil, fmt.Errorf("failed to create target table %s.%s: %v", targetSchema, targetTableName, err)
 
 	}
 
-	logger.Info("[Task] Successfully created target table %s.%s (using CREATE TABLE statement)", targetSchema, tableName)
+	logger.Info("[Task] Successfully created target table %s.%s (using CREATE TABLE statement)", targetSchema, targetTableName)
 
 	return savedIndexes, nil
 
@@ -4712,6 +4835,19 @@ func (s *TaskService) completeTask(taskID string) {
 
 		task.Complete()
 
+		if task.Context.RepeatRemaining > 0 && task.ConsumeScheduledRun() {
+			interval := time.Duration(task.Context.RepeatIntervalSec) * time.Second
+			if interval < 0 {
+				interval = 0
+			}
+			next := time.Now().Add(interval)
+			task.Context.Status = taskEntity.TaskStatusScheduled
+			task.Context.ScheduledAt = &next
+			task.Context.LastUpdateTime = time.Now()
+		} else {
+			task.ResetRepeat()
+		}
+
 		s.storage.Save(task)
 
 	}
@@ -4798,7 +4934,7 @@ func (s *TaskService) ScheduleTask(taskID string, scheduledAt time.Time) error {
 
 	// 保存状态
 	if err := s.storage.Save(task); err != nil {
-		fmt.Printf("保存任务状态失败: %v\n", err)
+		return fmt.Errorf("failed to save scheduled task state: %w", err)
 	}
 
 	// 记录审计日志
@@ -4812,6 +4948,29 @@ func (s *TaskService) ScheduleTask(taskID string, scheduledAt time.Time) error {
 	}
 
 	logger.Info("[Task %s] Scheduled to start at %s", taskID, scheduledAt.Format(time.RFC3339))
+	return nil
+}
+
+// ScheduleTaskWithRepeat 设置定时启动并可重复执行。
+func (s *TaskService) ScheduleTaskWithRepeat(taskID string, scheduledAt time.Time, repeatCount, intervalSec int) error {
+	if repeatCount < 1 {
+		repeatCount = 1
+	}
+	if err := s.ScheduleTask(taskID, scheduledAt); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+	task.ConfigureRepeat(repeatCount, intervalSec)
+	if err := s.storage.Save(task); err != nil {
+		return fmt.Errorf("failed to save repeat schedule state: %w", err)
+	}
 	return nil
 }
 
@@ -4833,7 +4992,7 @@ func (s *TaskService) CancelSchedule(taskID string) error {
 
 	// 保存状态
 	if err := s.storage.Save(task); err != nil {
-		fmt.Printf("保存任务状态失败: %v\n", err)
+		return fmt.Errorf("failed to save cancelled schedule state: %w", err)
 	}
 
 	// 记录审计日志
@@ -4851,13 +5010,21 @@ func (s *TaskService) CancelSchedule(taskID string) error {
 
 // StartScheduler 启动定时调度器，每秒检查一次是否有到期的定时任务需要启动
 func (s *TaskService) StartScheduler() {
-	s.schedulerStop = make(chan struct{})
+	s.schedulerMu.Lock()
+	if s.schedulerStop != nil {
+		s.schedulerMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	s.schedulerStop = stop
+	s.schedulerMu.Unlock()
+
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.schedulerStop:
+			case <-stop:
 				logger.Info("Task scheduler stopped")
 				return
 			case <-ticker.C:
@@ -4870,8 +5037,15 @@ func (s *TaskService) StartScheduler() {
 
 // StopScheduler 停止定时调度器
 func (s *TaskService) StopScheduler() {
-	if s.schedulerStop != nil {
-		close(s.schedulerStop)
+	s.schedulerMu.Lock()
+	stop := s.schedulerStop
+	if stop != nil {
+		s.schedulerStop = nil
+	}
+	s.schedulerMu.Unlock()
+
+	if stop != nil {
+		close(stop)
 	}
 }
 

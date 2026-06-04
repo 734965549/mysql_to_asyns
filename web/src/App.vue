@@ -59,6 +59,8 @@ const selectedDatabases = ref([]); // 库级别同步时选中的源数据库列
 
 const targetDatabaseMappings = ref([]); // [{source, target}] 源->目标库映射
 
+const targetTableMappings = ref({}); // {qualifiedSourceTable: targetTableName}
+
 const selectedTables = ref([]);
 
 const activeTableSourceDatabase = ref("");
@@ -179,7 +181,11 @@ const taskForm = ref({
 
   target_schema: "",
 
+  target_database: "",
+
   tables: [],
+
+  target_tables: [],
 
   mode: "FULL",
 
@@ -196,6 +202,8 @@ const taskForm = ref({
   enable_read_only: false,
 
   enable_consistent_snapshot: false,
+
+  enable_drop_table_before_ddl: false,
 });
 
 // 刷新状态
@@ -604,7 +612,11 @@ function resetForm() {
 
     target_schema: "",
 
+    target_database: "",
+
     tables: [],
+
+    target_tables: [],
 
     mode: "FULL",
 
@@ -621,6 +633,8 @@ function resetForm() {
     enable_read_only: false,
 
     enable_consistent_snapshot: false,
+
+    enable_drop_table_before_ddl: false,
   };
 
   selectedSyncLevel.value = "database";
@@ -629,7 +643,13 @@ function resetForm() {
 
   targetDatabaseMappings.value = [];
 
+  targetTableMappings.value = {};
+
   selectedTables.value = [];
+
+  taskForm.value.target_database = "";
+
+  taskForm.value.target_tables = [];
 
   activeTableSourceDatabase.value = "";
 
@@ -777,7 +797,11 @@ async function createTask() {
 
   let tablesPayload = [];
 
+  let targetTablesPayload = [];
+
   let sourceDatabasesPayload = [];
+
+  const sourceTableNames = [];
 
   let targetDatabasesPayload = [];
 
@@ -785,21 +809,17 @@ async function createTask() {
 
   let targetSchemaPayload = taskForm.value.target_schema;
 
+  let targetDatabasePayload = taskForm.value.target_database;
+
   if (selectedSyncLevel.value === "database") {
-    // 库级别：使用多选的库列表
-
     sourceDatabasesPayload = selectedDatabases.value;
-
     targetDatabasesPayload = targetDatabaseMappings.value.map((m) => m.target);
 
-    // source_schema / target_schema 留空（由 source_databases 驱动）
-
     sourceSchemaPayload = "";
-
     targetSchemaPayload = "";
+    targetDatabasePayload = taskForm.value.target_database || "";
   } else {
     sourceDatabasesPayload = selectedDatabases.value;
-
     targetDatabasesPayload = selectedDatabases.value.map((db) => {
       const mapping = targetDatabaseMappings.value.find(
         (item) => item.source === db,
@@ -809,15 +829,22 @@ async function createTask() {
     });
 
     sourceSchemaPayload = selectedDatabases.value[0] || "";
-
     targetSchemaPayload = targetDatabasesPayload[0] || "";
+    targetDatabasePayload = taskForm.value.target_database || targetSchemaPayload;
 
     tablesPayload = selectedDatabases.value.flatMap((db) => {
       const tableNames = tableSelectionsByDatabase.value[db] || [];
 
-      return tableNames.map((tableName) =>
-        getQualifiedTableName(db, tableName),
-      );
+      return tableNames.map((tableName) => getQualifiedTableName(db, tableName));
+    });
+
+    targetTablesPayload = selectedDatabases.value.flatMap((db) => {
+      const tableNames = tableSelectionsByDatabase.value[db] || [];
+
+      return tableNames.map((tableName) => {
+        const sourceQualifiedName = getQualifiedTableName(db, tableName);
+        return targetTableMappings.value[sourceQualifiedName] || tableName;
+      });
     });
 
     selectedTables.value = [...tablesPayload];
@@ -890,6 +917,10 @@ async function createTask() {
 
     target_databases: targetDatabasesPayload,
 
+    target_database: targetDatabasePayload,
+
+    target_tables: targetTablesPayload,
+
     source_db: useCustomSourceDB.value ? customSourceDB.value : null,
 
     target_db: useCustomTargetDB.value ? customTargetDB.value : null,
@@ -960,91 +991,93 @@ async function createTask() {
 
 // 启动任务
 
-async function startTask(taskId) {
-  try {
-    const res = await fetch(`${API_BASE}/tasks/${taskId}/start`, {
-      method: "POST",
-    });
-
-    if (res.ok) {
-      fetchTasks();
-
-      Message.success("任务已启动");
-    } else {
-      const errorMsg = await handleApiError(res, "启动失败");
-
-      Message.error(errorMsg);
-
-      // 刷新任务列表以获取最新状态
-
-      fetchTasks();
-    }
-  } catch (e) {
-    Message.error("启动失败: " + e.message);
-  }
-}
-
-// 定时启动相关
 const scheduleModalVisible = ref(false);
 const scheduleTaskId = ref("");
+const scheduleMode = ref("once");
 const scheduleTime = ref("");
+const repeatCount = ref(1);
+const repeatIntervalSec = ref(60);
+
+function openStartTaskModal(taskId, mode = "immediate") {
+  scheduleTaskId.value = taskId;
+  scheduleMode.value = mode;
+  repeatCount.value = 1;
+  repeatIntervalSec.value = 60;
+
+  const d = new Date(Date.now() + 5 * 60 * 1000);
+  scheduleTime.value = toDateTimeInputValue(d);
+  scheduleModalVisible.value = true;
+}
+
+function toDateTimeInputValue(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
 
 function openScheduleModal(taskId) {
   scheduleTaskId.value = taskId;
-  // 默认设置为当前时间后5分钟
+  scheduleMode.value = "once";
+  repeatCount.value = 1;
+  repeatIntervalSec.value = 60;
+
   const d = new Date(Date.now() + 5 * 60 * 1000);
-  const pad = (n) => String(n).padStart(2, "0");
-  scheduleTime.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  scheduleTime.value = toDateTimeInputValue(d);
   scheduleModalVisible.value = true;
 }
 
 async function confirmSchedule() {
-  if (!scheduleTime.value) {
-    Message.warning("请选择定时启动时间");
-    return;
-  }
   try {
-    const scheduledAt = scheduleTime.value instanceof Date ? scheduleTime.value : new Date(scheduleTime.value);
-    if (isNaN(scheduledAt.getTime())) {
-      Message.error("时间格式不正确");
-      return;
+    const payload = {};
+
+    if (scheduleMode.value !== "immediate") {
+      if (!scheduleTime.value) {
+        Message.warning("请选择定时启动时间");
+        return;
+      }
+
+      const scheduledAt = new Date(scheduleTime.value);
+      if (isNaN(scheduledAt.getTime())) {
+        Message.error("时间格式不正确");
+        return;
+      }
+      if (scheduledAt <= new Date()) {
+        Message.error("定时启动时间不能早于当前时间");
+        return;
+      }
+      payload.scheduled_at = scheduledAt.toISOString();
     }
-    if (scheduledAt <= new Date()) {
-      Message.error("定时启动时间不能早于当前时间");
-      return;
+
+    if (scheduleMode.value === "repeat") {
+      const count = Number(repeatCount.value);
+      const interval = Number(repeatIntervalSec.value);
+      if (!Number.isInteger(count) || count < 1) {
+        Message.error("重复次数必须大于等于 1");
+        return;
+      }
+      if (!Number.isInteger(interval) || interval < 0) {
+        Message.error("重复间隔秒数必须大于等于 0");
+        return;
+      }
+      payload.repeat_count = count;
+      payload.repeat_interval_sec = interval;
     }
+
     const res = await fetch(`${API_BASE}/tasks/${scheduleTaskId.value}/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ scheduled_at: scheduledAt.toISOString() }),
+      body: Object.keys(payload).length ? JSON.stringify(payload) : undefined,
     });
+
     if (res.ok) {
       fetchTasks();
-      Message.success("定时启动已设置");
+      Message.success(scheduleMode.value === "immediate" ? "任务已启动" : "定时启动已设置");
       scheduleModalVisible.value = false;
     } else {
-      const errorMsg = await handleApiError(res, "设置定时启动失败");
+      const errorMsg = await handleApiError(res, scheduleMode.value === "immediate" ? "启动失败" : "设置定时启动失败");
       Message.error(errorMsg);
     }
   } catch (e) {
-    Message.error("设置定时启动失败: " + e.message);
-  }
-}
-
-async function cancelSchedule(taskId) {
-  try {
-    const res = await fetch(`${API_BASE}/tasks/${taskId}/cancel-schedule`, {
-      method: "POST",
-    });
-    if (res.ok) {
-      fetchTasks();
-      Message.success("已取消定时启动");
-    } else {
-      const errorMsg = await handleApiError(res, "取消定时启动失败");
-      Message.error(errorMsg);
-    }
-  } catch (e) {
-    Message.error("取消定时启动失败: " + e.message);
+    Message.error((scheduleMode.value === "immediate" ? "启动失败" : "设置定时启动失败") + ": " + e.message);
   }
 }
 
@@ -1131,7 +1164,11 @@ function fillTaskFormFromTask(task) {
 
     target_schema: task.config.target_schema,
 
+    target_database: task.config.target_database || "",
+
     tables: task.config.tables || [],
+
+    target_tables: task.config.target_tables || [],
 
     mode: task.config.mode,
 
@@ -1148,6 +1185,8 @@ function fillTaskFormFromTask(task) {
     enable_read_only: task.config.enable_read_only || false,
 
     enable_consistent_snapshot: task.config.enable_consistent_snapshot || false,
+
+    enable_drop_table_before_ddl: task.config.enable_drop_table_before_ddl || false,
   };
 
   if (task.config.sync_level === "DATABASE") {
@@ -1192,11 +1231,14 @@ function fillTaskFormFromTask(task) {
     }
 
     const rawTables = task.config.tables || [];
+    const rawTargetTables = task.config.target_tables || [];
 
     selectedTables.value = [...rawTables];
 
-    for (const table of rawTables) {
+    for (let i = 0; i < rawTables.length; i += 1) {
+      const table = rawTables[i];
       const parsed = parseQualifiedTableName(table);
+      const targetTable = rawTargetTables[i] || parsed.table;
 
       if (parsed.database && sourceDatabases.includes(parsed.database)) {
         ensureTableSelectionBucket(parsed.database);
@@ -1208,6 +1250,7 @@ function fillTaskFormFromTask(task) {
         ) {
           tableSelectionsByDatabase.value[parsed.database].push(parsed.table);
         }
+        targetTableMappings.value[table] = targetTable;
       } else if (sourceDatabases.length > 0 && parsed.table) {
         const fallbackDb = sourceDatabases[0];
 
@@ -1218,6 +1261,7 @@ function fillTaskFormFromTask(task) {
         ) {
           tableSelectionsByDatabase.value[fallbackDb].push(parsed.table);
         }
+        targetTableMappings.value[getQualifiedTableName(fallbackDb, parsed.table)] = targetTable;
       }
     }
 
@@ -1754,6 +1798,25 @@ const totalSelectedTables = computed(() => {
   return selectedDatabases.value.reduce((sum, db) => {
     return sum + (tableSelectionsByDatabase.value[db] || []).length;
   }, 0);
+});
+
+const currentDatabaseTargetTableMappings = computed(() => {
+  const currentDb = activeTableSourceDatabase.value;
+
+  if (!currentDb) {
+    return [];
+  }
+
+  const sourceTables = tableSelectionsByDatabase.value[currentDb] || [];
+
+  return sourceTables.map((tableName) => {
+    const sourceQualifiedName = getQualifiedTableName(currentDb, tableName);
+
+    return {
+      source: sourceQualifiedName,
+      target: targetTableMappings.value[sourceQualifiedName] || tableName,
+    };
+  });
 });
 
 // 计算属性：过滤后的数据库列表
@@ -2295,12 +2358,19 @@ watch(
                 </a-form-item>
 
                 <div
-                  v-if="selectedSyncLevel === 'table' && targetType === 'MYSQL'"
+                  v-if="selectedSyncLevel === 'database'"
                   class="table-mapping-panel"
                 >
                   <div class="table-mapping-title">
-                    源库 -> 目标库映射（表级别）
+                    库级别同步目标库配置
                   </div>
+
+                  <a-form-item label="默认目标库名">
+                    <a-input
+                      v-model="taskForm.target_database"
+                      placeholder="请输入默认目标库名"
+                    />
+                  </a-form-item>
 
                   <div class="table-mapping-list">
                     <div
@@ -2328,29 +2398,23 @@ watch(
                   </div>
                 </div>
 
-                <!-- 表级别：保留单个目标库输入兼容旧任务 + 同步模式 -->
+                <!-- 表级别：目标库、目标表映射 -->
 
                 <a-row :gutter="16">
                   <a-col
-                    v-if="
-                      selectedSyncLevel === 'table' && targetType === 'MYSQL'
-                    "
-                    :span="12"
+                    v-if="selectedSyncLevel === 'table'"
+                    :span="targetType === 'MYSQL' ? 12 : 24"
                   >
                     <a-form-item label="目标数据库" required>
                       <a-input
-                        v-model="taskForm.target_schema"
+                        v-model="taskForm.target_database"
                         placeholder="请输入目标数据库名"
                       />
                     </a-form-item>
                   </a-col>
 
                   <a-col
-                    :span="
-                      selectedSyncLevel === 'table' && targetType === 'MYSQL'
-                        ? 12
-                        : 24
-                    "
+                    :span="selectedSyncLevel === 'table' && targetType === 'MYSQL' ? 12 : 24"
                   >
                     <a-form-item label="同步模式">
                       <a-select v-model="taskForm.mode">
@@ -2363,6 +2427,33 @@ watch(
                     </a-form-item>
                   </a-col>
                 </a-row>
+
+                <div v-if="selectedSyncLevel === 'table'" class="table-mapping-panel">
+                  <div class="table-mapping-title">表级别同步目标表配置</div>
+
+                  <div class="table-mapping-list">
+                    <div
+                      v-for="mapping in currentDatabaseTargetTableMappings"
+                      :key="mapping.source"
+                      class="table-mapping-item"
+                    >
+                      <span class="table-mapping-source">{{ mapping.source }}</span>
+
+                      <icon-arrow-right style="color: #86909c" />
+
+                      <a-input
+                        v-model="targetTableMappings[mapping.source]"
+                        placeholder="目标表名"
+                        style="width: 220px"
+                      />
+                    </div>
+
+                    <a-empty
+                      v-if="currentDatabaseTargetTableMappings.length === 0"
+                      description="请先在左侧选择当前源库并勾选表"
+                    />
+                  </div>
+                </div>
               </a-col>
 
               <a-col :span="12">
@@ -2556,6 +2647,21 @@ watch(
                         >
                           同步开始时自动关闭目标库 read_only /
                           super_read_only，同步结束后自动恢复
+                        </a-typography-text>
+                      </a-space>
+                    </a-checkbox>
+                  </a-form-item>
+
+                  <a-form-item v-if="targetType === 'MYSQL'">
+                    <a-checkbox v-model="taskForm.enable_drop_table_before_ddl">
+                      <a-space direction="vertical" :size="4">
+                        <span style="font-weight: 500">同步 DDL 前删除目标表</span>
+
+                        <a-typography-text
+                          type="secondary"
+                          style="font-size: 12px"
+                        >
+                          建表前执行 DROP TABLE IF EXISTS，仅作用于目标库/目标表；适用于需要重建表结构的场景
                         </a-typography-text>
                       </a-space>
                     </a-checkbox>
@@ -3570,12 +3676,12 @@ watch(
                       type="primary"
                       size="small"
                       status="success"
-                      @click="startTask(task.config.id)"
                     >
                       <icon-play-arrow /> 启动
                       <template #content>
-                        <a-doption @click="startTask(task.config.id)">立即启动</a-doption>
-                        <a-doption @click="openScheduleModal(task.config.id)">定时启动</a-doption>
+                        <a-doption @click="openStartTaskModal(task.config.id, 'immediate')">立即启动</a-doption>
+                        <a-doption @click="openStartTaskModal(task.config.id, 'once')">单次定时启动</a-doption>
+                        <a-doption @click="openStartTaskModal(task.config.id, 'repeat')">重复定时启动</a-doption>
                       </template>
                     </a-dropdown-button>
 
@@ -4229,15 +4335,12 @@ watch(
               "
               type="primary"
               status="success"
-              @click="
-                startTask(selectedTaskForDetail.config.id);
-                detailDrawerVisible = false;
-              "
             >
               <icon-play-arrow /> 启动
               <template #content>
-                <a-doption @click="startTask(selectedTaskForDetail.config.id); detailDrawerVisible = false;">立即启动</a-doption>
-                <a-doption @click="openScheduleModal(selectedTaskForDetail.config.id); detailDrawerVisible = false;">定时启动</a-doption>
+                <a-doption @click="openStartTaskModal(selectedTaskForDetail.config.id, 'immediate'); detailDrawerVisible = false;">立即启动</a-doption>
+                <a-doption @click="openStartTaskModal(selectedTaskForDetail.config.id, 'once'); detailDrawerVisible = false;">单次定时启动</a-doption>
+                <a-doption @click="openStartTaskModal(selectedTaskForDetail.config.id, 'repeat'); detailDrawerVisible = false;">重复定时启动</a-doption>
               </template>
             </a-dropdown-button>
 
@@ -4270,28 +4373,63 @@ watch(
       </div>
     </a-drawer>
 
-    <!-- 定时启动时间选择弹窗 -->
+    <!-- 启动任务弹窗 -->
     <a-modal
       v-model:visible="scheduleModalVisible"
-      title="设置定时启动"
+      title="启动任务"
       @ok="confirmSchedule"
       @cancel="scheduleModalVisible = false"
       ok-text="确认"
       cancel-text="取消"
-      :width="420"
+      :width="520"
     >
       <a-form layout="vertical">
-        <a-form-item label="定时启动时间">
-          <a-date-picker
-            v-model="scheduleTime"
-            show-time
-            format="YYYY-MM-DD HH:mm:ss"
-            style="width: 100%"
-            placeholder="请选择启动时间"
-          />
+        <a-form-item label="启动方式">
+          <a-radio-group v-model="scheduleMode" type="button">
+            <a-radio value="immediate">立即启动</a-radio>
+            <a-radio value="once">单次定时启动</a-radio>
+            <a-radio value="repeat">重复定时启动</a-radio>
+          </a-radio-group>
         </a-form-item>
+
+        <template v-if="scheduleMode !== 'immediate'">
+          <a-form-item label="定时启动时间">
+            <a-date-picker
+              v-model="scheduleTime"
+              show-time
+              value-format="YYYY-MM-DDTHH:mm:ss"
+              format="YYYY-MM-DD HH:mm:ss"
+              style="width: 100%"
+              placeholder="请选择启动时间"
+            />
+          </a-form-item>
+        </template>
+
+        <template v-if="scheduleMode === 'repeat'">
+          <a-row :gutter="16">
+            <a-col :span="12">
+              <a-form-item label="重复次数">
+                <a-input-number v-model="repeatCount" :min="1" :step="1" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="12">
+              <a-form-item label="间隔秒数">
+                <a-input-number v-model="repeatIntervalSec" :min="0" :step="1" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+          </a-row>
+        </template>
+
         <a-typography-text type="secondary" style="font-size: 12px">
-          任务将在设定的时间自动启动，设置后状态变为"定时中"。
+          <template v-if="scheduleMode === 'immediate'">
+            任务将立即启动。
+          </template>
+          <template v-else-if="scheduleMode === 'once'">
+            任务将在设定时间自动启动一次。
+          </template>
+          <template v-else>
+            任务将在设定时间首次启动，并在每次执行完成后按间隔自动再次启动，直到达到重复次数。
+          </template>
         </a-typography-text>
       </a-form>
     </a-modal>

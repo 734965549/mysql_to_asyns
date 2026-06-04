@@ -46,26 +46,28 @@ type DatabaseConfig struct { // 定义数据库连接配置结构体
 
 // TaskConfig 任务配置
 type TaskConfig struct { // 定义任务配置结构体
-	StorageID                int64           `json:"storage_id,omitempty"`       // 存储ID
-	ID                       string          `json:"id"`                         // 任务ID
-	Name                     string          `json:"name"`                       // 任务名称
-	SyncLevel                SyncLevel       `json:"sync_level"`                 // 同步级别：DATABASE(全库) 或 TABLE(指定表)
-	SourceSchema             string          `json:"source_schema"`              // 源模式名
-	TargetSchema             string          `json:"target_schema"`              // 目标模式名
-	SourceDatabases          []string        `json:"source_databases"`           // 源数据库列表（库级别/表级别多库时使用）
-	TargetDatabase           string          `json:"target_database"`            // 目标数据库（库级别同步时，所有库同步到此库）
-	TargetDatabases          []string        `json:"target_databases"`           // 目标数据库列表（与 SourceDatabases 一一对应）
-	Tables                   []string        `json:"tables"`                     // 表名列表
-	Mode                     SyncMode        `json:"mode"`                       // 同步模式
-	BatchSize                int             `json:"batch_size"`                 // 批处理大小
-	WorkerCount              int             `json:"worker_count"`               // 工作线程数
-	IntraTableWorkerCount    int             `json:"intra_table_worker_count"`   // 单表内并行读/写 goroutine 数；0 表示沿用旧逻辑 min(worker_count,16)
-	EnableLimitOne           bool            `json:"enable_limit_one"`           // 无主键表LIMIT 1保护
-	OptimizeIndex            bool            `json:"optimize_index"`             // 索引优化：先删除非主键索引，数据迁移完成后再重建
-	EnableReadOnly           bool            `json:"enable_read_only"`           // 同步前临时关闭目标库只读，同步后恢复
-	EnableConsistentSnapshot bool            `json:"enable_consistent_snapshot"` // 全量阶段使用一致性快照读取（牺牲部分并行度换取一致性）
-	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`        // 源数据库配置（可选，覆盖配置文件）
-	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`        // 目标数据库配置（可选，覆盖配置文件）
+	StorageID                int64           `json:"storage_id,omitempty"`         // 存储ID
+	ID                       string          `json:"id"`                           // 任务ID
+	Name                     string          `json:"name"`                         // 任务名称
+	SyncLevel                SyncLevel       `json:"sync_level"`                   // 同步级别：DATABASE(全库) 或 TABLE(指定表)
+	SourceSchema             string          `json:"source_schema"`                // 源模式名
+	TargetSchema             string          `json:"target_schema"`                // 目标模式名
+	SourceDatabases          []string        `json:"source_databases"`             // 源数据库列表（库级别/表级别多库时使用）
+	TargetDatabase           string          `json:"target_database"`              // 目标数据库（库级别同步时，所有库同步到此库）
+	TargetDatabases          []string        `json:"target_databases"`             // 目标数据库列表（与 SourceDatabases 一一对应）
+	Tables                   []string        `json:"tables"`                       // 源表名列表
+	TargetTables             []string        `json:"target_tables"`                // 目标表名列表（与 Tables 一一对应；空则沿用源表名）
+	Mode                     SyncMode        `json:"mode"`                         // 同步模式
+	BatchSize                int             `json:"batch_size"`                   // 批处理大小
+	WorkerCount              int             `json:"worker_count"`                 // 工作线程数
+	IntraTableWorkerCount    int             `json:"intra_table_worker_count"`     // 单表内并行读/写 goroutine 数；0 表示沿用旧逻辑 min(worker_count,16)
+	EnableLimitOne           bool            `json:"enable_limit_one"`             // 无主键表LIMIT 1保护
+	OptimizeIndex            bool            `json:"optimize_index"`               // 索引优化：先删除非主键索引，数据迁移完成后再重建
+	EnableReadOnly           bool            `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
+	EnableConsistentSnapshot bool            `json:"enable_consistent_snapshot"`   // 全量阶段使用一致性快照读取（牺牲部分并行度换取一致性）
+	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS（库级别/表级别）
+	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`          // 源数据库配置（可选，覆盖配置文件）
+	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`          // 目标数据库配置（可选，覆盖配置文件）
 }
 
 // ProcessContext 处理上下文
@@ -79,8 +81,11 @@ type ProcessContext struct { // 定义处理上下文结构体
 	EndTime             time.Time   `json:"end_time"`               // 结束时间
 	LastUpdateTime      time.Time   `json:"last_update_time"`       // 最后更新时间
 	ErrorStack          string      `json:"error_stack"`            // 错误堆栈
-	ScheduledAt         *time.Time  `json:"scheduled_at,omitempty"` // 定时启动时间（为空表示立即启动）
+	ScheduledAt         *time.Time  `json:"scheduled_at,omitempty"` // 下次定时启动时间（为空表示立即启动）
 	ScheduledFromStatus *TaskStatus `json:"scheduled_from_status,omitempty"`
+	RepeatCount         int         `json:"repeat_count,omitempty"`        // 定时启动总次数（包含首次执行）
+	RepeatRemaining     int         `json:"repeat_remaining,omitempty"`    // 剩余重复次数（包含下一次执行）
+	RepeatIntervalSec   int         `json:"repeat_interval_sec,omitempty"` // 重复启动间隔（秒）
 }
 
 // SyncTask 同步任务
@@ -108,6 +113,34 @@ func (t *SyncTask) Start() { // 启动任务
 	t.Context.ScheduledFromStatus = nil
 }
 
+// ConfigureRepeat 设置重复定时启动参数
+func (t *SyncTask) ConfigureRepeat(repeatCount, intervalSec int) {
+	if repeatCount < 1 {
+		repeatCount = 1
+	}
+	if intervalSec < 0 {
+		intervalSec = 0
+	}
+	t.Context.RepeatCount = repeatCount
+	t.Context.RepeatRemaining = repeatCount
+	t.Context.RepeatIntervalSec = intervalSec
+}
+
+// ConsumeScheduledRun 消耗一次已计划执行次数，返回是否还需要继续调度。
+func (t *SyncTask) ConsumeScheduledRun() bool {
+	if t.Context.RepeatRemaining > 0 {
+		t.Context.RepeatRemaining--
+	}
+	return t.Context.RepeatRemaining > 0
+}
+
+// ResetRepeat 清空重复定时配置
+func (t *SyncTask) ResetRepeat() {
+	t.Context.RepeatCount = 0
+	t.Context.RepeatRemaining = 0
+	t.Context.RepeatIntervalSec = 0
+}
+
 // Schedule 设置定时启动
 func (t *SyncTask) Schedule(scheduledAt time.Time) { // 设置定时启动
 	if t.Context.Status != TaskStatusScheduled {
@@ -131,6 +164,7 @@ func (t *SyncTask) CancelSchedule() { // 取消定时启动
 	t.Context.Status = restoreStatus
 	t.Context.ScheduledAt = nil
 	t.Context.ScheduledFromStatus = nil
+	t.ResetRepeat()
 	t.Context.LastUpdateTime = time.Now()
 }
 

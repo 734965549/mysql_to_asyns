@@ -24,6 +24,22 @@ import (
 // mockAnalyzer 是一个模拟的 IdentityAnalyzer
 type mockAnalyzer struct{}
 
+type failingTaskStorage struct {
+	err error
+}
+
+func (s *failingTaskStorage) Save(task *taskEntity.SyncTask) error {
+	return s.err
+}
+
+func (s *failingTaskStorage) Delete(taskID string) error {
+	return nil
+}
+
+func (s *failingTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
+	return nil, nil
+}
+
 func (m *mockAnalyzer) AnalyzeTable(schema, tableName string) (*entity.TableIdentity, error) {
 	return &entity.TableIdentity{
 		TableName:    tableName,
@@ -78,9 +94,19 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepPrimaryOnlyDDLValid(t *testing.
 func newTestTaskService(dataDir string) *TaskService {
 	storage := NewFileTaskStorage(dataDir)
 	return &TaskService{
-		tasks:   make(map[string]*taskEntity.SyncTask),
-		storage: storage,
+		tasks:    make(map[string]*taskEntity.SyncTask),
+		runtimes: make(map[string]*taskRuntime),
+		storage:  storage,
 	}
+}
+
+func newScheduledTestTaskService(dataDir string) *TaskService {
+	ts := newTestTaskService(dataDir)
+	ts.initRuntimeFn = func(task *taskEntity.SyncTask) (*taskRuntime, error) {
+		return &taskRuntime{}, nil
+	}
+	ts.executeSyncFn = func(ctx context.Context, taskID string, runtime *taskRuntime) {}
+	return ts
 }
 
 func newDefaultConfig() *config.Config {
@@ -134,6 +160,34 @@ func TestResolveSourceSchema(t *testing.T) {
 
 		assert.Equal(t, "config_db", ts.resolveSourceSchema(task))
 	})
+}
+
+func TestResolveTargetSchema(t *testing.T) {
+	ts := NewTaskService(&config.Config{Storage: config.StorageConfig{Mode: "file", DataDir: t.TempDir()}})
+	defer ts.Close()
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "rename-target"})
+	assert.Equal(t, "target_db", ts.resolveTargetSchema(task, "target_db"))
+
+	task.Config.TargetSchema = "custom_target"
+	assert.Equal(t, "custom_target", ts.resolveTargetSchema(task, "target_db"))
+
+	task.Config.TargetSchema = ""
+	task.Config.TargetDB = &taskEntity.DatabaseConfig{Database: "target_override"}
+	assert.Equal(t, "target_override", ts.resolveTargetSchema(task, "source_db"))
+}
+
+func TestResolveTableTargetName(t *testing.T) {
+	ts := NewTaskService(&config.Config{Storage: config.StorageConfig{Mode: "file", DataDir: t.TempDir()}})
+	defer ts.Close()
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "rename-table", Tables: []string{"users", "orders"}, TargetTables: []string{"users_bak", "orders_bak"}})
+	assert.Equal(t, "users_bak", ts.resolveTableTargetName(task, "users", 0))
+	assert.Equal(t, "orders_bak", ts.resolveTableTargetName(task, "orders", 1))
+	assert.Equal(t, "fallback", ts.resolveTableTargetName(task, "fallback", 5))
+
+	task.Config.TargetTables = nil
+	assert.Equal(t, "users", ts.resolveTableTargetName(task, "users", 0))
 }
 
 func TestNewTaskService(t *testing.T) {
@@ -285,23 +339,26 @@ func TestCreateTask(t *testing.T) {
 	ts := NewTaskService(newDefaultConfig())
 
 	taskConfig := taskEntity.TaskConfig{
-		ID:           "test_task_1",
-		Name:         "Test Task",
-		SourceSchema: "source_db",
-		TargetSchema: "target_db",
-		Tables:       []string{"users", "orders"},
-		Mode:         taskEntity.SyncModeFull,
+		ID:                       "test_task_1",
+		Name:                     "Test Task",
+		SourceSchema:             "source_db",
+		TargetSchema:             "target_db",
+		Tables:                   []string{"users", "orders"},
+		Mode:                     taskEntity.SyncModeFull,
+		EnableDropTableBeforeDDL: true,
 	}
 
 	task, err := ts.CreateTask(taskConfig)
 	assert.NoError(t, err)
 	assert.NotNil(t, task)
 	assert.Equal(t, "test_task_1", task.Config.ID)
+	assert.True(t, task.Config.EnableDropTableBeforeDDL)
 
 	// 验证任务已添加到服务中
 	retrievedTask, exists := ts.GetTask("test_task_1")
 	assert.True(t, exists)
 	assert.Equal(t, task.Config.ID, retrievedTask.Config.ID)
+	assert.True(t, retrievedTask.Config.EnableDropTableBeforeDDL)
 }
 
 func TestGetTask(t *testing.T) {
@@ -1730,6 +1787,86 @@ func TestWithDDL(t *testing.T) {
 	})
 }
 
+func TestDropTargetTableIfNeeded(t *testing.T) {
+	ts := &TaskService{}
+	err := ts.dropTargetTableIfNeeded(nil, "test", "users", true)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "target connection is nil")
+
+	mockDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer mockDB.Close()
+
+	conn, err := mockDB.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	t.Run("disabled returns nil", func(t *testing.T) {
+		err := ts.dropTargetTableIfNeeded(conn, "test", "users", false)
+		assert.NoError(t, err)
+	})
+
+	t.Run("drops target table when enabled", func(t *testing.T) {
+		mock.ExpectExec("DROP TABLE IF EXISTS `test`.`users`").WillReturnResult(sqlmock.NewResult(0, 0))
+		err := ts.dropTargetTableIfNeeded(conn, "test", "users", true)
+		require.NoError(t, err)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("uses custom target table name when dropping", func(t *testing.T) {
+		customMockDB, customMock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer customMockDB.Close()
+
+		customConn, err := customMockDB.Conn(context.Background())
+		require.NoError(t, err)
+		defer customConn.Close()
+
+		customMock.ExpectExec("DROP TABLE IF EXISTS `prod_backup`.`users_archive`").WillReturnResult(sqlmock.NewResult(0, 0))
+		err = ts.dropTargetTableIfNeeded(customConn, "prod_backup", "users_archive", true)
+		require.NoError(t, err)
+		require.NoError(t, customMock.ExpectationsWereMet())
+	})
+}
+
+func TestEnsureTargetTable_DropBeforeDDLRecreatesExistingTable(t *testing.T) {
+	sourceDB, sourceMock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer sourceDB.Close()
+
+	targetDB, targetMock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	ts := &TaskService{tasks: make(map[string]*taskEntity.SyncTask)}
+	runtime := &taskRuntime{sourceDB: sourceDB, targetDB: targetDB}
+
+	targetMock.ExpectQuery("SELECT schema_name FROM information_schema.schemata WHERE schema_name = ?").WithArgs("target_db").WillReturnError(sql.ErrNoRows)
+	targetMock.ExpectExec("CREATE DATABASE IF NOT EXISTS `target_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci").WillReturnResult(sqlmock.NewResult(0, 0))
+	targetMock.ExpectQuery("SELECT table_name FROM information_schema.tables WHERE table_schema = 'target_db' AND table_name = 'users'").WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("users"))
+	targetMock.ExpectExec("DROP TABLE IF EXISTS `target_db`.`users`").WillReturnResult(sqlmock.NewResult(0, 0))
+	targetMock.ExpectExec("CREATE TABLE `target_db`.`users` LIKE `source_db`.`users`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	t.Run("existing table is recreated when enabled", func(t *testing.T) {
+		targetConn, err := targetDB.Conn(context.Background())
+		require.NoError(t, err)
+		defer targetConn.Close()
+		sourceConn, err := sourceDB.Conn(context.Background())
+		require.NoError(t, err)
+		defer sourceConn.Close()
+
+		runtime.sourceDB = sourceDB
+		runtime.targetDB = targetDB
+
+		// ensureTargetTable 只会在 CREATE TABLE LIKE 前走目标库连接的 DROP，因此这里仅验证执行路径
+		_, err = ts.ensureTargetTable(runtime, "source_db", "target_db", "users", "users", false, true)
+		require.NoError(t, err)
+	})
+
+	require.NoError(t, targetMock.ExpectationsWereMet())
+	require.NoError(t, sourceMock.ExpectationsWereMet())
+}
+
 // ==================== min ====================
 
 func TestMin(t *testing.T) {
@@ -1889,4 +2026,121 @@ func TestCancelScheduleRestoresFailedStatus(t *testing.T) {
 	assert.Nil(t, task.Context.ScheduledAt)
 	assert.Nil(t, task.Context.ScheduledFromStatus)
 	assert.NoError(t, ts.Close())
+}
+
+func TestScheduleTaskWithRepeatConfiguresRepeatFields(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "schedule_repeat", Name: "Schedule Repeat"})
+	require.NoError(t, err)
+
+	when := time.Now().Add(time.Minute)
+	require.NoError(t, ts.ScheduleTaskWithRepeat(task.Config.ID, when, 3, 30))
+
+	assert.Equal(t, taskEntity.TaskStatusScheduled, task.Context.Status)
+	require.NotNil(t, task.Context.ScheduledAt)
+	assert.WithinDuration(t, when, *task.Context.ScheduledAt, time.Second)
+	assert.Equal(t, 3, task.Context.RepeatCount)
+	assert.Equal(t, 3, task.Context.RepeatRemaining)
+	assert.Equal(t, 30, task.Context.RepeatIntervalSec)
+	assert.NoError(t, ts.Close())
+}
+
+func TestScheduleTaskWithRepeatRejectsInvalidTask(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	err := ts.ScheduleTaskWithRepeat("missing", time.Now().Add(time.Minute), 2, 10)
+	assert.Error(t, err)
+}
+
+func TestCancelScheduleClearsRepeatFields(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "schedule_cancel_repeat", Name: "Schedule Cancel Repeat"})
+	require.NoError(t, err)
+
+	require.NoError(t, ts.ScheduleTaskWithRepeat(task.Config.ID, time.Now().Add(time.Minute), 3, 30))
+	require.NoError(t, ts.CancelSchedule(task.Config.ID))
+
+	assert.Equal(t, taskEntity.TaskStatusPending, task.Context.Status)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
+	assert.Zero(t, task.Context.RepeatCount)
+	assert.Zero(t, task.Context.RepeatRemaining)
+	assert.Zero(t, task.Context.RepeatIntervalSec)
+	assert.NoError(t, ts.Close())
+}
+
+func TestStartTaskImmediatelyClearsStaleRepeatFields(t *testing.T) {
+	ts := newScheduledTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "start_clear_repeat", Name: "Start Clear Repeat"})
+	require.NoError(t, err)
+	task.ConfigureRepeat(3, 30)
+
+	require.NoError(t, ts.StartTask(context.Background(), task.Config.ID))
+
+	assert.Equal(t, taskEntity.TaskStatusRunning, task.Context.Status)
+	assert.Zero(t, task.Context.RepeatCount)
+	assert.Zero(t, task.Context.RepeatRemaining)
+	assert.Zero(t, task.Context.RepeatIntervalSec)
+	assert.NoError(t, ts.Close())
+}
+
+func TestCompleteTaskWithRepeatReschedulesUntilExhausted(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "repeat_complete", Name: "Repeat Complete"})
+	require.NoError(t, err)
+
+	require.NoError(t, ts.ScheduleTaskWithRepeat(task.Config.ID, time.Now().Add(time.Minute), 2, 1))
+	task.Start()
+	ts.completeTask(task.Config.ID)
+
+	assert.Equal(t, taskEntity.TaskStatusScheduled, task.Context.Status)
+	require.NotNil(t, task.Context.ScheduledAt)
+	assert.Equal(t, 2, task.Context.RepeatCount)
+	assert.Equal(t, 1, task.Context.RepeatRemaining)
+	assert.Equal(t, 1, task.Context.RepeatIntervalSec)
+
+	task.Start()
+	ts.completeTask(task.Config.ID)
+
+	assert.Equal(t, taskEntity.TaskStatusCompleted, task.Context.Status)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Zero(t, task.Context.RepeatCount)
+	assert.Zero(t, task.Context.RepeatRemaining)
+	assert.Zero(t, task.Context.RepeatIntervalSec)
+	assert.NoError(t, ts.Close())
+}
+
+func TestScheduleOperationsReturnStorageErrors(t *testing.T) {
+	storageErr := fmt.Errorf("storage unavailable")
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"schedule_save_error": taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "schedule_save_error", Name: "Schedule Save Error"}),
+		},
+		runtimes: make(map[string]*taskRuntime),
+		storage:  &failingTaskStorage{err: storageErr},
+	}
+
+	err := ts.ScheduleTask("schedule_save_error", time.Now().Add(time.Minute))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to save scheduled task state")
+
+	ts.tasks["schedule_save_error"] = taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "schedule_save_error", Name: "Schedule Save Error"})
+	err = ts.ScheduleTaskWithRepeat("schedule_save_error", time.Now().Add(time.Minute), 2, 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to save")
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "cancel_save_error", Name: "Cancel Save Error"})
+	task.Schedule(time.Now().Add(time.Minute))
+	ts.tasks["cancel_save_error"] = task
+	err = ts.CancelSchedule("cancel_save_error")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to save cancelled schedule state")
+}
+
+func TestStopSchedulerIsIdempotent(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	ts.StartScheduler()
+	assert.NotPanics(t, func() {
+		ts.StopScheduler()
+		ts.StopScheduler()
+	})
 }

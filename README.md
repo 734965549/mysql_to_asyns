@@ -399,38 +399,45 @@ docker compose up -d --build
 
 
 
-``bash
-
+```bash
 POST /api/tasks
-
 Content-Type: application/json
+```
 
+**请求示例：**
 
-
+```json
 {
-
   "name": "用户表同步",
-
   "mode": "ALL",
-
   "sync_level": "TABLE",
-
   "source_schema": "production",
-
   "target_schema": "production_backup",
-
   "tables": ["users", "orders"],
-
+  "target_tables": ["users_archive", "orders_archive"],
   "batch_size": 1000,
-
   "worker_count": 4,
-
+  "intra_table_worker_count": 8,
   "enable_limit_one": false,
-
-  "enable_consistent_snapshot": true
-
+  "optimize_index": true,
+  "enable_read_only": true,
+  "enable_consistent_snapshot": true,
+  "enable_drop_table_before_ddl": true,
+  "source_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "production",
+    "username": "root",
+    "password": "root_password"
+  },
+  "target_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "production_backup",
+    "username": "root",
+    "password": "root_password"
+  }
 }
-
 ```
 
 
@@ -462,6 +469,7 @@ Content-Type: application/json
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
 
 | enable_consistent_snapshot | bool | 否 | 全量阶段启用并发一致性快照（任务级参数，默认false） |
+| enable_drop_table_before_ddl | bool | 否 | 同步 DDL 前先执行 `DROP TABLE IF EXISTS`，适用于库级别/表级别同步，默认false |
 
 
 
@@ -472,6 +480,69 @@ Content-Type: application/json
 - 开启后，全量阶段会让多个 worker 在同一时点快照上并发读取。
 
 - 快照建立时会短暂执行 FTWRL（`FLUSH TABLES WITH READ LOCK`），建议在低峰时段执行。
+
+**`enable_drop_table_before_ddl` 说明：**
+
+- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`）。
+
+- 当目标库中已存在同名表时，如果开启该开关，任务会在执行 `CREATE TABLE ... LIKE ...` 或回放 `SHOW CREATE TABLE` 之前，先执行：`DROP TABLE IF EXISTS \`目标库\`.\`目标表\``。
+
+- 该行为会在库级别同步和表级别同步中生效，适合“每次都以源表结构重建目标表”的场景。
+
+- 注意：开启后会删除目标表及其数据，请确认目标库允许覆盖。
+
+
+
+#### 更新任务
+
+
+
+```bash
+PUT /api/tasks/:id
+Content-Type: application/json
+```
+
+**请求示例：**
+
+```json
+{
+  "name": "用户表同步-调整版",
+  "mode": "ALL",
+  "sync_level": "TABLE",
+  "source_schema": "production",
+  "target_schema": "production_backup",
+  "tables": ["users", "orders"],
+  "target_tables": ["users_archive", "orders_archive"],
+  "batch_size": 2000,
+  "worker_count": 8,
+  "intra_table_worker_count": 12,
+  "enable_limit_one": false,
+  "optimize_index": true,
+  "enable_read_only": true,
+  "enable_consistent_snapshot": true,
+  "enable_drop_table_before_ddl": true,
+  "source_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "production",
+    "username": "root",
+    "password": "root_password"
+  },
+  "target_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "production_backup",
+    "username": "root",
+    "password": "root_password"
+  }
+}
+```
+
+**说明：**
+
+- 更新任务时，请把需要保留的字段一并传入，后端按请求体覆盖对应配置。
+- `enable_drop_table_before_ddl=true` 时，任务在同步表结构前会先执行 `DROP TABLE IF EXISTS`。
+- 如果只想切换该开关，可以只传该字段和任务标识相关的必要字段，但建议前端保存完整配置，避免遗漏。
 
 
 
@@ -504,12 +575,53 @@ GET /api/tasks/:id
 
 
 ```bash
-
 POST /api/tasks/:id/start
-
 ```
 
+**请求体说明：**
 
+- 不传请求体：立即启动任务。
+- 传入 `scheduled_at`：设置单次定时启动。
+- 传入 `repeat_count` 和 `repeat_interval_sec`：设置重复定时启动。
+
+**请求示例 1：立即启动**
+
+```bash
+curl -X POST http://localhost:8080/api/tasks/任务ID/start
+```
+
+**请求示例 2：单次定时启动**
+
+```json
+{
+  "scheduled_at": "2026-06-04T18:30:00+08:00"
+}
+```
+
+**请求示例 3：重复定时启动**
+
+```json
+{
+  "scheduled_at": "2026-06-04T18:30:00+08:00",
+  "repeat_count": 3,
+  "repeat_interval_sec": 60
+}
+```
+
+**参数说明：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| scheduled_at | string | 定时启动时必填 | 首次启动时间，RFC3339 格式 |
+| repeat_count | int | 否 | 重复启动总次数，包含首次执行；不传或传 0 表示仅执行一次 |
+| repeat_interval_sec | int | 否 | 每次执行完成后到下一次启动的间隔秒数，默认 0 |
+
+**说明：**
+
+- `scheduled_at` 不能早于当前时间。
+- `repeat_count` 必须大于等于 0。
+- `repeat_interval_sec` 必须大于等于 0。
+- 重复启动会在每次任务执行完成后，自动安排下一次启动，直到达到 `repeat_count`。
 
 #### 暂停任务
 

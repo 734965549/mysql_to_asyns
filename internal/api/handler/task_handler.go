@@ -56,7 +56,8 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	SourceDatabases          []string               `json:"source_databases"`           // 源数据库列表（库级别同步时使用）
 	TargetDatabase           string                 `json:"target_database"`            // 目标数据库（库级别同步时，所有库同步到此库）
 	TargetDatabases          []string               `json:"target_databases"`           // 目标数据库列表（与 SourceDatabases 一一对应）
-	Tables                   []string               `json:"tables"`                     // 表列表
+	Tables                   []string               `json:"tables"`                     // 源表列表
+	TargetTables             []string               `json:"target_tables"`              // 目标表列表（与 Tables 一一对应；空则沿用源表名）
 	Mode                     string                 `json:"mode" binding:"required"`    // 同步模式，必填
 	BatchSize                int                    `json:"batch_size"`                 // 批处理大小
 	WorkerCount              int                    `json:"worker_count"`               // 工作线程数
@@ -65,6 +66,7 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	OptimizeIndex            bool                   `json:"optimize_index"`             // 索引优化：先删后建
 	EnableReadOnly           bool                   `json:"enable_read_only"`           // 同步前关闭目标只读，同步后恢复
 	EnableConsistentSnapshot bool                   `json:"enable_consistent_snapshot"` // 是否启用全量一致性快照
+	EnableDropTableBeforeDDL bool                   `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`        // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`        // 目标数据库配置（可选）
 }
@@ -132,7 +134,8 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		SourceDatabases:          req.SourceDatabases,           // 设置源数据库列表
 		TargetDatabase:           req.TargetDatabase,            // 设置目标数据库
 		TargetDatabases:          req.TargetDatabases,           // 设置目标数据库列表
-		Tables:                   req.Tables,                    // 设置表列表
+		Tables:                   req.Tables,                    // 设置源表列表
+		TargetTables:             req.TargetTables,              // 设置目标表列表
 		Mode:                     taskEntity.SyncMode(req.Mode), // 设置同步模式
 		BatchSize:                req.BatchSize,                 // 设置批处理大小
 		WorkerCount:              req.WorkerCount,               // 设置工作线程数
@@ -141,6 +144,7 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		OptimizeIndex:            req.OptimizeIndex,             // 设置索引优化开关
 		EnableReadOnly:           req.EnableReadOnly,            // 设置只读管理开关
 		EnableConsistentSnapshot: req.EnableConsistentSnapshot,  // 设置一致性快照开关
+		EnableDropTableBeforeDDL: req.EnableDropTableBeforeDDL,   // 设置DDL前DROP TABLE开关
 		SourceDB:                 sourceDB,                      // 设置源数据库配置
 		TargetDB:                 targetDB,                      // 设置目标数据库配置
 	}
@@ -155,7 +159,9 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 
 // StartTaskRequest 启动任务请求结构体（可选）
 type StartTaskRequest struct {
-	ScheduledAt *time.Time `json:"scheduled_at,omitempty"` // 定时启动时间（为空表示立即启动）
+	ScheduledAt      *time.Time `json:"scheduled_at,omitempty"`      // 定时启动时间（为空表示立即启动）
+	RepeatCount      int        `json:"repeat_count,omitempty"`      // 重复启动次数（包含首次执行）
+	RepeatIntervalSec int       `json:"repeat_interval_sec,omitempty"` // 重复启动间隔（秒）
 }
 
 // StartTask 启动任务方法（支持立即启动和定时启动）
@@ -172,6 +178,27 @@ func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 	if req.ScheduledAt != nil { // 定时启动
 		if req.ScheduledAt.Before(time.Now()) { // 校验时间不能是过去
 			c.JSON(http.StatusBadRequest, gin.H{"error": "定时启动时间不能早于当前时间"})
+			return
+		}
+		if req.RepeatCount < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "repeat_count 不能小于 0"})
+			return
+		}
+		if req.RepeatCount > 0 && req.RepeatIntervalSec < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "repeat_interval_sec 不能小于 0"})
+			return
+		}
+		if req.RepeatCount > 0 {
+			if err := h.taskService.ScheduleTaskWithRepeat(taskID, *req.ScheduledAt, req.RepeatCount, req.RepeatIntervalSec); err != nil {
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "task not found") {
+					c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+				} else {
+					c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+				}
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"message": "Task scheduled", "scheduled_at": req.ScheduledAt, "repeat_count": req.RepeatCount, "repeat_interval_sec": req.RepeatIntervalSec})
 			return
 		}
 		if err := h.taskService.ScheduleTask(taskID, *req.ScheduledAt); err != nil {
@@ -628,6 +655,9 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.EnableConsistentSnapshot != nil { // 如果提供了一致性快照开关
 		task.Config.EnableConsistentSnapshot = *req.EnableConsistentSnapshot // 更新一致性快照开关
 	}
+	if req.EnableDropTableBeforeDDL != nil { // 如果提供了DDL前DROP TABLE开关
+		task.Config.EnableDropTableBeforeDDL = *req.EnableDropTableBeforeDDL // 更新DDL前DROP TABLE开关
+	}
 
 	// 更新数据库配置
 	if req.SourceDB != nil { // 如果提供了源数据库配置
@@ -689,7 +719,8 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	TargetSchema             string                 `json:"target_schema"`                        // 目标模式名
 	SourceDatabases          []string               `json:"source_databases"`                     // 源数据库列表
 	TargetDatabases          []string               `json:"target_databases"`                     // 目标数据库列表
-	Tables                   []string               `json:"tables"`                               // 表列表
+	Tables                   []string               `json:"tables"`                               // 源表列表
+	TargetTables             []string               `json:"target_tables"`                         // 目标表列表（与 Tables 一一对应；空则沿用源表名）
 	Mode                     string                 `json:"mode"`                                 // 同步模式
 	BatchSize                int                    `json:"batch_size"`                           // 批处理大小
 	WorkerCount              int                    `json:"worker_count"`                         // 工作线程数
@@ -698,6 +729,7 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`             // 索引优化（可选）
 	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`           // 只读管理（可选）
 	EnableConsistentSnapshot *bool                  `json:"enable_consistent_snapshot,omitempty"` // 是否启用全量一致性快照（可选）
+	EnableDropTableBeforeDDL *bool                  `json:"enable_drop_table_before_ddl,omitempty"` // DDL前是否先DROP TABLE（可选）
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                  // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                  // 目标数据库配置（可选）
 }
