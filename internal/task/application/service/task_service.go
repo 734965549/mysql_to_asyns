@@ -3928,6 +3928,7 @@ func extractTableDefinition(createSQL string) string {
 func stripNonPrimaryIndexesFromCreateSQL(createSQL string) string {
 
 	lines := strings.Split(createSQL, "\n")
+	autoIncrementColumns := extractAutoIncrementColumnsFromCreateSQL(lines)
 
 	filtered := make([]string, 0, len(lines))
 
@@ -3935,7 +3936,7 @@ func stripNonPrimaryIndexesFromCreateSQL(createSQL string) string {
 
 		trimmed := strings.TrimSpace(line)
 
-		if i > 0 && i < len(lines)-1 && isSecondaryIndexDefinitionLine(trimmed) {
+		if i > 0 && i < len(lines)-1 && isSecondaryIndexDefinitionLine(trimmed) && !indexDefinitionUsesAnyColumn(trimmed, autoIncrementColumns) {
 
 			continue
 
@@ -3956,6 +3957,46 @@ func stripNonPrimaryIndexesFromCreateSQL(createSQL string) string {
 	}
 
 	return strings.Join(filtered, "\n")
+
+}
+
+func extractAutoIncrementColumnsFromCreateSQL(lines []string) map[string]struct{} {
+
+	columns := make(map[string]struct{})
+
+	for _, line := range lines {
+
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "`") || !strings.Contains(strings.ToUpper(trimmed), "AUTO_INCREMENT") {
+			continue
+		}
+
+		end := strings.Index(trimmed[1:], "`")
+		if end < 0 {
+			continue
+		}
+
+		columns[trimmed[1:1+end]] = struct{}{}
+
+	}
+
+	return columns
+
+}
+
+func indexDefinitionUsesAnyColumn(indexDefinition string, columns map[string]struct{}) bool {
+
+	if len(columns) == 0 {
+		return false
+	}
+
+	for column := range columns {
+		if strings.Contains(indexDefinition, fmt.Sprintf("`%s`", column)) {
+			return true
+		}
+	}
+
+	return false
 
 }
 

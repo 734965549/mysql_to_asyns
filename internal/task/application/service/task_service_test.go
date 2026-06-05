@@ -90,6 +90,25 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepPrimaryOnlyDDLValid(t *testing.
 	assert.Contains(t, stripped, "PRIMARY KEY (`id`,`tenant_id`)")
 }
 
+func TestStripNonPrimaryIndexesFromCreateSQL_KeepsAutoIncrementKey(t *testing.T) {
+	createSQL := "CREATE TABLE `repair` (\n" +
+		"  `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+		"  `dealer_id` bigint DEFAULT NULL,\n" +
+		"  `name` varchar(255) DEFAULT NULL,\n" +
+		"  UNIQUE KEY `uk_id` (`id`),\n" +
+		"  KEY `idx_dealer_id` (`dealer_id`),\n" +
+		"  KEY `idx_name` (`name`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+	stripped := stripNonPrimaryIndexesFromCreateSQL(createSQL)
+
+	assert.Contains(t, stripped, "`id` bigint NOT NULL AUTO_INCREMENT")
+	assert.Contains(t, stripped, "UNIQUE KEY `uk_id` (`id`)")
+	assert.NotContains(t, stripped, "KEY `idx_dealer_id` (`dealer_id`)")
+	assert.NotContains(t, stripped, "KEY `idx_name` (`name`)")
+	assert.False(t, strings.Contains(stripped, ",\n) ENGINE"))
+}
+
 // newTestTaskService 创建一个使用自定义数据目录的测试任务服务
 func newTestTaskService(dataDir string) *TaskService {
 	storage := NewFileTaskStorage(dataDir)
