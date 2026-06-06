@@ -140,13 +140,18 @@ func TestGetAllTasks(t *testing.T) {
 
 	}
 
-	var tasks []*taskEntity.SyncTask
+	var resp struct {
+		Total    int64                  `json:"total"`
+		Page     int                    `json:"page"`
+		PageSize int                    `json:"page_size"`
+		Items    []*taskEntity.SyncTask `json:"items"`
+	}
 
-	json.Unmarshal(w.Body.Bytes(), &tasks)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 
-	// 鍒濆鐘舵€佸簲璇ユ槸绌烘暟缁?
+	// 初始状态应该是空数组
 
-	if tasks == nil {
+	if resp.Items == nil {
 
 		t.Error("expected tasks array, got nil")
 

@@ -557,12 +557,38 @@ async function fetchTables() {
 
 // 获取任务列表
 
-async function fetchTasks() {
+let taskFetchSeq = 0;
+
+async function fetchTasks(page = taskPagination.value.current, pageSize = taskPagination.value.pageSize) {
+  const fetchSeq = ++taskFetchSeq;
   try {
-    const res = await fetch(`${API_BASE}/tasks`);
+    const params = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+    });
+
+    if (taskFilters.value.status) {
+      params.set("status", taskFilters.value.status);
+    }
+
+    if (taskFilters.value.keyword) {
+      params.set("keyword", taskFilters.value.keyword);
+    }
+
+    if (taskFilters.value.sort) {
+      params.set("sort", taskFilters.value.sort);
+    }
+
+    const res = await fetch(`${API_BASE}/tasks?${params.toString()}`);
 
     if (res.ok) {
-      tasks.value = await res.json();
+      const data = await res.json();
+      if (fetchSeq !== taskFetchSeq) return;
+      tasks.value = data.items || [];
+      taskPagination.value.current = data.page || page;
+      taskPagination.value.pageSize = data.page_size || pageSize;
+      taskPagination.value.total = data.total || 0;
+      syncTaskFiltersToUrl();
     }
   } catch (e) {
     console.error("获取任务列表失败:", e);
@@ -1680,6 +1706,9 @@ function handlePopState() {
 
     resetForm();
   }
+
+  loadTaskFiltersFromUrl();
+  fetchTasks(taskPagination.value.current, taskPagination.value.pageSize);
 }
 
 let refreshInterval;
@@ -1691,9 +1720,12 @@ onMounted(async () => {
 
   fetchDatabases();
 
-  fetchTasks();
+  loadTaskFiltersFromUrl();
+  await fetchTasks(taskPagination.value.current, taskPagination.value.pageSize);
 
-  refreshInterval = setInterval(fetchTasks, 3000);
+  refreshInterval = setInterval(() => {
+    fetchTasks(taskPagination.value.current, taskPagination.value.pageSize);
+  }, 3000);
 });
 
 onUnmounted(() => {
@@ -1712,7 +1744,7 @@ function onMenuClick(key) {
   selectedKey.value = [key];
 
   if (key === "tasks") {
-    fetchTasks();
+    fetchTasks(taskPagination.value.current, taskPagination.value.pageSize);
   } else if (key === "config") {
     // 只有在从非配置页面切换过来时才获取配置，避免在配置页面内操作时被覆盖
 
@@ -1726,35 +1758,67 @@ function onMenuClick(key) {
 
 const currentPage = computed(() => selectedKey.value[0]);
 
-// 计算属性：对任务列表进行稳定排序（避免列表闪烁）
+const taskFilters = ref({
+  status: "",
+  keyword: "",
+  sort: "created_at_desc",
+});
 
-const sortedTasks = computed(() => {
-  return [...tasks.value].sort((a, b) => {
-    const aStorageID = Number(a?.config?.storage_id || 0);
+const syncUrlDebounceState = { timer: null };
 
-    const bStorageID = Number(b?.config?.storage_id || 0);
+function syncTaskFiltersToUrl() {
+  if (syncUrlDebounceState.timer) {
+    clearTimeout(syncUrlDebounceState.timer);
+  }
+  syncUrlDebounceState.timer = setTimeout(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("page");
+    url.searchParams.delete("page_size");
+    url.searchParams.delete("status");
+    url.searchParams.delete("keyword");
+    url.searchParams.delete("sort");
 
-    if (aStorageID > 0 || bStorageID > 0) {
-      return aStorageID - bStorageID;
+    if (taskPagination.value.current > 1) {
+      url.searchParams.set("page", String(taskPagination.value.current));
+    }
+    if (taskPagination.value.pageSize !== 10) {
+      url.searchParams.set("page_size", String(taskPagination.value.pageSize));
+    }
+    if (taskFilters.value.status) {
+      url.searchParams.set("status", taskFilters.value.status);
+    }
+    if (taskFilters.value.keyword) {
+      url.searchParams.set("keyword", taskFilters.value.keyword);
+    }
+    if (taskFilters.value.sort) {
+      url.searchParams.set("sort", taskFilters.value.sort);
     }
 
-    return a.config.id.localeCompare(b.config.id);
-  });
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  }, 0);
+}
+
+function loadTaskFiltersFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const page = Number.parseInt(params.get("page") || "1", 10);
+  const pageSize = Number.parseInt(params.get("page_size") || "10", 10);
+
+  taskPagination.value.current = Number.isFinite(page) && page > 0 ? page : 1;
+  taskPagination.value.pageSize = Number.isFinite(pageSize) && pageSize > 0 ? pageSize : 10;
+  taskFilters.value.status = params.get("status") || "";
+  taskFilters.value.keyword = params.get("keyword") || "";
+  taskFilters.value.sort = params.get("sort") || "created_at_desc";
+}
+
+const taskPagination = ref({
+  current: 1,
+  pageSize: 10,
+  total: 0,
 });
 
-const taskSearchText = ref("");
+const filteredTasks = computed(() => tasks.value);
 
-const filteredTasks = computed(() => {
-  if (!taskSearchText.value) {
-    return sortedTasks.value;
-  }
-  const lowerSearch = taskSearchText.value.toLowerCase();
-  return sortedTasks.value.filter(
-    (t) =>
-      t.config.name?.toLowerCase().includes(lowerSearch) ||
-      t.config.id?.toLowerCase().includes(lowerSearch),
-  );
-});
+const paginatedTasks = computed(() => filteredTasks.value);
 
 const currentDatabaseSelectedTables = computed({
   get() {
@@ -3373,12 +3437,45 @@ watch(
                 "
               >
                 <span>任务列表</span>
-                <a-input-search
-                  v-model="taskSearchText"
-                  placeholder="搜索任务名称..."
-                  style="width: 280px"
-                  allow-clear
-                />
+                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
+                  <a-select
+                    v-model="taskFilters.status"
+                    placeholder="状态"
+                    allow-clear
+                    style="width: 130px"
+                    @change="() => fetchTasks(1, taskPagination.value.pageSize)"
+                  >
+                    <a-option value="PENDING">待执行</a-option>
+                    <a-option value="RUNNING">运行中</a-option>
+                    <a-option value="PAUSED">已暂停</a-option>
+                    <a-option value="SCHEDULED">已计划</a-option>
+                    <a-option value="COMPLETED">已完成</a-option>
+                    <a-option value="FAILED">失败</a-option>
+                  </a-select>
+                  <a-select
+                    v-model="taskFilters.sort"
+                    placeholder="排序"
+                    style="width: 150px"
+                    @change="() => fetchTasks(1, taskPagination.pageSize)"
+                  >
+                    <a-option value="created_at_desc">创建时间倒序</a-option>
+                    <a-option value="created_at_asc">创建时间正序</a-option>
+                    <a-option value="name_asc">名称正序</a-option>
+                    <a-option value="name_desc">名称倒序</a-option>
+                    <a-option value="status_asc">状态正序</a-option>
+                    <a-option value="status_desc">状态倒序</a-option>
+                    <a-option value="progress_asc">进度正序</a-option>
+                    <a-option value="progress_desc">进度倒序</a-option>
+                  </a-select>
+                  <a-input-search
+                    v-model="taskFilters.keyword"
+                    placeholder="搜索任务名称/ID/表名..."
+                    style="width: 280px"
+                    allow-clear
+                    @search="() => fetchTasks(1, taskPagination.value.pageSize)"
+                    @clear="() => fetchTasks(1, taskPagination.value.pageSize)"
+                  />
+                </div>
               </div>
             </template>
 
@@ -3392,7 +3489,7 @@ watch(
 
             <a-list v-else :bordered="false">
               <a-list-item
-                v-for="task in filteredTasks"
+                v-for="task in paginatedTasks"
                 :key="task.config.id"
                 class="task-item"
               >
@@ -3605,10 +3702,10 @@ watch(
                       track-color="var(--color-fill-2)"
                       animation
                     />
-                    
+
                     <div class="progress-details">
                       <span class="progress-text">
-                        已处理: {{ task.context.processed_rows || 0 }} / 
+                        已处理: {{ task.context.processed_rows || 0 }} /
                         {{ task.context.total_rows || 0 }}
                       </span>
                       <span class="progress-percent-text">{{ getProgress(task) }}%</span>
@@ -3699,6 +3796,19 @@ watch(
                 </a-card>
               </a-list-item>
             </a-list>
+
+            <div class="task-pagination" v-if="taskPagination.total > 0">
+              <a-pagination
+                v-model:current="taskPagination.current"
+                v-model:page-size="taskPagination.pageSize"
+                :total="taskPagination.total"
+                :page-size-options="['5', '10', '20', '50']"
+                show-total
+                show-page-size
+                @change="(page, pageSize) => fetchTasks(page, pageSize)"
+                @page-size-change="(pageSize) => fetchTasks(1, pageSize)"
+              />
+            </div>
           </a-card>
         </div>
 
@@ -4782,6 +4892,12 @@ watch(
   border-top: 1px solid #e5e6eb;
 
   padding-top: 12px;
+}
+
+.task-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
 }
 
 /* 双栏选择器样式 */

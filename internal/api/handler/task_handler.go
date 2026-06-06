@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -273,10 +274,32 @@ func (h *TaskHandler) GetTask(c *gin.Context) { // 获取任务详情
 	c.JSON(http.StatusOK, task) // 返回任务详情
 }
 
-// GetAllTasks 获取所有任务方法
+// GetAllTasks 获取任务列表方法，支持分页/筛选/搜索/排序
 func (h *TaskHandler) GetAllTasks(c *gin.Context) { // 获取所有任务列表
-	tasks := h.taskService.GetAllTasks() // 获取所有任务
-	c.JSON(http.StatusOK, tasks)         // 返回任务列表
+	page := 1
+	pageSize := 10
+	status := c.Query("status")
+	keyword := c.Query("keyword")
+	sortBy := c.Query("sort")
+
+	if v := c.Query("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	if v := c.Query("page_size"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageSize = n
+		}
+	}
+
+	items, total, page, pageSize := h.taskService.GetTasksPage(page, pageSize, status, keyword, sortBy)
+	c.JSON(http.StatusOK, gin.H{
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+		"items":     items,
+	})
 }
 
 // GetTaskMetrics 获取任务指标方法

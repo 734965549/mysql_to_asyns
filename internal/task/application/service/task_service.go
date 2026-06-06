@@ -922,6 +922,159 @@ func (s *TaskService) GetAllTasks() []*taskEntity.SyncTask {
 
 }
 
+// GetTasksPage 获取分页任务列表
+func taskStatusRank(status taskEntity.TaskStatus) int {
+	switch status {
+	case taskEntity.TaskStatusRunning:
+		return 0
+	case taskEntity.TaskStatusScheduled:
+		return 1
+	case taskEntity.TaskStatusPending:
+		return 2
+	case taskEntity.TaskStatusPaused:
+		return 3
+	case taskEntity.TaskStatusFailed:
+		return 4
+	case taskEntity.TaskStatusCompleted:
+		return 5
+	default:
+		return 6
+	}
+}
+
+func taskDisplayTime(task *taskEntity.SyncTask) time.Time {
+	if task == nil {
+		return time.Time{}
+	}
+	if !task.Context.StartTime.IsZero() {
+		return task.Context.StartTime
+	}
+	if !task.Context.LastUpdateTime.IsZero() {
+		return task.Context.LastUpdateTime
+	}
+	return time.Time{}
+}
+
+func (s *TaskService) GetTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	if page <= 0 {
+		page = 1
+	}
+
+	status = strings.ToUpper(strings.TrimSpace(status))
+	keyword = strings.ToLower(strings.TrimSpace(keyword))
+	sortBy = strings.ToLower(strings.TrimSpace(sortBy))
+
+	tasks := make([]*taskEntity.SyncTask, 0, len(s.tasks))
+	for _, task := range s.tasks {
+		if task == nil {
+			continue
+		}
+		if status != "" && strings.ToUpper(string(task.Context.Status)) != status {
+			continue
+		}
+		if keyword != "" {
+			name := strings.ToLower(strings.TrimSpace(task.Config.Name))
+			id := strings.ToLower(strings.TrimSpace(task.Config.ID))
+			sourceSchema := strings.ToLower(strings.TrimSpace(task.Config.SourceSchema))
+			targetSchema := strings.ToLower(strings.TrimSpace(task.Config.TargetSchema))
+			matched := strings.Contains(name, keyword) || strings.Contains(id, keyword) || strings.Contains(sourceSchema, keyword) || strings.Contains(targetSchema, keyword)
+			if !matched {
+				for _, tableName := range task.Config.Tables {
+					if strings.Contains(strings.ToLower(tableName), keyword) {
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		tasks = append(tasks, task)
+	}
+
+	sort.Slice(tasks, func(i, j int) bool {
+		a := tasks[i]
+		b := tasks[j]
+		createdAtA := taskDisplayTime(a)
+		createdAtB := taskDisplayTime(b)
+		if sortBy == "created_at_asc" {
+			if createdAtA.Equal(createdAtB) {
+				return a.Config.ID < b.Config.ID
+			}
+			return createdAtA.Before(createdAtB)
+		}
+		if sortBy == "name_asc" {
+			if a.Config.Name == b.Config.Name {
+				return a.Config.ID < b.Config.ID
+			}
+			return a.Config.Name < b.Config.Name
+		}
+		if sortBy == "name_desc" {
+			if a.Config.Name == b.Config.Name {
+				return a.Config.ID > b.Config.ID
+			}
+			return a.Config.Name > b.Config.Name
+		}
+		if sortBy == "status_asc" || sortBy == "status_desc" {
+			aStatus := taskStatusRank(a.Context.Status)
+			bStatus := taskStatusRank(b.Context.Status)
+			if aStatus == bStatus {
+				if createdAtA.Equal(createdAtB) {
+					return a.Config.ID > b.Config.ID
+				}
+				return createdAtA.After(createdAtB)
+			}
+			if sortBy == "status_asc" {
+				return aStatus < bStatus
+			}
+			return aStatus > bStatus
+		}
+		if sortBy == "progress_asc" || sortBy == "progress_desc" {
+			aProgress := a.Context.ProgressPercent
+			bProgress := b.Context.ProgressPercent
+			if aProgress == bProgress {
+				if createdAtA.Equal(createdAtB) {
+					return a.Config.ID > b.Config.ID
+				}
+				return createdAtA.After(createdAtB)
+			}
+			if sortBy == "progress_asc" {
+				return aProgress < bProgress
+			}
+			return aProgress > bProgress
+		}
+		if sortBy == "created_at_desc" || sortBy == "" {
+			if createdAtA.Equal(createdAtB) {
+				return a.Config.ID > b.Config.ID
+			}
+			return createdAtA.After(createdAtB)
+		}
+		if createdAtA.Equal(createdAtB) {
+			return a.Config.ID > b.Config.ID
+		}
+		return createdAtA.After(createdAtB)
+	})
+
+	total := len(tasks)
+	start := (page - 1) * pageSize
+	if start >= total {
+		return []*taskEntity.SyncTask{}, total, page, pageSize
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+
+	return tasks[start:end], total, page, pageSize
+}
+
 // UpdateTask 更新任务
 
 func (s *TaskService) UpdateTask(task *taskEntity.SyncTask) error {
