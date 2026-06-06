@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	taskEntity "mysql-to-async/internal/task/domain/entity"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1895,44 +1897,32 @@ func TestMin(t *testing.T) {
 	assert.Equal(t, -1, min(-1, 0))
 }
 
-// ==================== globalSnapshotState Borrow/Return ====================
+// ==================== captureFullSyncStartPosition（短锁取位点） ====================
 
-func TestGlobalSnapshotState_BorrowReturn(t *testing.T) {
-	t.Run("nil state returns error", func(t *testing.T) {
-		var g *globalSnapshotState
-		_, err := g.Borrow(context.Background())
-		assert.Error(t, err)
-	})
+// captureFullSyncStartPosition 已固定为"短锁取位点"模式：
+// 永远先 FTWRL，SHOW MASTER STATUS 拿到位点后立即 UNLOCK。
+func TestCaptureFullSyncStartPosition_ShortReadLock(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
 
-	t.Run("nil pool returns error", func(t *testing.T) {
-		g := &globalSnapshotState{}
-		_, err := g.Borrow(context.Background())
-		assert.Error(t, err)
-	})
+	mock.ExpectExec("FLUSH TABLES WITH READ LOCK").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SHOW MASTER STATUS").WillReturnRows(sqlmock.NewRows([]string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set"}).AddRow("mysql-bin.000123", 456, "", "", ""))
+	mock.ExpectExec("UNLOCK TABLES").WillReturnResult(sqlmock.NewResult(0, 0))
 
-	t.Run("cancelled context returns error", func(t *testing.T) {
-		g := &globalSnapshotState{pool: make(chan *sql.Conn, 1)}
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		_, err := g.Borrow(ctx)
-		assert.Error(t, err)
-	})
+	ts := newTestTaskService(t.TempDir())
+	pos, err := ts.captureFullSyncStartPosition(context.Background(), &taskRuntime{sourceDB: db})
 
-	t.Run("return nil on nil state does not panic", func(t *testing.T) {
-		var g *globalSnapshotState
-		assert.NotPanics(t, func() { g.Return(nil) })
-	})
+	require.NoError(t, err)
+	assert.Equal(t, "mysql-bin.000123", pos.Name)
+	assert.Equal(t, uint32(456), pos.Pos)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
 
-	t.Run("return nil conn does not panic", func(t *testing.T) {
-		g := &globalSnapshotState{pool: make(chan *sql.Conn, 1)}
-		assert.NotPanics(t, func() { g.Return(nil) })
-	})
-
-	t.Run("ReturnAll handles nil", func(t *testing.T) {
-		g := &globalSnapshotState{pool: make(chan *sql.Conn, 2)}
-		assert.NotPanics(t, func() { g.ReturnAll(nil) })
-		assert.NotPanics(t, func() { g.ReturnAll([]*sql.Conn{nil, nil}) })
-	})
+func TestCaptureFullSyncStartPosition_NilRuntime(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	_, err := ts.captureFullSyncStartPosition(context.Background(), nil)
+	assert.Error(t, err)
 }
 
 // ==================== resolveSourceSchema edge cases ====================
@@ -2153,6 +2143,261 @@ func TestScheduleOperationsReturnStorageErrors(t *testing.T) {
 	err = ts.CancelSchedule("cancel_save_error")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to save cancelled schedule state")
+}
+
+// ==================== 阶段状态机：entity 助手方法 ====================
+
+func TestSyncPhase_HelpersOnFreshTask(t *testing.T) {
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "phase_fresh"})
+	assert.Equal(t, taskEntity.SyncPhaseInit, task.Context.SyncPhase)
+	assert.False(t, task.HasFullSyncEverCompleted(), "fresh task must not be considered completed")
+	assert.False(t, task.FullSyncIncomplete(), "fresh task is neither completed nor incomplete")
+}
+
+func TestSyncPhase_MarkFullSyncStartedThenCompleted(t *testing.T) {
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "phase_full"})
+
+	task.MarkFullSyncStarted("mysql-bin.000001:120")
+	assert.Equal(t, taskEntity.SyncPhaseFullStarted, task.Context.SyncPhase)
+	assert.Equal(t, "mysql-bin.000001:120", task.Context.FullSyncStartPosition)
+	require.NotNil(t, task.Context.FullSyncStartedAt)
+	assert.Nil(t, task.Context.FullSyncCompletedAt)
+	assert.True(t, task.FullSyncIncomplete(), "FULL_STARTED is incomplete")
+	assert.False(t, task.HasFullSyncEverCompleted(), "FULL_STARTED is not completed")
+
+	task.MarkFullSyncCompleted()
+	assert.Equal(t, taskEntity.SyncPhaseFullCompleted, task.Context.SyncPhase)
+	require.NotNil(t, task.Context.FullSyncCompletedAt)
+	assert.True(t, task.HasFullSyncEverCompleted(), "after FULL_COMPLETED, must be ever-completed")
+	assert.False(t, task.FullSyncIncomplete(), "FULL_COMPLETED is not incomplete anymore")
+}
+
+func TestSyncPhase_MarkFullSyncFailedKeepsIncompleteFlag(t *testing.T) {
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "phase_fail"})
+	task.MarkFullSyncStarted("mysql-bin.000002:999")
+	task.MarkFullSyncFailed("simulated DB error")
+
+	assert.Equal(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
+	assert.Equal(t, "simulated DB error", task.Context.FullSyncFailedReason)
+	assert.True(t, task.FullSyncIncomplete(), "FULL_FAILED still counts as incomplete (must rerun)")
+	assert.False(t, task.HasFullSyncEverCompleted(), "FULL_FAILED must not pretend to be completed")
+}
+
+func TestSyncPhase_MarkIncrementalStartedPreservesCompletion(t *testing.T) {
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "phase_incr"})
+	task.MarkFullSyncStarted("mysql-bin.000003:1")
+	task.MarkFullSyncCompleted()
+	task.MarkIncrementalStarted()
+
+	assert.Equal(t, taskEntity.SyncPhaseIncrementalStarted, task.Context.SyncPhase)
+	assert.True(t, task.HasFullSyncEverCompleted(), "INCREMENTAL_STARTED also satisfies HasFullSyncEverCompleted")
+	assert.False(t, task.FullSyncIncomplete())
+}
+
+func TestSyncPhase_UpdateIncrementalPosition(t *testing.T) {
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "phase_pos"})
+	task.MarkFullSyncCompleted()
+	task.MarkIncrementalStarted()
+
+	task.UpdateIncrementalPosition("mysql-bin.000004:777")
+	assert.Equal(t, "mysql-bin.000004:777", task.Context.LastIncrementalPosition)
+	assert.Equal(t, taskEntity.SyncPhaseIncrementalStarted, task.Context.SyncPhase, "updating position should not change phase")
+}
+
+func TestSyncPhase_ResetWipesAllPhaseFields(t *testing.T) {
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "phase_reset"})
+	task.MarkFullSyncStarted("mysql-bin.000005:1")
+	task.MarkFullSyncCompleted()
+	task.MarkIncrementalStarted()
+	task.UpdateIncrementalPosition("mysql-bin.000005:888")
+
+	task.ResetSyncPhase()
+	assert.Equal(t, taskEntity.SyncPhaseInit, task.Context.SyncPhase)
+	assert.Empty(t, task.Context.FullSyncStartPosition)
+	assert.Empty(t, task.Context.LastIncrementalPosition)
+	assert.Empty(t, task.Context.FullSyncFailedReason)
+	assert.Nil(t, task.Context.FullSyncStartedAt)
+	assert.Nil(t, task.Context.FullSyncCompletedAt)
+	assert.False(t, task.HasFullSyncEverCompleted())
+	assert.False(t, task.FullSyncIncomplete())
+}
+
+// ==================== 阶段状态机：service 持久化 helper ====================
+
+func TestUpdateSyncPhase_PersistsAndIsNoopForUnknownTask(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "persist_phase", Name: "Persist Phase"})
+	ts.tasks[task.Config.ID] = task
+
+	ts.updateSyncPhase("persist_phase", func(tk *taskEntity.SyncTask) {
+		tk.MarkFullSyncStarted("mysql-bin.000010:5")
+	})
+
+	assert.Equal(t, taskEntity.SyncPhaseFullStarted, task.Context.SyncPhase)
+	assert.Equal(t, "mysql-bin.000010:5", task.Context.FullSyncStartPosition)
+
+	assert.NotPanics(t, func() {
+		ts.updateSyncPhase("does_not_exist", func(_ *taskEntity.SyncTask) {
+			t.Fatal("mutator should not run for missing task")
+		})
+	})
+}
+
+// ==================== executeSync 入口门禁 + 暂停 bug ====================
+
+// TestExecuteSync_IncrementalRequiresFullSync 覆盖修复 5：
+// 纯 INCREMENTAL 模式下，若任务从未完成过全量，必须直接标 FAILED 而不是订阅 binlog。
+func TestExecuteSync_IncrementalRequiresFullSync(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:   "incr_without_full",
+		Name: "Incremental Without Full",
+		Mode: taskEntity.SyncModeIncremental,
+	})
+	task.Start() // 状态 RUNNING，否则 failTaskUnlessCancelled 会忽略
+	ts.tasks[task.Config.ID] = task
+
+	ts.executeSync(context.Background(), task.Config.ID, &taskRuntime{})
+
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status,
+		"INCREMENTAL without prior FULL must fail-fast, not silently start a stale subscriber")
+	assert.Contains(t, task.Context.ErrorStack, "requires a previously completed full sync")
+}
+
+// TestExecuteSync_IncrementalAllowedAfterFullCompleted 覆盖修复 5 的肯定路径：
+// 一旦阶段为 FULL_COMPLETED，INCREMENTAL 必须放行进入 executeIncrementalSync。
+// 这里用 nil runtime 触发 executeIncrementalSync 内部的早退保护，确认门禁本身已通过。
+func TestExecuteSync_IncrementalAllowedAfterFullCompleted(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:   "incr_after_full",
+		Name: "Incremental After Full",
+		Mode: taskEntity.SyncModeIncremental,
+	})
+	task.Start()
+	task.MarkFullSyncStarted("mysql-bin.000020:1")
+	task.MarkFullSyncCompleted()
+	ts.tasks[task.Config.ID] = task
+
+	ts.executeSync(context.Background(), task.Config.ID, nil)
+
+	// 门禁通过后进入 executeIncrementalSync，由于 runtime 为 nil 会把任务标 FAILED，
+	// 但错误信息应来自"task runtime is nil"，证明门禁本身已放行。
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Contains(t, task.Context.ErrorStack, "runtime")
+	assert.NotContains(t, task.Context.ErrorStack, "requires a previously completed full sync")
+}
+
+// TestExecuteSync_FullPauseDoesNotCompleteTask 覆盖暂停被错标 COMPLETED 的 P0 bug：
+// 全量过程中用户暂停 → executeFullSync 入口的"早期停止检查"返回 errFullSyncStoppedByUser
+// → executeSync 识别 sentinel 后既不能调用 completeTask 也不能把任务标 FAILED，
+// 阶段也不能被推进到 FULL_COMPLETED。
+//
+// 这里复用 executeFullSync 入口的早停短路：不需要 mock SQL，只要 runtime 三件套非 nil
+// 即可，校验通过后就会撞到 isTaskStopped 检查。
+func TestExecuteSync_FullPauseDoesNotCompleteTask(t *testing.T) {
+	db, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	ts := newTestTaskService(t.TempDir())
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:           "full_paused",
+		Name:         "Full Paused",
+		Mode:         taskEntity.SyncModeFull,
+		SourceSchema: "dummy",
+	})
+	task.Start()
+	ts.tasks[task.Config.ID] = task
+
+	// 模拟"用户在全量过程中按了暂停"
+	task.Pause()
+
+	ts.executeSync(context.Background(), task.Config.ID, &taskRuntime{
+		sourceDB: db,
+		targetDB: db,
+		analyzer: &mockAnalyzer{},
+	})
+
+	assert.Equal(t, taskEntity.TaskStatusPaused, task.Context.Status,
+		"paused full sync must NOT be marked COMPLETED (regression of pause-as-success bug)")
+	assert.NotEqual(t, taskEntity.SyncPhaseFullCompleted, task.Context.SyncPhase,
+		"paused full sync must NOT advance phase to FULL_COMPLETED")
+	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase,
+		"paused full sync must NOT be flipped to FULL_FAILED either")
+}
+
+// TestErrFullSyncStoppedByUser_IsSentinel 守住 sentinel 的可识别性：
+// errors.Is 必须对包装后的错误仍为 true，否则上层 switch 会把暂停误判为失败。
+func TestErrFullSyncStoppedByUser_IsSentinel(t *testing.T) {
+	wrapped := fmt.Errorf("syncDatabasePair: %w", errFullSyncStoppedByUser)
+	assert.True(t, errors.Is(wrapped, errFullSyncStoppedByUser))
+
+	other := fmt.Errorf("something else")
+	assert.False(t, errors.Is(other, errFullSyncStoppedByUser))
+}
+
+// TestFormatBinlogPosition 覆盖小工具，避免空位点污染任务存档。
+func TestFormatBinlogPosition(t *testing.T) {
+	cases := []struct {
+		name string
+		in   mysqlPositionLike
+		want string
+	}{
+		{"empty file returns empty", mysqlPositionLike{Name: "", Pos: 0}, ""},
+		{"file+pos formatted", mysqlPositionLike{Name: "mysql-bin.000001", Pos: 4}, "mysql-bin.000001:4"},
+		{"file with zero pos still formats", mysqlPositionLike{Name: "mysql-bin.000099", Pos: 0}, "mysql-bin.000099:0"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := formatBinlogPosition(c.in.toMysql())
+			assert.Equal(t, c.want, got)
+		})
+	}
+}
+
+// mysqlPositionLike 单测内联辅助：把测试参数转成 mysql.Position，避免在每个 case 内手写转换。
+type mysqlPositionLike struct {
+	Name string
+	Pos  uint32
+}
+
+func (p mysqlPositionLike) toMysql() mysql.Position {
+	return mysql.Position{Name: p.Name, Pos: p.Pos}
+}
+
+// ==================== 节流型位点回写 ====================
+
+func TestThrottledPositionPersister_OnlyWritesAfterMinInterval(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "throttle"})
+	ts.tasks[task.Config.ID] = task
+
+	persist := ts.makeThrottledIncrementalPositionPersister(50 * time.Millisecond)
+
+	persist("throttle", mysqlPositionLike{Name: "mysql-bin.000100", Pos: 1}.toMysql())
+	assert.Equal(t, "mysql-bin.000100:1", task.Context.LastIncrementalPosition)
+
+	// 立即再写一次（在 throttle 窗口内）应被丢弃，不更新存档
+	persist("throttle", mysqlPositionLike{Name: "mysql-bin.000100", Pos: 2}.toMysql())
+	assert.Equal(t, "mysql-bin.000100:1", task.Context.LastIncrementalPosition,
+		"second call within throttle window must be dropped")
+
+	// 等过节流窗口后再写应放行
+	time.Sleep(80 * time.Millisecond)
+	persist("throttle", mysqlPositionLike{Name: "mysql-bin.000100", Pos: 3}.toMysql())
+	assert.Equal(t, "mysql-bin.000100:3", task.Context.LastIncrementalPosition)
+}
+
+func TestThrottledPositionPersister_IgnoresEmptyPosition(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "throttle_empty"})
+	ts.tasks[task.Config.ID] = task
+
+	persist := ts.makeThrottledIncrementalPositionPersister(time.Millisecond)
+	persist("throttle_empty", mysqlPositionLike{Name: "", Pos: 0}.toMysql())
+	assert.Empty(t, task.Context.LastIncrementalPosition, "empty position must not be written")
 }
 
 func TestStopSchedulerIsIdempotent(t *testing.T) {

@@ -4,6 +4,7 @@ package service
 
 import (
 	"context" // 上下文管理
+	"errors"
 	"sort"
 
 	"database/sql" // 数据库操作
@@ -1517,6 +1518,66 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 
 }
 
+// errFullSyncStoppedByUser 表示全量同步是被用户主动停止/暂停打断的，而不是真正的失败。
+// 上层 executeSync 据此区分"应当标 FAILED"还是"应当保留当前阶段并退出"。
+var errFullSyncStoppedByUser = errors.New("full sync stopped by user")
+
+// updateSyncPhase 持有写锁修改任务阶段相关字段并持久化。mutator 必须是无副作用的纯字段写入。
+// 若任务不存在则静默返回，不抛错，与 updateTaskStatus 行为一致。
+func (s *TaskService) updateSyncPhase(taskID string, mutator func(*taskEntity.SyncTask)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return
+	}
+	mutator(task)
+	if err := s.storage.Save(task); err != nil {
+		logger.Warn("[Task %s] Failed to persist sync phase update: %v", taskID, err)
+	}
+}
+
+// formatBinlogPosition 把 mysql.Position 序列化成 "file:pos"，便于在任务存档与日志中表示。
+// 位点为空时返回空串。
+func formatBinlogPosition(pos mysql.Position) string {
+	if pos.Name == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", pos.Name, pos.Pos)
+}
+
+// makeThrottledIncrementalPositionPersister 构造一个"节流型"位点回写回调，每 minInterval 最多
+// 写一次任务存档。增量同步每事件都会调它，但只有间隔足够时才真正落盘，避免频繁写引发的存储开销。
+//
+// 内部用 mutex + lastWriteAt 实现；不依赖任务级锁，回调本身完全幂等。
+// 注意：捕获 service 指针；持有 service 写锁的位置不要调用回调，避免反向锁顺序。
+func (s *TaskService) makeThrottledIncrementalPositionPersister(minInterval time.Duration) syncApp.PositionPersister {
+	if minInterval <= 0 {
+		minInterval = 5 * time.Second
+	}
+	var (
+		mu          sync.Mutex
+		lastWriteAt time.Time
+	)
+	return func(taskID string, pos mysql.Position) {
+		mu.Lock()
+		if time.Since(lastWriteAt) < minInterval {
+			mu.Unlock()
+			return
+		}
+		lastWriteAt = time.Now()
+		mu.Unlock()
+
+		posStr := formatBinlogPosition(pos)
+		if posStr == "" {
+			return
+		}
+		s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+			t.UpdateIncrementalPosition(posStr)
+		})
+	}
+}
+
 // executeSync 执行同步任务
 
 func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *taskRuntime) {
@@ -1583,12 +1644,30 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 
 	mode := strings.ToUpper(string(task.Config.Mode))
 
+	// 阶段快照日志：让运维一眼看出当前任务处在哪个同步阶段（修复 14）
+	logger.Info("[Task %s] Phase snapshot: phase=%q full_sync_completed_at=%v full_sync_start_position=%q last_incremental_position=%q",
+		taskID,
+		task.Context.SyncPhase,
+		task.Context.FullSyncCompletedAt,
+		task.Context.FullSyncStartPosition,
+		task.Context.LastIncrementalPosition,
+	)
+
 	switch mode {
 
 	case "FULL":
 
 		if err := s.executeFullSync(ctx, task, runtime); err != nil {
 
+			if errors.Is(err, errFullSyncStoppedByUser) {
+				// 用户主动暂停/停止：保留当前阶段，不调 completeTask、不标 FAILED
+				logger.Info("[Task %s] Full sync interrupted by user; phase remains %q", taskID, task.Context.SyncPhase)
+				return
+			}
+
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(err.Error())
+			})
 			s.failTaskUnlessCancelled(ctx, taskID, err.Error())
 
 		} else {
@@ -1599,18 +1678,54 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 
 	case "INCREMENTAL":
 
+		// === 修复 5：纯 INCREMENTAL 模式必须验证此前完成过全量 ===
+		// 否则起始位点要么是空（订阅当前主库位点 → 漏数据），要么是上次失败留下的脏位点。
+		if !task.HasFullSyncEverCompleted() {
+			msg := fmt.Sprintf(
+				"incremental sync requires a previously completed full sync (current phase=%q); please run FULL or ALL mode first to seed the target",
+				task.Context.SyncPhase,
+			)
+			logger.Error("[Task %s] %s", taskID, msg)
+			s.failTaskUnlessCancelled(ctx, taskID, msg)
+			return
+		}
+
 		s.executeIncrementalSync(ctx, task, runtime)
 
 	case "ALL":
 
-		// 先全量后增量
+		// === 修复 5：ALL 模式根据阶段决定是否跳过全量 ===
+		// 已经完成过全量（含已接管增量）→ 直接接增量，避免重复全量拷贝
+		// 全量未完成或处于 FULL_FAILED 中间态 → 重跑全量
+		if task.HasFullSyncEverCompleted() {
+			logger.Info("[Task %s] Full sync already completed (phase=%q, completed_at=%v); skipping full sync and resuming incremental from %q",
+				taskID, task.Context.SyncPhase, task.Context.FullSyncCompletedAt, task.Context.LastIncrementalPosition,
+			)
+			s.executeIncrementalSync(ctx, task, runtime)
+			return
+		}
+
+		if task.FullSyncIncomplete() {
+			logger.Warn("[Task %s] Previous full sync did not complete (phase=%q, reason=%q); restarting full sync from scratch",
+				taskID, task.Context.SyncPhase, task.Context.FullSyncFailedReason,
+			)
+		}
 
 		if err := s.executeFullSync(ctx, task, runtime); err == nil {
 
 			s.executeIncrementalSync(ctx, task, runtime)
 
+		} else if errors.Is(err, errFullSyncStoppedByUser) {
+
+			logger.Info("[Task %s] Full sync interrupted by user during ALL mode; not starting incremental, phase remains %q",
+				taskID, task.Context.SyncPhase)
+			return
+
 		} else {
 
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(err.Error())
+			})
 			s.failTaskUnlessCancelled(ctx, taskID, err.Error())
 
 		}
@@ -1633,6 +1748,14 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		return fmt.Errorf("task runtime is not initialized")
 
+	}
+
+	// 修复 1d：早期停止检查。任务在到达此处之前可能已被暂停/停止（例如用户调用 PauseTask
+	// 后又立刻触发新一轮 executeSync 调度的极端时序），此处一次性返回 sentinel，避免后续
+	// 还去拿 FTWRL / 跑全量。
+	if s.isTaskStopped(taskID) {
+		logger.Info("[Task %s] Full sync skipped: task already stopped before any work was done", taskID)
+		return errFullSyncStoppedByUser
 	}
 
 	// 构建 (sourceSchema, targetSchema) 对列表
@@ -1822,72 +1945,33 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		}
 	}()
 
-	// === 全局一致性快照：在任何数据读取之前统一建立 ===
-	var globalSnapshot *globalSnapshotState
-	if task.Config.EnableConsistentSnapshot {
-		workerCount := task.Config.WorkerCount
-		if workerCount <= 0 {
-			workerCount = 4
-		}
-		legacyCap, hardMax := s.intraTableConcurrencyCaps()
-		intraWorkers := taskEntity.EffectiveIntraTableWorkers(task.Config.IntraTableWorkerCount, workerCount, legacyCap, hardMax)
+	// === 低锁一致增量起点：在任何数据读取之前记录 binlog 位点 ===
+	// 参照云厂商 DTS/DRS 的常见做法：增量起点必须早于所有全量读取，确保全量期间的变更
+	// 都能通过 binlog 追平；全量读取本身使用普通短查询，避免长事务长期持有源库 MDL_SHARED_READ。
+	// 仅在取位点时短暂 FTWRL，取到位点后立即 UNLOCK，整个过程毫秒级。
+	//
+	// 当前实现固定走"短锁取位点（非一致性快照）"模式：跨 worker 之间的并行读取
+	// 会存在毫秒~秒级的时间差，依赖随后的 binlog 增量回放追平。
+	logger.Info("[Task %s] Full sync starting (mode=short-lock-position, non-snapshot; cross-worker time skew accepted, will be caught up by binlog)", taskID)
 
-		// 全局共享连接池大小 = intraWorkers（所有表共享，不再按表预分配）
-		poolSize := intraWorkers
-		if poolSize > 16 {
-			poolSize = 16
-		}
-
-		logger.Info("[Task %s] Preparing global consistent snapshot pool (size=%d) for %d tables...", taskID, poolSize, len(allTableEntries))
-		var err error
-		globalSnapshot, err = s.prepareGlobalSnapshot(ctx, runtime, poolSize)
-		if err != nil {
-			errMsg := fmt.Sprintf("Failed to prepare global consistent snapshot: %v", err)
-			logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
-		}
-		defer s.releaseGlobalSnapshot(globalSnapshot)
-	}
-
-	// === 记录 binlog 位点，供后续增量同步使用 ===
-	// 无论是否启用一致性快照，都在全量同步开始前记录 binlog 位点，
-	// 确保后续增量同步可以从正确位置开始，不会丢失全量期间的变更。
-	// 位点存储到 Redis（如果有配置）或程序内存（兜底）。
-	{
-		var binlogPos mysql.Position
-		if globalSnapshot != nil {
-			// 使用全局快照中 FTWRL 期间获取的精确位点
-			binlogPos = globalSnapshot.binlogPos
+	binlogPos, posErr := s.captureFullSyncStartPosition(ctx, runtime)
+	startPosStr := formatBinlogPosition(binlogPos)
+	if posErr != nil {
+		logger.Warn("[Task %s] Warning: failed to capture full-sync start binlog position: %v", taskID, posErr)
+	} else if binlogPos.Name != "" {
+		if err := s.checkpointManager.SavePosition(ctx, taskID, binlogPos); err != nil {
+			logger.Warn("[Task %s] Warning: failed to save binlog position for incremental sync: %v", taskID, err)
 		} else {
-			// 未启用快照时，直接查询当前 master 位点作为增量起点
-			var binlogFile, binlogDoDB, binlogIgnoreDB, executedGtidSet string
-			var pos uint32
-			err := runtime.sourceDB.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
-				&binlogFile, &pos, &binlogDoDB, &binlogIgnoreDB, &executedGtidSet,
-			)
-			if err != nil {
-				// 尝试 4 列格式（MySQL 5.6 及以下）
-				err = runtime.sourceDB.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
-					&binlogFile, &pos, &binlogDoDB, &binlogIgnoreDB,
-				)
-			}
-			if err != nil {
-				logger.Warn("[Task %s] Warning: failed to query master binlog position: %v", taskID, err)
-			} else {
-				binlogPos = mysql.Position{Name: binlogFile, Pos: pos}
-			}
-		}
-
-		if binlogPos.Name != "" {
-			if err := s.checkpointManager.SavePosition(ctx, taskID, binlogPos); err != nil {
-				logger.Warn("[Task %s] Warning: failed to save binlog position for incremental sync: %v", taskID, err)
-			} else {
-				logger.Info("[Task %s] Binlog position saved for incremental sync: %s:%d",
-					taskID, binlogPos.Name, binlogPos.Pos)
-			}
+			logger.Info("[Task %s] Full-sync start binlog position saved (will be incremental catch-up start point): %s",
+				taskID, startPosStr)
 		}
 	}
+
+	// === 修复 4/7：进入"全量已开始"阶段，持久化到任务存档 ===
+	// 失败/暂停后恢复时，根据这个标志决定是不是要重跑全量。
+	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+		t.MarkFullSyncStarted(startPosStr)
+	})
 
 	// 依次同步每个库（库间串行，库内表间并行）
 
@@ -1895,7 +1979,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		if s.isTaskStopped(taskID) {
 
-			return nil
+			// === 修复 1d：用 sentinel 代替 nil，避免上层把"用户暂停"误标为成功 ===
+			logger.Info("[Task %s] Full sync detected stop signal between database pairs; aborting without marking completed", taskID)
+			return errFullSyncStoppedByUser
 
 		}
 
@@ -1905,15 +1991,32 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		}
 
-		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], globalSnapshot); err != nil {
+		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src]); err != nil {
 
+			// 一并区分"被停止"和"真实失败"：库级 err 时再核查一次任务状态。
+			if s.isTaskStopped(taskID) {
+				logger.Info("[Task %s] Full sync stopped during pair %s->%s: %v", taskID, p.src, p.dst, err)
+				return errFullSyncStoppedByUser
+			}
 			return err
 
 		}
 
 	}
 
-	logger.Info("[Task %s] Full sync completed, estimated rows: %d", taskID, estimatedRows)
+	// 完成前最后一次停止检查：避免末尾刚好用户按了暂停就被误标完成。
+	if s.isTaskStopped(taskID) {
+		logger.Info("[Task %s] Full sync stopped right before completion; not marking completed", taskID)
+		return errFullSyncStoppedByUser
+	}
+
+	// === 修复 4：标记"全量已完成"，是后续 INCREMENTAL/ALL 模式跳过全量的唯一依据 ===
+	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+		t.MarkFullSyncCompleted()
+	})
+
+	logger.Info("[Task %s] Full sync completed (phase=FULL_COMPLETED, estimated rows=%d, start_position=%q)",
+		taskID, estimatedRows, startPosStr)
 
 	return nil
 
@@ -2025,7 +2128,7 @@ func adjustReadLimitForWideColumns(base int64, identity *entity.TableIdentity) i
 
 // syncDatabasePair 同步单个源库到目标库（含全部或指定表）
 
-func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, snapshot *globalSnapshotState) error {
+func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string) error {
 
 	taskID := task.Config.ID
 
@@ -2162,10 +2265,6 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			}
 
-			if snapshot != nil {
-				logger.Info("[Task %s] Table %s.%s: will borrow snapshot connections from global pool (size=%d)", taskID, sourceSchema, sourceTableName, snapshot.poolSize)
-			}
-
 			logger.Info("[Task %s] Syncing table data: %s.%s -> %s.%s", taskID, sourceSchema, sourceTableName, targetSchema, targetTableName)
 
 			// Keep the existing sync code readable while making rename semantics explicit:
@@ -2260,22 +2359,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if canParallelRange {
 
-				// 优先使用快照连接查询 MIN/MAX，保证一致性
-				var rangeQuerySource sourceQueryer = runtime.sourceDB
-				var rangeQueryConn *sql.Conn
-				if snapshot != nil {
-					if c, err := snapshot.Borrow(ctx); err == nil {
-						rangeQuerySource = c
-						rangeQueryConn = c
-					} else {
-						errMsg := fmt.Sprintf("borrow snapshot conn for PK range query on %s.%s: %v", sourceSchema, tableName, err)
-						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
-						errChan <- fmt.Errorf("%s", errMsg)
-						return
-					}
-				}
-
-				if err := rangeQuerySource.QueryRowContext(ctx,
+				if err := runtime.sourceDB.QueryRowContext(ctx,
 
 					fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
 
@@ -2292,34 +2376,15 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
-				if rangeQueryConn != nil {
-					snapshot.Return(rangeQueryConn)
-				}
-
 			}
 
 			var sampleBoundaries []interface{}
 
 			if canParallelSample {
 
-				// 优先使用快照连接进行采样查询，保证一致性
-				var sampleQuerySource sourceQueryer = runtime.sourceDB
-				var sampleQueryConn *sql.Conn
-				if snapshot != nil {
-					if c, err := snapshot.Borrow(ctx); err == nil {
-						sampleQuerySource = c
-						sampleQueryConn = c
-					} else {
-						errMsg := fmt.Sprintf("borrow snapshot conn for sample query on %s.%s: %v", sourceSchema, tableName, err)
-						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
-						errChan <- fmt.Errorf("%s", errMsg)
-						return
-					}
-				}
-
 				var totalRows int64
 
-				if qErr := sampleQuerySource.QueryRowContext(ctx,
+				if qErr := runtime.sourceDB.QueryRowContext(ctx,
 
 					fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", sourceSchema, tableName),
 				).Scan(&totalRows); qErr != nil || totalRows < int64(intraWorkers)*2 {
@@ -2332,7 +2397,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					var bErr error
 
-					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, sampleQuerySource, sourceSchema, tableName, identity.IdentifyCols, totalRows, intraWorkers)
+					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime.sourceDB, sourceSchema, tableName, identity.IdentifyCols, totalRows, intraWorkers)
 
 					if bErr != nil {
 
@@ -2344,10 +2409,26 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
-				if sampleQueryConn != nil {
-					snapshot.Return(sampleQueryConn)
-				}
+			}
 
+			// === 修复 14：决策摘要日志，让运维直接看出"模式 / 是否无主键 / 是否并行" ===
+			// 严格全局快照模式已下线，当前固定走"短锁取位点"，并行读取存在跨 worker 时间差，
+			// 由后续 binlog 增量回放兜底追平。
+			noPK := identity.Strategy == entity.FullColumnsStrategy
+			if noPK {
+				logger.Warn("[NoPK][Task %s] Table %s.%s will use FullColumns strategy (no primary key, no unique key); falling back to single-worker streaming read + INSERT IGNORE; idempotency on re-run is best-effort, recommend adding a primary or unique key",
+					taskID, sourceSchema, tableName)
+			}
+			switch {
+			case canParallelRange:
+				logger.Info("[Task %s] Table %s.%s decision: parallel read enabled (range, workers=%d, strategy=%s, non-snapshot mode -> cross-worker time skew accepted, will be caught up by binlog)",
+					taskID, sourceSchema, tableName, intraWorkers, identity.Strategy)
+			case canParallelSample:
+				logger.Info("[Task %s] Table %s.%s decision: parallel read enabled (sample, workers=%d, strategy=%s, non-snapshot mode -> cross-worker time skew accepted, will be caught up by binlog)",
+					taskID, sourceSchema, tableName, intraWorkers, identity.Strategy)
+			default:
+				logger.Info("[Task %s] Table %s.%s decision: sequential read (workers=1, strategy=%s, no_pk=%t)",
+					taskID, sourceSchema, tableName, identity.Strategy, noPK)
 			}
 
 			// === 执行同步 ===
@@ -2458,20 +2539,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
-				// 优先使用全局快照连接读取，保证一致性
-				var fullColReadSource sourceQueryer = runtime.sourceDB
-				if snapshot != nil {
-					sc, err := snapshot.Borrow(ctx)
-					if err != nil {
-						errMsg := fmt.Sprintf("borrow snapshot conn for full-columns read on %s.%s: %v", sourceSchema, tableName, err)
-						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
-						errChan <- fmt.Errorf("%s", errMsg)
-						return
-					}
-					fullColReadSource = sc
-					defer snapshot.Return(sc)
-				}
-				dr := reader.NewReader(fullColReadSource, sourceSchema, tableName, identity)
+				dr := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
 
 				for {
 
@@ -2559,7 +2627,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				var atomicProcessed int64
 
-				// minPK / maxPK 已在策略检测阶段（快照读）获取，此处直接复用
+				// minPK / maxPK 已在策略检测阶段获取，此处直接复用
 
 				// 数值主键按 min/max 等分，避免采样边界导致有效 worker 塌缩
 
@@ -2601,27 +2669,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}()
 
-						readSource := sourceQueryer(runtime.sourceDB)
-
-						var borrowedConn *sql.Conn
-						if snapshot != nil {
-							c, err := snapshot.Borrow(ctx)
-							if err != nil {
-								syncErrChan <- fmt.Errorf("w%d borrow snapshot conn: %w", wIdx, err)
-								return
-							}
-							borrowedConn = c
-							readSource = c
-						}
-						defer func() {
-							if borrowedConn != nil {
-								snapshot.Return(borrowedConn)
-							}
-						}()
-
 						// 创建reader
 
-						wReader := reader.NewRangeShardingReader(readSource, sourceSchema, tableName, identity)
+						wReader := reader.NewRangeShardingReader(runtime.sourceDB, sourceSchema, tableName, identity)
 
 						// 每个worker负责 [workerStart, workerEnd)
 
@@ -3093,24 +3143,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}
 
-						// 优先使用全局快照连接
-						var sampleReadSource sourceQueryer = runtime.sourceDB
-						var sampleBorrowedConn *sql.Conn
-						if snapshot != nil {
-							c, err := snapshot.Borrow(ctx)
-							if err != nil {
-								syncErrChan <- fmt.Errorf("w%d borrow snapshot conn: %w", wIdx, err)
-								return
-							}
-							sampleBorrowedConn = c
-							sampleReadSource = c
-						}
-						defer func() {
-							if sampleBorrowedConn != nil {
-								snapshot.Return(sampleBorrowedConn)
-							}
-						}()
-						wReader := reader.NewReader(sampleReadSource, sourceSchema, tableName, identity)
+						wReader := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
 
 						lastID := startBoundary
 
@@ -3351,20 +3384,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
-				// 优先使用全局快照连接读取，保证一致性
-				var fallbackReadSource sourceQueryer = runtime.sourceDB
-				if snapshot != nil {
-					sc, err := snapshot.Borrow(ctx)
-					if err != nil {
-						errMsg := fmt.Sprintf("borrow snapshot conn for keyset read on %s.%s: %v", sourceSchema, tableName, err)
-						logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
-						errChan <- fmt.Errorf("%s", errMsg)
-						return
-					}
-					fallbackReadSource = sc
-					defer snapshot.Return(sc)
-				}
-				dr := reader.NewReader(fallbackReadSource, sourceSchema, tableName, identity)
+				dr := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
 
 				var lastID interface{}
 
@@ -3506,6 +3526,12 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	taskID := task.Config.ID
 
+	// 修复 14：进入增量前打印一次"接管前快照"，便于追溯起始位点和上次完成的全量
+	logger.Info("[Task %s] Entering incremental sync (phase=%q, full_sync_completed_at=%v, full_sync_start_position=%q, last_incremental_position=%q)",
+		taskID, task.Context.SyncPhase, task.Context.FullSyncCompletedAt,
+		task.Context.FullSyncStartPosition, task.Context.LastIncrementalPosition,
+	)
+
 	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil || runtime.analyzer == nil {
 
 		logger.Error("[Task %s] Error: runtime is nil, cannot start incremental sync", taskID)
@@ -3620,6 +3646,10 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 		s.checkpointManager,
 	)
 
+	// 注入节流型位点回写回调（修复 4：把"最近落库位点"冗余到任务存档，方便恢复/审计）。
+	// 5 秒间隔足够把"任务存档里的位点"控制在合理新鲜度，又不会被每事件存储 IO 拖垮。
+	incrSync.SetPositionPersister(s.makeThrottledIncrementalPositionPersister(5 * time.Second))
+
 	// 保存到映射中
 
 	s.mu.Lock()
@@ -3628,11 +3658,43 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	s.mu.Unlock()
 
+	// === 修复 12：统一资源清理 ===
+	// 无论 Start 成功阻塞返回、立刻报错、panic，都要从 incrementalSyncs map 移除条目，
+	// 避免 PauseTask/Close/DeleteTask 误以为还有活跃的订阅。
+	defer func() {
+		s.mu.Lock()
+		if cur, ok := s.incrementalSyncs[taskID]; ok && cur == incrSync {
+			delete(s.incrementalSyncs, taskID)
+		}
+		s.mu.Unlock()
+	}()
+
+	// === 修复 4/14：标记增量阶段已启动并打"接管成功"日志 ===
+	// 注意：MarkIncrementalStarted 在 Start() 之前调用是有意的——Start() 会阻塞直到订阅退出，
+	// 此时任务确实已经进入"增量已接管"语义；即便 Start() 立刻报错，下方失败分支会回滚到 FullCompleted。
+	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+		t.MarkIncrementalStarted()
+	})
+
+	logger.Info("[Task %s] Incremental sync taking over: subscribing binlog from saved checkpoint (phase=INCREMENTAL_STARTED)", taskID)
+
 	// 启动增量同步
 
 	if err := incrSync.Start(ctx, taskID, syncConfig); err != nil {
 
 		logger.Error("[Task %s] Failed to start incremental sync: %v", taskID, err)
+
+		// 启动失败 → 回退阶段到 FULL_COMPLETED（如果全量曾完成）或 INIT，避免下次启动误认为增量在跑
+		s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+			if t.Context.FullSyncCompletedAt != nil {
+				t.Context.SyncPhase = taskEntity.SyncPhaseFullCompleted
+			} else {
+				t.Context.SyncPhase = taskEntity.SyncPhaseInit
+			}
+		})
+
+		// 主动 Stop，确保订阅、写入连接、审计 goroutine 等内部资源全部释放
+		incrSync.Stop()
 
 		s.failTaskUnlessCancelled(ctx, taskID, err.Error())
 
@@ -3640,7 +3702,7 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 
 	}
 
-	logger.Info("[Task %s] Incremental sync started successfully", taskID)
+	logger.Info("[Task %s] Incremental sync exited cleanly (subscriber stopped)", taskID)
 
 }
 
@@ -4198,305 +4260,100 @@ func min(a, b int) int {
 
 }
 
-// globalSnapshotState 全局一致性快照状态，在全量同步开始前统一建立，确保所有表读取到同一时刻的数据，
-// 并记录 binlog 位点以便后续增量同步从正确位置开始。
-// 采用全局共享连接池（channel），所有表复用固定数量的快照连接，避免按表预分配导致连接数爆炸。
-type globalSnapshotState struct {
-	binlogPos mysql.Position // FTWRL 期间通过 SHOW MASTER STATUS 获取的 binlog 位点
-	pool      chan *sql.Conn // 全局共享快照连接池
-	allConns  []*sql.Conn    // 所有快照连接（用于释放时统一关闭）
-	poolSize  int            // 连接池大小
-}
-
-// Borrow 从全局快照连接池中借出一个连接，阻塞直到有可用连接或 ctx 取消
-func (g *globalSnapshotState) Borrow(ctx context.Context) (*sql.Conn, error) {
-	if g == nil || g.pool == nil {
-		return nil, fmt.Errorf("snapshot pool not initialized")
-	}
-	select {
-	case conn := <-g.pool:
-		return conn, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-// Return 归还一个快照连接到池中
-func (g *globalSnapshotState) Return(conn *sql.Conn) {
-	if g == nil || g.pool == nil || conn == nil {
-		return
-	}
-	select {
-	case g.pool <- conn:
-	default:
-		// pool 已满（不应发生），关闭多余连接
-		conn.ExecContext(context.Background(), "ROLLBACK")
-		conn.Close()
-	}
-}
-
-// ReturnAll 归还多个快照连接到池中
-func (g *globalSnapshotState) ReturnAll(conns []*sql.Conn) {
-	for _, c := range conns {
-		g.Return(c)
-	}
-}
-
-// prepareGlobalSnapshot 在全量同步开始前一次性建立全局一致性快照：
-//  1. FLUSH TABLES WITH READ LOCK（阻止所有写入）
-//  2. SHOW MASTER STATUS 记录 binlog 位点
-//  3. 创建 poolSize 个全局共享快照连接（START TRANSACTION WITH CONSISTENT SNAPSHOT）
-//  4. UNLOCK TABLES
+// shortLockStepTimeout 单步（连接获取 / FTWRL / SHOW MASTER STATUS / UNLOCK）的超时上限。
+// 短锁取位点必须毫秒~秒级完成，超过该上限就视为源库异常或网络抖动，立即放弃并释放锁。
 //
-// 所有快照连接在同一个 FTWRL 窗口内建立，因此看到完全一致的数据视图。
-// 表任务通过 Borrow/Return 复用这些连接，而非按表预分配。
-func (s *TaskService) prepareGlobalSnapshot(
-	ctx context.Context,
-	runtime *taskRuntime,
-	poolSize int,
-) (*globalSnapshotState, error) {
+// 这个超时与上层任务 ctx 解绑：即便上层因为暂停/超时被 cancel，每一步仍会用 background ctx
+// 派生自己的超时，确保 UNLOCK 路径总能跑完，避免源库长期持锁。
+const shortLockStepTimeout = 5 * time.Second
 
+// captureFullSyncStartPosition 用"短锁取位点"获取全量同步的 binlog 起点。
+//
+// 修复 6：执行路径稳健性
+//   - 整个过程绑定一条专用连接（lockConn），确保 FTWRL 与 UNLOCK 落在同一会话；
+//   - **不依赖上层 ctx**：上层 ctx 可能因任务超时被 cancel，进而把"释放锁"也连带 cancel；
+//     这里为每一步用 context.Background() 派生独立的 shortLockStepTimeout，使解锁路径永远不会
+//     因上层取消而失败；
+//   - defer 中的 UNLOCK 兜底仍用 context.Background()，确保任何 panic / 提前 return 也能放锁；
+//   - 显式 UNLOCK 与 defer 兜底之间用 `locked` 标志去重，避免重复 UNLOCK 噪音。
+//
+// 修复 7：日志与命名明确——"start position" 表示**全量起点**，不是完成点；外层据此命名 checkpoint。
+func (s *TaskService) captureFullSyncStartPosition(_ context.Context, runtime *taskRuntime) (mysql.Position, error) {
 	if runtime == nil || runtime.sourceDB == nil {
-		return nil, fmt.Errorf("task runtime source db is not initialized")
-	}
-	if poolSize < 1 {
-		poolSize = 4
+		return mysql.Position{}, fmt.Errorf("task runtime source db is not initialized")
 	}
 
-	// 1. 获取锁连接
-	lockConn, err := runtime.sourceDB.Conn(ctx)
+	// 步骤 1：获取连接（独立超时，与上层 ctx 解绑）
+	connCtx, connCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
+	defer connCancel()
+	lockConn, err := runtime.sourceDB.Conn(connCtx)
 	if err != nil {
-		return nil, fmt.Errorf("get lock connection failed: %w", err)
+		return mysql.Position{}, fmt.Errorf("get lock connection failed: %w", err)
+	}
+	defer lockConn.Close()
+
+	// 步骤 2：FTWRL（独立超时）
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
+	defer lockCancel()
+	if _, err := lockConn.ExecContext(lockCtx, "FLUSH TABLES WITH READ LOCK"); err != nil {
+		return mysql.Position{}, fmt.Errorf("acquire global read lock failed: %w", err)
+	}
+	locked := true
+
+	// defer 兜底：无论后面出什么错都尝试 UNLOCK 一次。
+	// 用 background ctx + 独立超时，避免因上层 ctx 取消导致锁无法释放。
+	defer func() {
+		if !locked {
+			return
+		}
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
+		defer bgCancel()
+		if _, unlockErr := lockConn.ExecContext(bgCtx, "UNLOCK TABLES"); unlockErr != nil {
+			logger.Warn("[LowLockStartPosition] Defer UNLOCK TABLES failed (lock may still be held by session, but conn.Close will release it): %v", unlockErr)
+		} else {
+			logger.Info("[LowLockStartPosition] Defer UNLOCK TABLES succeeded as a safety net")
+		}
+	}()
+
+	// 步骤 3：读位点（独立超时）
+	posCtx, posCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
+	defer posCancel()
+	pos, err := queryMasterPosition(posCtx, lockConn)
+	if err != nil {
+		return mysql.Position{}, err
 	}
 
-	// 2. FLUSH TABLES WITH READ LOCK
-	if _, err := lockConn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
-		lockConn.Close()
-		return nil, fmt.Errorf("acquire global read lock failed: %w", err)
+	// 步骤 4：显式 UNLOCK（独立超时，失败也不阻塞返回 —— defer 会再尝试一次）
+	unlockCtx, unlockCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
+	defer unlockCancel()
+	if _, err := lockConn.ExecContext(unlockCtx, "UNLOCK TABLES"); err != nil {
+		// 显式 UNLOCK 失败：记录后返回 nil，等 defer 再试一次；不向上层抛错避免上层把位点丢掉。
+		logger.Warn("[LowLockStartPosition] Explicit UNLOCK TABLES failed (will retry in defer): %v", err)
+		return pos, nil
 	}
+	locked = false
 
-	// 3. SHOW MASTER STATUS 获取 binlog 位点
+	logger.Info("[LowLockStartPosition] Captured full-sync START position (this is the binlog point BEFORE any full read, not the completion point): %s:%d",
+		pos.Name, pos.Pos)
+	return pos, nil
+}
+
+func queryMasterPosition(ctx context.Context, db sourceQueryer) (mysql.Position, error) {
 	var binlogFile, binlogDoDB, binlogIgnoreDB, executedGtidSet string
 	var binlogPos uint32
-	if err := lockConn.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
+	if err := db.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
 		&binlogFile, &binlogPos, &binlogDoDB, &binlogIgnoreDB, &executedGtidSet,
 	); err != nil {
-		// 尝试 4 列格式（MySQL 5.6 及以下）
-		if err2 := lockConn.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
+		if err2 := db.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(
 			&binlogFile, &binlogPos, &binlogDoDB, &binlogIgnoreDB,
 		); err2 != nil {
-			lockConn.ExecContext(context.Background(), "UNLOCK TABLES")
-			lockConn.Close()
-			return nil, fmt.Errorf("show master status failed (5col: %v, 4col: %v)", err, err2)
+			return mysql.Position{}, fmt.Errorf("show master status failed (5col: %v, 4col: %v)", err, err2)
 		}
 	}
-
-	state := &globalSnapshotState{
-		binlogPos: mysql.Position{Name: binlogFile, Pos: binlogPos},
-		pool:      make(chan *sql.Conn, poolSize),
-		allConns:  make([]*sql.Conn, 0, poolSize),
-		poolSize:  poolSize,
+	if binlogFile == "" || binlogPos == 0 {
+		return mysql.Position{}, fmt.Errorf("empty master status position")
 	}
-
-	// cleanup 在出错时回滚并关闭所有已创建的快照连接
-	cleanup := func() {
-		for _, c := range state.allConns {
-			if c != nil {
-				c.ExecContext(context.Background(), "ROLLBACK")
-				c.Close()
-			}
-		}
-		lockConn.ExecContext(context.Background(), "UNLOCK TABLES")
-		lockConn.Close()
-	}
-
-	// 4. 创建 poolSize 个全局共享快照连接
-	for i := 0; i < poolSize; i++ {
-		conn, err := runtime.sourceDB.Conn(ctx)
-		if err != nil {
-			cleanup()
-			return nil, fmt.Errorf("get snapshot connection [%d] failed: %w", i, err)
-		}
-		if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-			conn.Close()
-			cleanup()
-			return nil, fmt.Errorf("set isolation [%d] failed: %w", i, err)
-		}
-		if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"); err != nil {
-			conn.Close()
-			cleanup()
-			return nil, fmt.Errorf("start snapshot [%d] failed: %w", i, err)
-		}
-		state.allConns = append(state.allConns, conn)
-		state.pool <- conn
-	}
-
-	// 5. UNLOCK TABLES — 所有快照连接已建立，写入可恢复
-	if _, err := lockConn.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("unlock tables failed: %w", err)
-	}
-	lockConn.Close()
-
-	logger.Info("[GlobalSnapshot] Established: binlog=%s:%d, poolSize=%d",
-		binlogFile, binlogPos, poolSize)
-
-	return state, nil
-}
-
-// releaseGlobalSnapshot 释放全局快照的所有连接
-func (s *TaskService) releaseGlobalSnapshot(state *globalSnapshotState) {
-	if state == nil {
-		return
-	}
-	// 排空 pool channel
-	for {
-		select {
-		case <-state.pool:
-		default:
-			goto drained
-		}
-	}
-drained:
-	for _, c := range state.allConns {
-		if c != nil {
-			c.ExecContext(context.Background(), "ROLLBACK")
-			c.Close()
-		}
-	}
-	logger.Info("[GlobalSnapshot] Released %d connections", len(state.allConns))
-}
-
-func (s *TaskService) prepareConsistentSnapshotReaders(ctx context.Context, runtime *taskRuntime, workers int) ([]*sql.Conn, error) {
-
-	if runtime == nil || runtime.sourceDB == nil {
-
-		return nil, fmt.Errorf("task runtime source db is not initialized")
-
-	}
-
-	if workers < 1 {
-
-		return nil, fmt.Errorf("invalid workers: %d", workers)
-
-	}
-
-	lockConn, err := runtime.sourceDB.Conn(ctx)
-
-	if err != nil {
-
-		return nil, fmt.Errorf("get lock connection failed: %w", err)
-
-	}
-
-	if _, err := lockConn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
-
-		lockConn.Close()
-
-		return nil, fmt.Errorf("acquire global read lock failed: %w", err)
-
-	}
-
-	conns := make([]*sql.Conn, 0, workers)
-
-	cleanup := func() {
-
-		for _, c := range conns {
-
-			if c != nil {
-
-				c.ExecContext(context.Background(), "ROLLBACK")
-
-				c.Close()
-
-			}
-
-		}
-
-		lockConn.ExecContext(context.Background(), "UNLOCK TABLES")
-
-		lockConn.Close()
-
-	}
-
-	for i := 0; i < workers; i++ {
-
-		conn, err := runtime.sourceDB.Conn(ctx)
-
-		if err != nil {
-
-			cleanup()
-
-			return nil, fmt.Errorf("get worker snapshot connection %d failed: %w", i, err)
-
-		}
-
-		if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-
-			conn.Close()
-
-			cleanup()
-
-			return nil, fmt.Errorf("set worker %d isolation failed: %w", i, err)
-
-		}
-
-		if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"); err != nil {
-
-			conn.Close()
-
-			cleanup()
-
-			return nil, fmt.Errorf("start worker %d snapshot transaction failed: %w", i, err)
-
-		}
-
-		conns = append(conns, conn)
-
-	}
-
-	if _, err := lockConn.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
-
-		lockConn.Close()
-
-		for _, c := range conns {
-
-			if c != nil {
-
-				c.ExecContext(context.Background(), "ROLLBACK")
-
-				c.Close()
-
-			}
-
-		}
-
-		return nil, fmt.Errorf("unlock tables failed: %w", err)
-
-	}
-
-	lockConn.Close()
-
-	return conns, nil
-
-}
-
-func (s *TaskService) releaseConsistentSnapshotReaders(conns []*sql.Conn) {
-
-	for _, c := range conns {
-
-		if c == nil {
-
-			continue
-
-		}
-
-		c.ExecContext(context.Background(), "ROLLBACK")
-
-		c.Close()
-
-	}
-
+	return mysql.Position{Name: binlogFile, Pos: binlogPos}, nil
 }
 
 func toInt64PK(v interface{}) (int64, bool) {
