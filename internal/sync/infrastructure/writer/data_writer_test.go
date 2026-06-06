@@ -491,3 +491,92 @@ func TestBufferedWriter_FlushWithData(t *testing.T) {
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+// === 修复 10/11：BatchWriter.WriteBatch 在 useUpsert 模式下必须发出 ON DUPLICATE KEY UPDATE ===
+
+// TestBatchWriter_WriteBatch_DefaultIsInsertIgnore 默认模式应保持 INSERT IGNORE（全量同步语义不变）。
+func TestBatchWriter_WriteBatch_DefaultIsInsertIgnore(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	mock.ExpectExec("INSERT IGNORE INTO `users` (`id`, `name`) VALUES (?, ?)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := NewBatchWriter(db, identity, 100)
+	err = w.WriteBatch(context.Background(), []map[string]interface{}{{"id": 1, "name": "Alice"}})
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBatchWriter_WriteBatch_UpsertModeEmitsOnDuplicateKey 增量模式启用 upsert 后，
+// 同一 SQL 必须改为 `INSERT ... ON DUPLICATE KEY UPDATE 非键列 = VALUES(...)`。
+func TestBatchWriter_WriteBatch_UpsertModeEmitsOnDuplicateKey(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	mock.ExpectExec("INSERT INTO `users` (`id`, `name`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := NewBatchWriter(db, identity, 100)
+	w.EnableUpsert()
+	err = w.WriteBatch(context.Background(), []map[string]interface{}{{"id": 1, "name": "Alice"}})
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBufferedWriter_EnableUpsert_ForwardsToBatchWriter BufferedWriter 是增量路径的入口，
+// EnableUpsert 必须能正确转发到底层 BatchWriter，避免增量 INSERT 仍走 IGNORE。
+func TestBufferedWriter_EnableUpsert_ForwardsToBatchWriter(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	bw := NewBufferedWriter(db, identity, 100, time.Hour)
+	bw.EnableUpsert()
+
+	mock.ExpectExec("INSERT INTO `users` (`id`, `name`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	bw.mu.Lock()
+	bw.buffer = append(bw.buffer, map[string]interface{}{"id": 1, "name": "Alice"})
+	bw.mu.Unlock()
+
+	assert.NoError(t, bw.Flush())
+	assert.NoError(t, bw.Close())
+	assert.NoError(t, mock.ExpectationsWereMet())
+}

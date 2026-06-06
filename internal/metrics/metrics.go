@@ -22,6 +22,16 @@ type Metrics struct { // 定义Prometheus指标结构体
 	
 	BinlogLag        prometheus.Gauge // Binlog延迟指标
 	BinlogPosition   prometheus.Gauge // Binlog位置指标
+
+	// === 修复 10/14：增量阶段 UPDATE/DELETE 命中 0 行的累计指标 ===
+	// 0 行匹配通常意味着目标侧已与事件不一致（漂移）；当前实现选择 warn + 埋点而非 hard fail，
+	// 但这两个计数器允许通过 Prometheus 长期观测漂移趋势，必要时触发告警。
+	IncrementalZeroRowUpdateTotal prometheus.Counter // 增量 UPDATE 命中 0 行的次数（按事件计）
+	IncrementalZeroRowDeleteTotal prometheus.Counter // 增量 DELETE 命中 0 行的次数（按事件计）
+
+	// === 修复 9/14：无主键表增量事件计数 ===
+	// 用户选择"无主键表照走"，至少要把无主键事件流量量化出来，方便定位风险表与衡量影响面。
+	IncrementalNoPKTableEventsTotal prometheus.Counter
 }
 
 var ( // 定义包级别变量
@@ -78,6 +88,18 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 				Name: "mysql_sync_binlog_position", // 指标名称
 				Help: "Current binlog position", // 指标帮助信息
 			}),
+			IncrementalZeroRowUpdateTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_incremental_zero_row_update_total",
+				Help: "Total number of incremental UPDATE events that matched 0 rows (possible data drift)",
+			}),
+			IncrementalZeroRowDeleteTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_incremental_zero_row_delete_total",
+				Help: "Total number of incremental DELETE events that matched 0 rows (possible data drift)",
+			}),
+			IncrementalNoPKTableEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_incremental_no_pk_table_events_total",
+				Help: "Total number of incremental events targeting tables without primary/unique key (idempotency at risk)",
+			}),
 		}
 		
 		// 注册指标
@@ -92,9 +114,27 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 		prometheus.MustRegister(instance.SyncErrors) // 注册同步错误指标
 		prometheus.MustRegister(instance.BinlogLag) // 注册Binlog延迟指标
 		prometheus.MustRegister(instance.BinlogPosition) // 注册Binlog位置指标
+		prometheus.MustRegister(instance.IncrementalZeroRowUpdateTotal)
+		prometheus.MustRegister(instance.IncrementalZeroRowDeleteTotal)
+		prometheus.MustRegister(instance.IncrementalNoPKTableEventsTotal)
 	})
 	
 	return instance // 返回实例
+}
+
+// IncrementIncrementalZeroRowUpdate 增量 UPDATE 命中 0 行时调用，累计漂移事件。
+func (m *Metrics) IncrementIncrementalZeroRowUpdate() {
+	m.IncrementalZeroRowUpdateTotal.Inc()
+}
+
+// IncrementIncrementalZeroRowDelete 增量 DELETE 命中 0 行时调用，累计漂移事件。
+func (m *Metrics) IncrementIncrementalZeroRowDelete() {
+	m.IncrementalZeroRowDeleteTotal.Inc()
+}
+
+// IncrementIncrementalNoPKTableEvents 增量事件落到无主键/无唯一键表时调用，按事件计数。
+func (m *Metrics) IncrementIncrementalNoPKTableEvents() {
+	m.IncrementalNoPKTableEventsTotal.Inc()
 }
 
 // UpdateTaskMetrics 更新任务指标方法

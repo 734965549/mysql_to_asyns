@@ -493,3 +493,131 @@ func TestNewSQLBuilder(t *testing.T) {
 		t.Error("builder matchStrategy should not be nil")
 	}
 }
+
+// === 修复 10/11：BuildBatchUpsert 行为分流 ===
+
+// TestSQLBuilder_BuildBatchUpsert_PKTableUsesUpsert PK 表应使用 ON DUPLICATE KEY UPDATE，
+// 且只更新非主键列，保证同一 PK 的后续 INSERT 事件能覆盖旧值。
+func TestSQLBuilder_BuildBatchUpsert_PKTableUsesUpsert(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "id", IsPrimaryKey: true},
+		{Name: "name", IsPrimaryKey: false},
+		{Name: "email", IsPrimaryKey: false},
+	}
+	identity := createTestIdentity(entity.PKStrategy, "users", columns, []string{"id"})
+	builder := NewSQLBuilder(identity)
+
+	rows := []map[string]interface{}{
+		{"id": 1, "name": "alice", "email": "a@x"},
+		{"id": 2, "name": "bob", "email": "b@x"},
+	}
+
+	query, args := builder.BuildBatchUpsert(rows)
+
+	if !strings.Contains(query, "INSERT INTO") {
+		t.Errorf("expected INSERT INTO, got: %s", query)
+	}
+	if !strings.Contains(query, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("expected ON DUPLICATE KEY UPDATE, got: %s", query)
+	}
+	if strings.Contains(query, "`id` = VALUES(`id`)") {
+		t.Errorf("PK column should not appear in UPDATE clause, got: %s", query)
+	}
+	if !strings.Contains(query, "`name` = VALUES(`name`)") {
+		t.Errorf("non-PK column 'name' should appear in UPDATE clause, got: %s", query)
+	}
+	if !strings.Contains(query, "`email` = VALUES(`email`)") {
+		t.Errorf("non-PK column 'email' should appear in UPDATE clause, got: %s", query)
+	}
+	if len(args) != 6 {
+		t.Errorf("expected 6 args (2 rows * 3 cols), got %d", len(args))
+	}
+}
+
+// TestSQLBuilder_BuildBatchUpsert_UKTableUsesUpsert UK 表（无 PK）同样应走 upsert。
+func TestSQLBuilder_BuildBatchUpsert_UKTableUsesUpsert(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "email", IsPrimaryKey: false, IsUnique: true},
+		{Name: "name", IsPrimaryKey: false},
+	}
+	identity := createTestIdentity(entity.UKStrategy, "members", columns, []string{"email"})
+	builder := NewSQLBuilder(identity)
+
+	rows := []map[string]interface{}{{"email": "x@y", "name": "alice"}}
+	query, _ := builder.BuildBatchUpsert(rows)
+
+	if !strings.Contains(query, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("UK table must use upsert, got: %s", query)
+	}
+}
+
+// TestSQLBuilder_BuildBatchUpsert_FullColumnsDegradedToIgnore 无主键 / 无唯一键表必须退化为 INSERT IGNORE，
+// 因为没有冲突键，ON DUPLICATE 没有意义。
+func TestSQLBuilder_BuildBatchUpsert_FullColumnsDegradedToIgnore(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "message", IsPrimaryKey: false},
+		{Name: "level", IsPrimaryKey: false},
+	}
+	identity := createTestIdentity(entity.FullColumnsStrategy, "logs", columns, []string{"message", "level"})
+	builder := NewSQLBuilder(identity)
+
+	rows := []map[string]interface{}{{"message": "hi", "level": "INFO"}}
+	query, _ := builder.BuildBatchUpsert(rows)
+
+	if !strings.Contains(query, "INSERT IGNORE") {
+		t.Errorf("no-PK/no-UK table must degrade to INSERT IGNORE, got: %s", query)
+	}
+	if strings.Contains(query, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("no-PK/no-UK table must NOT emit ON DUPLICATE KEY UPDATE (no conflict key), got: %s", query)
+	}
+}
+
+// TestSQLBuilder_BuildBatchUpsert_AllPKColumnsFallsBackToIgnore 全部列都是主键时，没有可 UPDATE 的非主键列，
+// 应退化为 INSERT IGNORE，避免生成空 SET 子句的非法 SQL。
+func TestSQLBuilder_BuildBatchUpsert_AllPKColumnsFallsBackToIgnore(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "a", IsPrimaryKey: true},
+		{Name: "b", IsPrimaryKey: true},
+	}
+	identity := createTestIdentity(entity.PKStrategy, "join_table", columns, []string{"a", "b"})
+	builder := NewSQLBuilder(identity)
+
+	rows := []map[string]interface{}{{"a": 1, "b": 2}}
+	query, _ := builder.BuildBatchUpsert(rows)
+
+	if !strings.Contains(query, "INSERT IGNORE") {
+		t.Errorf("all-PK table must fall back to INSERT IGNORE, got: %s", query)
+	}
+}
+
+// TestSQLBuilder_BuildBatchInsert_UnchangedSemantics 守住全量路径继续走 INSERT IGNORE 不变。
+func TestSQLBuilder_BuildBatchInsert_UnchangedSemantics(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "id", IsPrimaryKey: true},
+		{Name: "v", IsPrimaryKey: false},
+	}
+	identity := createTestIdentity(entity.PKStrategy, "tbl", columns, []string{"id"})
+	builder := NewSQLBuilder(identity)
+
+	rows := []map[string]interface{}{{"id": 1, "v": "x"}}
+	query, _ := builder.BuildBatchInsert(rows)
+
+	if !strings.Contains(query, "INSERT IGNORE") {
+		t.Errorf("BuildBatchInsert must keep INSERT IGNORE semantics for full sync, got: %s", query)
+	}
+	if strings.Contains(query, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("BuildBatchInsert must NOT emit upsert clause, got: %s", query)
+	}
+}
+
+// TestSQLBuilder_BuildBatchUpsert_EmptyRowsReturnsEmpty 空切片应安全返回，避免拼出非法 SQL。
+func TestSQLBuilder_BuildBatchUpsert_EmptyRowsReturnsEmpty(t *testing.T) {
+	columns := []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}}
+	identity := createTestIdentity(entity.PKStrategy, "tbl", columns, []string{"id"})
+	builder := NewSQLBuilder(identity)
+
+	query, args := builder.BuildBatchUpsert(nil)
+	if query != "" || args != nil {
+		t.Errorf("empty rows must return empty query, got query=%q args=%v", query, args)
+	}
+}

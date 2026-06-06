@@ -138,49 +138,102 @@ func (b *SQLBuilder) BuildDelete(row map[string]interface{}) (string, []interfac
 	return query, whereArgs // 返回查询语句和参数
 }
 
-// BuildBatchInsert 构建批量INSERT语句方法（使用INSERT ON DUPLICATE KEY UPDATE，不删除数据）
+// BuildBatchInsert 构建批量 INSERT IGNORE 语句方法。
+//
+// 用途：全量同步阶段，目标表通常为空或仅有少量重叠行，IGNORE 跳过重复键的开销最低；
+// 对于增量重放可能反复到达同一 INSERT 的场景，IGNORE 不会更新已有行，**不具有 upsert 语义**，
+// 请增量路径使用 BuildBatchUpsert（按 strategy 分流，详见函数注释）。
 func (b *SQLBuilder) BuildBatchInsert(rows []map[string]interface{}) (string, []interface{}) { // 构建批量INSERT语句
 	if len(rows) == 0 { // 如果没有行数据
 		return "", nil // 返回空
 	}
 
-	// 获取列名（加 backtick 防止关键字冲突）
-	columns := make([]string, 0, len(b.identity.Columns)) // 创建列引用列表
-	columnNames := make([]string, 0, len(b.identity.Columns)) // 创建列名列表
-	for _, col := range b.identity.Columns { // 遍历所有列
-		columns = append(columns, "`"+col.Name+"`") // 添加列引用
-		columnNames = append(columnNames, col.Name) // 添加列名
-	}
-
-	// 构建值占位符
-	var values []interface{} // 定义值列表
-	var rowPlaceholders []string // 定义行占位符列表
-
-	for _, row := range rows { // 遍历所有行
-		placeholders := make([]string, 0, len(columnNames)) // 创建占位符列表
-		for _, colName := range columnNames { // 遍历所有列名
-			placeholders = append(placeholders, "?") // 添加占位符
-			values = append(values, row[colName]) // 添加值
-		}
-		rowPlaceholders = append(rowPlaceholders, "("+strings.Join(placeholders, ", ")+")") // 添加行占位符
-	}
-
-	// 构建 ON DUPLICATE KEY UPDATE 子句（只更新非主键列）
-	var updates []string // 定义更新列表
-	for _, col := range b.identity.Columns { // 遍历所有列
-		if !col.IsPrimaryKey { // 如果不是主键列
-			updates = append(updates, fmt.Sprintf("`%s` = VALUES(`%s`)", col.Name, col.Name)) // 添加更新语句
-		}
-	}
+	columns, _, values, rowPlaceholders := b.collectBatchValues(rows)
 
 	// 全量同步场景：目标表通常为空，ON DUPLICATE KEY UPDATE 的 UPDATE 步骤纯属开销。
 	// 使用 INSERT IGNORE 可跳过重复键检查的写入代价，对空表与 ON DUPLICATE 行为一致。
-	query := fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES %s", // 使用INSERT IGNORE
-		b.tableRef(), // 表引用
-		strings.Join(columns, ", "), // 列名
-		strings.Join(rowPlaceholders, ", ")) // 行占位符
+	query := fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES %s",
+		b.tableRef(),
+		strings.Join(columns, ", "),
+		strings.Join(rowPlaceholders, ", "))
 
-	return query, values // 返回查询语句和参数
+	return query, values
+}
+
+// BuildBatchUpsert 构建批量 upsert 语句方法。
+//
+// 修复 10/11：增量阶段的 INSERT 事件必须能在"重复到达"时仍把目标表收敛到与源库一致的状态。
+//   - 有主键或唯一键的表（PKStrategy / UKStrategy）：使用 `INSERT ... ON DUPLICATE KEY UPDATE 非键列 = VALUES(...)`，
+//     保证后到的 INSERT/UPDATE 事件会覆盖之前的旧值；
+//   - 无主键、无唯一键的表（FullColumnsStrategy）：MySQL 没有可识别的"冲突键"，
+//     ON DUPLICATE KEY UPDATE 退化为普通 INSERT，会插入重复行；此时回退到 `INSERT IGNORE`
+//     与 BuildBatchInsert 行为一致，并由 sync 服务侧在事件入口打出 [NoPK] 告警。
+func (b *SQLBuilder) BuildBatchUpsert(rows []map[string]interface{}) (string, []interface{}) {
+	if len(rows) == 0 {
+		return "", nil
+	}
+
+	columns, _, values, rowPlaceholders := b.collectBatchValues(rows)
+
+	// 无主键 / 无唯一键：没有可识别的冲突键，ON DUPLICATE 没有意义，退化为 INSERT IGNORE
+	if b.identity == nil || !b.identity.HasPK && !b.identity.HasUK {
+		query := fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES %s",
+			b.tableRef(),
+			strings.Join(columns, ", "),
+			strings.Join(rowPlaceholders, ", "))
+		return query, values
+	}
+
+	// 有 PK/UK：拼 ON DUPLICATE KEY UPDATE 子句，只更新非主键列（避免 PK 列自我覆盖）
+	updates := make([]string, 0, len(b.identity.Columns))
+	for _, col := range b.identity.Columns {
+		if col.IsPrimaryKey {
+			continue
+		}
+		updates = append(updates, fmt.Sprintf("`%s` = VALUES(`%s`)", col.Name, col.Name))
+	}
+
+	if len(updates) == 0 {
+		// 全部列都是主键（极少见，例如关联表）：等价于 INSERT IGNORE
+		query := fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES %s",
+			b.tableRef(),
+			strings.Join(columns, ", "),
+			strings.Join(rowPlaceholders, ", "))
+		return query, values
+	}
+
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s ON DUPLICATE KEY UPDATE %s",
+		b.tableRef(),
+		strings.Join(columns, ", "),
+		strings.Join(rowPlaceholders, ", "),
+		strings.Join(updates, ", "))
+
+	return query, values
+}
+
+// collectBatchValues 抽取 BuildBatchInsert / BuildBatchUpsert 公共的列名与值占位符构造逻辑。
+// 返回：带 backtick 的列引用、裸列名、扁平化的参数列表、每行的"(?, ?, ...)" 占位符。
+func (b *SQLBuilder) collectBatchValues(rows []map[string]interface{}) ([]string, []string, []interface{}, []string) {
+	columns := make([]string, 0, len(b.identity.Columns))
+	columnNames := make([]string, 0, len(b.identity.Columns))
+	for _, col := range b.identity.Columns {
+		columns = append(columns, "`"+col.Name+"`")
+		columnNames = append(columnNames, col.Name)
+	}
+
+	var values []interface{}
+	rowPlaceholders := make([]string, 0, len(rows))
+
+	for _, row := range rows {
+		placeholders := make([]string, 0, len(columnNames))
+		for _, colName := range columnNames {
+			placeholders = append(placeholders, "?")
+			values = append(values, row[colName])
+		}
+		rowPlaceholders = append(rowPlaceholders, "("+strings.Join(placeholders, ", ")+")")
+	}
+
+	return columns, columnNames, values, rowPlaceholders
 }
 
 // GetStrategyName 获取当前策略名称方法
