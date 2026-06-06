@@ -172,11 +172,11 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 
 GRANT SELECT ON *.* TO 'username'@'%';
 
-# 若创建任务时启用 enable_consistent_snapshot=true（并发一致性快照）
+# 全量起点位点采用"短锁取位点"模式，会短暂执行 FLUSH TABLES WITH READ LOCK，
 
-# 建议额外授予 RELOAD 权限（用于快照建立阶段的 FTWRL）
+# 因此需要 RELOAD 权限
 
-# GRANT RELOAD ON *.* TO 'username'@'%';
+GRANT RELOAD ON *.* TO 'username'@'%';
 
 FLUSH PRIVILEGES;
 
@@ -421,7 +421,6 @@ Content-Type: application/json
   "enable_limit_one": false,
   "optimize_index": true,
   "enable_read_only": true,
-  "enable_consistent_snapshot": true,
   "enable_drop_table_before_ddl": true,
   "source_db": {
     "host": "127.0.0.1",
@@ -468,18 +467,17 @@ Content-Type: application/json
 
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
 
-| enable_consistent_snapshot | bool | 否 | 全量阶段启用并发一致性快照（任务级参数，默认false） |
 | enable_drop_table_before_ddl | bool | 否 | 同步 DDL 前先执行 `DROP TABLE IF EXISTS`，适用于库级别/表级别同步，默认false |
 
 
 
-**`enable_consistent_snapshot` 说明：**
+**全量起点位点说明（无需配置）：**
 
-- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`），不是 `application.toml` 全局配置。
+- 全量同步开始前会自动短暂执行一次 `FLUSH TABLES WITH READ LOCK` 取到 binlog 位点，
+  随后立即 `UNLOCK TABLES`，整个过程毫秒级，对所有任务默认生效，无 JSON / TOML 开关。
 
-- 开启后，全量阶段会让多个 worker 在同一时点快照上并发读取。
-
-- 快照建立时会短暂执行 FTWRL（`FLUSH TABLES WITH READ LOCK`），建议在低峰时段执行。
+- 历史版本曾提供 `enable_consistent_snapshot` 任务级字段（"严格全局快照 + 长事务连接池"
+  模式），现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
 
 **`enable_drop_table_before_ddl` 说明：**
 
@@ -519,7 +517,6 @@ Content-Type: application/json
   "enable_limit_one": false,
   "optimize_index": true,
   "enable_read_only": true,
-  "enable_consistent_snapshot": true,
   "enable_drop_table_before_ddl": true,
   "source_db": {
     "host": "127.0.0.1",
@@ -789,9 +786,7 @@ curl -X POST http://localhost:8080/api/tasks \
 
     "worker_count": 16,
 
-    "intra_table_worker_count": 16,
-
-    "enable_consistent_snapshot": true
+    "intra_table_worker_count": 16
 
   }'
 

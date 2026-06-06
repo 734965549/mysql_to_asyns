@@ -385,20 +385,21 @@
 - 需要足够的临时空间
 - 建议在低峰期执行
 
-### 并发一致性快照（enable_consistent_snapshot）
+### 全量起点位点（无需配置，默认走"短锁取位点"）
 
 **作用**:
-- 在全量阶段启用并发一致性快照读取。
-- 前端在创建/编辑任务时通过“启用并发一致性快照（全量）”复选框控制。
+- 全量同步开始前，自动短暂执行一次 `FLUSH TABLES WITH READ LOCK` 取到 binlog 位点，
+  随后立即 `UNLOCK TABLES`，整个过程毫秒级。
+- 该位点被持久化为后续增量同步的起点，保证全量期间的所有 DML 都能被增量阶段完整回放。
 
 **接口传参**:
-- 勾选后，请求体会自动携带：`"enable_consistent_snapshot": true`
-- 未勾选时为：`"enable_consistent_snapshot": false`
-- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`），不是 `application.toml` 全局配置。
+- 无任何前端开关、无任何任务请求体字段需要配置；该行为对所有任务默认生效。
 
-**注意事项**:
-- 开启后快照建立阶段会短暂使用 FTWRL（`FLUSH TABLES WITH READ LOCK`）。
-- 建议在业务低峰执行大表全量同步，并确保源库账号具备相关权限。
+**历史变更**:
+- 老版本曾提供 `enable_consistent_snapshot` 字段以及"严格全局快照 + 长事务连接池"
+  模式，现已移除。当前实现统一使用"短锁取位点 + 全量短查询"，避免长事务长期
+  持有源库 `MDL_SHARED_READ`。如果你的客户端代码仍在传 `enable_consistent_snapshot`
+  字段，请直接删除，服务端会忽略。
 
 ---
 

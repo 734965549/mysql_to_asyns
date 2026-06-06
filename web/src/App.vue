@@ -201,8 +201,6 @@ const taskForm = ref({
 
   enable_read_only: false,
 
-  enable_consistent_snapshot: false,
-
   enable_drop_table_before_ddl: false,
 });
 
@@ -631,8 +629,6 @@ function resetForm() {
     optimize_index: false,
 
     enable_read_only: false,
-
-    enable_consistent_snapshot: false,
 
     enable_drop_table_before_ddl: false,
   };
@@ -1183,8 +1179,6 @@ function fillTaskFormFromTask(task) {
     optimize_index: task.config.optimize_index || false,
 
     enable_read_only: task.config.enable_read_only || false,
-
-    enable_consistent_snapshot: task.config.enable_consistent_snapshot || false,
 
     enable_drop_table_before_ddl: task.config.enable_drop_table_before_ddl || false,
   };
@@ -2667,24 +2661,6 @@ watch(
                     </a-checkbox>
                   </a-form-item>
 
-                  <a-form-item>
-                    <a-checkbox v-model="taskForm.enable_consistent_snapshot">
-                      <a-space direction="vertical" :size="4">
-                        <span style="font-weight: 500"
-                          >启用并发一致性快照（全量）</span
-                        >
-
-                        <a-typography-text
-                          type="secondary"
-                          style="font-size: 12px"
-                        >
-                          全量阶段并发 worker
-                          读取同一时点快照，提升一致性；快照建立时会短暂加读锁（FTWRL）
-                        </a-typography-text>
-                      </a-space>
-                    </a-checkbox>
-                  </a-form-item>
-
                   <a-collapse :default-active-key="[]">
                     <a-collapse-item key="source" header="自定义源数据库连接">
                       <template #extra
@@ -4106,13 +4082,6 @@ watch(
             }}
           </a-descriptions-item>
 
-          <a-descriptions-item label="并发一致性快照">
-            {{
-              selectedTaskForDetail.config.enable_consistent_snapshot
-                ? "开启"
-                : "关闭"
-            }}
-          </a-descriptions-item>
         </a-descriptions>
 
         <!-- 源端和目标端配置 -->

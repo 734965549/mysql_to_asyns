@@ -65,7 +65,6 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	EnableLimitOne           bool                   `json:"enable_limit_one"`           // 是否启用LIMIT 1优化
 	OptimizeIndex            bool                   `json:"optimize_index"`             // 索引优化：先删后建
 	EnableReadOnly           bool                   `json:"enable_read_only"`           // 同步前关闭目标只读，同步后恢复
-	EnableConsistentSnapshot bool                   `json:"enable_consistent_snapshot"` // 是否启用全量一致性快照
 	EnableDropTableBeforeDDL bool                   `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`        // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`        // 目标数据库配置（可选）
@@ -143,7 +142,6 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		EnableLimitOne:           req.EnableLimitOne,            // 设置LIMIT 1优化开关
 		OptimizeIndex:            req.OptimizeIndex,             // 设置索引优化开关
 		EnableReadOnly:           req.EnableReadOnly,            // 设置只读管理开关
-		EnableConsistentSnapshot: req.EnableConsistentSnapshot,  // 设置一致性快照开关
 		EnableDropTableBeforeDDL: req.EnableDropTableBeforeDDL,   // 设置DDL前DROP TABLE开关
 		SourceDB:                 sourceDB,                      // 设置源数据库配置
 		TargetDB:                 targetDB,                      // 设置目标数据库配置
@@ -652,9 +650,6 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.EnableReadOnly != nil { // 如果提供了只读管理开关
 		task.Config.EnableReadOnly = *req.EnableReadOnly // 更新只读管理开关
 	}
-	if req.EnableConsistentSnapshot != nil { // 如果提供了一致性快照开关
-		task.Config.EnableConsistentSnapshot = *req.EnableConsistentSnapshot // 更新一致性快照开关
-	}
 	if req.EnableDropTableBeforeDDL != nil { // 如果提供了DDL前DROP TABLE开关
 		task.Config.EnableDropTableBeforeDDL = *req.EnableDropTableBeforeDDL // 更新DDL前DROP TABLE开关
 	}
@@ -728,7 +723,6 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	EnableLimitOne           bool                   `json:"enable_limit_one"`                     // 是否启用LIMIT 1优化
 	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`             // 索引优化（可选）
 	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`           // 只读管理（可选）
-	EnableConsistentSnapshot *bool                  `json:"enable_consistent_snapshot,omitempty"` // 是否启用全量一致性快照（可选）
 	EnableDropTableBeforeDDL *bool                  `json:"enable_drop_table_before_ddl,omitempty"` // DDL前是否先DROP TABLE（可选）
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                  // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                  // 目标数据库配置（可选）

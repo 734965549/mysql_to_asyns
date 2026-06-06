@@ -21,12 +21,5 @@
 # 不配置数据库和Redis，启动时不会验证连接
 # 数据库信息将在创建任务时通过API传入
 #
-# 任务级参数说明（非 application.toml 全局配置）：
-# enable_consistent_snapshot 需要在创建/更新任务请求体中传入，例如：
-# {
-#   "name": "full-sync-orders",
-#   "mode": "FULL",
-#   "sync_level": "TABLE",
-#   "tables": ["orders"],
-#   "enable_consistent_snapshot": true
-# }
+# 注：全量起点位点采用"短锁取位点"模式（短暂 FTWRL 后立即 UNLOCK），对所有任务
+# 默认生效，无需任何配置开关。历史的 enable_consistent_snapshot 任务级字段已下线。
