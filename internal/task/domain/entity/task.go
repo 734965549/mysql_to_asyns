@@ -35,6 +35,20 @@ const ( // 定义常量
 	SyncLevelTable    SyncLevel = "TABLE"    // 表级别同步：同步指定的表
 )
 
+// SyncPhase 同步阶段（独立于 TaskStatus 的细粒度阶段标志，用于恢复时区分"全量未完成 / 全量已完成 / 增量已接管"）。
+//
+// TaskStatus 描述任务整体运行/暂停/失败，SyncPhase 描述同步进度处在哪个阶段；恢复决策（要不要重跑全量、能不能直接接增量）
+// 完全基于 SyncPhase，不再仅靠 TaskConfig.Mode 和 binlog 位点是否存在做判断。
+type SyncPhase string
+
+const (
+	SyncPhaseInit               SyncPhase = ""                    // 未开始（兼容历史任务的零值，等价于"从未同步过"）
+	SyncPhaseFullStarted        SyncPhase = "FULL_STARTED"        // 全量已开始，但尚未完成（中途崩溃/暂停后停留在该阶段）
+	SyncPhaseFullCompleted      SyncPhase = "FULL_COMPLETED"      // 全量已完成，但尚未启动增量
+	SyncPhaseFullFailed         SyncPhase = "FULL_FAILED"         // 全量明确失败（被 failTaskUnlessCancelled 标记），下次必须重跑全量
+	SyncPhaseIncrementalStarted SyncPhase = "INCREMENTAL_STARTED" // 增量已启动（可重启时直接接增量，无需重跑全量）
+)
+
 // DatabaseConfig 数据库连接配置
 type DatabaseConfig struct { // 定义数据库连接配置结构体
 	Host     string `json:"host"`     // 数据库主机地址
@@ -64,7 +78,6 @@ type TaskConfig struct { // 定义任务配置结构体
 	EnableLimitOne           bool            `json:"enable_limit_one"`             // 无主键表LIMIT 1保护
 	OptimizeIndex            bool            `json:"optimize_index"`               // 索引优化：先删除非主键索引，数据迁移完成后再重建
 	EnableReadOnly           bool            `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
-	EnableConsistentSnapshot bool            `json:"enable_consistent_snapshot"`   // 全量阶段使用一致性快照读取（牺牲部分并行度换取一致性）
 	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS（库级别/表级别）
 	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`          // 源数据库配置（可选，覆盖配置文件）
 	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`          // 目标数据库配置（可选，覆盖配置文件）
@@ -86,6 +99,16 @@ type ProcessContext struct { // 定义处理上下文结构体
 	RepeatCount         int         `json:"repeat_count,omitempty"`        // 定时启动总次数（包含首次执行）
 	RepeatRemaining     int         `json:"repeat_remaining,omitempty"`    // 剩余重复次数（包含下一次执行）
 	RepeatIntervalSec   int         `json:"repeat_interval_sec,omitempty"` // 重复启动间隔（秒）
+
+	// === 全量/增量阶段状态机（独立于 Status）===
+	// 这些字段持久化在任务存档中，重启 / 重新 StartTask 时用于判断"该跑全量还是直接接增量"。
+	// 历史任务无这些字段时按零值处理（SyncPhase=""），等价于 SyncPhaseInit，需要按 Mode 走完整流程。
+	SyncPhase               SyncPhase  `json:"sync_phase,omitempty"`                  // 同步阶段：FULL_STARTED / FULL_COMPLETED / FULL_FAILED / INCREMENTAL_STARTED
+	FullSyncStartedAt       *time.Time `json:"full_sync_started_at,omitempty"`        // 最近一次全量启动时间
+	FullSyncCompletedAt     *time.Time `json:"full_sync_completed_at,omitempty"`      // 全量完成时间（仅 SyncPhaseFullCompleted/IncrementalStarted 时有意义）
+	FullSyncStartPosition   string     `json:"full_sync_start_position,omitempty"`    // 全量启动时捕获的 binlog 位点 "file:pos"（增量的起点）
+	LastIncrementalPosition string     `json:"last_incremental_position,omitempty"`   // 最近一次成功落库的增量位点 "file:pos"
+	FullSyncFailedReason    string     `json:"full_sync_failed_reason,omitempty"`     // 全量失败原因（便于排查；SyncPhase=FULL_FAILED 时填充）
 }
 
 // SyncTask 同步任务
@@ -198,6 +221,73 @@ func (t *SyncTask) UpdateProgress(processedRows int64, position string) { // 更
 		t.Context.ProgressPercent = float64(processedRows) / float64(t.Context.TotalRows) * 100 // 计算进度百分比
 	}
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
+}
+
+// MarkFullSyncStarted 标记全量同步进入"已开始但未完成"阶段，并记录 binlog 起点位点字符串。
+// startPosition 形如 "mysql-bin.000123:456"；空串表示位点尚未捕获（捕获失败时也要打点，方便排查）。
+func (t *SyncTask) MarkFullSyncStarted(startPosition string) {
+	now := time.Now()
+	t.Context.SyncPhase = SyncPhaseFullStarted
+	t.Context.FullSyncStartedAt = &now
+	t.Context.FullSyncStartPosition = startPosition
+	t.Context.FullSyncCompletedAt = nil
+	t.Context.FullSyncFailedReason = ""
+	t.Context.LastUpdateTime = now
+}
+
+// MarkFullSyncCompleted 标记全量同步完成。完成后才允许增量直接接管。
+func (t *SyncTask) MarkFullSyncCompleted() {
+	now := time.Now()
+	t.Context.SyncPhase = SyncPhaseFullCompleted
+	t.Context.FullSyncCompletedAt = &now
+	t.Context.FullSyncFailedReason = ""
+	t.Context.LastUpdateTime = now
+}
+
+// MarkFullSyncFailed 标记全量明确失败（不是用户主动暂停）。失败后下次启动必须重跑全量，不能直接接增量。
+func (t *SyncTask) MarkFullSyncFailed(reason string) {
+	t.Context.SyncPhase = SyncPhaseFullFailed
+	t.Context.FullSyncFailedReason = reason
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// MarkIncrementalStarted 标记增量已启动。一旦进入该阶段，重启时即可直接接增量，不再重跑全量。
+func (t *SyncTask) MarkIncrementalStarted() {
+	t.Context.SyncPhase = SyncPhaseIncrementalStarted
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// UpdateIncrementalPosition 持久化最近一次增量位点字符串到任务存档（与 checkpoint manager 互为冗余，方便快照与离线排查）。
+// position 形如 "mysql-bin.000123:7890"。
+func (t *SyncTask) UpdateIncrementalPosition(position string) {
+	t.Context.LastIncrementalPosition = position
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// ResetSyncPhase 清空所有阶段标志，回到 SyncPhaseInit，下次启动必须从全量开始。
+// 用于显式"重新全量"的运维操作（目前未暴露 API，但保留方法以便后续扩展）。
+func (t *SyncTask) ResetSyncPhase() {
+	t.Context.SyncPhase = SyncPhaseInit
+	t.Context.FullSyncStartedAt = nil
+	t.Context.FullSyncCompletedAt = nil
+	t.Context.FullSyncStartPosition = ""
+	t.Context.LastIncrementalPosition = ""
+	t.Context.FullSyncFailedReason = ""
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// HasFullSyncEverCompleted 返回是否曾经完成过一次全量（含 INCREMENTAL_STARTED 阶段）。
+// 这是"INCREMENTAL 模式能不能直接启动"以及"ALL 模式能不能跳过全量"的唯一判据。
+func (t *SyncTask) HasFullSyncEverCompleted() bool {
+	return t.Context.SyncPhase == SyncPhaseFullCompleted ||
+		t.Context.SyncPhase == SyncPhaseIncrementalStarted
+}
+
+// FullSyncIncomplete 返回全量是否处于"开始过但未完成"的中间态（崩溃/暂停/失败留下的不一致快照）。
+// 该状态下不允许直接接增量，必须重跑全量。
+func (t *SyncTask) FullSyncIncomplete() bool {
+	return t.Context.SyncPhase == SyncPhaseFullStarted ||
+		t.Context.SyncPhase == SyncPhaseFullFailed
 }
 
 // EffectiveIntraTableWorkers 计算单表内实际并行 worker 数。intraConfigured<=0 时：取表级 worker 数且封顶 legacyCap；>0 时显式配置，封顶 hardMax。
