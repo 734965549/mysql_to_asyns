@@ -5,6 +5,45 @@ import { Message, Modal } from "@arco-design/web-vue";
 
 const API_BASE = "/api";
 
+const TASK_SORT_OPTIONS = [
+  {
+    value: "created_at_desc",
+    label: "创建时间（新 → 旧）",
+    default: true,
+  },
+  {
+    value: "created_at_asc",
+    label: "创建时间（旧 → 新）",
+  },
+  {
+    value: "name_asc",
+    label: "任务名称（A → Z）",
+  },
+  {
+    value: "name_desc",
+    label: "任务名称（Z → A）",
+  },
+  {
+    value: "status_asc",
+    label: "状态优先（待执行 → 失败）",
+  },
+  {
+    value: "status_desc",
+    label: "状态优先（失败 → 待执行）",
+  },
+  {
+    value: "progress_asc",
+    label: "进度（低 → 高）",
+  },
+  {
+    value: "progress_desc",
+    label: "进度（高 → 低）",
+  },
+];
+
+const TASK_SORT_DEFAULT = TASK_SORT_OPTIONS.find((option) => option.default)?.value || "created_at_desc";
+const TASK_SORT_LABEL_MAP = Object.fromEntries(TASK_SORT_OPTIONS.map((option) => [option.value, option.label]));
+
 // 统一错误处理函数
 
 async function handleApiError(response, defaultMsg = "操作失败") {
@@ -1730,30 +1769,19 @@ const currentPage = computed(() => selectedKey.value[0]);
 const taskFilters = ref({
   status: "",
   keyword: "",
-  sort: "created_at_desc",
+  sort: TASK_SORT_DEFAULT,
 });
 
 function resetTaskFilters() {
   taskFilters.value = {
     status: "",
     keyword: "",
-    sort: "created_at_desc",
+    sort: TASK_SORT_DEFAULT,
   };
 }
 
 function getSortLabel(sortKey) {
-  const labels = {
-    created_at_desc: "创建时间（旧 → 新）",
-    created_at_asc: "创建时间（新 → 旧）",
-    name_asc: "任务名称（A → Z）",
-    name_desc: "任务名称（Z → A）",
-    status_asc: "状态优先（待执行 → 失败）",
-    status_desc: "状态优先（失败 → 待执行）",
-    progress_asc: "进度（低 → 高）",
-    progress_desc: "进度（高 → 低）",
-  };
-
-  return labels[sortKey] || sortKey;
+  return TASK_SORT_LABEL_MAP[sortKey] || sortKey;
 }
 
 function clearAllTaskFilters() {
@@ -1774,7 +1802,7 @@ const activeTaskFilterChips = computed(() => {
 });
 
 const hasActiveTaskFilters = computed(() => {
-  return Boolean(taskFilters.value.status || taskFilters.value.keyword || taskFilters.value.sort !== 'created_at_desc');
+  return Boolean(taskFilters.value.status || taskFilters.value.keyword || taskFilters.value.sort !== TASK_SORT_DEFAULT);
 });
 
 const syncUrlDebounceState = { timer: null };
