@@ -1743,8 +1743,8 @@ function resetTaskFilters() {
 
 function getSortLabel(sortKey) {
   const labels = {
-    created_at_desc: "创建时间（新 → 旧）",
-    created_at_asc: "创建时间（旧 → 新）",
+    created_at_desc: "创建时间（旧 → 新）",
+    created_at_asc: "创建时间（新 → 旧）",
     name_asc: "任务名称（A → Z）",
     name_desc: "任务名称（Z → A）",
     status_asc: "状态优先（待执行 → 失败）",
@@ -3476,8 +3476,8 @@ watch(
                     style="width: 160px"
                     @change="() => fetchTasks(1, taskPagination.pageSize)"
                   >
-                    <a-option value="created_at_desc">创建时间（新 → 旧）</a-option>
-                    <a-option value="created_at_asc">创建时间（旧 → 新）</a-option>
+                    <a-option value="created_at_desc">创建时间（旧 → 新）</a-option>
+                    <a-option value="created_at_asc">创建时间（新 → 旧）</a-option>
                     <a-option value="name_asc">任务名称（A → Z）</a-option>
                     <a-option value="name_desc">任务名称（Z → A）</a-option>
                     <a-option value="status_asc">状态优先（待执行 → 失败）</a-option>
@@ -3549,8 +3549,8 @@ watch(
                     <a-col :span="8">
                       <a-form-item label="排序预设">
                         <a-select v-model="taskFilters.sort">
-                          <a-option value="created_at_desc">创建时间（新 → 旧）</a-option>
-                          <a-option value="created_at_asc">创建时间（旧 → 新）</a-option>
+                          <a-option value="created_at_desc">创建时间（旧 → 新）</a-option>
+                          <a-option value="created_at_asc">创建时间（新 → 旧）</a-option>
                           <a-option value="name_asc">任务名称（A → Z）</a-option>
                           <a-option value="name_desc">任务名称（Z → A）</a-option>
                           <a-option value="status_asc">状态优先（待执行 → 失败）</a-option>
