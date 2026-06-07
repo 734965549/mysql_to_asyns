@@ -50,25 +50,25 @@ type DatabaseConfigRequest struct { // 定义数据库配置请求结构体
 
 // CreateTaskRequest 创建任务请求结构体
 type CreateTaskRequest struct { // 定义创建任务请求结构体
-	Name                     string                 `json:"name" binding:"required"`    // 任务名称，必填
-	SyncLevel                string                 `json:"sync_level"`                 // 同步级别: DATABASE 或 TABLE
-	SourceSchema             string                 `json:"source_schema"`              // 源模式名
-	TargetSchema             string                 `json:"target_schema"`              // 目标模式名
-	SourceDatabases          []string               `json:"source_databases"`           // 源数据库列表（库级别同步时使用）
-	TargetDatabase           string                 `json:"target_database"`            // 目标数据库（库级别同步时，所有库同步到此库）
-	TargetDatabases          []string               `json:"target_databases"`           // 目标数据库列表（与 SourceDatabases 一一对应）
-	Tables                   []string               `json:"tables"`                     // 源表列表
-	TargetTables             []string               `json:"target_tables"`              // 目标表列表（与 Tables 一一对应；空则沿用源表名）
-	Mode                     string                 `json:"mode" binding:"required"`    // 同步模式，必填
-	BatchSize                int                    `json:"batch_size"`                 // 批处理大小
-	WorkerCount              int                    `json:"worker_count"`               // 工作线程数
-	IntraTableWorkerCount    int                    `json:"intra_table_worker_count"`   // 表内工作线程数
-	EnableLimitOne           bool                   `json:"enable_limit_one"`           // 是否启用LIMIT 1优化
-	OptimizeIndex            bool                   `json:"optimize_index"`             // 索引优化：先删后建
-	EnableReadOnly           bool                   `json:"enable_read_only"`           // 同步前关闭目标只读，同步后恢复
+	Name                     string                 `json:"name" binding:"required"`      // 任务名称，必填
+	SyncLevel                string                 `json:"sync_level"`                   // 同步级别: DATABASE 或 TABLE
+	SourceSchema             string                 `json:"source_schema"`                // 源模式名
+	TargetSchema             string                 `json:"target_schema"`                // 目标模式名
+	SourceDatabases          []string               `json:"source_databases"`             // 源数据库列表（库级别同步时使用）
+	TargetDatabase           string                 `json:"target_database"`              // 目标数据库（库级别同步时，所有库同步到此库）
+	TargetDatabases          []string               `json:"target_databases"`             // 目标数据库列表（与 SourceDatabases 一一对应）
+	Tables                   []string               `json:"tables"`                       // 源表列表
+	TargetTables             []string               `json:"target_tables"`                // 目标表列表（与 Tables 一一对应；空则沿用源表名）
+	Mode                     string                 `json:"mode" binding:"required"`      // 同步模式，必填
+	BatchSize                int                    `json:"batch_size"`                   // 批处理大小
+	WorkerCount              int                    `json:"worker_count"`                 // 工作线程数
+	IntraTableWorkerCount    int                    `json:"intra_table_worker_count"`     // 表内工作线程数
+	EnableLimitOne           bool                   `json:"enable_limit_one"`             // 是否启用LIMIT 1优化
+	OptimizeIndex            bool                   `json:"optimize_index"`               // 索引优化：先删后建
+	EnableReadOnly           bool                   `json:"enable_read_only"`             // 同步前关闭目标只读，同步后恢复
 	EnableDropTableBeforeDDL bool                   `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS
-	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`        // 源数据库配置（可选）
-	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`        // 目标数据库配置（可选）
+	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
+	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
 }
 
 // CreateTask 创建任务方法
@@ -143,7 +143,7 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		EnableLimitOne:           req.EnableLimitOne,            // 设置LIMIT 1优化开关
 		OptimizeIndex:            req.OptimizeIndex,             // 设置索引优化开关
 		EnableReadOnly:           req.EnableReadOnly,            // 设置只读管理开关
-		EnableDropTableBeforeDDL: req.EnableDropTableBeforeDDL,   // 设置DDL前DROP TABLE开关
+		EnableDropTableBeforeDDL: req.EnableDropTableBeforeDDL,  // 设置DDL前DROP TABLE开关
 		SourceDB:                 sourceDB,                      // 设置源数据库配置
 		TargetDB:                 targetDB,                      // 设置目标数据库配置
 	}
@@ -158,9 +158,12 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 
 // StartTaskRequest 启动任务请求结构体（可选）
 type StartTaskRequest struct {
-	ScheduledAt      *time.Time `json:"scheduled_at,omitempty"`      // 定时启动时间（为空表示立即启动）
-	RepeatCount      int        `json:"repeat_count,omitempty"`      // 重复启动次数（包含首次执行）
-	RepeatIntervalSec int       `json:"repeat_interval_sec,omitempty"` // 重复启动间隔（秒）
+	ScheduledAt       *time.Time `json:"scheduled_at,omitempty"`        // 定时启动时间（为空表示立即启动）
+	RepeatCount       int        `json:"repeat_count,omitempty"`        // 重复启动次数（包含首次执行）
+	RepeatIntervalSec int        `json:"repeat_interval_sec,omitempty"` // 重复启动间隔（秒）
+	ScheduleMode      string     `json:"schedule_mode,omitempty"`       // 定时模式：once / repeat / cron
+	CronExpression    string     `json:"cron_expression,omitempty"`     // Cron 表达式
+	CronTimezone      string     `json:"cron_timezone,omitempty"`       // Cron 时区
 }
 
 // StartTask 启动任务方法（支持立即启动和定时启动）
@@ -185,6 +188,23 @@ func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 		}
 		if req.RepeatCount > 0 && req.RepeatIntervalSec < 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "repeat_interval_sec 不能小于 0"})
+			return
+		}
+		if strings.EqualFold(req.ScheduleMode, "cron") {
+			if strings.TrimSpace(req.CronExpression) == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "cron_expression 不能为空"})
+				return
+			}
+			if err := h.taskService.ScheduleCronTask(taskID, *req.ScheduledAt, req.CronExpression, req.CronTimezone); err != nil {
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "task not found") {
+					c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+				} else {
+					c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+				}
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"message": "Task scheduled", "scheduled_at": req.ScheduledAt, "schedule_mode": "cron", "cron_expression": req.CronExpression, "cron_timezone": req.CronTimezone})
 			return
 		}
 		if req.RepeatCount > 0 {
@@ -731,24 +751,24 @@ func (h *TaskHandler) DeleteTask(c *gin.Context) { // 删除任务
 
 // UpdateTaskRequest 更新任务请求结构体
 type UpdateTaskRequest struct { // 定义更新任务请求结构体
-	Name                     string                 `json:"name"`                                 // 任务名称
-	SyncLevel                string                 `json:"sync_level"`                           // 同步级别
-	SourceSchema             string                 `json:"source_schema"`                        // 源模式名
-	TargetSchema             string                 `json:"target_schema"`                        // 目标模式名
-	SourceDatabases          []string               `json:"source_databases"`                     // 源数据库列表
-	TargetDatabases          []string               `json:"target_databases"`                     // 目标数据库列表
-	Tables                   []string               `json:"tables"`                               // 源表列表
-	TargetTables             []string               `json:"target_tables"`                         // 目标表列表（与 Tables 一一对应；空则沿用源表名）
-	Mode                     string                 `json:"mode"`                                 // 同步模式
-	BatchSize                int                    `json:"batch_size"`                           // 批处理大小
-	WorkerCount              int                    `json:"worker_count"`                         // 工作线程数
-	IntraTableWorkerCount    *int                   `json:"intra_table_worker_count,omitempty"`   // 表内工作线程数（可选）
-	EnableLimitOne           bool                   `json:"enable_limit_one"`                     // 是否启用LIMIT 1优化
-	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`             // 索引优化（可选）
-	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`           // 只读管理（可选）
+	Name                     string                 `json:"name"`                                   // 任务名称
+	SyncLevel                string                 `json:"sync_level"`                             // 同步级别
+	SourceSchema             string                 `json:"source_schema"`                          // 源模式名
+	TargetSchema             string                 `json:"target_schema"`                          // 目标模式名
+	SourceDatabases          []string               `json:"source_databases"`                       // 源数据库列表
+	TargetDatabases          []string               `json:"target_databases"`                       // 目标数据库列表
+	Tables                   []string               `json:"tables"`                                 // 源表列表
+	TargetTables             []string               `json:"target_tables"`                          // 目标表列表（与 Tables 一一对应；空则沿用源表名）
+	Mode                     string                 `json:"mode"`                                   // 同步模式
+	BatchSize                int                    `json:"batch_size"`                             // 批处理大小
+	WorkerCount              int                    `json:"worker_count"`                           // 工作线程数
+	IntraTableWorkerCount    *int                   `json:"intra_table_worker_count,omitempty"`     // 表内工作线程数（可选）
+	EnableLimitOne           bool                   `json:"enable_limit_one"`                       // 是否启用LIMIT 1优化
+	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`               // 索引优化（可选）
+	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`             // 只读管理（可选）
 	EnableDropTableBeforeDDL *bool                  `json:"enable_drop_table_before_ddl,omitempty"` // DDL前是否先DROP TABLE（可选）
-	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                  // 源数据库配置（可选）
-	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                  // 目标数据库配置（可选）
+	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                    // 源数据库配置（可选）
+	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                    // 目标数据库配置（可选）
 }
 
 // generateID 生成唯一ID函数

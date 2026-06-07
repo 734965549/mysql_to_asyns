@@ -2,8 +2,10 @@ package entity // 声明当前文件属于entity包，用于定义数据实体
 
 import ( // 导入外部包和标准库
 
-	"mysql-to-async/pkg/crypto"
+	"strings"
 	"time" // 导入time包，用于时间处理
+
+	"mysql-to-async/pkg/crypto"
 )
 
 // TaskStatus 任务状态
@@ -99,16 +101,19 @@ type ProcessContext struct { // 定义处理上下文结构体
 	RepeatCount         int         `json:"repeat_count,omitempty"`        // 定时启动总次数（包含首次执行）
 	RepeatRemaining     int         `json:"repeat_remaining,omitempty"`    // 剩余重复次数（包含下一次执行）
 	RepeatIntervalSec   int         `json:"repeat_interval_sec,omitempty"` // 重复启动间隔（秒）
+	ScheduleMode        string      `json:"schedule_mode,omitempty"`       // 定时模式：once / repeat / cron
+	CronExpression      string      `json:"cron_expression,omitempty"`     // Cron 表达式（支持扩展语义）
+	CronTimezone        string      `json:"cron_timezone,omitempty"`       // Cron 时区（可选，默认本地时区）
 
 	// === 全量/增量阶段状态机（独立于 Status）===
 	// 这些字段持久化在任务存档中，重启 / 重新 StartTask 时用于判断"该跑全量还是直接接增量"。
 	// 历史任务无这些字段时按零值处理（SyncPhase=""），等价于 SyncPhaseInit，需要按 Mode 走完整流程。
-	SyncPhase               SyncPhase  `json:"sync_phase,omitempty"`                  // 同步阶段：FULL_STARTED / FULL_COMPLETED / FULL_FAILED / INCREMENTAL_STARTED
-	FullSyncStartedAt       *time.Time `json:"full_sync_started_at,omitempty"`        // 最近一次全量启动时间
-	FullSyncCompletedAt     *time.Time `json:"full_sync_completed_at,omitempty"`      // 全量完成时间（仅 SyncPhaseFullCompleted/IncrementalStarted 时有意义）
-	FullSyncStartPosition   string     `json:"full_sync_start_position,omitempty"`    // 全量启动时捕获的 binlog 位点 "file:pos"（增量的起点）
-	LastIncrementalPosition string     `json:"last_incremental_position,omitempty"`   // 最近一次成功落库的增量位点 "file:pos"
-	FullSyncFailedReason    string     `json:"full_sync_failed_reason,omitempty"`     // 全量失败原因（便于排查；SyncPhase=FULL_FAILED 时填充）
+	SyncPhase               SyncPhase  `json:"sync_phase,omitempty"`                // 同步阶段：FULL_STARTED / FULL_COMPLETED / FULL_FAILED / INCREMENTAL_STARTED
+	FullSyncStartedAt       *time.Time `json:"full_sync_started_at,omitempty"`      // 最近一次全量启动时间
+	FullSyncCompletedAt     *time.Time `json:"full_sync_completed_at,omitempty"`    // 全量完成时间（仅 SyncPhaseFullCompleted/IncrementalStarted 时有意义）
+	FullSyncStartPosition   string     `json:"full_sync_start_position,omitempty"`  // 全量启动时捕获的 binlog 位点 "file:pos"（增量的起点）
+	LastIncrementalPosition string     `json:"last_incremental_position,omitempty"` // 最近一次成功落库的增量位点 "file:pos"
+	FullSyncFailedReason    string     `json:"full_sync_failed_reason,omitempty"`   // 全量失败原因（便于排查；SyncPhase=FULL_FAILED 时填充）
 }
 
 // SyncTask 同步任务
@@ -144,9 +149,18 @@ func (t *SyncTask) ConfigureRepeat(repeatCount, intervalSec int) {
 	if intervalSec < 0 {
 		intervalSec = 0
 	}
+	t.Context.ScheduleMode = "repeat"
 	t.Context.RepeatCount = repeatCount
 	t.Context.RepeatRemaining = repeatCount
 	t.Context.RepeatIntervalSec = intervalSec
+}
+
+// ConfigureCronSchedule 设置 Cron 定时启动。
+func (t *SyncTask) ConfigureCronSchedule(expr, timezone string) {
+	t.Context.ScheduleMode = "cron"
+	t.Context.CronExpression = strings.TrimSpace(expr)
+	t.Context.CronTimezone = strings.TrimSpace(timezone)
+	t.ResetRepeat()
 }
 
 // ConsumeScheduledRun 消耗一次已计划执行次数，返回是否还需要继续调度。

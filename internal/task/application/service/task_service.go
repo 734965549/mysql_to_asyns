@@ -33,6 +33,8 @@ import (
 
 	"time" // 时间处理
 
+	cron "github.com/robfig/cron/v3"
+
 	"mysql-to-async/internal/audit" // 审计日志包
 
 	"mysql-to-async/internal/checkpoint" // 检查点管理包
@@ -4886,7 +4888,17 @@ func (s *TaskService) completeTask(taskID string) {
 
 		task.Complete()
 
-		if task.Context.RepeatRemaining > 0 && task.ConsumeScheduledRun() {
+		if task.Context.ScheduleMode == "cron" {
+			next, err := nextCronRun(task, time.Now())
+			if err != nil {
+				logger.Warn("[Task %s] Failed to compute next cron run: %v", taskID, err)
+				task.ResetRepeat()
+			} else {
+				task.Context.Status = taskEntity.TaskStatusScheduled
+				task.Context.ScheduledAt = &next
+				task.Context.LastUpdateTime = time.Now()
+			}
+		} else if task.Context.RepeatRemaining > 0 && task.ConsumeScheduledRun() {
 			interval := time.Duration(task.Context.RepeatIntervalSec) * time.Second
 			if interval < 0 {
 				interval = 0
@@ -5025,6 +5037,32 @@ func (s *TaskService) ScheduleTaskWithRepeat(taskID string, scheduledAt time.Tim
 	return nil
 }
 
+// ScheduleCronTask 设置 cron 定时启动。
+func (s *TaskService) ScheduleCronTask(taskID string, scheduledAt time.Time, expr, timezone string) error {
+	if err := s.ScheduleTask(taskID, scheduledAt); err != nil {
+		return err
+	}
+	if strings.TrimSpace(expr) == "" {
+		return fmt.Errorf("cron expression cannot be empty")
+	}
+	if _, _, err := parseCronExpression(expr, timezone, scheduledAt.Location()); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+	task.ConfigureCronSchedule(expr, timezone)
+	if err := s.storage.Save(task); err != nil {
+		return fmt.Errorf("failed to save cron schedule state: %w", err)
+	}
+	return nil
+}
+
 // CancelSchedule 取消定时启动
 func (s *TaskService) CancelSchedule(taskID string) error {
 	s.mu.Lock()
@@ -5125,6 +5163,64 @@ func (s *TaskService) checkScheduledTasks() {
 }
 
 // SkipError 跳过错误
+
+func parseCronExpression(expr, timezone string, fallbackLoc *time.Location) (cron.Schedule, bool, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return nil, false, fmt.Errorf("cron expression cannot be empty")
+	}
+	if strings.HasSuffix(expr, " L * *") || strings.Contains(expr, " L ") {
+		return nil, true, nil
+	}
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	sched, err := parser.Parse(expr)
+	if err != nil {
+		return nil, false, err
+	}
+	_ = timezone
+	_ = fallbackLoc
+	return sched, false, nil
+}
+
+func nextCronRun(task *taskEntity.SyncTask, now time.Time) (time.Time, error) {
+	if task == nil {
+		return time.Time{}, fmt.Errorf("task is nil")
+	}
+	expr := strings.TrimSpace(task.Context.CronExpression)
+	if expr == "" {
+		return time.Time{}, fmt.Errorf("cron expression cannot be empty")
+	}
+	if strings.Contains(expr, " L ") {
+		parts := strings.Fields(expr)
+		if len(parts) != 5 {
+			return time.Time{}, fmt.Errorf("unsupported cron expression: %s", expr)
+		}
+		minute, hour := parts[0], parts[1]
+		if minute == "*" || hour == "*" {
+			return time.Time{}, fmt.Errorf("unsupported last-business-day cron: %s", expr)
+		}
+		next := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+		for i := 0; i < 15; i++ {
+			candidate := next.AddDate(0, i, 0)
+			lastDay := time.Date(candidate.Year(), candidate.Month()+1, 0, 0, 0, 0, 0, now.Location())
+			for lastDay.Weekday() == time.Saturday || lastDay.Weekday() == time.Sunday {
+				lastDay = lastDay.AddDate(0, 0, -1)
+			}
+			hh, _ := strconv.Atoi(hour)
+			mm, _ := strconv.Atoi(minute)
+			run := time.Date(lastDay.Year(), lastDay.Month(), lastDay.Day(), hh, mm, 0, 0, now.Location())
+			if run.After(now) {
+				return run, nil
+			}
+		}
+		return time.Time{}, fmt.Errorf("failed to compute next run for %s", expr)
+	}
+	sched, _, err := parseCronExpression(expr, task.Context.CronTimezone, now.Location())
+	if err != nil {
+		return time.Time{}, err
+	}
+	return sched.Next(now), nil
+}
 
 func (s *TaskService) SkipError(taskID string) error {
 

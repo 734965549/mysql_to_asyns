@@ -1015,17 +1015,16 @@ async function createTask() {
 
 const scheduleModalVisible = ref(false);
 const scheduleTaskId = ref("");
-const scheduleMode = ref("once");
+const scheduleMode = ref("cron");
 const scheduleTime = ref("");
-const repeatCount = ref(1);
-const repeatIntervalSec = ref(60);
+const scheduleCron = ref("0 9 * * 1-5");
+const scheduleTimezone = ref(Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai");
 
-function openStartTaskModal(taskId, mode = "immediate") {
+function openStartTaskModal(taskId, mode = "cron") {
   scheduleTaskId.value = taskId;
   scheduleMode.value = mode;
-  repeatCount.value = 1;
-  repeatIntervalSec.value = 60;
-
+  scheduleCron.value = "0 9 * * 1-5";
+  scheduleTimezone.value = Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai";
   const d = new Date(Date.now() + 5 * 60 * 1000);
   scheduleTime.value = toDateTimeInputValue(d);
   scheduleModalVisible.value = true;
@@ -1037,52 +1036,22 @@ function toDateTimeInputValue(date) {
 }
 
 function openScheduleModal(taskId) {
-  scheduleTaskId.value = taskId;
-  scheduleMode.value = "once";
-  repeatCount.value = 1;
-  repeatIntervalSec.value = 60;
-
-  const d = new Date(Date.now() + 5 * 60 * 1000);
-  scheduleTime.value = toDateTimeInputValue(d);
-  scheduleModalVisible.value = true;
+  openStartTaskModal(taskId, "cron");
 }
 
 async function confirmSchedule() {
   try {
     const payload = {};
 
-    if (scheduleMode.value !== "immediate") {
-      if (!scheduleTime.value) {
-        Message.warning("请选择定时启动时间");
-        return;
-      }
-
-      const scheduledAt = new Date(scheduleTime.value);
-      if (isNaN(scheduledAt.getTime())) {
-        Message.error("时间格式不正确");
-        return;
-      }
-      if (scheduledAt <= new Date()) {
-        Message.error("定时启动时间不能早于当前时间");
-        return;
-      }
-      payload.scheduled_at = scheduledAt.toISOString();
+    const expr = String(scheduleCron.value || "").trim();
+    if (!expr) {
+      Message.error("请输入 cron 表达式");
+      return;
     }
-
-    if (scheduleMode.value === "repeat") {
-      const count = Number(repeatCount.value);
-      const interval = Number(repeatIntervalSec.value);
-      if (!Number.isInteger(count) || count < 1) {
-        Message.error("重复次数必须大于等于 1");
-        return;
-      }
-      if (!Number.isInteger(interval) || interval < 0) {
-        Message.error("重复间隔秒数必须大于等于 0");
-        return;
-      }
-      payload.repeat_count = count;
-      payload.repeat_interval_sec = interval;
-    }
+    payload.scheduled_at = new Date().toISOString();
+    payload.schedule_mode = "cron";
+    payload.cron_expression = expr;
+    payload.cron_timezone = String(scheduleTimezone.value || "").trim();
 
     const res = await fetch(`${API_BASE}/tasks/${scheduleTaskId.value}/start`, {
       method: "POST",
@@ -3752,9 +3721,7 @@ watch(
                     >
                       <icon-play-arrow /> 启动
                       <template #content>
-                        <a-doption @click="openStartTaskModal(task.config.id, 'immediate')">立即启动</a-doption>
-                        <a-doption @click="openStartTaskModal(task.config.id, 'once')">单次定时启动</a-doption>
-                        <a-doption @click="openStartTaskModal(task.config.id, 'repeat')">重复定时启动</a-doption>
+                        <a-doption @click="openStartTaskModal(task.config.id, 'cron')">Cron 定时启动</a-doption>
                       </template>
                     </a-dropdown-button>
 
@@ -4306,6 +4273,9 @@ watch(
             <span v-if="selectedTaskForDetail.context.status === 'SCHEDULED' && selectedTaskForDetail.context.scheduled_at" style="margin-left: 8px; color: #165DFF; font-size: 13px;">
               <icon-clock-circle /> {{ formatScheduledTime(selectedTaskForDetail) }}
             </span>
+            <span v-if="selectedTaskForDetail.context.cron_expression" style="margin-left: 8px; color: #86909C; font-size: 12px;">
+              {{ selectedTaskForDetail.context.cron_expression }}
+            </span>
           </a-descriptions-item>
 
           <a-descriptions-item label="进度">
@@ -4417,9 +4387,7 @@ watch(
             >
               <icon-play-arrow /> 启动
               <template #content>
-                <a-doption @click="openStartTaskModal(selectedTaskForDetail.config.id, 'immediate'); detailDrawerVisible = false;">立即启动</a-doption>
-                <a-doption @click="openStartTaskModal(selectedTaskForDetail.config.id, 'once'); detailDrawerVisible = false;">单次定时启动</a-doption>
-                <a-doption @click="openStartTaskModal(selectedTaskForDetail.config.id, 'repeat'); detailDrawerVisible = false;">重复定时启动</a-doption>
+                <a-doption @click="openStartTaskModal(selectedTaskForDetail.config.id, 'cron'); detailDrawerVisible = false;">Cron 定时启动</a-doption>
               </template>
             </a-dropdown-button>
 
@@ -4455,60 +4423,41 @@ watch(
     <!-- 启动任务弹窗 -->
     <a-modal
       v-model:visible="scheduleModalVisible"
-      title="启动任务"
+      title="Cron 定时启动"
       @ok="confirmSchedule"
       @cancel="scheduleModalVisible = false"
       ok-text="确认"
       cancel-text="取消"
-      :width="520"
+      :width="720"
     >
       <a-form layout="vertical">
-        <a-form-item label="启动方式">
-          <a-radio-group v-model="scheduleMode" type="button">
-            <a-radio value="immediate">立即启动</a-radio>
-            <a-radio value="once">单次定时启动</a-radio>
-            <a-radio value="repeat">重复定时启动</a-radio>
-          </a-radio-group>
+        <a-alert
+          type="info"
+          :show-icon="true"
+          style="margin-bottom: 16px"
+          title="Cron 支持标准语法，并兼容 L / W / #"
+          description="例如：0 9 * * 1-5 表示每周一到周五 09:00；0 0 L * * 表示每月最后一天 00:00。"
+        />
+
+        <a-form-item label="Cron 表达式">
+          <a-input v-model="scheduleCron" placeholder="例如：0 9 * * 1-5" />
         </a-form-item>
 
-        <template v-if="scheduleMode !== 'immediate'">
-          <a-form-item label="定时启动时间">
-            <a-date-picker
-              v-model="scheduleTime"
-              show-time
-              value-format="YYYY-MM-DDTHH:mm:ss"
-              format="YYYY-MM-DD HH:mm:ss"
-              style="width: 100%"
-              placeholder="请选择启动时间"
-            />
-          </a-form-item>
-        </template>
+        <a-form-item label="时区">
+          <a-input v-model="scheduleTimezone" placeholder="例如：Asia/Shanghai" />
+        </a-form-item>
 
-        <template v-if="scheduleMode === 'repeat'">
-          <a-row :gutter="16">
-            <a-col :span="12">
-              <a-form-item label="重复次数">
-                <a-input-number v-model="repeatCount" :min="1" :step="1" style="width: 100%" />
-              </a-form-item>
-            </a-col>
-            <a-col :span="12">
-              <a-form-item label="间隔秒数">
-                <a-input-number v-model="repeatIntervalSec" :min="0" :step="1" style="width: 100%" />
-              </a-form-item>
-            </a-col>
-          </a-row>
-        </template>
+        <a-form-item label="快捷模板">
+          <a-space wrap>
+            <a-button size="small" @click="scheduleCron = '0 9 * * 1-5'">工作日 9:00</a-button>
+            <a-button size="small" @click="scheduleCron = '30 9 * * 1-5'">工作日 9:30</a-button>
+            <a-button size="small" @click="scheduleCron = '0 0 L * *'">每月最后一个工作日 00:00</a-button>
+            <a-button size="small" @click="scheduleCron = '0 10 ? * 1#1'">每月第一个周一 10:00</a-button>
+          </a-space>
+        </a-form-item>
 
         <a-typography-text type="secondary" style="font-size: 12px">
-          <template v-if="scheduleMode === 'immediate'">
-            任务将立即启动。
-          </template>
-          <template v-else-if="scheduleMode === 'once'">
-            任务将在设定时间自动启动一次。
-          </template>
-          <template v-else>
-            任务将在设定时间首次启动，并在每次执行完成后按间隔自动再次启动，直到达到重复次数。
-          </template>
+          支持标准 cron 与扩展语义。提交后系统会保存原始表达式，并据此计算下一次触发时间。
         </a-typography-text>
       </a-form>
     </a-modal>
