@@ -165,6 +165,8 @@ type TaskStorage interface {
 
 	LoadAll() ([]*taskEntity.SyncTask, error) // 加载所有任务
 
+	QueryTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int, error) // 分页查询任务
+
 }
 
 // MySQLTaskStorage MySQL 任务存储结构体
@@ -396,100 +398,105 @@ func (s *MySQLTaskStorage) Delete(taskID string) error {
 
 }
 
+func (s *MySQLTaskStorage) buildTaskSortClause(sortBy string) string {
+	switch strings.ToLower(strings.TrimSpace(sortBy)) {
+	case "created_at_asc":
+		return "ORDER BY created_at ASC, pk_id ASC"
+	case "name_asc":
+		return "ORDER BY name ASC, pk_id ASC"
+	case "name_desc":
+		return "ORDER BY name DESC, pk_id DESC"
+	case "status_asc":
+		return "ORDER BY JSON_UNQUOTE(JSON_EXTRACT(content, '$.context.status')) ASC, pk_id ASC"
+	case "status_desc":
+		return "ORDER BY JSON_UNQUOTE(JSON_EXTRACT(content, '$.context.status')) DESC, pk_id DESC"
+	case "progress_asc":
+		return "ORDER BY CAST(JSON_UNQUOTE(JSON_EXTRACT(content, '$.context.progress_percent')) AS DECIMAL(10,2)) ASC, pk_id ASC"
+	case "progress_desc":
+		return "ORDER BY CAST(JSON_UNQUOTE(JSON_EXTRACT(content, '$.context.progress_percent')) AS DECIMAL(10,2)) DESC, pk_id DESC"
+	default:
+		return "ORDER BY created_at DESC, pk_id DESC"
+	}
+}
+
+func (s *MySQLTaskStorage) buildTaskWhereClause(status, keyword string) (string, []interface{}) {
+	clauses := make([]string, 0, 4)
+	args := make([]interface{}, 0, 4)
+
+	if status = strings.TrimSpace(status); status != "" {
+		clauses = append(clauses, "UPPER(JSON_UNQUOTE(JSON_EXTRACT(content, '$.context.status'))) = UPPER(?)")
+		args = append(args, status)
+	}
+
+	if keyword = strings.TrimSpace(keyword); keyword != "" {
+		like := "%" + keyword + "%"
+		clauses = append(clauses, "(LOWER(JSON_UNQUOTE(JSON_EXTRACT(content, '$.config.name'))) LIKE LOWER(?) OR LOWER(JSON_UNQUOTE(JSON_EXTRACT(content, '$.config.id'))) LIKE LOWER(?) OR LOWER(JSON_UNQUOTE(JSON_EXTRACT(content, '$.config.source_schema'))) LIKE LOWER(?) OR LOWER(JSON_UNQUOTE(JSON_EXTRACT(content, '$.config.target_schema'))) LIKE LOWER(?) OR JSON_SEARCH(content, 'one', ?, NULL, '$.config.tables[*]') IS NOT NULL)")
+		args = append(args, like, like, like, like, like)
+	}
+
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func (s *MySQLTaskStorage) QueryTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	if page <= 0 {
+		page = 1
+	}
+
+	whereClause, args := s.buildTaskWhereClause(status, keyword)
+	countSQL := "SELECT COUNT(*) FROM sys_sync_tasks " + whereClause
+
+	var total int
+	if err := s.db.QueryRow(countSQL, args...).Scan(&total); err != nil {
+		return nil, 0, page, pageSize, err
+	}
+
+	orderBy := s.buildTaskSortClause(sortBy)
+	query := "SELECT pk_id, content FROM sys_sync_tasks " + whereClause + " " + orderBy + " LIMIT ? OFFSET ?"
+	queryArgs := append(append([]interface{}{}, args...), pageSize, (page-1)*pageSize)
+
+	rows, err := s.db.Query(query, queryArgs...)
+	if err != nil {
+		return nil, 0, page, pageSize, err
+	}
+	defer rows.Close()
+
+	items := make([]*taskEntity.SyncTask, 0, pageSize)
+	for rows.Next() {
+		var storageID int64
+		var data []byte
+		if err := rows.Scan(&storageID, &data); err != nil {
+			continue
+		}
+		var task taskEntity.SyncTask
+		if err := json.Unmarshal(data, &task); err != nil {
+			continue
+		}
+		task.Config.StorageID = storageID
+		if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil {
+			logger.Warn("Warning: failed to decrypt task passwords: %v", decErr)
+		}
+		items = append(items, &task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, page, pageSize, err
+	}
+	return items, total, page, pageSize, nil
+}
+
 // LoadAll 从数据库加载所有任务
 
 func (s *MySQLTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
-
-	s.mu.RLock() // 获取读锁
-
-	defer s.mu.RUnlock() // 延迟释放读锁
-
-	query := "SELECT pk_id, content FROM sys_sync_tasks ORDER BY pk_id ASC" // 构建查询SQL
-
-	rows, err := s.db.Query(query) // 执行查询
-
-	if err != nil {
-
-		fallbackRows, fbErr := s.db.Query("SELECT content FROM sys_sync_tasks") // 执行备用查询
-
-		if fbErr != nil {
-
-			return nil, err // 返回原始错误
-
-		}
-
-		defer fallbackRows.Close() // 延迟关闭结果集
-
-		var fallbackTasks []*taskEntity.SyncTask // 声明备用任务列表
-
-		for fallbackRows.Next() { // 遍历备用结果集
-
-			var data []byte // 声明数据字节数组
-
-			if scanErr := fallbackRows.Scan(&data); scanErr != nil { // 扫描数据
-
-				continue // 跳过错误行
-
-			}
-
-			var task taskEntity.SyncTask // 声明任务对象
-
-			if unmarshalErr := json.Unmarshal(data, &task); unmarshalErr != nil { // 反序列化任务
-
-				logger.Warn("Warning: failed to unmarshal task: %v", unmarshalErr) // 打印警告日志
-
-				continue // 跳过错误行
-
-			}
-
-			if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil { // 解密密码
-				logger.Warn("Warning: failed to decrypt task passwords: %v", decErr)
-			}
-
-			fallbackTasks = append(fallbackTasks, &task) // 添加到任务列表
-
-		}
-
-		return fallbackTasks, nil // 返回任务列表
-
-	}
-
-	defer rows.Close()
-
-	var tasks []*taskEntity.SyncTask // 声明任务列表
-
-	for rows.Next() { // 遍历结果集
-
-		var storageID int64 // 声明存储ID
-
-		var data []byte // 声明数据字节数组
-
-		if err := rows.Scan(&storageID, &data); err != nil { // 扫描数据
-
-			continue // 跳过错误行
-
-		}
-
-		var task taskEntity.SyncTask // 声明任务对象
-
-		if err := json.Unmarshal(data, &task); err != nil { // 反序列化任务
-
-			continue // 跳过错误行
-
-		}
-
-		task.Config.StorageID = storageID // 设置存储ID
-
-		if decErr := task.DecryptPasswords(s.encryptKey); decErr != nil { // 解密密码
-			logger.Warn("Warning: failed to decrypt task passwords: %v", decErr)
-		}
-
-		tasks = append(tasks, &task) // 添加到任务列表
-
-	}
-
-	return tasks, nil // 返回任务列表
-
+	tasks, _, _, _, err := s.QueryTasksPage(1, 1000000, "", "", "created_at_desc")
+	return tasks, err
 }
 
 func newTaskStorageFromConfig(cfg *config.Config) (TaskStorage, func() error, string, error) {
@@ -935,11 +942,11 @@ func taskDisplayTime(task *taskEntity.SyncTask) time.Time {
 	if !task.Context.CreatedAt.IsZero() {
 		return task.Context.CreatedAt
 	}
-	if !task.Context.StartTime.IsZero() {
-		return task.Context.StartTime
-	}
 	if !task.Context.LastUpdateTime.IsZero() {
 		return task.Context.LastUpdateTime
+	}
+	if !task.Context.StartTime.IsZero() {
+		return task.Context.StartTime
 	}
 	return time.Time{}
 }
@@ -954,16 +961,33 @@ func taskStorageOrderKey(task *taskEntity.SyncTask) int64 {
 	if !task.Context.CreatedAt.IsZero() {
 		return task.Context.CreatedAt.UnixNano()
 	}
-	if !task.Context.StartTime.IsZero() {
-		return task.Context.StartTime.UnixNano()
-	}
 	if !task.Context.LastUpdateTime.IsZero() {
 		return task.Context.LastUpdateTime.UnixNano()
+	}
+	if !task.Context.StartTime.IsZero() {
+		return task.Context.StartTime.UnixNano()
 	}
 	return 0
 }
 
 func (s *TaskService) GetTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int) {
+	s.mu.RLock()
+	storage := s.storage
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return []*taskEntity.SyncTask{}, 0, page, pageSize
+	}
+
+	items, total, page, pageSize, err := storage.QueryTasksPage(page, pageSize, status, keyword, sortBy)
+	if err != nil {
+		logger.Warn("[TaskService] QueryTasksPage failed, falling back to in-memory scan: %v", err)
+		return s.getTasksPageFromMemory(page, pageSize, status, keyword, sortBy)
+	}
+	return items, total, page, pageSize
+}
+
+func (s *TaskService) getTasksPageFromMemory(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1012,74 +1036,41 @@ func (s *TaskService) GetTasksPage(page, pageSize int, status, keyword, sortBy s
 		b := tasks[j]
 		createdAtA := taskDisplayTime(a)
 		createdAtB := taskDisplayTime(b)
-		if sortBy == "created_at_asc" {
-			if createdAtA.Equal(createdAtB) {
-				return a.Config.ID < b.Config.ID
-			}
+		switch sortBy {
+		case "created_at_asc":
+			if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }
 			return createdAtA.Before(createdAtB)
-		}
-		if sortBy == "name_asc" {
-			if a.Config.Name == b.Config.Name {
-				return a.Config.ID < b.Config.ID
-			}
+		case "name_asc":
+			if a.Config.Name == b.Config.Name { return a.Config.ID < b.Config.ID }
 			return a.Config.Name < b.Config.Name
-		}
-		if sortBy == "name_desc" {
-			if a.Config.Name == b.Config.Name {
-				return a.Config.ID > b.Config.ID
-			}
+		case "name_desc":
+			if a.Config.Name == b.Config.Name { return a.Config.ID > b.Config.ID }
 			return a.Config.Name > b.Config.Name
-		}
-		if sortBy == "status_asc" || sortBy == "status_desc" {
-			aStatus := taskStatusRank(a.Context.Status)
-			bStatus := taskStatusRank(b.Context.Status)
-			if aStatus == bStatus {
-				if createdAtA.Equal(createdAtB) {
-					return a.Config.ID > b.Config.ID
-				}
-				return createdAtA.After(createdAtB)
-			}
-			if sortBy == "status_asc" {
-				return aStatus < bStatus
-			}
+		case "status_asc":
+			aStatus, bStatus := taskStatusRank(a.Context.Status), taskStatusRank(b.Context.Status)
+			if aStatus == bStatus { if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }; return createdAtA.After(createdAtB) }
+			return aStatus < bStatus
+		case "status_desc":
+			aStatus, bStatus := taskStatusRank(a.Context.Status), taskStatusRank(b.Context.Status)
+			if aStatus == bStatus { if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }; return createdAtA.After(createdAtB) }
 			return aStatus > bStatus
-		}
-		if sortBy == "progress_asc" || sortBy == "progress_desc" {
-			aProgress := a.Context.ProgressPercent
-			bProgress := b.Context.ProgressPercent
-			if aProgress == bProgress {
-				if createdAtA.Equal(createdAtB) {
-					return a.Config.ID > b.Config.ID
-				}
-				return createdAtA.After(createdAtB)
-			}
-			if sortBy == "progress_asc" {
-				return aProgress < bProgress
-			}
-			return aProgress > bProgress
-		}
-		if sortBy == "created_at_desc" || sortBy == "" {
-			if createdAtA.Equal(createdAtB) {
-				return a.Config.ID > b.Config.ID
-			}
+		case "progress_asc":
+			if a.Context.ProgressPercent == b.Context.ProgressPercent { if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }; return createdAtA.After(createdAtB) }
+			return a.Context.ProgressPercent < b.Context.ProgressPercent
+		case "progress_desc":
+			if a.Context.ProgressPercent == b.Context.ProgressPercent { if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }; return createdAtA.After(createdAtB) }
+			return a.Context.ProgressPercent > b.Context.ProgressPercent
+		default:
+			if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }
 			return createdAtA.After(createdAtB)
 		}
-		if createdAtA.Equal(createdAtB) {
-			return a.Config.ID > b.Config.ID
-		}
-		return createdAtA.After(createdAtB)
 	})
 
 	total := len(tasks)
 	start := (page - 1) * pageSize
-	if start >= total {
-		return []*taskEntity.SyncTask{}, total, page, pageSize
-	}
+	if start >= total { return []*taskEntity.SyncTask{}, total, page, pageSize }
 	end := start + pageSize
-	if end > total {
-		end = total
-	}
-
+	if end > total { end = total }
 	return tasks[start:end], total, page, pageSize
 }
 
@@ -5502,6 +5493,95 @@ func (s *FileTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 
 	return tasks, nil
 
+}
+
+func (s *FileTaskStorage) QueryTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int, error) {
+	tasks, err := s.LoadAll()
+	if err != nil {
+		return nil, 0, page, pageSize, err
+	}
+	filtered := make([]*taskEntity.SyncTask, 0, len(tasks))
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		if status != "" && strings.ToUpper(string(task.Context.Status)) != strings.ToUpper(strings.TrimSpace(status)) {
+			continue
+		}
+		if keyword != "" {
+			kw := strings.ToLower(strings.TrimSpace(keyword))
+			matched := strings.Contains(strings.ToLower(task.Config.Name), kw) || strings.Contains(strings.ToLower(task.Config.ID), kw) || strings.Contains(strings.ToLower(task.Config.SourceSchema), kw) || strings.Contains(strings.ToLower(task.Config.TargetSchema), kw)
+			if !matched {
+				for _, tableName := range task.Config.Tables {
+					if strings.Contains(strings.ToLower(tableName), kw) {
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		filtered = append(filtered, task)
+	}
+	order := strings.ToLower(strings.TrimSpace(sortBy))
+	sort.Slice(filtered, func(i, j int) bool {
+		a := filtered[i]
+		b := filtered[j]
+		ai := taskStorageOrderKey(a)
+		bi := taskStorageOrderKey(b)
+		switch order {
+		case "created_at_asc":
+			return ai < bi
+		case "name_asc":
+			return strings.ToLower(a.Config.Name) < strings.ToLower(b.Config.Name)
+		case "name_desc":
+			return strings.ToLower(a.Config.Name) > strings.ToLower(b.Config.Name)
+		case "status_asc":
+			aRank := taskStatusRank(a.Context.Status)
+			bRank := taskStatusRank(b.Context.Status)
+			if aRank == bRank {
+				return ai < bi
+			}
+			return aRank < bRank
+		case "status_desc":
+			aRank := taskStatusRank(a.Context.Status)
+			bRank := taskStatusRank(b.Context.Status)
+			if aRank == bRank {
+				return ai > bi
+			}
+			return aRank > bRank
+		case "progress_asc":
+			if a.Context.ProgressPercent == b.Context.ProgressPercent {
+				return ai < bi
+			}
+			return a.Context.ProgressPercent < b.Context.ProgressPercent
+		case "progress_desc":
+			if a.Context.ProgressPercent == b.Context.ProgressPercent {
+				return ai > bi
+			}
+			return a.Context.ProgressPercent > b.Context.ProgressPercent
+		default:
+			return ai > bi
+		}
+	})
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	if page <= 0 {
+		page = 1
+	}
+	total := len(filtered)
+	start := (page - 1) * pageSize
+	if start >= total {
+		return []*taskEntity.SyncTask{}, total, page, pageSize, nil
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return filtered[start:end], total, page, pageSize, nil
 }
 
 // Close 优雅关闭任务服务
