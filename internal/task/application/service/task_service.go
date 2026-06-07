@@ -944,6 +944,25 @@ func taskDisplayTime(task *taskEntity.SyncTask) time.Time {
 	return time.Time{}
 }
 
+func taskStorageOrderKey(task *taskEntity.SyncTask) int64 {
+	if task == nil {
+		return 0
+	}
+	if task.Config.StorageID > 0 {
+		return task.Config.StorageID
+	}
+	if !task.Context.CreatedAt.IsZero() {
+		return task.Context.CreatedAt.UnixNano()
+	}
+	if !task.Context.StartTime.IsZero() {
+		return task.Context.StartTime.UnixNano()
+	}
+	if !task.Context.LastUpdateTime.IsZero() {
+		return task.Context.LastUpdateTime.UnixNano()
+	}
+	return 0
+}
+
 func (s *TaskService) GetTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

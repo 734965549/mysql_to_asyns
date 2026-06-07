@@ -3598,14 +3598,9 @@ watch(
                     <a-col :span="8">
                       <a-form-item label="排序预设">
                         <a-select v-model="taskFilters.sort">
-                          <a-option value="created_at_desc">创建时间（旧 → 新）</a-option>
-                          <a-option value="created_at_asc">创建时间（新 → 旧）</a-option>
-                          <a-option value="name_asc">任务名称（A → Z）</a-option>
-                          <a-option value="name_desc">任务名称（Z → A）</a-option>
-                          <a-option value="status_asc">状态优先（待执行 → 失败）</a-option>
-                          <a-option value="status_desc">状态优先（失败 → 待执行）</a-option>
-                          <a-option value="progress_asc">进度（低 → 高）</a-option>
-                          <a-option value="progress_desc">进度（高 → 低）</a-option>
+                          <a-option v-for="option in taskSortOptions" :key="option.value" :value="option.value">
+                            {{ option.label }}
+                          </a-option>
                         </a-select>
                       </a-form-item>
                     </a-col>
