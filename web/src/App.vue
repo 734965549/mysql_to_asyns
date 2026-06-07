@@ -1741,6 +1741,41 @@ function resetTaskFilters() {
   };
 }
 
+function getSortLabel(sortKey) {
+  const labels = {
+    created_at_desc: "创建时间（新 → 旧）",
+    created_at_asc: "创建时间（旧 → 新）",
+    name_asc: "任务名称（A → Z）",
+    name_desc: "任务名称（Z → A）",
+    status_asc: "状态优先（待执行 → 失败）",
+    status_desc: "状态优先（失败 → 待执行）",
+    progress_asc: "进度（低 → 高）",
+    progress_desc: "进度（高 → 低）",
+  };
+
+  return labels[sortKey] || sortKey;
+}
+
+function clearAllTaskFilters() {
+  resetTaskFilters();
+  fetchTasks(1, taskPagination.value.pageSize);
+}
+
+const activeTaskFilterChips = computed(() => {
+  const chips = [];
+  if (taskFilters.value.status) {
+    chips.push({ key: 'status', label: `状态：${getStatusText(taskFilters.value.status)}` });
+  }
+  if (taskFilters.value.keyword) {
+    chips.push({ key: 'keyword', label: `关键词：${taskFilters.value.keyword}` });
+  }
+  chips.push({ key: 'sort', label: `排序：${getSortLabel(taskFilters.value.sort)}` });
+  return chips;
+});
+
+const hasActiveTaskFilters = computed(() => {
+  return Boolean(taskFilters.value.status || taskFilters.value.keyword || taskFilters.value.sort !== 'created_at_desc');
+});
 
 const syncUrlDebounceState = { timer: null };
 
@@ -3441,14 +3476,14 @@ watch(
                     style="width: 160px"
                     @change="() => fetchTasks(1, taskPagination.pageSize)"
                   >
-                    <a-option value="created_at_desc">创建时间倒序</a-option>
-                    <a-option value="created_at_asc">创建时间正序</a-option>
-                    <a-option value="name_asc">名称正序</a-option>
-                    <a-option value="name_desc">名称倒序</a-option>
-                    <a-option value="status_asc">状态正序</a-option>
-                    <a-option value="status_desc">状态倒序</a-option>
-                    <a-option value="progress_asc">进度正序</a-option>
-                    <a-option value="progress_desc">进度倒序</a-option>
+                    <a-option value="created_at_desc">创建时间（新 → 旧）</a-option>
+                    <a-option value="created_at_asc">创建时间（旧 → 新）</a-option>
+                    <a-option value="name_asc">任务名称（A → Z）</a-option>
+                    <a-option value="name_desc">任务名称（Z → A）</a-option>
+                    <a-option value="status_asc">状态优先（待执行 → 失败）</a-option>
+                    <a-option value="status_desc">状态优先（失败 → 待执行）</a-option>
+                    <a-option value="progress_asc">进度（低 → 高）</a-option>
+                    <a-option value="progress_desc">进度（高 → 低）</a-option>
                   </a-select>
                   <a-input-search
                     v-model="taskFilters.keyword"
@@ -3462,39 +3497,37 @@ watch(
               </div>
             </template>
 
-            <div class="task-filter-panel">
-              <div class="task-filter-panel__header">
-                <div>
-                  <div class="task-filter-panel__title">筛选面板</div>
-                  <div class="task-filter-panel__desc">支持状态、排序与关键词组合筛选</div>
+            <a-card class="task-filter-panel" :bordered="false">
+              <template #title>
+                <div class="task-filter-panel__header">
+                  <div>
+                    <div class="task-filter-panel__title">筛选面板</div>
+                    <div class="task-filter-panel__desc">支持状态、排序与关键词组合筛选</div>
+                  </div>
+                  <div class="task-filter-panel__actions">
+                    <a-tag color="arcoblue" bordered>当前页 {{ paginatedTasks.length }} 条</a-tag>
+                    <a-button size="small" type="text" @click="clearAllTaskFilters">
+                      一键清空
+                    </a-button>
+                  </div>
                 </div>
-                <div class="task-filter-panel__actions">
-                  <a-tag color="arcoblue" bordered>当前页 {{ paginatedTasks.length }} 条</a-tag>
-                  <a-button size="small" type="text" @click="resetTaskFilters(); fetchTasks(1, taskPagination.pageSize)">重置筛选</a-button>
-                </div>
-              </div>
+              </template>
 
-              <div class="task-filter-panel__body">
-                <a-tag
-                  v-if="taskFilters.status"
-                  size="small"
-                  color="arcoblue"
-                  bordered
-                  class="filter-chip"
-                >
-                  状态：{{ getStatusText(taskFilters.status) }}
-                </a-tag>
-                <a-tag
-                  v-if="taskFilters.keyword"
-                  size="small"
-                  bordered
-                  class="filter-chip"
-                >
-                  关键词：{{ taskFilters.keyword }}
-                </a-tag>
-                <a-tag size="small" bordered class="filter-chip">
-                  排序：{{ taskFilters.sort }}
-                </a-tag>
+              <div class="task-filter-summary">
+                <div class="task-filter-summary__title">已选筛选条件</div>
+                <div v-if="activeTaskFilterChips.length > 0" class="task-filter-summary__chips">
+                  <a-tag
+                    v-for="chip in activeTaskFilterChips"
+                    :key="chip.key + chip.label"
+                    size="small"
+                    color="arcoblue"
+                    bordered
+                    class="filter-chip"
+                  >
+                    {{ chip.label }}
+                  </a-tag>
+                </div>
+                <div v-else class="task-filter-summary__empty">当前没有生效的筛选条件，将展示全部任务。</div>
               </div>
 
               <a-collapse class="advanced-filter-collapse" :default-active-key="['advanced']">
@@ -3516,14 +3549,14 @@ watch(
                     <a-col :span="8">
                       <a-form-item label="排序预设">
                         <a-select v-model="taskFilters.sort">
-                          <a-option value="created_at_desc">创建时间倒序</a-option>
-                          <a-option value="created_at_asc">创建时间正序</a-option>
-                          <a-option value="name_asc">名称正序</a-option>
-                          <a-option value="name_desc">名称倒序</a-option>
-                          <a-option value="status_asc">状态正序</a-option>
-                          <a-option value="status_desc">状态倒序</a-option>
-                          <a-option value="progress_asc">进度正序</a-option>
-                          <a-option value="progress_desc">进度倒序</a-option>
+                          <a-option value="created_at_desc">创建时间（新 → 旧）</a-option>
+                          <a-option value="created_at_asc">创建时间（旧 → 新）</a-option>
+                          <a-option value="name_asc">任务名称（A → Z）</a-option>
+                          <a-option value="name_desc">任务名称（Z → A）</a-option>
+                          <a-option value="status_asc">状态优先（待执行 → 失败）</a-option>
+                          <a-option value="status_desc">状态优先（失败 → 待执行）</a-option>
+                          <a-option value="progress_asc">进度（低 → 高）</a-option>
+                          <a-option value="progress_desc">进度（高 → 低）</a-option>
                         </a-select>
                       </a-form-item>
                     </a-col>
@@ -3535,7 +3568,7 @@ watch(
                   </a-row>
                 </a-collapse-item>
               </a-collapse>
-            </div>
+            </a-card>
 
             <div v-if="filteredTasks.length === 0" class="empty-state empty-state--card">
               <a-empty description="暂无匹配的任务">
@@ -4804,11 +4837,20 @@ watch(
 }
 
 .task-filter-panel {
-  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
-  border: 1px solid #e5eaf3;
-  border-radius: 14px;
-  padding: 14px 16px;
   margin-bottom: 18px;
+  border: 1px solid #e5eaf3;
+  border-radius: 16px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+}
+
+.task-filter-panel :deep(.arco-card-header) {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid #edf2f7;
+}
+
+.task-filter-panel :deep(.arco-card-body) {
+  padding: 16px 20px 20px;
 }
 
 .task-filter-panel__header {
@@ -4816,7 +4858,7 @@ watch(
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 10px;
+  flex-wrap: wrap;
 }
 
 .task-filter-panel__title {
@@ -4831,10 +4873,37 @@ watch(
   color: #86909c;
 }
 
-.task-filter-panel__body {
+.task-filter-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.task-filter-summary {
+  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+  border: 1px solid #e5eaf3;
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+
+.task-filter-summary__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1d2129;
+  margin-bottom: 8px;
+}
+
+.task-filter-summary__chips {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.task-filter-summary__empty {
+  font-size: 12px;
+  color: #86909c;
 }
 
 .empty-state {

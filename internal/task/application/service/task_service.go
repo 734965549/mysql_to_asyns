@@ -296,22 +296,6 @@ func (s *MySQLTaskStorage) initTable() error { // 初始化数据表
 
 	}
 
-	// 检查并添加 created_at 列（如果不存在）
-
-	var createdExists int
-
-	err = s.db.QueryRow("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name = 'sys_sync_tasks' AND column_name = 'created_at'").Scan(&createdExists)
-
-	if err == nil && createdExists == 0 {
-
-		if _, err := s.db.Exec("ALTER TABLE sys_sync_tasks ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"); err != nil {
-
-			logger.Warn("Warning: failed to add created_at column: %v", err) // 打印警告日志
-
-		}
-
-	}
-
 	// 检查并添加唯一索引（如果不存在）
 
 	var indexExists int
@@ -947,6 +931,9 @@ func taskStatusRank(status taskEntity.TaskStatus) int {
 func taskDisplayTime(task *taskEntity.SyncTask) time.Time {
 	if task == nil {
 		return time.Time{}
+	}
+	if !task.Context.CreatedAt.IsZero() {
+		return task.Context.CreatedAt
 	}
 	if !task.Context.StartTime.IsZero() {
 		return task.Context.StartTime

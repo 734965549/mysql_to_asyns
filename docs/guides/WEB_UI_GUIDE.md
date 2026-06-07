@@ -70,6 +70,36 @@ GET /api/tasks?page=1&page_size=10&status=RUNNING&keyword=order&sort=created_at_
 }
 ```
 
+#### 任务时间字段
+
+- `created_at`: 任务创建时间，由后端在任务存档中写入，并对应数据库表 `sys_sync_tasks.created_at`
+- `updated_at`: 任务更新时间，由数据库在更新任务记录时自动维护，对应 `sys_sync_tasks.updated_at`
+
+#### 任务存储表结构
+
+任务元数据存储在 `sys_sync_tasks` 中，推荐结构如下：
+
+```sql
+CREATE TABLE IF NOT EXISTS sys_sync_tasks (
+  pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  id VARCHAR(64) NOT NULL,
+  name VARCHAR(255),
+  content JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (pk_id),
+  UNIQUE KEY uk_task_id (id)
+);
+```
+
+如果你是从旧版本升级，建议由 DBA 统一执行补表脚本，示例：
+
+```sql
+ALTER TABLE sys_sync_tasks
+  ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+```
+
 #### 支持的查询参数
 
 - **page**: 页码，默认 `1`

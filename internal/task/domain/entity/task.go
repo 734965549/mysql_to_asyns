@@ -92,6 +92,7 @@ type ProcessContext struct { // 定义处理上下文结构体
 	ProgressPercent     float64     `json:"progress_percent"`       // 进度百分比
 	TotalRows           int64       `json:"total_rows"`             // 总行数
 	ProcessedRows       int64       `json:"processed_rows"`         // 已处理行数
+	CreatedAt           time.Time   `json:"created_at"`             // 创建时间
 	StartTime           time.Time   `json:"start_time"`             // 开始时间
 	EndTime             time.Time   `json:"end_time"`               // 结束时间
 	LastUpdateTime      time.Time   `json:"last_update_time"`       // 最后更新时间
@@ -124,10 +125,13 @@ type SyncTask struct { // 定义同步任务结构体
 
 // NewSyncTask 创建同步任务函数
 func NewSyncTask(config TaskConfig) *SyncTask { // 创建同步任务实例
+	now := time.Now()
 	return &SyncTask{ // 返回任务实例
 		Config: config, // 设置配置
 		Context: ProcessContext{ // 初始化上下文
-			Status: TaskStatusPending, // 设置初始状态为待执行
+			Status:    TaskStatusPending, // 设置初始状态为待执行
+			CreatedAt: now,
+			LastUpdateTime: now,
 		},
 	}
 }
