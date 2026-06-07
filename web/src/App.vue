@@ -1015,12 +1015,12 @@ async function createTask() {
 
 const scheduleModalVisible = ref(false);
 const scheduleTaskId = ref("");
-const scheduleMode = ref("cron");
+const scheduleMode = ref("immediate");
 const scheduleTime = ref("");
 const scheduleCron = ref("0 9 * * 1-5");
 const scheduleTimezone = ref(Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai");
 
-function openStartTaskModal(taskId, mode = "cron") {
+function openStartTaskModal(taskId, mode = "immediate") {
   scheduleTaskId.value = taskId;
   scheduleMode.value = mode;
   scheduleCron.value = "0 9 * * 1-5";
@@ -3718,6 +3718,7 @@ watch(
                       type="primary"
                       size="small"
                       status="success"
+                      @click="openStartTaskModal(task.config.id, 'immediate')"
                     >
                       <icon-play-arrow /> 启动
                       <template #content>
