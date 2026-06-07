@@ -911,11 +911,11 @@ func (s *TaskService) GetAllTasks() []*taskEntity.SyncTask {
 // GetTasksPage 获取分页任务列表
 func taskStatusRank(status taskEntity.TaskStatus) int {
 	switch status {
-	case taskEntity.TaskStatusRunning:
+	case taskEntity.TaskStatusPending:
 		return 0
 	case taskEntity.TaskStatusScheduled:
 		return 1
-	case taskEntity.TaskStatusPending:
+	case taskEntity.TaskStatusRunning:
 		return 2
 	case taskEntity.TaskStatusPaused:
 		return 3
