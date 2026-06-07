@@ -57,6 +57,7 @@ func SetupRouter(taskSvc *taskService.TaskService, analyzer service.IdentityAnal
 		// 任务管理
 		tasks := api.Group("/tasks") // 创建任务路由分组
 		{                            // 分组开始
+			tasks.GET("/sort-options", taskHandler.GetTaskSortOptions)     // 获取任务排序选项：GET /api/tasks/sort-options
 			tasks.POST("", taskHandler.CreateTask)                         // 创建任务路由：POST /api/tasks
 			tasks.GET("", taskHandler.GetAllTasks)                         // 获取所有任务路由：GET /api/tasks
 			tasks.GET("/:id", taskHandler.GetTask)                         // 获取任务详情路由：GET /api/tasks/:id

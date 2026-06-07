@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +31,69 @@ import (
 type TaskHandler struct { // 定义任务处理器结构体
 	taskService *taskService.TaskService         // 任务服务实例
 	analyzer    metadataService.IdentityAnalyzer // 元数据分析器实例
+}
+
+type TaskSortOption struct {
+	Value   string `json:"value"`
+	Label   string `json:"label"`
+	Default bool   `json:"default,omitempty"`
+}
+
+var taskSortOptions = []TaskSortOption{
+	{Value: "created_at_desc", Label: "创建时间（新 → 旧）", Default: true},
+	{Value: "created_at_asc", Label: "创建时间（旧 → 新）"},
+	{Value: "name_asc", Label: "任务名称（A → Z）"},
+	{Value: "name_desc", Label: "任务名称（Z → A）"},
+	{Value: "status_asc", Label: "状态优先（待执行 → 失败）"},
+	{Value: "status_desc", Label: "状态优先（失败 → 待执行）"},
+	{Value: "progress_asc", Label: "进度（低 → 高）"},
+	{Value: "progress_desc", Label: "进度（高 → 低）"},
+}
+
+func init() {
+	if options, err := loadTaskSortOptions(); err == nil && len(options) > 0 {
+		taskSortOptions = options
+	}
+}
+
+func loadTaskSortOptions() ([]TaskSortOption, error) {
+	data, err := os.ReadFile("shared/task_sort_options.json")
+	if err != nil {
+		return nil, err
+	}
+	var options []TaskSortOption
+	if err := json.Unmarshal(data, &options); err != nil {
+		return nil, err
+	}
+	if len(options) == 0 {
+		return nil, fmt.Errorf("task sort options are empty")
+	}
+	return options, nil
+}
+
+func getTaskSortDefault() string {
+	for _, opt := range taskSortOptions {
+		if opt.Default {
+			return opt.Value
+		}
+	}
+	return "created_at_desc"
+}
+
+func isValidTaskSort(sortBy string) bool {
+	for _, opt := range taskSortOptions {
+		if opt.Value == sortBy {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *TaskHandler) GetTaskSortOptions(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"default": getTaskSortDefault(),
+		"options": taskSortOptions,
+	})
 }
 
 // NewTaskHandler 创建任务处理器函数
@@ -301,6 +366,9 @@ func (h *TaskHandler) GetAllTasks(c *gin.Context) { // 获取所有任务列表
 	status := c.Query("status")
 	keyword := c.Query("keyword")
 	sortBy := c.Query("sort")
+	if !isValidTaskSort(sortBy) {
+		sortBy = getTaskSortDefault()
+	}
 
 	if v := c.Query("page"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

@@ -4,8 +4,8 @@ import { ref, onMounted, onUnmounted, watch, computed } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 
 const API_BASE = "/api";
-
-const TASK_SORT_OPTIONS = [
+const TASK_SORT_OPTIONS_URL = "/api/tasks/sort-options";
+const TASK_SORT_FALLBACK_OPTIONS = [
   {
     value: "created_at_desc",
     label: "创建时间（新 → 旧）",
@@ -41,8 +41,26 @@ const TASK_SORT_OPTIONS = [
   },
 ];
 
-const TASK_SORT_DEFAULT = TASK_SORT_OPTIONS.find((option) => option.default)?.value || "created_at_desc";
-const TASK_SORT_LABEL_MAP = Object.fromEntries(TASK_SORT_OPTIONS.map((option) => [option.value, option.label]));
+const taskSortOptions = ref([...TASK_SORT_FALLBACK_OPTIONS]);
+const taskSortDefault = ref("created_at_desc");
+const taskSortLabelMap = computed(() => Object.fromEntries(taskSortOptions.value.map((option) => [option.value, option.label])));
+
+async function loadTaskSortOptions() {
+  try {
+    const res = await fetch(TASK_SORT_OPTIONS_URL);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (Array.isArray(data.options) && data.options.length > 0) {
+      taskSortOptions.value = data.options;
+      const defaultOption = data.options.find((option) => option.default) || data.options[0];
+      if (defaultOption?.value) {
+        taskSortDefault.value = defaultOption.value;
+      }
+    }
+  } catch (e) {
+    console.warn("加载任务排序选项失败，使用本地回退定义:", e);
+  }
+}
 
 // 统一错误处理函数
 
@@ -1725,10 +1743,14 @@ onMounted(async () => {
   window.addEventListener("popstate", handlePopState);
 
   await fetchDefaultConfig();
+  await loadTaskSortOptions();
 
   fetchDatabases();
 
   loadTaskFiltersFromUrl();
+  if (!taskFilters.value.sort || !taskSortOptions.value.some((option) => option.value === taskFilters.value.sort)) {
+    taskFilters.value.sort = taskSortDefault.value;
+  }
   await fetchTasks(taskPagination.value.current, taskPagination.value.pageSize);
 
   refreshInterval = setInterval(() => {
@@ -1769,19 +1791,19 @@ const currentPage = computed(() => selectedKey.value[0]);
 const taskFilters = ref({
   status: "",
   keyword: "",
-  sort: TASK_SORT_DEFAULT,
+  sort: taskSortDefault.value,
 });
 
 function resetTaskFilters() {
   taskFilters.value = {
     status: "",
     keyword: "",
-    sort: TASK_SORT_DEFAULT,
+    sort: taskSortDefault.value,
   };
 }
 
 function getSortLabel(sortKey) {
-  return TASK_SORT_LABEL_MAP[sortKey] || sortKey;
+  return taskSortLabelMap.value[sortKey] || sortKey;
 }
 
 function clearAllTaskFilters() {
@@ -1802,7 +1824,7 @@ const activeTaskFilterChips = computed(() => {
 });
 
 const hasActiveTaskFilters = computed(() => {
-  return Boolean(taskFilters.value.status || taskFilters.value.keyword || taskFilters.value.sort !== TASK_SORT_DEFAULT);
+  return Boolean(taskFilters.value.status || taskFilters.value.keyword || taskFilters.value.sort !== taskSortDefault.value);
 });
 
 const syncUrlDebounceState = { timer: null };
@@ -3504,14 +3526,13 @@ watch(
                     style="width: 160px"
                     @change="() => fetchTasks(1, taskPagination.pageSize)"
                   >
-                    <a-option value="created_at_desc">创建时间（旧 → 新）</a-option>
-                    <a-option value="created_at_asc">创建时间（新 → 旧）</a-option>
-                    <a-option value="name_asc">任务名称（A → Z）</a-option>
-                    <a-option value="name_desc">任务名称（Z → A）</a-option>
-                    <a-option value="status_asc">状态优先（待执行 → 失败）</a-option>
-                    <a-option value="status_desc">状态优先（失败 → 待执行）</a-option>
-                    <a-option value="progress_asc">进度（低 → 高）</a-option>
-                    <a-option value="progress_desc">进度（高 → 低）</a-option>
+                    <a-option
+                      v-for="option in taskSortOptions"
+                      :key="option.value"
+                      :value="option.value"
+                    >
+                      {{ option.label }}
+                    </a-option>
                   </a-select>
                   <a-input-search
                     v-model="taskFilters.keyword"
