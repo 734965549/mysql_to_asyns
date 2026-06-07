@@ -1733,6 +1733,15 @@ const taskFilters = ref({
   sort: "created_at_desc",
 });
 
+function resetTaskFilters() {
+  taskFilters.value = {
+    status: "",
+    keyword: "",
+    sort: "created_at_desc",
+  };
+}
+
+
 const syncUrlDebounceState = { timer: null };
 
 function syncTaskFiltersToUrl() {
@@ -3397,23 +3406,28 @@ watch(
 
           <a-card class="task-list-card">
             <template #title>
-              <div
-                style="
-                  display: flex;
-                  align-items: center;
-                  justify-content: space-between;
-                  width: 100%;
-                "
-              >
-                <span>任务列表</span>
-                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
+              <div class="task-list-header">
+                <div class="task-list-title-wrap">
+                  <a-typography-title :heading="6" style="margin: 0">
+                    任务列表
+                  </a-typography-title>
+                  <a-typography-text type="secondary">
+                    统一筛选、排序与搜索，帮助快速定位任务
+                  </a-typography-text>
+                </div>
+
+                <div class="task-list-toolbar">
+                  <a-tag color="arcoblue" size="small" bordered>
+                    共 {{ taskPagination.total }} 条
+                  </a-tag>
                   <a-select
                     v-model="taskFilters.status"
-                    placeholder="状态"
+                    placeholder="任务状态"
                     allow-clear
-                    style="width: 130px"
-                    @change="() => fetchTasks(1, taskPagination.value.pageSize)"
+                    style="width: 150px"
+                    @change="() => fetchTasks(1, taskPagination.pageSize)"
                   >
+                    <a-option value="">全部</a-option>
                     <a-option value="PENDING">待执行</a-option>
                     <a-option value="RUNNING">运行中</a-option>
                     <a-option value="PAUSED">已暂停</a-option>
@@ -3423,8 +3437,8 @@ watch(
                   </a-select>
                   <a-select
                     v-model="taskFilters.sort"
-                    placeholder="排序"
-                    style="width: 150px"
+                    placeholder="排序方式"
+                    style="width: 160px"
                     @change="() => fetchTasks(1, taskPagination.pageSize)"
                   >
                     <a-option value="created_at_desc">创建时间倒序</a-option>
@@ -3438,165 +3452,253 @@ watch(
                   </a-select>
                   <a-input-search
                     v-model="taskFilters.keyword"
-                    placeholder="搜索任务名称/ID/表名..."
-                    style="width: 280px"
+                    placeholder="搜索任务名称 / ID / 表名"
+                    style="width: 320px"
                     allow-clear
-                    @search="() => fetchTasks(1, taskPagination.value.pageSize)"
-                    @clear="() => fetchTasks(1, taskPagination.value.pageSize)"
+                    @search="() => fetchTasks(1, taskPagination.pageSize)"
+                    @clear="() => fetchTasks(1, taskPagination.pageSize)"
                   />
                 </div>
               </div>
             </template>
 
-            <div v-if="filteredTasks.length === 0" class="empty-state">
-              <a-empty description="暂无匹配的任务">
-                <a-button type="primary" @click="openCreateDialog"
-                  >创建任务</a-button
+            <div class="task-filter-panel">
+              <div class="task-filter-panel__header">
+                <div>
+                  <div class="task-filter-panel__title">筛选面板</div>
+                  <div class="task-filter-panel__desc">支持状态、排序与关键词组合筛选</div>
+                </div>
+                <div class="task-filter-panel__actions">
+                  <a-tag color="arcoblue" bordered>当前页 {{ paginatedTasks.length }} 条</a-tag>
+                  <a-button size="small" type="text" @click="resetTaskFilters(); fetchTasks(1, taskPagination.pageSize)">重置筛选</a-button>
+                </div>
+              </div>
+
+              <div class="task-filter-panel__body">
+                <a-tag
+                  v-if="taskFilters.status"
+                  size="small"
+                  color="arcoblue"
+                  bordered
+                  class="filter-chip"
                 >
+                  状态：{{ getStatusText(taskFilters.status) }}
+                </a-tag>
+                <a-tag
+                  v-if="taskFilters.keyword"
+                  size="small"
+                  bordered
+                  class="filter-chip"
+                >
+                  关键词：{{ taskFilters.keyword }}
+                </a-tag>
+                <a-tag size="small" bordered class="filter-chip">
+                  排序：{{ taskFilters.sort }}
+                </a-tag>
+              </div>
+
+              <a-collapse class="advanced-filter-collapse" :default-active-key="['advanced']">
+                <a-collapse-item key="advanced" header="高级筛选">
+                  <a-row :gutter="12">
+                    <a-col :span="8">
+                      <a-form-item label="快速筛选">
+                        <a-select v-model="taskFilters.status" allow-clear placeholder="按状态筛选">
+                          <a-option value="">全部</a-option>
+                          <a-option value="PENDING">待执行</a-option>
+                          <a-option value="RUNNING">运行中</a-option>
+                          <a-option value="PAUSED">已暂停</a-option>
+                          <a-option value="SCHEDULED">已计划</a-option>
+                          <a-option value="COMPLETED">已完成</a-option>
+                          <a-option value="FAILED">失败</a-option>
+                        </a-select>
+                      </a-form-item>
+                    </a-col>
+                    <a-col :span="8">
+                      <a-form-item label="排序预设">
+                        <a-select v-model="taskFilters.sort">
+                          <a-option value="created_at_desc">创建时间倒序</a-option>
+                          <a-option value="created_at_asc">创建时间正序</a-option>
+                          <a-option value="name_asc">名称正序</a-option>
+                          <a-option value="name_desc">名称倒序</a-option>
+                          <a-option value="status_asc">状态正序</a-option>
+                          <a-option value="status_desc">状态倒序</a-option>
+                          <a-option value="progress_asc">进度正序</a-option>
+                          <a-option value="progress_desc">进度倒序</a-option>
+                        </a-select>
+                      </a-form-item>
+                    </a-col>
+                    <a-col :span="8">
+                      <a-form-item label="关键词搜索">
+                        <a-input-search v-model="taskFilters.keyword" placeholder="任务名 / ID / 表名" allow-clear @search="() => fetchTasks(1, taskPagination.pageSize)" @clear="() => fetchTasks(1, taskPagination.pageSize)" />
+                      </a-form-item>
+                    </a-col>
+                  </a-row>
+                </a-collapse-item>
+              </a-collapse>
+            </div>
+
+            <div v-if="filteredTasks.length === 0" class="empty-state empty-state--card">
+              <a-empty description="暂无匹配的任务">
+                <a-button type="primary" @click="openCreateDialog">
+                  创建任务
+                </a-button>
               </a-empty>
             </div>
 
-            <a-list v-else :bordered="false">
+            <a-list v-else :bordered="false" class="task-list">
               <a-list-item
                 v-for="task in paginatedTasks"
                 :key="task.config.id"
                 class="task-item"
               >
                 <a-card :bordered="false" class="task-card-inner">
-                  <div class="task-header">
-                    <div class="task-title">
-                      <a-typography-title :heading="6" style="margin: 0">
-                        {{ task.config.name }}
-                      </a-typography-title>
+                  <div class="task-card-grid">
+                    <div class="task-card-main">
+                      <div class="task-header">
+                        <div class="task-title">
+                          <a-typography-title :heading="6" style="margin: 0">
+                            {{ task.config.name }}
+                          </a-typography-title>
 
-                      <a-tag
-                        :color="getStatusColor(task.context.status)"
-                        size="small"
-                      >
-                        {{ getStatusText(task.context.status) }}
-                      </a-tag>
-                      <a-tag
-                        v-if="task.context.status === 'SCHEDULED' && task.context.scheduled_at"
-                        color="arcoblue"
-                        size="small"
-                      >
-                        <icon-clock-circle /> {{ formatScheduledTime(task) }}
-                      </a-tag>
-                      <!-- 目标端类型 Badge -->
-                      <a-tag
-                        v-if="
-                          task.config.sink_configs &&
-                          task.config.sink_configs.length > 0
-                        "
-                        :color="
-                          task.config.sink_configs.length > 1
-                            ? 'purple'
-                            : task.config.sink_configs[0].type === 'KAFKA'
-                              ? 'orange'
-                              : task.config.sink_configs[0].type ===
-                                  'HTTP_WEBHOOK'
-                                ? 'green'
-                                : 'blue'
-                        "
-                        size="small"
-                        bordered
-                      >
-                        {{
-                          task.config.sink_configs.length > 1
-                            ? "MULTI-SINK"
-                            : getSinkTypeLabel(task.config.sink_configs[0].type)
-                        }}
-                      </a-tag>
-                      <a-tag v-else color="blue" size="small" bordered
-                        >MySQL 数据库</a-tag
-                      >
-                    </div>
-                  </div>
-
-                  <a-descriptions :column="4" size="small" class="task-desc">
-                    <a-descriptions-item label="同步级别">
-                      {{
-                        task.config.sync_level === "DATABASE"
-                          ? "库级别"
-                          : "表级别"
-                      }}
-                    </a-descriptions-item>
-
-                    <a-descriptions-item label="源库">
-                      <template
-                        v-if="
-                          task.config.sync_level === 'DATABASE' &&
-                          task.config.source_databases?.length
-                        "
-                      >
-                        <a-tag
-                          v-for="db in task.config.source_databases"
-                          :key="db"
-                          size="small"
-                          color="arcoblue"
-                          style="margin-right: 4px"
-                          >{{ db }}</a-tag
-                        >
-                      </template>
-
-                      <template v-else>{{
-                        task.config.source_schema || "-"
-                      }}</template>
-                    </a-descriptions-item>
-
-                    <a-descriptions-item label="目标端">
-                      <!-- 根据目标类型显示不同的目标信息 -->
-                      <template
-                        v-if="
-                          task.config.sink_configs &&
-                          task.config.sink_configs.length > 0
-                        "
-                      >
-                        <template v-if="task.config.sink_configs.length > 1">
-                          <a-tag size="small" color="purple"
-                            >{{
-                              task.config.sink_configs.length
+                          <a-tag
+                            :color="getStatusColor(task.context.status)"
+                            size="small"
+                            bordered
+                            class="task-status-tag"
+                          >
+                            {{ getStatusText(task.context.status) }}
+                          </a-tag>
+                          <a-tag
+                            v-if="task.context.status === 'SCHEDULED' && task.context.scheduled_at"
+                            color="arcoblue"
+                            size="small"
+                            bordered
+                            class="task-status-tag"
+                          >
+                            <icon-clock-circle /> {{ formatScheduledTime(task) }}
+                          </a-tag>
+                          <a-tag
+                            v-if="
+                              task.config.sink_configs &&
+                              task.config.sink_configs.length > 0
+                            "
+                            :color="
+                              task.config.sink_configs.length > 1
+                                ? 'purple'
+                                : task.config.sink_configs[0].type === 'KAFKA'
+                                  ? 'orange'
+                                  : task.config.sink_configs[0].type ===
+                                      'HTTP_WEBHOOK'
+                                    ? 'green'
+                                    : 'blue'
+                            "
+                            size="small"
+                            bordered
+                            class="task-status-tag"
+                          >
+                            {{
+                              task.config.sink_configs.length > 1
+                                ? 'MULTI-SINK'
+                                : getSinkTypeLabel(task.config.sink_configs[0].type)
                             }}
-                            个目标端</a-tag
-                          >
-                        </template>
-                        <template v-else>
+                          </a-tag>
+                          <a-tag v-else color="blue" size="small" bordered class="task-status-tag">MySQL 数据库</a-tag>
+                        </div>
+                      </div>
+
+                      <a-descriptions :column="4" size="small" class="task-desc">
+                        <a-descriptions-item label="同步级别">
+                          {{
+                            task.config.sync_level === "DATABASE"
+                              ? "库级别"
+                              : "表级别"
+                          }}
+                        </a-descriptions-item>
+
+                        <a-descriptions-item label="源库">
                           <template
-                            v-if="task.config.sink_configs[0].type === 'KAFKA'"
-                          >
-                            <a-tag
-                              size="small"
-                              color="orange"
-                              style="max-width: 150px"
-                              class="text-ellipsis"
-                              :title="
-                                task.config.sink_configs[0].options?.topic
-                              "
-                            >
-                              Topic:
-                              {{
-                                task.config.sink_configs[0].options?.topic ||
-                                "-"
-                              }}
-                            </a-tag>
-                          </template>
-                          <template
-                            v-else-if="
-                              task.config.sink_configs[0].type ===
-                              'HTTP_WEBHOOK'
+                            v-if="
+                              task.config.sync_level === 'DATABASE' &&
+                              task.config.source_databases?.length
                             "
                           >
                             <a-tag
+                              v-for="db in task.config.source_databases"
+                              :key="db"
                               size="small"
-                              color="green"
-                              style="max-width: 150px"
-                              class="text-ellipsis"
-                              :title="task.config.sink_configs[0].options?.url"
+                              color="arcoblue"
+                              class="inline-tag"
+                              bordered
+                              >{{ db }}</a-tag
                             >
-                              {{
-                                task.config.sink_configs[0].options?.url || "-"
-                              }}
-                            </a-tag>
+                          </template>
+
+                          <template v-else>{{ task.config.source_schema || '-' }}</template>
+                        </a-descriptions-item>
+
+                        <a-descriptions-item label="目标端">
+                          <template
+                            v-if="
+                              task.config.sink_configs &&
+                              task.config.sink_configs.length > 0
+                            "
+                          >
+                            <template v-if="task.config.sink_configs.length > 1">
+                              <a-tag size="small" color="purple" bordered>
+                                {{ task.config.sink_configs.length }} 个目标端
+                              </a-tag>
+                            </template>
+                            <template v-else>
+                              <template
+                                v-if="task.config.sink_configs[0].type === 'KAFKA'"
+                              >
+                                <a-tag
+                                  size="small"
+                                  color="orange"
+                                  class="text-ellipsis inline-tag"
+                                  bordered
+                                  :title="task.config.sink_configs[0].options?.topic"
+                                >
+                                  Topic: {{ task.config.sink_configs[0].options?.topic || '-' }}
+                                </a-tag>
+                              </template>
+                              <template
+                                v-else-if="task.config.sink_configs[0].type === 'HTTP_WEBHOOK'"
+                              >
+                                <a-tag
+                                  size="small"
+                                  color="green"
+                                  class="text-ellipsis inline-tag"
+                                  bordered
+                                  :title="task.config.sink_configs[0].options?.url"
+                                >
+                                  {{ task.config.sink_configs[0].options?.url || '-' }}
+                                </a-tag>
+                              </template>
+                              <template v-else>
+                                <template
+                                  v-if="
+                                    task.config.sync_level === 'DATABASE' &&
+                                    task.config.target_databases?.length
+                                  "
+                                >
+                                  <a-tag
+                                    v-for="db in task.config.target_databases"
+                                    :key="db"
+                                    size="small"
+                                    color="green"
+                                    class="inline-tag"
+                                    bordered
+                                    >{{ db }}</a-tag
+                                  >
+                                </template>
+                                <template v-else>{{
+                                  task.config.sink_configs[0].options?.target_schema ||
+                                  task.config.target_schema ||
+                                  '-'
+                                }}</template>
+                              </template>
+                            </template>
                           </template>
                           <template v-else>
                             <template
@@ -3610,156 +3712,116 @@ watch(
                                 :key="db"
                                 size="small"
                                 color="green"
-                                style="margin-right: 4px"
+                                class="inline-tag"
+                                bordered
                                 >{{ db }}</a-tag
                               >
                             </template>
-                            <template v-else>{{
-                              task.config.sink_configs[0].options
-                                ?.target_schema ||
-                              task.config.target_schema ||
-                              "-"
-                            }}</template>
+                            <template v-else>{{ task.config.target_schema || '-' }}</template>
                           </template>
-                        </template>
-                      </template>
-                      <template v-else>
-                        <template
-                          v-if="
-                            task.config.sync_level === 'DATABASE' &&
-                            task.config.target_databases?.length
-                          "
-                        >
-                          <a-tag
-                            v-for="db in task.config.target_databases"
-                            :key="db"
-                            size="small"
-                            color="green"
-                            style="margin-right: 4px"
-                            >{{ db }}</a-tag
-                          >
-                        </template>
-                        <template v-else>{{
-                          task.config.target_schema || "-"
-                        }}</template>
-                      </template>
-                    </a-descriptions-item>
+                        </a-descriptions-item>
 
-                    <a-descriptions-item label="表数量">
-                      {{
-                        task.config.sync_level === "DATABASE"
-                          ? "全库"
-                          : task.config.tables?.length || 0
-                      }}
-                    </a-descriptions-item>
-                  </a-descriptions>
+                        <a-descriptions-item label="表数量">
+                          {{
+                            task.config.sync_level === "DATABASE"
+                              ? "全库"
+                              : task.config.tables?.length || 0
+                          }}
+                        </a-descriptions-item>
+                      </a-descriptions>
 
-                  <!-- 进度条 -->
+                      <div
+                        v-if="task.context.status === 'RUNNING'"
+                        class="task-progress"
+                      >
+                        <a-progress
+                          :percent="getProgress(task) / 100"
+                          :stroke-width="12"
+                          status="normal"
+                          :show-text="false"
+                          style="flex: 1; margin: 0"
+                          size="large"
+                          color="var(--color-primary-light-4)"
+                          track-color="var(--color-fill-2)"
+                          animation
+                        />
 
-                  <div
-                    v-if="task.context.status === 'RUNNING'"
-                    class="task-progress"
-                  >
-                    <a-progress
-                      :percent="getProgress(task) / 100"
-                      :stroke-width="12"
-                      status="normal"
-                      :show-text="false"
-                      style="flex: 1; margin: 0"
-                      size="large"
-                      color="var(--color-primary-light-4)"
-                      track-color="var(--color-fill-2)"
-                      animation
-                    />
-
-                    <div class="progress-details">
-                      <span class="progress-text">
-                        已处理: {{ task.context.processed_rows || 0 }} /
-                        {{ task.context.total_rows || 0 }}
-                      </span>
-                      <span class="progress-percent-text">{{ getProgress(task) }}%</span>
+                        <div class="progress-details">
+                          <span class="progress-text">
+                            已处理: {{ task.context.processed_rows || 0 }} /
+                            {{ task.context.total_rows || 0 }}
+                          </span>
+                          <span class="progress-percent-text">{{ getProgress(task) }}%</span>
+                        </div>
+                      </div>
                     </div>
-                  </div>
 
-                  <!-- 操作按钮 -->
+                    <div class="task-card-actions">
+                      <a-button size="small" @click="showTaskDetail(task)">
+                        <template #icon><icon-eye /></template>
+                        详情
+                      </a-button>
 
-                  <div class="task-actions">
-                    <a-button size="small" @click="showTaskDetail(task)">
-                      <template #icon><icon-eye /></template>
+                      <a-button size="small" @click="openDuplicateFromTask(task)">
+                        <template #icon><icon-copy /></template>
+                        复制新建
+                      </a-button>
 
-                      详情
-                    </a-button>
+                      <a-button
+                        v-if="task.context.status === 'PENDING' || task.context.status === 'PAUSED'"
+                        size="small"
+                        @click="openEditDialog(task)"
+                      >
+                        <template #icon><icon-edit /></template>
+                        编辑
+                      </a-button>
 
-                    <a-button size="small" @click="openDuplicateFromTask(task)">
-                      <template #icon><icon-copy /></template>
+                      <a-dropdown-button
+                        v-if="task.context.status === 'PENDING' || task.context.status === 'PAUSED' || task.context.status === 'FAILED'"
+                        type="primary"
+                        size="small"
+                        status="success"
+                        @click="openStartTaskModal(task.config.id, 'immediate')"
+                      >
+                        <icon-play-arrow /> 启动
+                        <template #content>
+                          <a-doption @click="openStartTaskModal(task.config.id, 'cron')">Cron 定时启动</a-doption>
+                        </template>
+                      </a-dropdown-button>
 
-                      复制新建
-                    </a-button>
-
-                    <a-button
-                      v-if="
-                        task.context.status === 'PENDING' ||
-                        task.context.status === 'PAUSED'
-                      "
-                      size="small"
-                      @click="openEditDialog(task)"
-                    >
-                      <template #icon><icon-edit /></template>
-
-                      编辑
-                    </a-button>
-
-                    <a-dropdown-button
-                      v-if="
-                        task.context.status === 'PENDING' ||
-                        task.context.status === 'PAUSED' ||
-                        task.context.status === 'FAILED'
-                      "
-                      type="primary"
-                      size="small"
-                      status="success"
-                      @click="openStartTaskModal(task.config.id, 'immediate')"
-                    >
-                      <icon-play-arrow /> 启动
-                      <template #content>
-                        <a-doption @click="openStartTaskModal(task.config.id, 'cron')">Cron 定时启动</a-doption>
+                      <template v-if="task.context.status === 'SCHEDULED'">
+                        <a-tooltip :content="'计划启动: ' + formatScheduledTime(task)">
+                          <a-button
+                            size="small"
+                            status="warning"
+                            @click="cancelSchedule(task.config.id)"
+                          >
+                            <template #icon><icon-clock-circle /></template>
+                            取消定时
+                          </a-button>
+                        </a-tooltip>
                       </template>
-                    </a-dropdown-button>
 
-                    <template v-if="task.context.status === 'SCHEDULED'">
-                      <a-tooltip :content="'计划启动: ' + formatScheduledTime(task)">
-                        <a-button
-                          size="small"
-                          status="warning"
-                          @click="cancelSchedule(task.config.id)"
-                        >
-                          <template #icon><icon-clock-circle /></template>
-                          取消定时
-                        </a-button>
-                      </a-tooltip>
-                    </template>
+                      <a-button
+                        v-if="task.context.status === 'RUNNING'"
+                        size="small"
+                        status="warning"
+                        @click="pauseTask(task.config.id)"
+                      >
+                        <template #icon><icon-pause /></template>
+                        暂停
+                      </a-button>
 
-                    <a-button
-                      v-if="task.context.status === 'RUNNING'"
-                      size="small"
-                      status="warning"
-                      @click="pauseTask(task.config.id)"
-                    >
-                      <template #icon><icon-pause /></template>
-
-                      暂停
-                    </a-button>
-
-                    <a-button
-                      v-if="task.context.status !== 'RUNNING' && task.context.status !== 'SCHEDULED'"
-                      size="small"
-                      status="danger"
-                      @click="deleteTask(task.config.id)"
-                    >
-                      <template #icon><icon-delete /></template>
-
-                      删除
-                    </a-button>
+                      <a-button
+                        v-if="task.context.status !== 'RUNNING' && task.context.status !== 'SCHEDULED'"
+                        size="small"
+                        status="danger"
+                        @click="deleteTask(task.config.id)"
+                      >
+                        <template #icon><icon-delete /></template>
+                        删除
+                      </a-button>
+                    </div>
                   </div>
                 </a-card>
               </a-list-item>
@@ -3782,216 +3844,164 @@ watch(
 
         <!-- 系统配置页面 -->
 
-        <div v-show="taskFormPage === 'none' && currentPage === 'config'">
-          <a-card title="系统配置 (etc/application.toml)">
+        <div v-show="taskFormPage === 'none' && currentPage === 'config'" class="config-page-shell">
+          <div class="config-hero">
+            <div>
+              <a-typography-title :heading="4" style="margin: 0 0 8px 0">系统配置</a-typography-title>
+              <a-typography-text type="secondary">统一管理服务监听、日志、默认数据库与任务持久化配置。</a-typography-text>
+            </div>
+            <a-tag color="arcoblue" bordered>配置文件：etc/application.toml</a-tag>
+          </div>
+
+          <a-row :gutter="16" class="config-summary-row">
+            <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="HTTP 端口" :value="configForm.http.port" /></a-card></a-col>
+            <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="Redis DB" :value="configForm.redis.db" /></a-card></a-col>
+            <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="日志级别" :value="configForm.log.level?.toUpperCase() || '-'" /></a-card></a-col>
+          </a-row>
+
+          <a-card class="config-page-card" :bordered="false">
             <a-form :model="configForm" layout="vertical" @submit="saveConfig">
-              <a-row :gutter="32">
-                <!-- 基础配置 -->
-
+              <a-row :gutter="20">
                 <a-col :span="12">
-                  <a-typography-title :heading="6"
-                    >HTTP 服务配置</a-typography-title
-                  >
+                  <a-card class="config-section-card" :bordered="false">
+                    <template #title>基础连接</template>
 
-                  <a-form-item label="监听地址">
-                    <a-input
-                      v-model="configForm.http.host"
-                      placeholder="0.0.0.0"
-                    />
-                  </a-form-item>
-
-                  <a-form-item label="监听端口">
-                    <a-input-number
-                      v-model="configForm.http.port"
-                      :min="1"
-                      :max="65535"
-                    />
-                  </a-form-item>
-
-                  <a-typography-title :heading="6" style="margin-top: 20px"
-                    >Redis 状态持久化配置</a-typography-title
-                  >
-
-                  <a-form-item label="主机">
-                    <a-input
-                      v-model="configForm.redis.host"
-                      placeholder="127.0.0.1"
-                    />
-                  </a-form-item>
-
-                  <a-form-item label="端口">
-                    <a-input-number
-                      v-model="configForm.redis.port"
-                      :min="1"
-                      :max="65535"
-                    />
-                  </a-form-item>
-
-                  <a-form-item label="密码">
-                    <a-input-password
-                      v-model="configForm.redis.password"
-                      placeholder="留空表示无密码"
-                    />
-                  </a-form-item>
-
-                  <a-form-item label="数据库索引 (DB)">
-                    <a-input-number
-                      v-model="configForm.redis.db"
-                      :min="0"
-                      :max="15"
-                    />
-                  </a-form-item>
-                </a-col>
-
-                <!-- 日志配置（支持热加载） -->
-
-                <a-col :span="12">
-                  <a-typography-title :heading="6">
-                    日志配置
-                    <a-tag color="green" size="small" style="margin-left: 8px; vertical-align: middle">热加载</a-tag>
-                  </a-typography-title>
-
-                  <a-form-item label="日志级别">
-                    <a-select v-model="configForm.log.level">
-                      <a-option value="debug">Debug</a-option>
-
-                      <a-option value="info">Info</a-option>
-
-                      <a-option value="warn">Warn</a-option>
-
-                      <a-option value="error">Error</a-option>
-                    </a-select>
-                  </a-form-item>
-
-                  <a-form-item label="输出开关">
-                    <a-space direction="vertical">
-                      <a-checkbox v-model="configForm.log.console.enable">
-                        开启控制台标准输出 (Stdout)
-                      </a-checkbox>
-
-                      <a-checkbox v-model="configForm.log.file.enable">
-                        开启文件持久化输出 (File)
-                      </a-checkbox>
-                    </a-space>
-                  </a-form-item>
-
-                  <a-form-item>
-                    <a-button
-                      type="primary"
-                      status="success"
-                      :loading="logApplying"
-                      @click="applyLogConfig"
-                      style="width: 100%"
-                    >
-                      <template #icon><icon-sync /></template>
-                      立即应用日志配置（无需重启）
-                    </a-button>
-                    <div style="margin-top: 4px; color: #86909c; font-size: 12px">
-                      修改日志级别或输出开关后点击此按钮，配置即刻生效并持久化到配置文件
-                    </div>
-                  </a-form-item>
-
-                  <a-typography-title :heading="6" style="margin-top: 20px"
-                    >默认数据库环境 (用于元数据浏览)</a-typography-title
-                  >
-
-                  <a-form-item label="默认源库地址">
-                    <a-input v-model="configForm.datasource.host" />
-                  </a-form-item>
-
-                  <a-form-item label="默认目标库地址">
-                    <a-input v-model="configForm.target.host" />
-                  </a-form-item>
-
-                  <a-form-item label="调试模式 (Debug)">
-                    <a-switch v-model="configForm.datasource.debug" />
-                  </a-form-item>
-
-                  <a-typography-title :heading="6" style="margin-top: 20px"
-                    >任务数据持久化配置</a-typography-title
-                  >
-
-                  <a-form-item label="持久化模式">
-                    <a-radio-group
-                      v-model="configForm.storage.mode"
-                      type="button"
-                    >
-                      <a-radio value="file">本地文件</a-radio>
-
-                      <a-radio value="mysql">MySQL 数据库</a-radio>
-                    </a-radio-group>
-                  </a-form-item>
-
-                  <template v-if="configForm.storage.mode === 'file'">
-                    <a-form-item label="数据目录">
-                      <a-input
-                        v-model="configForm.storage.data_dir"
-                        placeholder="data"
-                      />
-                    </a-form-item>
-                  </template>
-
-                  <template v-if="configForm.storage.mode === 'mysql'">
-                    <a-form-item label="MySQL 主机">
-                      <a-input
-                        v-model="configForm.storage.host"
-                        placeholder="127.0.0.1"
-                      />
+                    <a-form-item label="HTTP 监听地址">
+                      <a-input v-model="configForm.http.host" placeholder="0.0.0.0" />
                     </a-form-item>
 
-                    <a-row :gutter="16">
+                    <a-form-item label="HTTP 监听端口">
+                      <a-input-number v-model="configForm.http.port" :min="1" :max="65535" style="width: 100%" />
+                    </a-form-item>
+
+                    <a-divider orientation="left" style="margin: 16px 0">Redis 状态持久化</a-divider>
+
+                    <a-form-item label="Redis 主机">
+                      <a-input v-model="configForm.redis.host" placeholder="127.0.0.1" />
+                    </a-form-item>
+
+                    <a-row :gutter="12">
                       <a-col :span="12">
-                        <a-form-item label="端口">
-                          <a-input-number
-                            v-model="configForm.storage.port"
-                            :min="1"
-                            :max="65535"
-                          />
+                        <a-form-item label="Redis 端口">
+                          <a-input-number v-model="configForm.redis.port" :min="1" :max="65535" style="width: 100%" />
                         </a-form-item>
                       </a-col>
-
                       <a-col :span="12">
-                        <a-form-item label="数据库">
-                          <a-input v-model="configForm.storage.database" />
+                        <a-form-item label="数据库索引 (DB)">
+                          <a-input-number v-model="configForm.redis.db" :min="0" :max="15" style="width: 100%" />
                         </a-form-item>
                       </a-col>
                     </a-row>
 
-                    <a-form-item label="用户名">
-                      <a-input v-model="configForm.storage.username" />
+                    <a-form-item label="Redis 密码">
+                      <a-input-password v-model="configForm.redis.password" placeholder="留空表示无密码" />
+                    </a-form-item>
+                  </a-card>
+                </a-col>
+
+                <a-col :span="12">
+                  <a-card class="config-section-card" :bordered="false">
+                    <template #title>
+                      <span>日志与默认环境</span>
+                      <a-tag color="green" size="small" style="margin-left: 8px">热加载</a-tag>
+                    </template>
+
+                    <a-form-item label="日志级别">
+                      <a-select v-model="configForm.log.level">
+                        <a-option value="debug">Debug</a-option>
+                        <a-option value="info">Info</a-option>
+                        <a-option value="warn">Warn</a-option>
+                        <a-option value="error">Error</a-option>
+                      </a-select>
                     </a-form-item>
 
-                    <a-form-item label="密码">
-                      <a-input-password v-model="configForm.storage.password" />
+                    <a-form-item label="输出开关">
+                      <a-space direction="vertical" style="width: 100%">
+                        <a-checkbox v-model="configForm.log.console.enable">开启控制台标准输出 (Stdout)</a-checkbox>
+                        <a-checkbox v-model="configForm.log.file.enable">开启文件持久化输出 (File)</a-checkbox>
+                      </a-space>
                     </a-form-item>
-                  </template>
+
+                    <a-form-item>
+                      <a-button type="primary" status="success" :loading="logApplying" @click="applyLogConfig" style="width: 100%">
+                        <template #icon><icon-sync /></template>
+                        立即应用日志配置（无需重启）
+                      </a-button>
+                      <div class="config-hint">修改日志级别或输出开关后点击此按钮，配置即刻生效并持久化到配置文件。</div>
+                    </a-form-item>
+
+                    <a-divider orientation="left" style="margin: 16px 0">默认数据库环境</a-divider>
+
+                    <a-form-item label="默认源库地址">
+                      <a-input v-model="configForm.datasource.host" />
+                    </a-form-item>
+
+                    <a-form-item label="默认目标库地址">
+                      <a-input v-model="configForm.target.host" />
+                    </a-form-item>
+
+                    <a-form-item label="调试模式 (Debug)">
+                      <a-switch v-model="configForm.datasource.debug" />
+                    </a-form-item>
+                  </a-card>
                 </a-col>
               </a-row>
 
-              <div
-                style="
-                  margin-top: 30px;
-                  text-align: center;
-                  border-top: 1px solid #f0f0f0;
-                  padding-top: 20px;
-                "
-              >
-                <a-button
-                  type="primary"
-                  size="large"
-                  :loading="configLoading"
-                  @click="saveConfig"
-                >
+              <a-card class="config-section-card config-storage-card" :bordered="false">
+                <template #title>
+                  <span>任务数据持久化</span>
+                </template>
+
+                <a-form-item label="持久化模式">
+                  <a-radio-group v-model="configForm.storage.mode" type="button">
+                    <a-radio value="file">本地文件</a-radio>
+                    <a-radio value="mysql">MySQL 数据库</a-radio>
+                  </a-radio-group>
+                </a-form-item>
+
+                <template v-if="configForm.storage.mode === 'file'">
+                  <a-form-item label="数据目录">
+                    <a-input v-model="configForm.storage.data_dir" placeholder="data" />
+                  </a-form-item>
+                </template>
+
+                <template v-if="configForm.storage.mode === 'mysql'">
+                  <a-row :gutter="16">
+                    <a-col :span="8">
+                      <a-form-item label="MySQL 主机">
+                        <a-input v-model="configForm.storage.host" placeholder="127.0.0.1" />
+                      </a-form-item>
+                    </a-col>
+                    <a-col :span="4">
+                      <a-form-item label="端口">
+                        <a-input-number v-model="configForm.storage.port" :min="1" :max="65535" style="width: 100%" />
+                      </a-form-item>
+                    </a-col>
+                    <a-col :span="6">
+                      <a-form-item label="数据库">
+                        <a-input v-model="configForm.storage.database" />
+                      </a-form-item>
+                    </a-col>
+                    <a-col :span="6">
+                      <a-form-item label="用户名">
+                        <a-input v-model="configForm.storage.username" />
+                      </a-form-item>
+                    </a-col>
+                  </a-row>
+
+                  <a-form-item label="密码">
+                    <a-input-password v-model="configForm.storage.password" />
+                  </a-form-item>
+                </template>
+              </a-card>
+
+              <div class="config-actions-bar">
+                <a-button type="primary" size="large" :loading="configLoading" @click="saveConfig">
                   保存并同步到 application.toml
                 </a-button>
-
-                <div style="margin-top: 12px">
-                  <a-typography-text type="secondary">
-                    <icon-info-circle />
-                    注意：修改配置后将直接改写服务器磁盘文件，部分底层服务（如端口监听）需重启
-                    Go 程序生效。
-                  </a-typography-text>
-                </div>
+                <a-typography-text type="secondary">
+                  <icon-info-circle /> 修改配置后将直接改写服务器磁盘文件，部分底层服务（如端口监听）需重启 Go 程序生效。
+                </a-typography-text>
               </div>
             </a-form>
           </a-card>
@@ -4756,13 +4766,92 @@ watch(
 }
 
 .task-list-card {
-  border-radius: 8px;
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+  border: 1px solid rgba(229, 231, 235, 0.9);
+  overflow: hidden;
+}
+
+.task-list-card :deep(.arco-card-header) {
+  border-bottom: 1px solid #edf2f7;
+  padding: 20px 24px 16px;
+}
+
+.task-list-card :deep(.arco-card-body) {
+  padding: 20px 24px 24px;
+}
+
+.task-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.task-list-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.task-list-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.task-filter-panel {
+  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+  border: 1px solid #e5eaf3;
+  border-radius: 14px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+}
+
+.task-filter-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.task-filter-panel__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1d2129;
+}
+
+.task-filter-panel__desc {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #86909c;
+}
+
+.task-filter-panel__body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .empty-state {
   padding: 60px 0;
 
   text-align: center;
+}
+
+.empty-state--card {
+  background: #fbfcfe;
+  border: 1px dashed #dfe5ef;
+  border-radius: 14px;
+  margin: 4px 0 18px;
+}
+
+.task-list {
+  margin-top: 4px;
 }
 
 .task-item {
@@ -4778,11 +4867,43 @@ watch(
 }
 
 .task-card-inner {
-  background: #fafbfc;
-
-  border-radius: 8px;
-
+  background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%);
+  border: 1px solid #edf2f7;
+  border-radius: 14px;
   width: 100%;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+}
+
+.task-card-inner :deep(.arco-card-body) {
+  padding: 20px;
+}
+
+.task-card-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 240px;
+  gap: 16px;
+  align-items: start;
+}
+
+.task-card-main {
+  min-width: 0;
+}
+
+.task-card-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+  justify-content: flex-start;
+  padding-left: 16px;
+  border-left: 1px solid #edf2f7;
+  position: sticky;
+  top: 12px;
+}
+
+.task-card-actions :deep(.arco-btn) {
+  width: 100%;
+  justify-content: center;
 }
 
 .task-header {
@@ -4800,11 +4921,55 @@ watch(
 
   align-items: center;
 
-  gap: 12px;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.task-status-tag {
+  margin-right: 0;
+}
+
+.inline-tag {
+  margin-right: 6px;
+  margin-bottom: 4px;
 }
 
 .task-desc {
   margin-bottom: 12px;
+}
+
+.task-progress {
+  padding: 14px 16px;
+  background: #f8fbff;
+  border: 1px solid #e6f0ff;
+  border-radius: 12px;
+}
+
+.progress-details {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  margin-top: 8px;
+}
+
+.progress-text {
+  font-size: 12px;
+  color: var(--color-text-3);
+}
+
+.progress-percent-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-primary-light-4);
+}
+
+.task-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid #edf2f7;
 }
 
 .task-progress {
