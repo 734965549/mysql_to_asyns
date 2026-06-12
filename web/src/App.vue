@@ -1134,6 +1134,26 @@ function formatScheduledTime(task) {
   return "";
 }
 
+// 取消定时启动
+
+async function cancelSchedule(taskId) {
+  try {
+    const res = await fetch(`${API_BASE}/tasks/${taskId}/cancel-schedule`, {
+      method: "POST",
+    });
+
+    if (res.ok) {
+      fetchTasks();
+      Message.success("已取消定时启动");
+    } else {
+      const errorMsg = await handleApiError(res, "取消定时失败");
+      Message.error(errorMsg);
+    }
+  } catch (e) {
+    Message.error("取消定时失败: " + e.message);
+  }
+}
+
 // 暂停任务
 
 async function pauseTask(taskId) {
