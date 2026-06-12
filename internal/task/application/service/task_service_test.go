@@ -42,6 +42,10 @@ func (s *failingTaskStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
 	return nil, nil
 }
 
+func (s *failingTaskStorage) QueryTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int, error) {
+	return nil, 0, page, pageSize, s.err
+}
+
 func (m *mockAnalyzer) AnalyzeTable(schema, tableName string) (*entity.TableIdentity, error) {
 	return &entity.TableIdentity{
 		TableName:    tableName,

@@ -115,6 +115,29 @@ type ProcessContext struct { // 定义处理上下文结构体
 	FullSyncStartPosition   string     `json:"full_sync_start_position,omitempty"`  // 全量启动时捕获的 binlog 位点 "file:pos"（增量的起点）
 	LastIncrementalPosition string     `json:"last_incremental_position,omitempty"` // 最近一次成功落库的增量位点 "file:pos"
 	FullSyncFailedReason    string     `json:"full_sync_failed_reason,omitempty"`   // 全量失败原因（便于排查；SyncPhase=FULL_FAILED 时填充）
+
+	// === 全量同步断点续传 ===
+	// 记录每张表的全量同步进度，key = "sourceSchema.tableName"。暂停/重启后据此跳过已完成的表，
+	// 并让未完成的表从上次"已提交"的主键位置继续。随任务存档落盘，进程重启也不丢。
+	FullSyncResume map[string]*TableSyncProgress `json:"full_sync_resume,omitempty"`
+}
+
+// ResumeKey 续传游标：主键各列的字符串化值（单列主键长度为 1，复合主键按列顺序）。
+// interface{} 主键值（含 []byte / int / string 等）统一转为字符串持久化，
+// 回填给 ReadBatchByKeys 作为 SQL bind 参数（字符串可被 MySQL 隐式转换为目标列类型）。
+type ResumeKey struct {
+	Vals []string `json:"vals"`
+}
+
+// TableSyncProgress 单表全量同步断点。
+type TableSyncProgress struct {
+	Done             bool               `json:"done"`                        // 该表是否已完整同步
+	ReadPath         string             `json:"read_path,omitempty"`         // 读取路径：keyset / range / sample / nopk
+	IntraWorkers     int                `json:"intra_workers,omitempty"`     // 首跑时的表内并行度（变化则分片游标失效）
+	Cursor           *ResumeKey         `json:"cursor,omitempty"`            // 单线程 keyset 路径整表游标
+	ShardCursors     map[int]*ResumeKey `json:"shard_cursors,omitempty"`     // 并行路径每分片游标，key = worker 序号
+	SampleBoundaries []*ResumeKey       `json:"sample_boundaries,omitempty"` // sample 路径首跑边界，续传复用以保证分片确定性
+	ProcessedRows    int64              `json:"processed_rows,omitempty"`    // 该表已处理行数（仅用于展示/排查）
 }
 
 // SyncTask 同步任务
@@ -306,6 +329,69 @@ func (t *SyncTask) HasFullSyncEverCompleted() bool {
 func (t *SyncTask) FullSyncIncomplete() bool {
 	return t.Context.SyncPhase == SyncPhaseFullStarted ||
 		t.Context.SyncPhase == SyncPhaseFullFailed
+}
+
+// ResetFullSyncResume 清空所有表的全量续传断点（全新一轮全量开始时调用）。
+func (t *SyncTask) ResetFullSyncResume() {
+	t.Context.FullSyncResume = nil
+}
+
+// GetTableProgress 返回指定表的续传断点；不存在时返回 nil。
+func (t *SyncTask) GetTableProgress(tableKey string) *TableSyncProgress {
+	if t.Context.FullSyncResume == nil {
+		return nil
+	}
+	return t.Context.FullSyncResume[tableKey]
+}
+
+// ensureTableProgress 获取（或创建）指定表的续传断点。
+func (t *SyncTask) ensureTableProgress(tableKey string) *TableSyncProgress {
+	if t.Context.FullSyncResume == nil {
+		t.Context.FullSyncResume = make(map[string]*TableSyncProgress)
+	}
+	p := t.Context.FullSyncResume[tableKey]
+	if p == nil {
+		p = &TableSyncProgress{}
+		t.Context.FullSyncResume[tableKey] = p
+	}
+	return p
+}
+
+// InitTableProgress 记录该表本次同步采用的读取路径与并行度（用于续传时校验断点是否仍然有效）。
+func (t *SyncTask) InitTableProgress(tableKey, readPath string, intraWorkers int) {
+	p := t.ensureTableProgress(tableKey)
+	p.ReadPath = readPath
+	p.IntraWorkers = intraWorkers
+}
+
+// SetTableCursor 记录单线程 keyset 路径整表游标。
+func (t *SyncTask) SetTableCursor(tableKey string, key *ResumeKey) {
+	p := t.ensureTableProgress(tableKey)
+	p.Cursor = key
+}
+
+// SetShardCursor 记录并行路径某分片的游标。
+func (t *SyncTask) SetShardCursor(tableKey string, shard int, key *ResumeKey) {
+	p := t.ensureTableProgress(tableKey)
+	if p.ShardCursors == nil {
+		p.ShardCursors = make(map[int]*ResumeKey)
+	}
+	p.ShardCursors[shard] = key
+}
+
+// SetSampleBoundaries 持久化 sample 路径首跑的采样边界，续传时复用以保证分片确定性。
+func (t *SyncTask) SetSampleBoundaries(tableKey string, boundaries []*ResumeKey) {
+	p := t.ensureTableProgress(tableKey)
+	p.SampleBoundaries = boundaries
+}
+
+// MarkTableDone 标记某表已完整同步，并清理其游标以释放存档体积。
+func (t *SyncTask) MarkTableDone(tableKey string) {
+	p := t.ensureTableProgress(tableKey)
+	p.Done = true
+	p.Cursor = nil
+	p.ShardCursors = nil
+	p.SampleBoundaries = nil
 }
 
 // EffectiveIntraTableWorkers 计算单表内实际并行 worker 数。intraConfigured<=0 时：取表级 worker 数且封顶 legacyCap；>0 时显式配置，封顶 hardMax。

@@ -1858,7 +1858,7 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 		}
 
 		if task.FullSyncIncomplete() {
-			logger.Warn("[Task %s] Previous full sync did not complete (phase=%q, reason=%q); restarting full sync from scratch",
+			logger.Warn("[Task %s] Previous full sync did not complete (phase=%q, reason=%q); resuming full sync from saved checkpoints (completed tables skipped, partial tables continue from last committed key)",
 				taskID, task.Context.SyncPhase, task.Context.FullSyncFailedReason,
 			)
 		}
@@ -1909,6 +1909,10 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		logger.Info("[Task %s] Full sync skipped: task already stopped before any work was done", taskID)
 		return errFullSyncStoppedByUser
 	}
+
+	// 续传断点生命周期：仅当处于"全量未完成中间态"（暂停/失败留下）且未开启 DROP TABLE 时保留断点，
+	// 其余情况（全新一轮、或会重建目标表）一律清空，确保不会沿用陈旧断点。必须在 MarkFullSyncStarted 之前调用。
+	s.resetResumeIfFresh(taskID)
 
 	// 构建 (sourceSchema, targetSchema) 对列表
 
@@ -2166,6 +2170,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
 		t.MarkFullSyncCompleted()
 	})
+
+	// 全量整体完成，续传断点已无意义，清空以释放存档体积。
+	s.clearFullSyncResume(taskID)
 
 	logger.Info("[Task %s] Full sync completed (phase=FULL_COMPLETED, estimated rows=%d, start_position=%q)",
 		taskID, estimatedRows, startPosStr)
@@ -2425,6 +2432,19 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			targetIdentity := *identity
 			targetIdentity.TableName = targetTableName
 
+			// === 全量断点续传：读取该表已有进度 ===
+			tableKey := fullSyncTableKey(sourceSchema, tableName)
+			canResume := resumeEnabled(task)
+			var tableProgress *taskEntity.TableSyncProgress
+			if canResume {
+				tableProgress = s.getTableProgress(taskID, tableKey)
+				// 已完整同步过的表：直接跳过数据同步与索引处理（索引在首次完成时已恢复）。
+				if tableProgress != nil && tableProgress.Done {
+					logger.Info("[Task %s] Resume: table %s.%s already completed, skipping", taskID, sourceSchema, tableName)
+					return
+				}
+			}
+
 			savedIndexes := append([]map[string]interface{}(nil), preparedIndexes...)
 
 			if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
@@ -2588,6 +2608,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			if identity.Strategy == entity.FullColumnsStrategy {
 
 				// 无主键表：单协程流式读取 + 事务批量提交
+				// 无主键无法行级续传，只支持表级（被中断则整表重跑，依赖 INSERT IGNORE 幂等）。
+				if canResume {
+					s.initTableProgress(taskID, tableKey, "nopk", 1)
+				}
 
 				conn, err := runtime.targetDB.Conn(ctx)
 
@@ -2803,6 +2827,19 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					taskID, sourceSchema, tableName, minPK, maxPK, intraWorkers, chunkSize)
 
+				// 续传：自旋启动 worker 前快照各分片断点（仅当并行度一致时有效），避免与 worker 写入竞争。
+				// 分片由 minPK/maxPK/intraWorkers 确定性推导，重启时分片划分一致，故按分片序号续传安全。
+				var rangeShardSeeds map[int]*taskEntity.ResumeKey
+				if canResume {
+					if tableProgress != nil && tableProgress.IntraWorkers == intraWorkers && len(tableProgress.ShardCursors) > 0 {
+						rangeShardSeeds = make(map[int]*taskEntity.ResumeKey, len(tableProgress.ShardCursors))
+						for k, v := range tableProgress.ShardCursors {
+							rangeShardSeeds[k] = v
+						}
+					}
+					s.initTableProgress(taskID, tableKey, "range", intraWorkers)
+				}
+
 				for w := 0; w < intraWorkers; w++ {
 
 					syncWg.Add(1)
@@ -2892,7 +2929,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}()
 
-						doWrite := func(rows []map[string]interface{}, mark string) error {
+						doWrite := func(rows []map[string]interface{}, mark string, rkey *taskEntity.ResumeKey) error {
 
 							for attempt := 0; ; attempt++ {
 
@@ -2962,6 +2999,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 								curTx = nil
 
+								// 提交成功后推进本分片续传游标。
+								if canResume {
+									s.recordResumeCursor(taskID, tableKey, wIdx, rkey)
+								}
+
 							}
 
 							return nil
@@ -2969,6 +3011,16 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 						}
 
 						lastID := startBoundary
+
+						// 续传：本分片从上次已提交的主键之后继续（分片划分确定性，序号一致）。
+						if canResume && rangeShardSeeds != nil {
+							if rk := rangeShardSeeds[wIdx]; rk != nil {
+								if cur, ok := resumeKeyToInt64(rk); ok && cur >= workerStart {
+									lastID = interface{}(cur)
+									logger.Info("[Task %s] Resume: table %s.%s w%d continue after %d", taskID, sourceSchema, tableName, wIdx, cur)
+								}
+							}
+						}
 
 						rangeMark := fmt.Sprintf("%s.%s:w%d:keyset", sourceSchema, tableName, wIdx)
 
@@ -3060,7 +3112,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 								taskID, wIdx, rangeMark, len(batch), firstPK, lastPK)
 
-							if err := doWrite(batch, rangeMark); err != nil {
+							if err := doWrite(batch, rangeMark, resumeKeyFromValue(lastPK)); err != nil {
 
 								syncErrChan <- err
 
@@ -3135,6 +3187,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			} else if canParallelSample {
 
 				// 非数值单列主键 / 复合主键：采样边界 + 表内并行 keyset + 每 worker 独立事务批量提交
+				// 采样边界与主键值多为字符串/二进制类型，comparePKValues 按字符串比较，
+				// 跨进程重建游标会因类型表示差异（[]byte vs string）破坏边界比较，故该路径仅支持表级续传：
+				// 完成则跳过，未完成则整表重跑（INSERT IGNORE 幂等）。
+				if canResume {
+					s.initTableProgress(taskID, tableKey, "sample", intraWorkers)
+				}
 
 				pkCol := identity.IdentifyCols[0]
 
@@ -3478,7 +3536,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}()
 
-				doWrite := func(rows []map[string]interface{}, mark string) error {
+				if canResume {
+					s.initTableProgress(taskID, tableKey, "keyset", 1)
+				}
+
+				doWrite := func(rows []map[string]interface{}, mark string, rkey *taskEntity.ResumeKey) error {
 
 					if curTx == nil {
 
@@ -3530,6 +3592,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						curTx = nil
 
+						// 提交成功后推进整表续传游标（shard=-1 表示单线程 keyset）。
+						if canResume {
+							s.recordResumeCursor(taskID, tableKey, -1, rkey)
+						}
+
 					}
 
 					return nil
@@ -3539,6 +3606,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				dr := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
 
 				var lastID interface{}
+
+				// 续传：从上次已提交的整表游标之后继续读取。
+				if canResume && tableProgress != nil && tableProgress.Cursor != nil {
+					lastID = lastIDFromResumeKey(tableProgress.Cursor, len(identity.IdentifyCols))
+					logger.Info("[Task %s] Resume: table %s.%s keyset continue after %v", taskID, sourceSchema, tableName, lastID)
+				}
 
 				for {
 
@@ -3574,9 +3647,13 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					pkCols := identity.IdentifyCols
 
+					var rkey *taskEntity.ResumeKey
+
 					if len(pkCols) == 1 {
 
 						lastID = lastRow[pkCols[0]]
+
+						rkey = resumeKeyFromValue(lastID)
 
 					} else {
 
@@ -3590,11 +3667,13 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						lastID = vals
 
+						rkey = resumeKeyFromValues(vals)
+
 					}
 
 					mark := fmt.Sprintf("%s.%s:%v", sourceSchema, tableName, lastID)
 
-					if err := doWrite(rows, mark); err != nil {
+					if err := doWrite(rows, mark, rkey); err != nil {
 
 						errMsg := fmt.Sprintf("Write failed for `%s`.`%s`: %v", sourceSchema, tableName, err)
 
@@ -3650,6 +3729,11 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
+			}
+
+			// 该表全量同步完成：记录断点为 Done，重启时直接跳过。
+			if canResume {
+				s.markTableDone(taskID, tableKey)
 			}
 
 			logger.Info("[Task %s] Table %s.%s -> %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, targetSchema, targetTableName, tableProcessedRows)
@@ -4767,6 +4851,163 @@ func (s *TaskService) isTaskStopped(taskID string) bool {
 
 	return task.Context.Status != taskEntity.TaskStatusRunning
 
+}
+
+// === 全量同步断点续传辅助 ===
+
+// fullSyncTableKey 生成续传断点的表键（与 FullSyncResume 的 key 保持一致）。
+func fullSyncTableKey(schema, table string) string {
+	return schema + "." + table
+}
+
+// stringifyKeyVal 把主键列值统一转为字符串以便持久化（[]byte 转字符串，其余用 %v）。
+func stringifyKeyVal(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case []byte:
+		return string(x)
+	case string:
+		return x
+	default:
+		return fmt.Sprintf("%v", x)
+	}
+}
+
+// resumeKeyFromValue 由单列主键值构造续传游标。
+func resumeKeyFromValue(v interface{}) *taskEntity.ResumeKey {
+	return &taskEntity.ResumeKey{Vals: []string{stringifyKeyVal(v)}}
+}
+
+// resumeKeyFromValues 由复合主键值构造续传游标。
+func resumeKeyFromValues(vals []interface{}) *taskEntity.ResumeKey {
+	out := make([]string, len(vals))
+	for i, v := range vals {
+		out[i] = stringifyKeyVal(v)
+	}
+	return &taskEntity.ResumeKey{Vals: out}
+}
+
+// lastIDFromResumeKey 把续传游标还原为 ReadBatchByKeys 所需的 lastID。
+// pkCols<=1 返回标量字符串；>1 返回 []interface{}（各列字符串）。无效返回 nil。
+func lastIDFromResumeKey(rk *taskEntity.ResumeKey, pkCols int) interface{} {
+	if rk == nil || len(rk.Vals) == 0 {
+		return nil
+	}
+	if pkCols <= 1 {
+		return rk.Vals[0]
+	}
+	out := make([]interface{}, len(rk.Vals))
+	for i, v := range rk.Vals {
+		out[i] = v
+	}
+	return out
+}
+
+// resumeKeyToInt64 解析数值主键续传游标，失败返回 (0,false)。
+func resumeKeyToInt64(rk *taskEntity.ResumeKey) (int64, bool) {
+	if rk == nil || len(rk.Vals) == 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(rk.Vals[0]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// resumeEnabled 判断该任务是否启用续传。开启了"DDL 前 DROP TABLE"时每次重启都会重建目标表，
+// 续传无意义且会因跳过已 DROP 的表而丢数据，故此时禁用续传。
+func resumeEnabled(task *taskEntity.SyncTask) bool {
+	return task != nil && !task.Config.EnableDropTableBeforeDDL
+}
+
+// resetResumeIfFresh 在全量开始时按需清空续传断点：
+// 仅当处于"全量未完成中间态"且未开启 DROP TABLE 时保留断点（真正的续传），否则视为全新一轮清空。
+func (s *TaskService) resetResumeIfFresh(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return
+	}
+	if !task.FullSyncIncomplete() || task.Config.EnableDropTableBeforeDDL {
+		task.ResetFullSyncResume()
+		s.storage.Save(task)
+	}
+}
+
+// clearFullSyncResume 清空续传断点（全量完成后调用）。
+func (s *TaskService) clearFullSyncResume(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if task, exists := s.tasks[taskID]; exists {
+		task.ResetFullSyncResume()
+		s.storage.Save(task)
+	}
+}
+
+// getTableProgress 在锁保护下读取某表的续传断点（返回 nil 表示无）。
+func (s *TaskService) getTableProgress(taskID, tableKey string) *taskEntity.TableSyncProgress {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if task, exists := s.tasks[taskID]; exists {
+		return task.GetTableProgress(tableKey)
+	}
+	return nil
+}
+
+// initTableProgress 记录某表本次采用的读取路径与并行度（供续传时校验断点有效性）。
+func (s *TaskService) initTableProgress(taskID, tableKey, readPath string, intraWorkers int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if task, exists := s.tasks[taskID]; exists {
+		task.InitTableProgress(tableKey, readPath, intraWorkers)
+		s.storage.Save(task)
+	}
+}
+
+// recordResumeCursor 在事务提交成功后记录某表/分片游标（shard<0 表示整表 keyset 游标）。
+func (s *TaskService) recordResumeCursor(taskID, tableKey string, shard int, key *taskEntity.ResumeKey) {
+	if key == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return
+	}
+	if shard < 0 {
+		task.SetTableCursor(tableKey, key)
+	} else {
+		task.SetShardCursor(tableKey, shard, key)
+	}
+	s.storage.Save(task)
+}
+
+// saveSampleBoundaries 持久化 sample 路径首跑的采样边界（单列主键），供续传复用以保证分片确定性。
+func (s *TaskService) saveSampleBoundaries(taskID, tableKey string, boundaries []interface{}) {
+	keys := make([]*taskEntity.ResumeKey, len(boundaries))
+	for i, b := range boundaries {
+		keys[i] = resumeKeyFromValue(b)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if task, exists := s.tasks[taskID]; exists {
+		task.SetSampleBoundaries(tableKey, keys)
+		s.storage.Save(task)
+	}
+}
+
+// markTableDone 标记某表全量同步完成。
+func (s *TaskService) markTableDone(taskID, tableKey string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if task, exists := s.tasks[taskID]; exists {
+		task.MarkTableDone(tableKey)
+		s.storage.Save(task)
+	}
 }
 
 // updateTaskProgress 更新任务进度
