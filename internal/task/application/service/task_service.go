@@ -5036,13 +5036,15 @@ func (s *TaskService) ScheduleTaskWithRepeat(taskID string, scheduledAt time.Tim
 
 // ScheduleCronTask 设置 cron 定时启动。
 func (s *TaskService) ScheduleCronTask(taskID string, scheduledAt time.Time, expr, timezone string) error {
-	if err := s.ScheduleTask(taskID, scheduledAt); err != nil {
-		return err
-	}
 	if strings.TrimSpace(expr) == "" {
 		return fmt.Errorf("cron expression cannot be empty")
 	}
+	// 先校验 cron 表达式合法性，避免设置无效的定时任务
 	if _, _, err := parseCronExpression(expr, timezone, scheduledAt.Location()); err != nil {
+		return fmt.Errorf("invalid cron expression %q: %w", expr, err)
+	}
+
+	if err := s.ScheduleTask(taskID, scheduledAt); err != nil {
 		return err
 	}
 
@@ -5054,9 +5056,20 @@ func (s *TaskService) ScheduleCronTask(taskID string, scheduledAt time.Time, exp
 		return fmt.Errorf("task not found: %s", taskID)
 	}
 	task.ConfigureCronSchedule(expr, timezone)
+
+	// cron 模式下首次执行时间应由 cron 表达式计算得出，而非沿用传入的基准时间（通常是“当前时刻”），
+	// 否则调度器会在下一秒立即启动任务，而不是等到 cron 指定的时刻。
+	next, err := nextCronRun(task, time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to compute next cron run for %q: %w", expr, err)
+	}
+	task.Context.ScheduledAt = &next
+	task.Context.LastUpdateTime = time.Now()
+
 	if err := s.storage.Save(task); err != nil {
 		return fmt.Errorf("failed to save cron schedule state: %w", err)
 	}
+	logger.Info("[Task %s] Cron 定时启动已设置: expr=%q tz=%q, 下次执行时间 %s", taskID, expr, timezone, next.Format(time.RFC3339))
 	return nil
 }
 

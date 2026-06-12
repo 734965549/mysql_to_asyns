@@ -243,7 +243,14 @@ func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 	}
 
 	if req.ScheduledAt != nil { // 定时启动
-		if req.ScheduledAt.Before(time.Now()) { // 校验时间不能是过去
+		isCron := strings.EqualFold(req.ScheduleMode, "cron")
+		logger.Info("[Task %s] 收到定时启动请求: mode=%q scheduled_at=%s cron=%q tz=%q",
+			taskID, req.ScheduleMode, req.ScheduledAt.Format(time.RFC3339), req.CronExpression, req.CronTimezone)
+
+		// cron 模式的实际执行时间由 cron 表达式决定，scheduled_at 仅为基准时间，
+		// 不应校验它是否早于当前时间（否则会因网络/处理耗时导致校验必然失败）。
+		if !isCron && req.ScheduledAt.Before(time.Now()) { // 校验时间不能是过去
+			logger.Warn("[Task %s] 定时启动校验失败: 时间 %s 早于当前时间", taskID, req.ScheduledAt.Format(time.RFC3339))
 			c.JSON(http.StatusBadRequest, gin.H{"error": "定时启动时间不能早于当前时间"})
 			return
 		}
@@ -255,13 +262,14 @@ func (h *TaskHandler) StartTask(c *gin.Context) { // 启动指定任务
 			c.JSON(http.StatusBadRequest, gin.H{"error": "repeat_interval_sec 不能小于 0"})
 			return
 		}
-		if strings.EqualFold(req.ScheduleMode, "cron") {
+		if isCron {
 			if strings.TrimSpace(req.CronExpression) == "" {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "cron_expression 不能为空"})
 				return
 			}
 			if err := h.taskService.ScheduleCronTask(taskID, *req.ScheduledAt, req.CronExpression, req.CronTimezone); err != nil {
 				errMsg := err.Error()
+				logger.Warn("[Task %s] 设置 cron 定时启动失败: %s", taskID, errMsg)
 				if strings.Contains(errMsg, "task not found") {
 					c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
 				} else {
