@@ -22,6 +22,7 @@
 
 - [配置说明](CONFIGURATION.md) - 配置文件详细说明和性能调优指南
 - [增量同步指南](guides/INCREMENTAL_SYNC_GUIDE.md) - 增量同步功能使用说明
+- [全量续传指南](guides/FULL_SYNC_RESUME_GUIDE.md) - 全量暂停/重启后的表级与行级断点续传
 - [Web UI使用指南](guides/WEB_UI_GUIDE.md) - Web管理界面使用说明和最佳实践
 
 ### 🎨 设计文档
@@ -67,6 +68,7 @@ mysql-to-async/
 - **任务管理**: [P0优化报告](optimization/P0_OPTIMIZATION_REPORT.md#1-任务存储持久化-)
 - **审计日志**: [P0优化报告](optimization/P0_OPTIMIZATION_REPORT.md#2-审计日志实现-)
 - **增量同步**: [增量同步指南](guides/INCREMENTAL_SYNC_GUIDE.md)
+- **全量续传**: [全量续传指南](guides/FULL_SYNC_RESUME_GUIDE.md)
 - **监控指标**: [P2优化报告](optimization/P2_OPTIMIZATION_REPORT.md#4-prometheus监控指标-)
 
 ### 部署运维
@@ -114,6 +116,7 @@ mysql-to-async/
 ## 📝 文档维护
 
 ### 更新日志
+- 2026-06-12: 全量同步断点续传（`full_sync_resume`）；新增 [全量续传指南](guides/FULL_SYNC_RESUME_GUIDE.md)
 - 2026-03-30: TaskService 改为任务级 runtime 隔离，支持并发启动任务
 - 2026-03-30: 新增并发启动隔离单测 `TestStartTask_ConcurrentRuntimeIsolation`
 - 2026-03-25: 添加数据库和表搜索框功能，支持实时过滤和模糊匹配
@@ -142,6 +145,6 @@ mysql-to-async/
 
 ---
 
-**文档版本**: v1.0  
-**最后更新**: 2026-03-20  
+**文档版本**: v1.1  
+**最后更新**: 2026-06-12  
 **维护者**: MySQL-to-Async Team

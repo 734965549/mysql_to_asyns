@@ -3,6 +3,7 @@ package infrastructure // 声明当前文件属于infrastructure包，用于基�
 import ( // 导入外部包和标准库
 	"database/sql"                                    // 导入database/sql包，用于数据库操作
 	"fmt"                                             // 导入fmt包，用于格式化输入输出
+	"strings"                                         // 字符串处理
 	"mysql-to-async/internal/metadata/domain/entity"  // 导入实体包
 	"mysql-to-async/internal/metadata/domain/service" // 导入服务包
 )
@@ -21,7 +22,7 @@ func NewSchemaDetector(db *sql.DB) *SchemaDetector { // 创建Schema探测器实
 func (d *SchemaDetector) GetTableColumns(schema, tableName string) ([]entity.ColumnMeta, error) { // 获取表的所有列信息
 	// 定义SQL查询语句
 	query := `
-		SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT
+		SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA
 		FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION
@@ -38,8 +39,9 @@ func (d *SchemaDetector) GetTableColumns(schema, tableName string) ([]entity.Col
 		var col entity.ColumnMeta        // 定义列元数据
 		var isNullable, columnKey string // 定义可空性和键类型
 		var defaultValue sql.NullString  // 定义默认值
+		var extra string                 // 列额外属性（含 auto_increment）
 
-		err := rows.Scan(&col.Name, &col.DataType, &isNullable, &columnKey, &defaultValue) // 扫描行数据
+		err := rows.Scan(&col.Name, &col.DataType, &isNullable, &columnKey, &defaultValue, &extra) // 扫描行数据
 		if err != nil {                                                                    // 如果扫描失败
 			return nil, err // 返回错误
 		}
@@ -47,6 +49,7 @@ func (d *SchemaDetector) GetTableColumns(schema, tableName string) ([]entity.Col
 		col.IsNullable = isNullable == "YES"  // 设置是否可空
 		col.IsPrimaryKey = columnKey == "PRI" // 设置是否主键
 		col.IsUnique = columnKey == "UNI"     // 设置是否唯一
+		col.IsAutoIncrement = strings.Contains(strings.ToLower(extra), "auto_increment")
 		if defaultValue.Valid {               // 如果默认值有效
 			col.DefaultValue = defaultValue.String // 设置默认值
 		}

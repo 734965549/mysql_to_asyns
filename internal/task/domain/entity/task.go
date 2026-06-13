@@ -39,8 +39,11 @@ const ( // 定义常量
 
 // SyncPhase 同步阶段（独立于 TaskStatus 的细粒度阶段标志，用于恢复时区分"全量未完成 / 全量已完成 / 增量已接管"）。
 //
-// TaskStatus 描述任务整体运行/暂停/失败，SyncPhase 描述同步进度处在哪个阶段；恢复决策（要不要重跑全量、能不能直接接增量）
-// 完全基于 SyncPhase，不再仅靠 TaskConfig.Mode 和 binlog 位点是否存在做判断。
+// TaskStatus 描述任务整体运行/暂停/失败，SyncPhase 描述同步进度处在哪个阶段。
+// 恢复决策分两层：
+//   - 阶段级：要不要重跑全量、能不能直接接增量 → 看 SyncPhase（HasFullSyncEverCompleted / FullSyncIncomplete）
+//   - 全量表级/行级：暂停后续传从哪张表、哪个主键继续 → 看 FullSyncResume（见 docs/guides/FULL_SYNC_RESUME_GUIDE.md）
+// 增量 binlog 位点由 checkpoint.Manager 管理，与 FullSyncResume 无关。
 type SyncPhase string
 
 const (
@@ -80,7 +83,7 @@ type TaskConfig struct { // 定义任务配置结构体
 	EnableLimitOne           bool            `json:"enable_limit_one"`             // 无主键表LIMIT 1保护
 	OptimizeIndex            bool            `json:"optimize_index"`               // 索引优化：先删除非主键索引，数据迁移完成后再重建
 	EnableReadOnly           bool            `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
-	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS（库级别/表级别）
+	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后禁用全量断点续传
 	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`          // 源数据库配置（可选，覆盖配置文件）
 	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`          // 目标数据库配置（可选，覆盖配置文件）
 }
@@ -130,6 +133,9 @@ type ResumeKey struct {
 }
 
 // TableSyncProgress 单表全量同步断点。
+//
+// 读取路径 read_path 取值：keyset（单线程主键顺序）、range（数值主键并行分片）、
+// sample（采样边界并行）、nopk（无主键流式）。range/keyset 支持行级续传；sample/nopk 仅表级。
 type TableSyncProgress struct {
 	Done             bool               `json:"done"`                        // 该表是否已完整同步
 	ReadPath         string             `json:"read_path,omitempty"`         // 读取路径：keyset / range / sample / nopk
@@ -325,7 +331,8 @@ func (t *SyncTask) HasFullSyncEverCompleted() bool {
 }
 
 // FullSyncIncomplete 返回全量是否处于"开始过但未完成"的中间态（崩溃/暂停/失败留下的不一致快照）。
-// 该状态下不允许直接接增量，必须重跑全量。
+// 该状态下不允许直接接增量；再次启动时会结合 FullSyncResume 做表级/行级续传（未开启 DROP TABLE 时），
+// 而非盲目整库从头重读。
 func (t *SyncTask) FullSyncIncomplete() bool {
 	return t.Context.SyncPhase == SyncPhaseFullStarted ||
 		t.Context.SyncPhase == SyncPhaseFullFailed

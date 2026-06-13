@@ -429,6 +429,51 @@ func TestCursorReader_ScanRowsWithByteData(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestBuildCompositeKeysetWhere(t *testing.T) {
+	t.Run("2列", func(t *testing.T) {
+		where, args := buildCompositeKeysetWhere([]string{"id", "device_id"}, []interface{}{"8bfe", "TA00"})
+		assert.Equal(t, "(`id` = ? AND `device_id` > ?) OR (`id` > ?)", where)
+		assert.Equal(t, []interface{}{"8bfe", "TA00", "8bfe"}, args)
+	})
+	t.Run("3列", func(t *testing.T) {
+		where, args := buildCompositeKeysetWhere(
+			[]string{"a", "b", "c"},
+			[]interface{}{1, 2, 3},
+		)
+		assert.Equal(t, "(`a` = ? AND `b` = ? AND `c` > ?) OR (`a` = ? AND `b` > ?) OR (`a` > ?)", where)
+		assert.Equal(t, []interface{}{1, 2, 3, 1, 2, 1}, args)
+	})
+}
+
+func TestRangeShardingReader_ReadBatchByKeys_CompositePK(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "device_id"}, {Name: "payload"}},
+		IdentifyCols: []string{"id", "device_id"},
+		CursorCols:   []string{"id", "device_id"},
+	}
+
+	rows := sqlmock.NewRows([]string{"id", "device_id", "payload"}).
+		AddRow("8bff", "TA01", "data1")
+	mock.ExpectQuery("SELECT `id`, `device_id`, `payload` FROM `test_db`.`devices` WHERE .* ORDER BY `id`, `device_id` ASC LIMIT .*").
+		WithArgs("8bfe", "TA00", "8bfe", int64(10)).
+		WillReturnRows(rows)
+
+	reader := NewRangeShardingReader(db, "test_db", "devices", identity)
+	results, err := reader.ReadBatchByKeys(context.Background(), []interface{}{"8bfe", "TA00"}, 10)
+
+	assert.NoError(t, err)
+	assert.Len(t, results, 1)
+	assert.Equal(t, "TA01", results[0]["device_id"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestRangeShardingReader_EmptyIdentifyCols(t *testing.T) {
 	db, _, err := sqlmock.New()
 	if err != nil {

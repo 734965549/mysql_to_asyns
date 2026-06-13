@@ -13,10 +13,23 @@ const ( // 定义常量
 type TableIdentity struct { // 定义表标识结构体，用于唯一标识一条记录
 	TableName    string           // 表名
 	Strategy     IdentityStrategy // 标识策略：使用何种方式标识记录
-	IdentifyCols []string         // 标识列集合：用于标识记录的列名
+	IdentifyCols []string         // 标识列集合：用于标识记录的列名（UPDATE/DELETE 匹配）
+	CursorCols   []string         // 游标/分片列：全量读取分页用；复合主键含自增列时仅含该自增列
 	Columns      []ColumnMeta     // 所有列信息：表的所有列的元数据
 	HasPK        bool             // 是否有主键：表是否存在主键
 	HasUK        bool             // 是否有唯一键：表是否存在唯一键
+}
+
+// EffectiveCursorCols 返回用于分页/分片的游标列。
+// 复合主键含自增列时仅返回该自增列；否则与 IdentifyCols 一致。
+func (t *TableIdentity) EffectiveCursorCols() []string {
+	if t == nil {
+		return nil
+	}
+	if len(t.CursorCols) > 0 {
+		return t.CursorCols
+	}
+	return t.IdentifyCols
 }
 
 // ColumnMeta 列元数据
@@ -24,9 +37,10 @@ type ColumnMeta struct { // 定义列元数据结构体，存储列的详细信�
 	Name         string // 列名：列的名称
 	DataType     string // 数据类型：列的数据类型
 	IsNullable   bool   // 是否可空：列是否允许为空值
-	IsPrimaryKey bool   // 是否主键：列是否为主键
-	IsUnique     bool   // 是否唯一：列是否有唯一约束
-	DefaultValue string // 默认值：列的默认值
+	IsPrimaryKey    bool   // 是否主键：列是否为主键
+	IsUnique        bool   // 是否唯一：列是否有唯一约束
+	IsAutoIncrement bool   // 是否自增：EXTRA 含 auto_increment
+	DefaultValue    string // 默认值：列的默认值
 }
 
 // TableInfo 表信息

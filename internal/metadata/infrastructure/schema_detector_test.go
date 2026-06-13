@@ -35,10 +35,10 @@ func TestSchemaDetector_GetTableColumns(t *testing.T) {
 			schema:    "test_db",
 			tableName: "users",
 			setupMock: func(mock sqlmock.Sqlmock) {
-				rows := sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT"}).
-					AddRow("id", "int", "NO", "PRI", nil).
-					AddRow("name", "varchar", "YES", "", nil).
-					AddRow("email", "varchar", "NO", "UNI", nil)
+				rows := sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "EXTRA"}).
+					AddRow("id", "int", "NO", "PRI", nil, "").
+					AddRow("name", "varchar", "YES", "", nil, "").
+					AddRow("email", "varchar", "NO", "UNI", nil, "")
 				mock.ExpectQuery("SELECT(.+)FROM information_schema.COLUMNS").
 					WithArgs("test_db", "users").
 					WillReturnRows(rows)
@@ -51,7 +51,7 @@ func TestSchemaDetector_GetTableColumns(t *testing.T) {
 			schema:    "test_db",
 			tableName: "empty_table",
 			setupMock: func(mock sqlmock.Sqlmock) {
-				rows := sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT"})
+				rows := sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "EXTRA"})
 				mock.ExpectQuery("SELECT(.+)FROM information_schema.COLUMNS").
 					WithArgs("test_db", "empty_table").
 					WillReturnRows(rows)
@@ -500,11 +500,11 @@ func TestSchemaDetector_ColumnMetaFields(t *testing.T) {
 	defer db.Close()
 
 	// 测试列的各种属性
-	rows := sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT"}).
-		AddRow("id", "int", "NO", "PRI", nil).
-		AddRow("name", "varchar", "YES", "", "default_name").
-		AddRow("email", "varchar", "NO", "UNI", nil).
-		AddRow("created_at", "datetime", "YES", "", "CURRENT_TIMESTAMP")
+	rows := sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "EXTRA"}).
+		AddRow("id", "int", "NO", "PRI", nil, "auto_increment").
+		AddRow("name", "varchar", "YES", "", "default_name", "").
+		AddRow("email", "varchar", "NO", "UNI", nil, "").
+		AddRow("created_at", "datetime", "YES", "", "CURRENT_TIMESTAMP", "")
 
 	mock.ExpectQuery("SELECT(.+)FROM information_schema.COLUMNS").
 		WithArgs("test_db", "test_table").
@@ -521,6 +521,7 @@ func TestSchemaDetector_ColumnMetaFields(t *testing.T) {
 	assert.Equal(t, "int", columns[0].DataType)
 	assert.False(t, columns[0].IsNullable)
 	assert.True(t, columns[0].IsPrimaryKey)
+	assert.True(t, columns[0].IsAutoIncrement)
 	assert.False(t, columns[0].IsUnique)
 
 	// 验证第二列（可空，有默认值）

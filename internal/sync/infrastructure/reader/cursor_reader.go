@@ -221,9 +221,10 @@ type RangeShardingReader struct { // 定义范围分片读取器结构体
 
 // NewRangeShardingReader 创建分片读取器函数
 func NewRangeShardingReader(db queryExecutor, schema, table string, identity *entity.TableIdentity) *RangeShardingReader { // 创建分片读取器实例
-	pkColumn := ""                      // 初始化主键列
-	if len(identity.IdentifyCols) > 0 { // 如果有标识列
-		pkColumn = identity.IdentifyCols[0] // 使用第一个标识列
+	pkColumn := "" // 初始化主键列
+	cursorCols := identity.EffectiveCursorCols()
+	if len(cursorCols) > 0 { // 如果有游标列
+		pkColumn = cursorCols[0] // 使用第一个游标列
 	}
 	return &RangeShardingReader{ // 返回读取器实例
 		db:       db,       // 设置数据库连接
@@ -258,7 +259,7 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 	}
 	columns := strings.Join(colParts, ", ") // 连接列名
 
-	pkCols := r.identity.IdentifyCols // 获取主键列
+	pkCols := r.identity.EffectiveCursorCols() // 获取游标/分片列
 
 	var query string       // 定义查询语句
 	var args []interface{} // 定义参数列表
@@ -275,23 +276,23 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 			args = []interface{}{lastID, limit} // 设置参数
 		}
 	} else { // 否则是复合主键
-		// 复合主键：WHERE (col1, col2, ...) > (?, ?, ...) ORDER BY col1, col2 LIMIT ?
-		// MySQL 支持行构造器比较，利用索引高效定位
+		// 复合主键：将 (pk1,...,pkN) > (v1,...,vN) 展开为 OR 表达式，
+		// 便于 MySQL 优化器按联合主键各列走索引（CDC 常用写法）。
 		var bkCols []string          // 创建备份列列表
 		for _, col := range pkCols { // 遍历主键列
 			bkCols = append(bkCols, "`"+col+"`") // 添加列引用
 		}
-		colList := strings.Join(bkCols, ", ")                                        // 连接列名
-		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(pkCols)), ", ") // 生成占位符
+		colList := strings.Join(bkCols, ", ") // 连接列名
 
 		if lastID == nil { // 如果没有上次ID
 			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s ASC LIMIT ?", // 构建查询
 				columns, r.schema, r.table, colList) // 排序并限制
 			args = []interface{}{limit} // 设置参数
-		} else if lastIDs, ok := lastID.([]interface{}); ok { // 完整复合主键值
-			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE (%s) > (%s) ORDER BY %s ASC LIMIT ?", // 构建查询
-				columns, r.schema, r.table, colList, placeholders, colList) // 使用行构造器比较
-			args = append(append([]interface{}{}, lastIDs...), limit) // 设置参数
+		} else if lastIDs, ok := lastID.([]interface{}); ok && len(lastIDs) == len(pkCols) { // 完整复合主键值
+			whereClause, whereArgs := buildCompositeKeysetWhere(pkCols, lastIDs)
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s ORDER BY %s ASC LIMIT ?", // 构建查询
+				columns, r.schema, r.table, whereClause, colList)
+			args = append(whereArgs, limit)
 		} else { // 单值：仅按第一主键列过滤（并行采样边界起始定位）
 			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` > ? ORDER BY %s ASC LIMIT ?", // 构建查询
 				columns, r.schema, r.table, pkCols[0], colList) // 按首列定位
@@ -397,6 +398,26 @@ func scanRowsToMaps(rows *sql.Rows) ([]map[string]interface{}, error) { // 扫�
 		return nil, err // 返回错误
 	}
 	return results, nil // 返回结果
+}
+
+// buildCompositeKeysetWhere 将复合主键元组比较 (pk1,...,pkN) > (v1,...,vN) 展开为 OR 表达式。
+// 2 列示例：(pk1 = ? AND pk2 > ?) OR (pk1 > ?)
+// N 列通用：(pk1=v1 AND ... AND pk_{k-1}=v_{k-1} AND pk_k > vk) OR ... OR (pk1 > v1)
+func buildCompositeKeysetWhere(pkCols []string, lastIDs []interface{}) (string, []interface{}) {
+	n := len(pkCols)
+	var branches []string
+	var args []interface{}
+	for k := n; k >= 1; k-- {
+		var conds []string
+		for j := 0; j < k-1; j++ {
+			conds = append(conds, fmt.Sprintf("`%s` = ?", pkCols[j]))
+			args = append(args, lastIDs[j])
+		}
+		conds = append(conds, fmt.Sprintf("`%s` > ?", pkCols[k-1]))
+		args = append(args, lastIDs[k-1])
+		branches = append(branches, "("+strings.Join(conds, " AND ")+")")
+	}
+	return strings.Join(branches, " OR "), args
 }
 
 // NewReader 根据表标识创建合适的读取器函数

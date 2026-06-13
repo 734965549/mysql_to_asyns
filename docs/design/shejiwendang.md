@@ -42,8 +42,12 @@
 *   **分片机制**：
     *   **有主键**：获取 `MAX(id)` 和 `MIN(id)`，按步长切分分片，Worker 协程并发拉取。
     *   **无主键**：无法切片。系统自动降级为 **单协程流式读取**，利用 Go 的 `sql.Rows` 迭代器降低内存占用，但在写入端保持多协程并发写入。
-*   **断点续传**：
-    *   记录已完成的分片 ID 或已读取的 Offset。
+*   **断点续传**（任务存档 `FullSyncResume`，不依赖 Redis）：
+    *   **表级**：`done=true` 的表在暂停/重启后直接跳过。
+    *   **行级**（keyset / range 路径）：事务提交成功后记录主键游标；range 大表按 worker 分片各自保存 `shard_cursors`。
+    *   **阶段级**：`SyncPhase=FULL_STARTED` 表示全量未完成；完成后变为 `FULL_COMPLETED`，ALL 模式可接增量。
+    *   **限制**：`enable_drop_table_before_ddl` 时禁用续传；无主键表与 sample 并行路径仅表级续传。
+    *   详见 [全量续传指南](../guides/FULL_SYNC_RESUME_GUIDE.md)。
 
 ### 3.2 增量同步 (Incremental CDC)
 *   **逻辑主键定位**：

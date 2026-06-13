@@ -49,7 +49,8 @@ mysql-to-async/
 │   └── task/
 │       ├── application/
 │       │   └── service/
-│       │       └── task_service_test.go
+│       │       ├── task_service_test.go
+│       │       └── resume_test.go   # 全量断点续传
 │       └── domain/
 │           └── entity/
 │               └── task_test.go
@@ -124,6 +125,7 @@ go test -v ./...
 | TestStartTask_ConcurrentRuntimeIsolation | 测试并发启动两个任务时 runtime 隔离 |
 | TestPauseTask | 测试暂停任务 |
 | TestTaskStatus | 测试任务状态转换 |
+| resume_test.go | 全量断点续传：游标序列化、range 分片确定性、断点生命周期 |
 
 ### Sync 模块
 

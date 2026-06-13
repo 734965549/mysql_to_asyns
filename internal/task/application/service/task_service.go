@@ -2511,19 +2511,26 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			// === 策略检测 ===
 
+			cursorCols := identity.EffectiveCursorCols()
+
+			if len(identity.IdentifyCols) > 1 && len(cursorCols) == 1 {
+				logger.Info("[Task %s] Table %s.%s: composite PK with auto_increment, using cursor key `%s` (identify=%v)",
+					taskID, sourceSchema, tableName, cursorCols[0], identity.IdentifyCols)
+			}
+
 			canParallelRange := identity.Strategy != entity.FullColumnsStrategy &&
 
-				len(identity.IdentifyCols) == 1 &&
+				len(cursorCols) == 1 &&
 
 				intraWorkers > 1 &&
 
-				isNumericPKColumn(identity, identity.IdentifyCols[0])
+				isNumericPKColumn(identity, cursorCols[0])
 
 			canParallelSample := !canParallelRange &&
 
 				identity.Strategy != entity.FullColumnsStrategy &&
 
-				len(identity.IdentifyCols) >= 1 &&
+				len(cursorCols) >= 1 &&
 
 				intraWorkers > 1
 
@@ -2535,14 +2542,14 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					fmt.Sprintf("SELECT COALESCE(MIN(`%s`), 0), COALESCE(MAX(`%s`), -1) FROM `%s`.`%s`",
 
-						identity.IdentifyCols[0], identity.IdentifyCols[0], sourceSchema, tableName),
+						cursorCols[0], cursorCols[0], sourceSchema, tableName),
 				).Scan(&minPK, &maxPK); err != nil || maxPK < minPK {
 
 					canParallelRange = false
 
 					canParallelSample = identity.Strategy != entity.FullColumnsStrategy &&
 
-						len(identity.IdentifyCols) >= 1 && intraWorkers > 1
+						len(cursorCols) >= 1 && intraWorkers > 1
 
 					logger.Info("[Task %s] Cannot get numeric PK range for %s.%s, trying sample parallel", taskID, sourceSchema, tableName)
 
@@ -2569,7 +2576,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					var bErr error
 
-					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime.sourceDB, sourceSchema, tableName, identity.IdentifyCols, totalRows, intraWorkers)
+					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime.sourceDB, sourceSchema, tableName, cursorCols, totalRows, intraWorkers)
 
 					if bErr != nil {
 
@@ -3056,7 +3063,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							if lastID != nil {
 
-								firstPK := batch[0][identity.IdentifyCols[0]]
+								firstPK := batch[0][cursorCols[0]]
 
 								if comparePKValues(firstPK, lastID) <= 0 {
 
@@ -3076,7 +3083,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 								for j, row := range batch {
 
-									if comparePKValues(row[identity.IdentifyCols[0]], endBoundary) >= 0 {
+									if comparePKValues(row[cursorCols[0]], endBoundary) >= 0 {
 
 										cutIdx = j
 
@@ -3104,9 +3111,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							// 记录批次范围信息
 
-							firstPK := batch[0][identity.IdentifyCols[0]]
+							firstPK := batch[0][cursorCols[0]]
 
-							lastPK := batch[len(batch)-1][identity.IdentifyCols[0]]
+							lastPK := batch[len(batch)-1][cursorCols[0]]
 
 							logger.Info("[Task %s] w%d processing batch: %s (%d rows) from %v to %v",
 
@@ -3130,7 +3137,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							lastRow := batch[len(batch)-1]
 
-							lastID = lastRow[identity.IdentifyCols[0]]
+							lastID = lastRow[cursorCols[0]]
 
 							// 检查是否达到边界
 
@@ -3194,7 +3201,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					s.initTableProgress(taskID, tableKey, "sample", intraWorkers)
 				}
 
-				pkCol := identity.IdentifyCols[0]
+				pkCol := cursorCols[0]
 
 				logger.Info("[Task %s] Table %s.%s: parallel sample sync pk=%s workers=%d",
 					taskID, sourceSchema, tableName, pkCol, intraWorkers)
@@ -3389,7 +3396,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 								for j, row := range batchRows {
 
-									if comparePKWithBoundary(identity.IdentifyCols, row, endBoundary) > 0 {
+									if comparePKWithBoundary(cursorCols, row, endBoundary) > 0 {
 
 										cutIdx = j
 
@@ -3429,18 +3436,18 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							s.incrementTaskProgress(taskID, n, mark)
 
 							// 更新 lastID：复合主键需要传完整的 []interface{} 给 ReadBatchByKeys
-							if len(identity.IdentifyCols) == 1 {
+							if len(cursorCols) == 1 {
 								lastID = firstPKVal
 							} else {
-								compositePK := make([]interface{}, len(identity.IdentifyCols))
-								for ci, col := range identity.IdentifyCols {
+								compositePK := make([]interface{}, len(cursorCols))
+								for ci, col := range cursorCols {
 									compositePK[ci] = lastRow[col]
 								}
 								lastID = compositePK
 							}
 
-							// 边界检查：使用完整复合主键比较（采样边界已包含所有主键列）
-							if endBoundary != nil && comparePKWithBoundary(identity.IdentifyCols, lastRow, endBoundary) >= 0 {
+							// 边界检查：使用游标列比较（采样边界已包含对应列值）
+							if endBoundary != nil && comparePKWithBoundary(cursorCols, lastRow, endBoundary) >= 0 {
 
 								break
 
@@ -3609,7 +3616,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				// 续传：从上次已提交的整表游标之后继续读取。
 				if canResume && tableProgress != nil && tableProgress.Cursor != nil {
-					lastID = lastIDFromResumeKey(tableProgress.Cursor, len(identity.IdentifyCols))
+					lastID = lastIDFromResumeKey(tableProgress.Cursor, len(cursorCols))
 					logger.Info("[Task %s] Resume: table %s.%s keyset continue after %v", taskID, sourceSchema, tableName, lastID)
 				}
 
@@ -3645,7 +3652,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					lastRow := rows[len(rows)-1]
 
-					pkCols := identity.IdentifyCols
+					pkCols := cursorCols
 
 					var rkey *taskEntity.ResumeKey
 
@@ -4854,6 +4861,14 @@ func (s *TaskService) isTaskStopped(taskID string) bool {
 }
 
 // === 全量同步断点续传辅助 ===
+//
+// 全量阶段暂停/失败后再次 StartTask 时：
+//   - 已完成表（FullSyncResume[tableKey].Done）跳过数据同步
+//   - keyset/range 路径从上次事务提交后的主键游标继续
+//   - 游标写入任务存档，不经过 checkpoint.Manager
+//   - enable_drop_table_before_ddl=true 时禁用续传（resumeEnabled 返回 false）
+//
+// 详见 docs/guides/FULL_SYNC_RESUME_GUIDE.md
 
 // fullSyncTableKey 生成续传断点的表键（与 FullSyncResume 的 key 保持一致）。
 func fullSyncTableKey(schema, table string) string {

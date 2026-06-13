@@ -18,7 +18,7 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 
 - **实时增量同步**：基于 Binlog 的实时数据捕获，延迟小于1秒
 
-- **断点续传**：Redis 持久化位点，服务重启后自动恢复
+- **断点续传**：全量阶段表级/行级续传（任务存档）；增量阶段 Binlog 位点（Redis/内存）
 
 - **无主键表同步**：智能识别策略，全列匹配保障数据一致性
 
@@ -56,7 +56,9 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 
 - **多种同步模式**：支持全量同步(FULL)、增量同步(INCREMENTAL)、全量+增量(ALL)
 
-- **断点续传**：基于 Redis 的 checkpoint 机制，支持任务中断后继续执行
+- **断点续传**：
+  - **全量**：暂停后重启跳过已完成表，从上次已提交主键继续（见 [全量续传指南](docs/guides/FULL_SYNC_RESUME_GUIDE.md)）
+  - **增量**：基于 Redis/内存 checkpoint 保存 Binlog 位点，服务重启后续订
 
 - **实时监控**：提供任务进度、状态、指标等实时监控
 
@@ -581,6 +583,7 @@ POST /api/tasks/:id/start
 - 不传请求体：立即启动任务。
 - 传入 `scheduled_at`：设置单次定时启动。
 - 传入 `repeat_count` 和 `repeat_interval_sec`：设置重复定时启动。
+- 传入 `schedule_mode: "cron"` 与 `cron_expression`：按 Cron 表达式周期启动（实际触发时间由后端计算）。
 
 **请求示例 1：立即启动**
 
@@ -606,17 +609,33 @@ curl -X POST http://localhost:8080/api/tasks/任务ID/start
 }
 ```
 
+**请求示例 4：Cron 定时启动**
+
+```json
+{
+  "scheduled_at": "2026-06-12T20:00:00+08:00",
+  "schedule_mode": "cron",
+  "cron_expression": "0 1 * * 6",
+  "cron_timezone": "Asia/Shanghai"
+}
+```
+
+Cron 模式下 `scheduled_at` 仅作基准时间，**下次执行时刻由 `cron_expression` 计算**；不会因请求处理耗时触发「时间早于当前时间」校验失败。
+
 **参数说明：**
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| scheduled_at | string | 定时启动时必填 | 首次启动时间，RFC3339 格式 |
+| scheduled_at | string | 定时启动时必填 | 首次/基准启动时间，RFC3339 格式 |
+| schedule_mode | string | 否 | `cron` 表示 Cron 周期调度 |
+| cron_expression | string | Cron 模式必填 | 标准五段 Cron，如 `0 1 * * 6` |
+| cron_timezone | string | 否 | 时区，默认本地 |
 | repeat_count | int | 否 | 重复启动总次数，包含首次执行；不传或传 0 表示仅执行一次 |
 | repeat_interval_sec | int | 否 | 每次执行完成后到下一次启动的间隔秒数，默认 0 |
 
 **说明：**
 
-- `scheduled_at` 不能早于当前时间。
+- 单次/重复定时模式下，`scheduled_at` 不能早于当前时间；Cron 模式不受此限制。
 - `repeat_count` 必须大于等于 0。
 - `repeat_interval_sec` 必须大于等于 0。
 - 重复启动会在每次任务执行完成后，自动安排下一次启动，直到达到 `repeat_count`。
@@ -630,6 +649,18 @@ curl -X POST http://localhost:8080/api/tasks/任务ID/start
 POST /api/tasks/:id/pause
 
 ```
+
+暂停后 `sync_phase` 保持为 `FULL_STARTED`（全量进行中时），`full_sync_resume` 断点保留在任务存档中。再次调用启动接口将从断点续传，而非整库从头重读（未开启「DDL 前 DROP TABLE」时）。
+
+#### 取消定时启动
+
+```bash
+
+POST /api/tasks/:id/cancel-schedule
+
+```
+
+仅当任务状态为 `SCHEDULED` 时可取消，恢复为设置定时前的状态。
 
 
 
@@ -989,7 +1020,9 @@ mysql-to-async/
 
 - 内存存储（备用）
 
-- 支持断点续传
+- **增量同步**：保存/恢复 Binlog 订阅位点（`SavePosition` / `GetPosition`）
+
+- **全量同步**：断点续传由任务存档 `context.full_sync_resume` 实现，不经过本模块
 
 
 
@@ -1019,19 +1052,31 @@ mysql-to-async/
 
 3. 分批读取源表数据
 
-4. 批量写入目标表
+4. 批量写入目标表（`INSERT IGNORE`，幂等）
 
-5. 更新进度
+5. 更新进度；事务提交成功后写入 `full_sync_resume` 游标
+
+6. 暂停后重启：跳过已完成表，未完成表从断点主键继续
 
 
 
 **性能优化**：
 
-- 有主键表：使用ID范围分片，并行读取
+- 有主键表（数值单列）：按 min/max 主键 range 分片，表内多 worker 并行 keyset 读取
 
-- 无主键表：使用OFFSET分页，顺序读取
+- 有主键表（其他）：单线程或 sample 边界并行 keyset 读取
 
-- 批量插入：使用批量INSERT语句
+- 无主键表：单协程流式读取（仅表级续传，中断后整表重跑）
+
+- 批量插入：使用批量 `INSERT IGNORE` 语句
+
+
+
+**断点续传**（详见 [全量续传指南](docs/guides/FULL_SYNC_RESUME_GUIDE.md)）：
+
+- 断点持久化在任务存档，进程重启不丢失
+
+- 开启 `enable_drop_table_before_ddl` 时自动禁用全量续传
 
 
 
@@ -1411,11 +1456,33 @@ binlog_row_image=FULL
 
 
 
-**原因**： 未配置Redis，使用内存存储位点。
+**原因**： 未配置 Redis，增量 Binlog 位点使用内存存储，进程退出后丢失。
 
 
 
-**解决方案**： 配置Redis并重启服务。
+**解决方案**： 配置 Redis 并重启服务。
+
+
+
+### Q3b: 全量同步暂停后重新启动是否从头开始？
+
+
+
+**默认行为（推荐配置）**： 不会。系统会跳过已完成的表，并从上次**已提交**的主键位置继续（`full_sync_resume` 保存在任务存档中）。
+
+
+
+**仍会从头的情况**：
+
+- 开启了「DDL 前 DROP TABLE」—— 每次启动会重建目标表，续传自动禁用
+
+- 全量已整体完成（`sync_phase=FULL_COMPLETED`）后再次全量—— 属于新一轮同步
+
+- 无主键表 / sample 并行路径—— 仅表级续传，未完成表会整表重跑（数据仍幂等）
+
+
+
+详见 [全量续传指南](docs/guides/FULL_SYNC_RESUME_GUIDE.md)。
 
 
 

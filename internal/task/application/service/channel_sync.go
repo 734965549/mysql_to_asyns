@@ -169,6 +169,7 @@ func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task
 
 	// 创建reader
 	rdr := reader.NewRangeShardingReader(cse.sourceDB, sourceSchema, tableName, identity)
+	cursorCols := identity.EffectiveCursorCols()
 
 	// 启动workers
 	channelSync.StartWorkers(ctx, func(batchTask *BatchTask) error {
@@ -198,8 +199,20 @@ func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task
 				break
 			}
 
-			firstPK := batch[0][identity.IdentifyCols[0]]
-			lastPK = batch[len(batch)-1][identity.IdentifyCols[0]]
+			var firstPK interface{}
+			if len(cursorCols) == 1 {
+				firstPK = batch[0][cursorCols[0]]
+				lastPK = batch[len(batch)-1][cursorCols[0]]
+			} else {
+				firstVals := make([]interface{}, len(cursorCols))
+				lastVals := make([]interface{}, len(cursorCols))
+				for i, col := range cursorCols {
+					firstVals[i] = batch[0][col]
+					lastVals[i] = batch[len(batch)-1][col]
+				}
+				firstPK = firstVals
+				lastPK = lastVals
+			}
 			mark := fmt.Sprintf("%s.%s:batch%d", sourceSchema, tableName, batchID)
 
 			// 添加批次到channel

@@ -10,7 +10,10 @@ import ( // 导入外部包和标准库
 	"github.com/redis/go-redis/v9" // 导入Redis客户端库
 )
 
-// Checkpoint 位点信息结构体
+// Checkpoint 增量同步位点信息（Binlog 文件/位置、按表 Offset 等）。
+//
+// 注意：全量同步的行级/表级断点续传保存在任务存档 ProcessContext.FullSyncResume 中，
+// 不由本包的 Manager 管理。SavePosition/GetPosition 主要用于增量阶段的 binlog 订阅恢复。
 type Checkpoint struct { // 定义检查点结构体
 	TaskID        string    `json:"task_id"` // 任务ID
 	TableName     string    `json:"table_name"` // 表名
