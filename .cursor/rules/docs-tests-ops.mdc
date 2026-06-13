@@ -1,0 +1,35 @@
+---
+description: Documentation, tests, configuration, deployment, and repository hygiene rules
+globs: README.md,docs/**/*.md,etc/**/*.toml,docker-compose.yml,Dockerfile,k8s/**/*.yaml,Makefile,*.md
+alwaysApply: false
+---
+
+# 文档、测试与运维规则
+
+## 文档同步
+
+- 用户可见能力变更必须更新 README 或 `docs/guides/`。
+- 配置项变更必须更新 `etc/application.toml.example`、`docs/CONFIGURATION.md`，并说明环境变量覆盖方式。
+- 同步语义变更必须更新对应设计/指南：全量续传、增量同步、无主键表、checkpoint、只读保护。
+- 文档统一使用 UTF-8。发现乱码时优先修复正在编辑文件附近的内容。
+
+## 测试与验证
+
+- 后端基础验证：`go test ./...`。
+- 覆盖率报告：`go test -coverprofile=coverage.out ./...`。
+- 前端验证：`cd web && npm run build`。
+- 配置、Docker、K8s 改动至少做静态检查；能本地启动时再跑容器或服务验证。
+- 测试应覆盖风险而不是只追求行覆盖：断点续传、无主键表、Binlog 位点、任务并发隔离、密码加密兼容、错误恢复。
+
+## 配置和安全
+
+- 不提交真实数据库密码、Redis 密码、AES 加密密钥、K8s Secret 明文。
+- 生产部署建议使用环境变量或 Secret 覆盖配置，前缀为 `MYSQL_TO_ASYNC_`。
+- `security.encrypt_key` 建议 32 字节；空值表示兼容不加密旧行为。
+- Redis 推荐用于生产 checkpoint；file storage 适合单机，MySQL storage 更适合集群。
+
+## 仓库卫生
+
+- 不把 `node_modules`、二进制产物、覆盖率输出、日志、临时文件作为代码改动提交。
+- 根目录已有历史产物时不要在无关任务中大规模删除；但新增规则、脚本或文档时应避免继续扩大污染。
+- Makefile 改动要在 Windows/Unix 差异上谨慎，当前项目主要在 Windows 工作区中开发。

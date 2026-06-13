@@ -124,6 +124,14 @@ const activeTableSourceDatabase = ref("");
 
 const tableSelectionsByDatabase = ref({});
 
+const tablesByDatabase = ref({});
+
+const loadingTablesByDatabase = ref({});
+
+const expandedTableDatabaseKeys = ref([]);
+
+const expandedTargetTableDatabaseKeys = ref([]);
+
 const editMode = ref(false);
 
 const editingTaskId = ref(null);
@@ -480,12 +488,17 @@ async function saveTargetConfig() {
 // 刷新表列表
 
 async function refreshTables() {
-  const currentSourceSchema =
-    activeTableSourceDatabase.value || taskForm.value.source_schema;
+  const databasesToRefresh =
+    selectedSyncLevel.value === "table" && selectedDatabases.value.length > 0
+      ? expandedTableDatabaseKeys.value.length > 0
+        ? expandedTableDatabaseKeys.value
+        : selectedDatabases.value
+      : [
+          activeTableSourceDatabase.value || taskForm.value.source_schema,
+        ].filter(Boolean);
 
-  if (!currentSourceSchema) {
+  if (databasesToRefresh.length === 0) {
     Message.warning("请先选择源数据库");
-
     return;
   }
 
@@ -494,19 +507,95 @@ async function refreshTables() {
   try {
     await fetch(`${API_BASE}/metadata/refresh`, { method: "POST" });
 
-    const res = await fetch(
-      `${API_BASE}/metadata/tables?schema=${currentSourceSchema}`,
+    await Promise.all(
+      databasesToRefresh.map((database) => fetchTablesForDatabase(database)),
     );
-
-    if (res.ok) {
-      tables.value = await res.json();
-    }
   } catch (e) {
     Message.error("刷新表列表失败");
-
     console.error("刷新表列表失败:", e);
   } finally {
     refreshingTables.value = false;
+  }
+}
+
+// 获取指定源库的表列表
+
+async function fetchTablesForDatabase(database) {
+  if (!database) {
+    return;
+  }
+
+  loadingTablesByDatabase.value = {
+    ...loadingTablesByDatabase.value,
+    [database]: true,
+  };
+
+  try {
+    let dbConfig = null;
+
+    if (useCustomSourceDB.value) {
+      if (customSourceDB.value.host) {
+        dbConfig = {
+          host: customSourceDB.value.host,
+          port: customSourceDB.value.port,
+          username: customSourceDB.value.username,
+          password: customSourceDB.value.password,
+          database: customSourceDB.value.database || database,
+        };
+      }
+    } else if (configForm.value.datasource && configForm.value.datasource.host) {
+      dbConfig = {
+        host: configForm.value.datasource.host,
+        port: configForm.value.datasource.port,
+        username: configForm.value.datasource.username,
+        password: configForm.value.datasource.password,
+        database: configForm.value.datasource.database || database,
+      };
+    }
+
+    let res;
+
+    if (dbConfig && dbConfig.host) {
+      res = await fetch(`${API_BASE}/metadata/tables-with-config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...dbConfig,
+          schema: database,
+        }),
+      });
+    } else {
+      res = await fetch(`${API_BASE}/metadata/tables?schema=${database}`);
+    }
+
+    if (res.ok) {
+      const tableList = await res.json();
+      tablesByDatabase.value = {
+        ...tablesByDatabase.value,
+        [database]: tableList,
+      };
+
+      if (activeTableSourceDatabase.value === database) {
+        tables.value = tableList;
+      }
+    } else {
+      const errText = await res.text();
+
+      try {
+        const errData = JSON.parse(errText);
+        Message.error(`获取表列表失败: ${errData.error || errText}`);
+      } catch {
+        Message.error(`获取表列表失败: ${errText}`);
+      }
+    }
+  } catch (e) {
+    console.error("获取表列表失败:", e);
+    Message.error(`获取表列表失败: ${e.message}`);
+  } finally {
+    loadingTablesByDatabase.value = {
+      ...loadingTablesByDatabase.value,
+      [database]: false,
+    };
   }
 }
 
@@ -520,96 +609,9 @@ async function fetchTables() {
     return;
   }
 
+  activeTableSourceDatabase.value = currentSourceSchema;
   taskForm.value.source_schema = currentSourceSchema;
-
-  loading.value = true;
-
-  try {
-    // 确定使用哪个数据库配置
-
-    let dbConfig = null;
-
-    if (useCustomSourceDB.value) {
-      // 开启自定义源数据库：使用自定义配置
-
-      if (customSourceDB.value.host) {
-        dbConfig = {
-          host: customSourceDB.value.host,
-
-          port: customSourceDB.value.port,
-
-          username: customSourceDB.value.username,
-
-          password: customSourceDB.value.password,
-
-          database:
-            customSourceDB.value.database || taskForm.value.source_schema,
-        };
-      }
-    } else {
-      // 未开启自定义源数据库：使用配置文件中的源数据库配置
-
-      if (configForm.value.datasource && configForm.value.datasource.host) {
-        dbConfig = {
-          host: configForm.value.datasource.host,
-
-          port: configForm.value.datasource.port,
-
-          username: configForm.value.datasource.username,
-
-          password: configForm.value.datasource.password,
-
-          database: configForm.value.datasource.database || currentSourceSchema,
-        };
-      }
-    }
-
-    let res;
-
-    if (dbConfig && dbConfig.host) {
-      // 使用自定义配置获取表列表
-
-      res = await fetch(`${API_BASE}/metadata/tables-with-config`, {
-        method: "POST",
-
-        headers: { "Content-Type": "application/json" },
-
-        body: JSON.stringify({
-          ...dbConfig,
-
-          schema: currentSourceSchema,
-        }),
-      });
-    } else {
-      // 使用默认连接（后端启动时建立的连接）
-
-      res = await fetch(
-        `${API_BASE}/metadata/tables?schema=${currentSourceSchema}`,
-      );
-    }
-
-    if (res.ok) {
-      tables.value = await res.json();
-    } else {
-      // 解析错误信息并显示给用户
-
-      const errText = await res.text();
-
-      try {
-        const errData = JSON.parse(errText);
-
-        Message.error(`获取表列表失败: ${errData.error || errText}`);
-      } catch {
-        Message.error(`获取表列表失败: ${errText}`);
-      }
-    }
-  } catch (e) {
-    console.error("获取表列表失败:", e);
-
-    Message.error(`获取表列表失败: ${e.message}`);
-  } finally {
-    loading.value = false;
-  }
+  await fetchTablesForDatabase(currentSourceSchema);
 }
 
 // 获取任务列表
@@ -734,6 +736,14 @@ function resetForm() {
 
   tableSelectionsByDatabase.value = {};
 
+  tablesByDatabase.value = {};
+
+  loadingTablesByDatabase.value = {};
+
+  expandedTableDatabaseKeys.value = [];
+
+  expandedTargetTableDatabaseKeys.value = [];
+
   editMode.value = false;
 
   editingTaskId.value = null;
@@ -769,6 +779,54 @@ function getQualifiedTableName(database, tableName) {
   return `${database}.${tableName}`;
 }
 
+function resolveTargetDatabaseName(mapping) {
+  const mapped = String(mapping?.target || "").trim();
+  const defaultTarget = String(taskForm.value.target_database || "").trim();
+
+  if (mapped && mapped !== mapping.source) {
+    return mapped;
+  }
+
+  if (defaultTarget) {
+    return defaultTarget;
+  }
+
+  return mapped || mapping.source;
+}
+
+function buildTargetDatabasesPayload() {
+  return targetDatabaseMappings.value.map((mapping) =>
+    resolveTargetDatabaseName(mapping),
+  );
+}
+
+function getTaskDatabaseMappings(task) {
+  if (!task?.config) {
+    return [];
+  }
+
+  const cfg = task.config;
+  const srcDbs =
+    cfg.source_databases?.length > 0
+      ? cfg.source_databases
+      : cfg.source_schema
+        ? [cfg.source_schema]
+        : [];
+  const dstDbs = cfg.target_databases || [];
+  const defaultTarget = cfg.target_database || cfg.target_schema || "";
+
+  return srcDbs.map((src, i) => {
+    const stored = dstDbs[i];
+    if (stored && stored !== src) {
+      return { source: src, target: stored };
+    }
+    if (defaultTarget && defaultTarget !== src) {
+      return { source: src, target: defaultTarget };
+    }
+    return { source: src, target: stored || defaultTarget || src };
+  });
+}
+
 function parseQualifiedTableName(qualifiedName) {
   const parts = String(qualifiedName || "").split(".");
 
@@ -793,16 +851,72 @@ function ensureTableSelectionBucket(database) {
   }
 }
 
+function updateDatabaseTableSelection(db, newValue) {
+  ensureTableSelectionBucket(db);
+  tableSelectionsByDatabase.value[db] = [...newValue];
+
+  selectedTables.value = selectedDatabases.value.flatMap((database) => {
+    const tableNames = tableSelectionsByDatabase.value[database] || [];
+    return tableNames.map((tableName) =>
+      getQualifiedTableName(database, tableName),
+    );
+  });
+}
+
+function getFilteredTablesForDatabase(database) {
+  const list = tablesByDatabase.value[database] || [];
+
+  if (!tableSearchText.value) {
+    return list;
+  }
+
+  const searchText = tableSearchText.value.toLowerCase();
+
+  return list.filter((table) =>
+    table.table_name.toLowerCase().includes(searchText),
+  );
+}
+
+function onTableDatabaseAccordionChange(activeKeys) {
+  const keys = Array.isArray(activeKeys) ? activeKeys : [activeKeys];
+  expandedTableDatabaseKeys.value = keys;
+
+  keys.forEach((db) => {
+    if (!tablesByDatabase.value[db]) {
+      fetchTablesForDatabase(db);
+    }
+  });
+}
+
+function toggleAllTablesForDatabase(database) {
+  if (!database) {
+    return;
+  }
+
+  const filtered = getFilteredTablesForDatabase(database);
+  const currentSelection = tableSelectionsByDatabase.value[database] || [];
+
+  if (
+    currentSelection.length === filtered.length &&
+    filtered.length > 0
+  ) {
+    updateDatabaseTableSelection(database, []);
+  } else {
+    updateDatabaseTableSelection(
+      database,
+      filtered.map((table) => table.table_name),
+    );
+  }
+}
+
 function onTableSourceDatabasesChange(databases) {
   selectedDatabases.value = databases;
 
   if (databases.length === 0) {
     activeTableSourceDatabase.value = "";
-
+    expandedTableDatabaseKeys.value = [];
     tables.value = [];
-
     tableSearchText.value = "";
-
     return;
   }
 
@@ -812,7 +926,21 @@ function onTableSourceDatabasesChange(databases) {
 
   taskForm.value.source_schema = activeTableSourceDatabase.value || "";
 
-  fetchTables();
+  const expanded = expandedTableDatabaseKeys.value.filter((db) =>
+    databases.includes(db),
+  );
+
+  if (expanded.length === 0) {
+    expandedTableDatabaseKeys.value = [databases[0]];
+    fetchTablesForDatabase(databases[0]);
+  } else {
+    expandedTableDatabaseKeys.value = expanded;
+    expanded.forEach((db) => {
+      if (!tablesByDatabase.value[db]) {
+        fetchTablesForDatabase(db);
+      }
+    });
+  }
 }
 
 function onActiveTableSourceDatabaseChange() {
@@ -870,6 +998,18 @@ async function createTask() {
 
       return;
     }
+
+    for (const db of selectedDatabases.value) {
+      const mapping = targetDatabaseMappings.value.find(
+        (item) => item.source === db,
+      );
+
+      if (!String(mapping?.target || taskForm.value.target_database || "").trim()) {
+        Message.warning(`请为源库 ${db} 配置目标库`);
+
+        return;
+      }
+    }
   }
 
   // 构建 payload
@@ -892,24 +1032,19 @@ async function createTask() {
 
   if (selectedSyncLevel.value === "database") {
     sourceDatabasesPayload = selectedDatabases.value;
-    targetDatabasesPayload = targetDatabaseMappings.value.map((m) => m.target);
+    targetDatabasesPayload = buildTargetDatabasesPayload();
 
     sourceSchemaPayload = "";
     targetSchemaPayload = "";
     targetDatabasePayload = taskForm.value.target_database || "";
   } else {
     sourceDatabasesPayload = selectedDatabases.value;
-    targetDatabasesPayload = selectedDatabases.value.map((db) => {
-      const mapping = targetDatabaseMappings.value.find(
-        (item) => item.source === db,
-      );
-
-      return mapping?.target || db;
-    });
+    targetDatabasesPayload = buildTargetDatabasesPayload();
 
     sourceSchemaPayload = selectedDatabases.value[0] || "";
     targetSchemaPayload = targetDatabasesPayload[0] || "";
-    targetDatabasePayload = taskForm.value.target_database || targetSchemaPayload;
+    targetDatabasePayload =
+      targetDatabasesPayload[0] || taskForm.value.target_database || "";
 
     tablesPayload = selectedDatabases.value.flatMap((db) => {
       const tableNames = tableSelectionsByDatabase.value[db] || [];
@@ -1331,7 +1466,22 @@ function fillTaskFormFromTask(task) {
 
     taskForm.value.source_schema = activeTableSourceDatabase.value || "";
 
-    fetchTables();
+    const dbsWithTables = sourceDatabases.filter(
+      (db) => (tableSelectionsByDatabase.value[db] || []).length > 0,
+    );
+
+    expandedTableDatabaseKeys.value =
+      dbsWithTables.length > 0
+        ? dbsWithTables
+        : sourceDatabases.slice(0, 1);
+
+    expandedTargetTableDatabaseKeys.value = dbsWithTables.length
+      ? dbsWithTables
+      : sourceDatabases.slice(0, 1);
+
+    expandedTableDatabaseKeys.value.forEach((db) => {
+      fetchTablesForDatabase(db);
+    });
   }
 
   if (task.config.source_db) {
@@ -1581,6 +1731,14 @@ function onSyncLevelChange() {
   activeTableSourceDatabase.value = "";
 
   tableSelectionsByDatabase.value = {};
+
+  tablesByDatabase.value = {};
+
+  loadingTablesByDatabase.value = {};
+
+  expandedTableDatabaseKeys.value = [];
+
+  expandedTargetTableDatabaseKeys.value = [];
 
   tableSearchText.value = "";
 
@@ -1937,6 +2095,33 @@ const totalSelectedTables = computed(() => {
   }, 0);
 });
 
+const tableTargetMappingsByDatabase = computed(() => {
+  return selectedDatabases.value
+    .map((db) => {
+      const sourceTables = tableSelectionsByDatabase.value[db] || [];
+      const mapping = targetDatabaseMappings.value.find(
+        (item) => item.source === db,
+      );
+
+      return {
+        database: db,
+        targetDatabase:
+          mapping?.target || taskForm.value.target_database || db,
+        tables: sourceTables.map((tableName) => {
+          const sourceQualifiedName = getQualifiedTableName(db, tableName);
+
+          return {
+            source: sourceQualifiedName,
+            tableName,
+            target:
+              targetTableMappings.value[sourceQualifiedName] || tableName,
+          };
+        }),
+      };
+    })
+    .filter((group) => group.tables.length > 0);
+});
+
 const currentDatabaseTargetTableMappings = computed(() => {
   const currentDb = activeTableSourceDatabase.value;
 
@@ -1996,13 +2181,26 @@ watch(
     if (selectedSyncLevel.value === "table") {
       if (newDbs.length === 0) {
         activeTableSourceDatabase.value = "";
-
+        expandedTableDatabaseKeys.value = [];
         tables.value = [];
       } else if (!newDbs.includes(activeTableSourceDatabase.value)) {
         activeTableSourceDatabase.value = newDbs[0];
 
-        fetchTables();
+        if (expandedTableDatabaseKeys.value.length === 0) {
+          expandedTableDatabaseKeys.value = [newDbs[0]];
+        }
+
+        fetchTablesForDatabase(newDbs[0]);
       }
+
+      newDbs.forEach((db) => {
+        if (
+          expandedTableDatabaseKeys.value.includes(db) &&
+          !tablesByDatabase.value[db]
+        ) {
+          fetchTablesForDatabase(db);
+        }
+      });
 
       const nextSelections = {};
 
@@ -2032,6 +2230,22 @@ watch(
     });
 
     targetDatabaseMappings.value = newMappings;
+  },
+  { deep: true },
+);
+
+watch(
+  tableTargetMappingsByDatabase,
+  (groups) => {
+    const dbKeys = groups.map((group) => group.database);
+
+    if (dbKeys.length === 0) {
+      return;
+    }
+
+    expandedTargetTableDatabaseKeys.value = [
+      ...new Set([...expandedTargetTableDatabaseKeys.value, ...dbKeys]),
+    ];
   },
   { deep: true },
 );
@@ -2468,21 +2682,6 @@ watch(
                       }}</a-option>
                     </a-select>
 
-                    <a-select
-                      v-model="activeTableSourceDatabase"
-                      placeholder="请选择当前要选表的源库"
-                      style="width: 300px"
-                      :disabled="selectedDatabases.length === 0"
-                      @change="onActiveTableSourceDatabaseChange"
-                    >
-                      <a-option
-                        v-for="db in selectedDatabases"
-                        :key="db"
-                        :value="db"
-                        >{{ db }}</a-option
-                      >
-                    </a-select>
-
                     <a-button
                       type="text"
                       size="small"
@@ -2493,6 +2692,38 @@ watch(
                     </a-button>
                   </a-space>
                 </a-form-item>
+
+                <div
+                  v-if="selectedSyncLevel === 'table'"
+                  class="table-mapping-panel"
+                >
+                  <div class="table-mapping-title">
+                    源库到目标库映射（每个源库可指定不同的目标库）
+                  </div>
+
+                  <div class="table-mapping-list">
+                    <div
+                      v-for="mapping in targetDatabaseMappings"
+                      :key="mapping.source"
+                      class="table-mapping-item"
+                    >
+                      <span class="table-mapping-source">{{ mapping.source }}</span>
+
+                      <icon-arrow-right style="color: #86909c" />
+
+                      <a-input
+                        v-model="mapping.target"
+                        placeholder="目标库名"
+                        style="width: 220px"
+                      />
+                    </div>
+
+                    <a-empty
+                      v-if="targetDatabaseMappings.length === 0"
+                      description="请先选择源数据库"
+                    />
+                  </div>
+                </div>
 
                 <div
                   v-if="selectedSyncLevel === 'database'"
@@ -2535,23 +2766,12 @@ watch(
                   </div>
                 </div>
 
-                <!-- 表级别：目标库、目标表映射 -->
+                <!-- 表级别：同步模式 -->
 
                 <a-row :gutter="16">
                   <a-col
                     v-if="selectedSyncLevel === 'table'"
-                    :span="targetType === 'MYSQL' ? 12 : 24"
-                  >
-                    <a-form-item label="目标数据库" required>
-                      <a-input
-                        v-model="taskForm.target_database"
-                        placeholder="请输入目标数据库名"
-                      />
-                    </a-form-item>
-                  </a-col>
-
-                  <a-col
-                    :span="selectedSyncLevel === 'table' && targetType === 'MYSQL' ? 12 : 24"
+                    :span="24"
                   >
                     <a-form-item label="同步模式">
                       <a-select v-model="taskForm.mode">
@@ -2568,28 +2788,41 @@ watch(
                 <div v-if="selectedSyncLevel === 'table'" class="table-mapping-panel">
                   <div class="table-mapping-title">表级别同步目标表配置</div>
 
-                  <div class="table-mapping-list">
-                    <div
-                      v-for="mapping in currentDatabaseTargetTableMappings"
-                      :key="mapping.source"
-                      class="table-mapping-item"
+                  <a-empty
+                    v-if="tableTargetMappingsByDatabase.length === 0"
+                    description="请先选择源库并勾选要同步的表"
+                  />
+
+                  <a-collapse
+                    v-else
+                    v-model:active-key="expandedTargetTableDatabaseKeys"
+                    expand-icon-position="right"
+                    class="table-db-collapse"
+                  >
+                    <a-collapse-item
+                      v-for="group in tableTargetMappingsByDatabase"
+                      :key="group.database"
+                      :header="`${group.database} → ${group.targetDatabase}（${group.tables.length} 表）`"
                     >
-                      <span class="table-mapping-source">{{ mapping.source }}</span>
+                      <div class="table-mapping-list">
+                        <div
+                          v-for="item in group.tables"
+                          :key="item.source"
+                          class="table-mapping-item"
+                        >
+                          <span class="table-mapping-source">{{ item.source }}</span>
 
-                      <icon-arrow-right style="color: #86909c" />
+                          <icon-arrow-right style="color: #86909c" />
 
-                      <a-input
-                        v-model="targetTableMappings[mapping.source]"
-                        placeholder="目标表名"
-                        style="width: 220px"
-                      />
-                    </div>
-
-                    <a-empty
-                      v-if="currentDatabaseTargetTableMappings.length === 0"
-                      description="请先在左侧选择当前源库并勾选表"
-                    />
-                  </div>
+                          <a-input
+                            v-model="targetTableMappings[item.source]"
+                            placeholder="目标表名"
+                            style="width: 220px"
+                          />
+                        </div>
+                      </div>
+                    </a-collapse-item>
+                  </a-collapse>
                 </div>
               </a-col>
 
@@ -2605,12 +2838,12 @@ watch(
                     class="table-selector-form-item"
                   >
                     <a-alert
-                      v-if="!activeTableSourceDatabase"
+                      v-if="selectedDatabases.length === 0"
                       type="info"
                       style="margin-bottom: 8px"
                       show-icon
                     >
-                      请先选择至少一个源数据库，再选择当前源库后勾选表
+                      请先选择至少一个源数据库，再展开库名勾选表
                     </a-alert>
 
                     <div class="table-toolbar">
@@ -2619,7 +2852,7 @@ watch(
                         placeholder="搜索表名..."
                         allow-clear
                         class="table-search-input"
-                        :disabled="!activeTableSourceDatabase"
+                        :disabled="selectedDatabases.length === 0"
                       >
                         <template #suffix><icon-search /></template>
                       </a-input>
@@ -2627,21 +2860,7 @@ watch(
                       <a-button
                         type="text"
                         size="small"
-                        :disabled="!activeTableSourceDatabase"
-                        @click="toggleAllTables"
-                      >
-                        {{
-                          currentDatabaseSelectedTables.length ===
-                            filteredTables.length && filteredTables.length > 0
-                            ? "取消全选"
-                            : "全选"
-                        }}
-                      </a-button>
-
-                      <a-button
-                        type="text"
-                        size="small"
-                        :disabled="!activeTableSourceDatabase"
+                        :disabled="selectedDatabases.length === 0"
                         :loading="refreshingTables"
                         @click="refreshTables"
                       >
@@ -2650,45 +2869,108 @@ watch(
                     </div>
 
                     <div class="table-list-panel">
-                      <a-checkbox-group
-                        v-model="currentDatabaseSelectedTables"
-                        v-if="
-                          activeTableSourceDatabase && filteredTables.length > 0
-                        "
-                        class="table-checkbox-group"
+                      <a-collapse
+                        v-if="selectedDatabases.length > 0"
+                        :active-key="expandedTableDatabaseKeys"
+                        expand-icon-position="right"
+                        class="table-db-collapse"
+                        @change="onTableDatabaseAccordionChange"
                       >
-                        <div class="table-list-grid">
-                          <div
-                            class="table-list-item"
-                            v-for="table in filteredTables"
-                            :key="table.table_name"
-                          >
-                            <a-checkbox :value="table.table_name">
-                              {{ table.table_name }}
+                        <a-collapse-item
+                          v-for="db in selectedDatabases"
+                          :key="db"
+                        >
+                          <template #header>
+                            <a-space>
+                              <icon-storage style="color: #165dff" />
+                              <span>{{ db }}</span>
+                              <a-tag size="small" color="arcoblue">
+                                已选
+                                {{
+                                  (tableSelectionsByDatabase[db] || []).length
+                                }}
+                                表
+                              </a-tag>
+                            </a-space>
+                          </template>
 
-                              <a-tag size="small" color="gray"
-                                >{{ table.table_row_count }} 行</a-tag
-                              >
-                            </a-checkbox>
+                          <div class="table-db-panel-toolbar">
+                            <a-button
+                              type="text"
+                              size="mini"
+                              :loading="loadingTablesByDatabase[db]"
+                              @click="fetchTablesForDatabase(db)"
+                            >
+                              <template #icon><icon-refresh /></template>
+                              刷新
+                            </a-button>
+
+                            <a-button
+                              type="text"
+                              size="mini"
+                              @click="toggleAllTablesForDatabase(db)"
+                            >
+                              {{
+                                (tableSelectionsByDatabase[db] || []).length ===
+                                  getFilteredTablesForDatabase(db).length &&
+                                getFilteredTablesForDatabase(db).length > 0
+                                  ? "取消全选"
+                                  : "全选"
+                              }}
+                            </a-button>
                           </div>
-                        </div>
-                      </a-checkbox-group>
+
+                          <a-spin
+                            :loading="loadingTablesByDatabase[db]"
+                            style="width: 100%"
+                          >
+                            <a-checkbox-group
+                              v-if="getFilteredTablesForDatabase(db).length > 0"
+                              :model-value="tableSelectionsByDatabase[db] || []"
+                              class="table-checkbox-group"
+                              @update:model-value="
+                                (val) => updateDatabaseTableSelection(db, val)
+                              "
+                            >
+                              <div class="table-list-grid">
+                                <div
+                                  class="table-list-item"
+                                  v-for="table in getFilteredTablesForDatabase(db)"
+                                  :key="`${db}.${table.table_name}`"
+                                >
+                                  <a-checkbox :value="table.table_name">
+                                    {{ table.table_name }}
+
+                                    <a-tag size="small" color="gray"
+                                      >{{ table.table_row_count }} 行</a-tag
+                                    >
+                                  </a-checkbox>
+                                </div>
+                              </div>
+                            </a-checkbox-group>
+
+                            <a-empty
+                              v-else
+                              :description="
+                                loadingTablesByDatabase[db]
+                                  ? '加载中...'
+                                  : '暂无匹配的表'
+                              "
+                              :style="{ padding: '12px 0' }"
+                            />
+                          </a-spin>
+                        </a-collapse-item>
+                      </a-collapse>
 
                       <a-empty
                         v-else
-                        :description="
-                          activeTableSourceDatabase
-                            ? '暂无匹配的表'
-                            : '请先选择当前源库'
-                        "
+                        description="请先选择源数据库"
                         :style="{ padding: '20px 0' }"
                       />
                     </div>
 
                     <div style="margin-top: 8px">
                       <a-typography-text type="secondary">
-                        当前库 {{ activeTableSourceDatabase || "-" }} 已选
-                        {{ currentDatabaseSelectedTables.length }} 个表，
                         总计已选 {{ totalSelectedTables }} 个表
                       </a-typography-text>
                     </div>
@@ -3710,10 +3992,7 @@ watch(
 
                         <a-descriptions-item label="源库">
                           <template
-                            v-if="
-                              task.config.sync_level === 'DATABASE' &&
-                              task.config.source_databases?.length
-                            "
+                            v-if="task.config.source_databases?.length"
                           >
                             <a-tag
                               v-for="db in task.config.source_databases"
@@ -3769,48 +4048,30 @@ watch(
                                 </a-tag>
                               </template>
                               <template v-else>
-                                <template
-                                  v-if="
-                                    task.config.sync_level === 'DATABASE' &&
-                                    task.config.target_databases?.length
-                                  "
+                                <a-tag
+                                  v-for="mapping in getTaskDatabaseMappings(task)"
+                                  :key="mapping.source"
+                                  size="small"
+                                  color="green"
+                                  class="inline-tag"
+                                  bordered
+                                  :title="`${mapping.source} → ${mapping.target}`"
+                                  >{{ mapping.target }}</a-tag
                                 >
-                                  <a-tag
-                                    v-for="db in task.config.target_databases"
-                                    :key="db"
-                                    size="small"
-                                    color="green"
-                                    class="inline-tag"
-                                    bordered
-                                    >{{ db }}</a-tag
-                                  >
-                                </template>
-                                <template v-else>{{
-                                  task.config.sink_configs[0].options?.target_schema ||
-                                  task.config.target_schema ||
-                                  '-'
-                                }}</template>
                               </template>
                             </template>
                           </template>
                           <template v-else>
-                            <template
-                              v-if="
-                                task.config.sync_level === 'DATABASE' &&
-                                task.config.target_databases?.length
-                              "
+                            <a-tag
+                              v-for="mapping in getTaskDatabaseMappings(task)"
+                              :key="mapping.source"
+                              size="small"
+                              color="green"
+                              class="inline-tag"
+                              bordered
+                              :title="`${mapping.source} → ${mapping.target}`"
+                              >{{ mapping.target }}</a-tag
                             >
-                              <a-tag
-                                v-for="db in task.config.target_databases"
-                                :key="db"
-                                size="small"
-                                color="green"
-                                class="inline-tag"
-                                bordered
-                                >{{ db }}</a-tag
-                              >
-                            </template>
-                            <template v-else>{{ task.config.target_schema || '-' }}</template>
                           </template>
                         </a-descriptions-item>
 
@@ -4182,23 +4443,19 @@ watch(
           >
             <a-space wrap>
               <span
-                v-for="(src, i) in selectedTaskForDetail.config
-                  .source_databases || []"
-                :key="src"
+                v-for="mapping in getTaskDatabaseMappings(selectedTaskForDetail)"
+                :key="mapping.source"
                 style="
                   display: inline-flex;
                   align-items: center;
                   margin-right: 12px;
                 "
               >
-                <a-tag color="blue">{{ src }}</a-tag>
+                <a-tag color="blue">{{ mapping.source }}</a-tag>
 
                 <span style="margin: 0 4px">→</span>
 
-                <a-tag color="green">{{
-                  (selectedTaskForDetail.config.target_databases || [])[i] ||
-                  src
-                }}</a-tag>
+                <a-tag color="green">{{ mapping.target }}</a-tag>
               </span>
             </a-space>
           </a-descriptions-item>
@@ -4230,26 +4487,40 @@ watch(
 
           <a-descriptions-item
             v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'"
+            label="数据库映射"
+            :span="2"
+          >
+            <a-space wrap>
+              <span
+                v-for="mapping in getTaskDatabaseMappings(selectedTaskForDetail)"
+                :key="mapping.source"
+                style="
+                  display: inline-flex;
+                  align-items: center;
+                  margin-right: 12px;
+                "
+              >
+                <a-tag color="blue">{{ mapping.source }}</a-tag>
+
+                <span style="margin: 0 4px">→</span>
+
+                <a-tag color="green">{{ mapping.target }}</a-tag>
+              </span>
+            </a-space>
+          </a-descriptions-item>
+
+          <a-descriptions-item
+            v-if="selectedTaskForDetail.config.sync_level !== 'DATABASE'"
             label="目标数据库"
             :span="2"
           >
             <a-space wrap>
-              <template
-                v-if="
-                  (selectedTaskForDetail.config.target_databases || []).length
-                "
+              <a-tag
+                v-for="mapping in getTaskDatabaseMappings(selectedTaskForDetail)"
+                :key="`target-${mapping.source}`"
+                color="green"
+                >{{ mapping.target }}</a-tag
               >
-                <a-tag
-                  v-for="db in selectedTaskForDetail.config.target_databases"
-                  :key="db"
-                  color="green"
-                  >{{ db }}</a-tag
-                >
-              </template>
-
-              <span v-else>{{
-                selectedTaskForDetail.config.target_schema || "-"
-              }}</span>
             </a-space>
           </a-descriptions-item>
 
@@ -5407,6 +5678,24 @@ watch(
   color: #1d2129;
 
   font-size: 13px;
+}
+
+.table-db-collapse {
+  border: 1px solid #e5e6eb;
+
+  border-radius: 4px;
+
+  background: #fff;
+}
+
+.table-db-panel-toolbar {
+  display: flex;
+
+  justify-content: flex-end;
+
+  gap: 4px;
+
+  margin-bottom: 8px;
 }
 
 .transfer-content {

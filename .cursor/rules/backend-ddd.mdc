@@ -1,0 +1,37 @@
+---
+description: Backend DDD boundaries and Go implementation rules
+globs: **/*.go
+alwaysApply: false
+---
+
+# Go 后端与 DDD 分层规则
+
+## 分层边界
+
+- `internal/api/router` 只注册路由；`internal/api/handler` 只处理参数解析、HTTP 状态码和响应结构。
+- `internal/task/application/service` 是任务生命周期编排层，负责创建、启动、暂停、恢复、调度、持久化协调。
+- `internal/task/domain/entity` 放任务聚合、状态、配置、上下文等领域对象。状态变更方法应保持可测试和幂等。
+- `internal/metadata/domain` 负责表元数据和身份策略；`internal/metadata/infrastructure` 负责访问 `information_schema`。
+- `internal/sync/application` 负责编排全量/增量执行；`internal/sync/domain/strategy` 放匹配策略；`internal/sync/infrastructure` 放 reader/writer/readonly 等外部系统实现。
+- `pkg` 只放跨模块可复用基础能力，例如 binlog、crypto、logger、storage。不要把业务规则下沉到 `pkg`。
+
+## 并发与生命周期
+
+- 所有长时间任务必须接收 `context.Context`，支持取消和优雅退出。
+- task runtime 必须按任务隔离，不能把某个任务的 DB 连接、analyzer、readOnlyManager 复用给另一个任务。
+- 对 `tasks`、`runtimes`、`incrementalSyncs`、scheduler 等共享状态修改时必须持有合适的锁。
+- 启动任务时要避免重复启动；暂停/失败/完成时要释放 runtime、cancel、checkpoint、DB 连接等资源。
+- goroutine 内部必须捕获 panic 并写审计/日志，不能让单任务崩溃拖垮服务进程。
+
+## 错误处理与日志
+
+- 错误要包上下文：使用 `fmt.Errorf("...: %w", err)` 保留根因。
+- 用户可见错误要明确是哪一步失败：连接源库、检测表结构、创建目标表、读取数据、写入数据、保存 checkpoint 等。
+- 同步失败、跳过、无主键风险、checkpoint 保存失败、只读保护失败都应有审计或结构化日志。
+- 日志不能输出明文密码、完整 DSN、加密密钥、Secret。
+
+## 测试要求
+
+- 修改领域策略、SQL builder、reader/writer、checkpoint、任务状态机时必须补或更新单元测试。
+- 使用 `go test ./...` 作为后端基础验证；涉及竞态或并发启动时增加确定性测试。
+- DB 相关测试优先用接口和 sqlmock；只有集成场景才依赖真实 MySQL/Redis。

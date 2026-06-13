@@ -1,0 +1,29 @@
+---
+description: Vue and Arco Design frontend rules for the Web management UI
+globs: web/**/*.{js,vue,css,html,json}
+alwaysApply: false
+---
+
+# Web 前端规则
+
+## 技术栈
+
+- 前端位于 `web/`，使用 Vite + Vue 3 + Arco Design Vue。
+- 保持单页管理控制台定位：任务列表、任务创建/编辑、数据库/表选择、状态监控、指标、详情抽屉、错误提示。
+- API 默认走相对路径 `/api`，不要在前端硬编码生产后端域名。
+
+## 交互契约
+
+- 创建任务时要清晰区分同步模式：`FULL`、`INCREMENTAL`、`ALL`；同步粒度：库级、表级。
+- 涉及自定义源库/目标库配置时，密码字段不要在 UI 中回显真实值。
+- 无主键表必须给出明显风险提示，说明会使用全列匹配，性能和安全性不同于主键表。
+- 长任务操作如启动、暂停、删除、重试必须有 loading、禁用重复点击、错误提示。
+- 展示 metrics 时要区分总量、已处理、进度、当前表、Binlog 文件/位点、延迟、任务状态。
+
+## 代码要求
+
+- 优先使用 Vue composition API 和现有组件风格，避免引入新的状态库，除非项目已经采用并有明确收益。
+- API 错误处理保持统一，后端返回 `{ error: "..." }` 时要展示可理解信息。
+- 修改后端接口时同步修改 Web UI 的字段名、默认值、空状态和错误状态。
+- 当前前端存在中文乱码。改动附近文案时应修复为 UTF-8 中文；不要继续提交乱码字符串。
+- 构建验证使用 `cd web && npm run build`。
