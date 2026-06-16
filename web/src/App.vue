@@ -2440,7 +2440,7 @@ watch(
         >
           <a-form :model="taskForm" layout="vertical">
             <a-row :gutter="32" class="task-base-config-row">
-              <a-col :span="12">
+              <a-col :span="24">
                 <a-form-item label="任务名称" required>
                   <a-input
                     v-model="taskForm.name"
@@ -6108,6 +6108,98 @@ watch(
 
   .task-filter-summary {
     grid-template-columns: 1fr;
+  }
+}
+/* Corrected alignment pass */
+.task-base-config-row > :deep(.arco-col) {
+  flex: 0 0 100%;
+  max-width: 100%;
+}
+
+.task-base-config-row :deep(.arco-select),
+.task-base-config-row :deep(.arco-input-wrapper) {
+  max-width: 100%;
+}
+
+.task-list-card :deep(.arco-card-header) {
+  padding: 18px 20px 14px;
+}
+
+.task-list-card :deep(.arco-card-body) {
+  padding: 18px 20px 22px;
+}
+
+.task-list-header,
+.task-list,
+.empty-state--card {
+  width: 100%;
+}
+
+.task-filter-panel {
+  margin: 0 0 18px;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  overflow: visible;
+}
+
+.task-filter-panel :deep(.arco-card-header),
+.task-filter-panel :deep(.arco-card-body) {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.task-filter-panel :deep(.arco-card-header) {
+  padding-top: 0;
+  padding-bottom: 12px;
+}
+
+.task-filter-panel :deep(.arco-card-body) {
+  padding-top: 14px;
+  padding-bottom: 0;
+}
+
+.task-filter-summary {
+  margin-bottom: 14px;
+  border-radius: 8px;
+}
+
+.advanced-filter-collapse {
+  width: 100%;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.task-card-inner {
+  border-radius: 8px;
+}
+
+.table-config-row {
+  margin-top: 12px;
+}
+
+.table-target-mapping-panel,
+.table-selector-panel {
+  height: 520px;
+  min-height: 520px;
+  max-height: 520px;
+}
+
+.table-target-mapping-panel .table-db-collapse {
+  overflow: hidden;
+}
+
+.table-target-mapping-panel :deep(.arco-collapse-item-content-box) {
+  max-height: 430px;
+}
+
+@media (max-width: 1200px) {
+  .table-target-mapping-panel,
+  .table-selector-panel {
+    height: 500px;
+    min-height: 500px;
+    max-height: 500px;
   }
 }
 </style>
