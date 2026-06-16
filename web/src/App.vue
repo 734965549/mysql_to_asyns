@@ -92,6 +92,30 @@ async function handleApiError(response, defaultMsg = "操作失败") {
 
 const selectedKey = ref(["tasks"]);
 
+const UI_THEME_STORAGE_KEY = "mysql_to_async_ui_theme";
+
+const uiThemeOptions = [
+  { value: "default", label: "默认白色", desc: "接近最初的浅色后台风格" },
+  { value: "blue", label: "深蓝科技", desc: "当前青蓝深色主题" },
+  { value: "gray", label: "高级灰", desc: "低饱和灰蓝工作台" },
+  { value: "black", label: "纯黑", desc: "高对比黑色主题" },
+  { value: "dark", label: "暗色", desc: "柔和暗色主题" },
+];
+
+const uiTheme = ref("default");
+const appThemeClass = computed(() => `theme-${uiTheme.value}`);
+
+function setUiTheme(theme) {
+  uiTheme.value = theme;
+  localStorage.setItem(UI_THEME_STORAGE_KEY, theme);
+}
+
+function syncUiThemeToDocument(theme) {
+  if (typeof document !== "undefined") {
+    document.documentElement.dataset.uiTheme = theme;
+  }
+}
+
 // 状态
 
 const tasks = ref([]);
@@ -1914,6 +1938,11 @@ function handlePopState() {
 let refreshInterval;
 
 onMounted(async () => {
+  const savedTheme = localStorage.getItem(UI_THEME_STORAGE_KEY);
+  if (uiThemeOptions.some((option) => option.value === savedTheme)) {
+    uiTheme.value = savedTheme;
+  }
+
   window.addEventListener("popstate", handlePopState);
 
   await fetchDefaultConfig();
@@ -2249,10 +2278,12 @@ watch(
   },
   { deep: true },
 );
+
+watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 </script>
 
 <template>
-  <a-layout class="layout-container">
+  <a-layout class="layout-container" :class="appThemeClass">
     <!-- 左侧导航栏 -->
 
     <a-layout-sider :width="220" :collapsible="false" class="sider">
@@ -2661,67 +2692,168 @@ watch(
                   </div>
                 </div>
 
-                <!-- 表级别：多选源数据库 -->
-
-                <a-form-item
-                  v-if="selectedSyncLevel === 'table'"
-                  label="源数据库"
-                  required
-                >
-                  <a-space wrap>
-                    <a-select
-                      v-model="selectedDatabases"
-                      placeholder="请选择源数据库（可多选）"
-                      style="width: 360px"
-                      multiple
-                      allow-clear
-                      @change="onTableSourceDatabasesChange"
-                    >
-                      <a-option v-for="db in databases" :key="db" :value="db">{{
-                        db
-                      }}</a-option>
-                    </a-select>
-
-                    <a-button
-                      type="text"
-                      size="small"
-                      :loading="refreshingDatabases"
-                      @click="refreshDatabases"
-                    >
-                      <template #icon><icon-refresh /></template>
-                    </a-button>
-                  </a-space>
-                </a-form-item>
+                <!-- 表级别：源库与目标库映射 -->
 
                 <div
                   v-if="selectedSyncLevel === 'table'"
-                  class="table-mapping-panel"
+                  class="db-transfer-container table-source-transfer-container"
                 >
-                  <div class="table-mapping-title">
-                    源库到目标库映射（每个源库可指定不同的目标库）
-                  </div>
+                  <div class="transfer-pane">
+                    <div class="transfer-header">
+                      <span class="title">源数据库</span>
 
-                  <div class="table-mapping-list">
-                    <div
-                      v-for="mapping in targetDatabaseMappings"
-                      :key="mapping.source"
-                      class="table-mapping-item"
-                    >
-                      <span class="table-mapping-source">{{ mapping.source }}</span>
+                      <a-button
+                        type="text"
+                        size="mini"
+                        :loading="refreshingDatabases"
+                        @click="refreshDatabases"
+                      >
+                        <template #icon><icon-refresh /></template>
+                      </a-button>
+                    </div>
 
-                      <icon-arrow-right style="color: #86909c" />
-
-                      <a-input
-                        v-model="mapping.target"
-                        placeholder="目标库名"
-                        style="width: 220px"
+                    <div class="transfer-search">
+                      <a-input-search
+                        v-model="databaseSearchText"
+                        placeholder="搜索库名..."
+                        size="small"
+                        allow-clear
                       />
                     </div>
 
-                    <a-empty
-                      v-if="targetDatabaseMappings.length === 0"
-                      description="请先选择源数据库"
-                    />
+                    <div class="transfer-content">
+                      <div class="transfer-list-header">
+                        <a-checkbox
+                          :model-value="
+                            selectedDatabases.length ===
+                              filteredDatabases.length &&
+                            filteredDatabases.length > 0
+                          "
+                          :indeterminate="
+                            selectedDatabases.length > 0 &&
+                            selectedDatabases.length < filteredDatabases.length
+                          "
+                          @change="
+                            () => {
+                              if (
+                                selectedDatabases.length ===
+                                filteredDatabases.length
+                              ) {
+                                selectedDatabases = [];
+                              } else {
+                                selectedDatabases = filteredDatabases;
+                              }
+                              onTableSourceDatabasesChange();
+                            }
+                          "
+                        >
+                          全选
+                        </a-checkbox>
+
+                        <span class="count"
+                          >{{ filteredDatabases.length }} 个库</span
+                        >
+                      </div>
+
+                      <div class="transfer-list">
+                        <a-checkbox-group
+                          v-model="selectedDatabases"
+                          direction="vertical"
+                          style="width: 100%"
+                          @change="onTableSourceDatabasesChange"
+                        >
+                          <div
+                            v-for="db in filteredDatabases"
+                            :key="db"
+                            class="transfer-list-item"
+                          >
+                            <a-checkbox :value="db">{{ db }}</a-checkbox>
+                          </div>
+                        </a-checkbox-group>
+
+                        <a-empty
+                          v-if="filteredDatabases.length === 0"
+                          description="暂无数据"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="transfer-arrow">
+                    <icon-arrow-right size="20" />
+                  </div>
+
+                  <div class="transfer-pane">
+                    <div class="transfer-header">
+                      <span class="title">
+                        源库到目标库映射（每个源库可指定不同的目标库）
+                      </span>
+
+                      <a-button
+                        type="text"
+                        size="mini"
+                        status="danger"
+                        @click="selectedDatabases = []"
+                        :disabled="selectedDatabases.length === 0"
+                      >
+                        清空
+                      </a-button>
+                    </div>
+
+                    <div class="transfer-header-tip">
+                      <span>源库名</span>
+
+                      <span>目标库名 (可修改)</span>
+                    </div>
+
+                    <div class="transfer-content bg-white">
+                      <div class="transfer-list">
+                        <div
+                          v-for="mapping in targetDatabaseMappings"
+                          :key="mapping.source"
+                          class="mapped-item"
+                        >
+                          <div class="source-name" :title="mapping.source">
+                            <icon-storage
+                              style="margin-right: 4px; color: #00e5ff"
+                            />
+
+                            {{ mapping.source }}
+                          </div>
+
+                          <div class="target-input">
+                            <a-input
+                              v-model="mapping.target"
+                              size="small"
+                              placeholder="目标库名"
+                              :style="{
+                                width: '100%',
+                                borderColor: mapping.target ? '' : '#ff7d00',
+                              }"
+                            />
+                          </div>
+
+                          <a-button
+                            type="text"
+                            size="mini"
+                            status="danger"
+                            class="remove-btn"
+                            @click="
+                              selectedDatabases = selectedDatabases.filter(
+                                (d) => d !== mapping.source,
+                              )
+                            "
+                          >
+                            <icon-close />
+                          </a-button>
+                        </div>
+
+                        <a-empty
+                          v-if="targetDatabaseMappings.length === 0"
+                          description="请从左侧选择数据库"
+                        />
+                      </div>
+                    </div>
                   </div>
                 </div>
 
@@ -3992,108 +4124,120 @@ watch(
                         </div>
                       </div>
 
-                      <a-descriptions :column="4" size="small" class="task-desc">
-                        <a-descriptions-item label="同步级别">
-                          {{
-                            task.config.sync_level === "DATABASE"
-                              ? "库级别"
-                              : "表级别"
-                          }}
-                        </a-descriptions-item>
+                      <div class="task-info-grid">
+                        <div class="task-info-cell task-info-cell--level">
+                          <span class="task-info-label">同步级别</span>
+                          <span class="task-info-value">
+                            {{
+                              task.config.sync_level === "DATABASE"
+                                ? "库级别"
+                                : "表级别"
+                            }}
+                          </span>
+                        </div>
 
-                        <a-descriptions-item label="源库">
-                          <template
-                            v-if="task.config.source_databases?.length"
-                          >
-                            <a-tag
-                              v-for="db in task.config.source_databases"
-                              :key="db"
-                              size="small"
-                              color="arcoblue"
-                              class="inline-tag"
-                              bordered
-                              >{{ db }}</a-tag
+                        <div class="task-info-cell task-info-cell--source">
+                          <span class="task-info-label">源库</span>
+                          <div class="task-info-value task-info-tags">
+                            <template
+                              v-if="task.config.source_databases?.length"
                             >
-                          </template>
-
-                          <template v-else>{{ task.config.source_schema || '-' }}</template>
-                        </a-descriptions-item>
-
-                        <a-descriptions-item label="目标端">
-                          <template
-                            v-if="
-                              task.config.sink_configs &&
-                              task.config.sink_configs.length > 0
-                            "
-                          >
-                            <template v-if="task.config.sink_configs.length > 1">
-                              <a-tag size="small" color="purple" bordered>
-                                {{ task.config.sink_configs.length }} 个目标端
-                              </a-tag>
+                              <a-tag
+                                v-for="db in task.config.source_databases"
+                                :key="db"
+                                size="small"
+                                color="arcoblue"
+                                class="inline-tag"
+                                bordered
+                                >{{ db }}</a-tag
+                              >
                             </template>
-                            <template v-else>
-                              <template
-                                v-if="task.config.sink_configs[0].type === 'KAFKA'"
-                              >
-                                <a-tag
-                                  size="small"
-                                  color="orange"
-                                  class="text-ellipsis inline-tag"
-                                  bordered
-                                  :title="task.config.sink_configs[0].options?.topic"
-                                >
-                                  Topic: {{ task.config.sink_configs[0].options?.topic || '-' }}
-                                </a-tag>
-                              </template>
-                              <template
-                                v-else-if="task.config.sink_configs[0].type === 'HTTP_WEBHOOK'"
-                              >
-                                <a-tag
-                                  size="small"
-                                  color="green"
-                                  class="text-ellipsis inline-tag"
-                                  bordered
-                                  :title="task.config.sink_configs[0].options?.url"
-                                >
-                                  {{ task.config.sink_configs[0].options?.url || '-' }}
+
+                            <template v-else>{{ task.config.source_schema || '-' }}</template>
+                          </div>
+                        </div>
+
+                        <div class="task-info-cell task-info-cell--target">
+                          <span class="task-info-label">目标端</span>
+                          <div class="task-info-value task-info-tags">
+                            <template
+                              v-if="
+                                task.config.sink_configs &&
+                                task.config.sink_configs.length > 0
+                              "
+                            >
+                              <template v-if="task.config.sink_configs.length > 1">
+                                <a-tag size="small" color="purple" bordered>
+                                  {{ task.config.sink_configs.length }} 个目标端
                                 </a-tag>
                               </template>
                               <template v-else>
-                                <a-tag
-                                  v-for="mapping in getTaskDatabaseMappings(task)"
-                                  :key="mapping.source"
-                                  size="small"
-                                  color="green"
-                                  class="inline-tag"
-                                  bordered
-                                  :title="`${mapping.source} → ${mapping.target}`"
-                                  >{{ mapping.target }}</a-tag
+                                <template
+                                  v-if="task.config.sink_configs[0].type === 'KAFKA'"
                                 >
+                                  <a-tag
+                                    size="small"
+                                    color="orange"
+                                    class="text-ellipsis inline-tag"
+                                    bordered
+                                    :title="task.config.sink_configs[0].options?.topic"
+                                  >
+                                    Topic: {{ task.config.sink_configs[0].options?.topic || '-' }}
+                                  </a-tag>
+                                </template>
+                                <template
+                                  v-else-if="task.config.sink_configs[0].type === 'HTTP_WEBHOOK'"
+                                >
+                                  <a-tag
+                                    size="small"
+                                    color="green"
+                                    class="text-ellipsis inline-tag"
+                                    bordered
+                                    :title="task.config.sink_configs[0].options?.url"
+                                  >
+                                    {{ task.config.sink_configs[0].options?.url || '-' }}
+                                  </a-tag>
+                                </template>
+                                <template v-else>
+                                  <a-tag
+                                    v-for="mapping in getTaskDatabaseMappings(task)"
+                                    :key="mapping.source"
+                                    size="small"
+                                    color="green"
+                                    class="inline-tag"
+                                    bordered
+                                    :title="`${mapping.source} → ${mapping.target}`"
+                                    >{{ mapping.target }}</a-tag
+                                  >
+                                </template>
                               </template>
                             </template>
-                          </template>
-                          <template v-else>
-                            <a-tag
-                              v-for="mapping in getTaskDatabaseMappings(task)"
-                              :key="mapping.source"
-                              size="small"
-                              color="green"
-                              class="inline-tag"
-                              bordered
-                              :title="`${mapping.source} → ${mapping.target}`"
-                              >{{ mapping.target }}</a-tag
-                            >
-                          </template>
-                        </a-descriptions-item>
+                            <template v-else>
+                              <a-tag
+                                v-for="mapping in getTaskDatabaseMappings(task)"
+                                :key="mapping.source"
+                                size="small"
+                                color="green"
+                                class="inline-tag"
+                                bordered
+                                :title="`${mapping.source} → ${mapping.target}`"
+                                >{{ mapping.target }}</a-tag
+                              >
+                            </template>
+                          </div>
+                        </div>
 
-                        <a-descriptions-item label="表数量">
-                          {{
-                            task.config.sync_level === "DATABASE"
-                              ? "全库"
-                              : task.config.tables?.length || 0
-                          }}
-                        </a-descriptions-item>
-                      </a-descriptions>
+                        <div class="task-info-cell task-info-cell--count">
+                          <span class="task-info-label">表数量</span>
+                          <span class="task-info-value">
+                            {{
+                              task.config.sync_level === "DATABASE"
+                                ? "全库"
+                                : task.config.tables?.length || 0
+                            }}
+                          </span>
+                        </div>
+                      </div>
 
                       <div
                         v-if="task.context.status === 'RUNNING'"
@@ -4223,6 +4367,32 @@ watch(
             </div>
             <a-tag color="arcoblue" bordered>配置文件：etc/application.toml</a-tag>
           </div>
+
+          <a-card class="config-section-card theme-config-card" :bordered="false">
+            <template #title>界面主题</template>
+            <div class="theme-option-grid">
+              <button
+                v-for="theme in uiThemeOptions"
+                :key="theme.value"
+                type="button"
+                class="theme-option"
+                :class="[`theme-option--${theme.value}`, { 'is-active': uiTheme === theme.value }]"
+                @click="setUiTheme(theme.value)"
+              >
+                <span class="theme-option__swatch">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </span>
+                <span class="theme-option__content">
+                  <span class="theme-option__title">{{ theme.label }}</span>
+                  <span class="theme-option__desc">{{ theme.desc }}</span>
+                </span>
+                <span v-if="uiTheme === theme.value" class="theme-option__checked">已启用</span>
+              </button>
+            </div>
+            <div class="config-hint">主题仅保存在当前浏览器本地，不会改写服务端配置文件。</div>
+          </a-card>
 
           <a-row :gutter="16" class="config-summary-row">
             <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="HTTP 端口" :value="configForm.http.port" /></a-card></a-col>
@@ -6415,6 +6585,1554 @@ watch(
     height: 500px;
     min-height: 500px;
     max-height: 500px;
+  }
+}
+
+/* Sci-fi create task surface */
+.layout-container {
+  background:
+    radial-gradient(circle at 12% 8%, rgba(0, 229, 255, 0.22), transparent 28%),
+    radial-gradient(circle at 88% 16%, rgba(255, 61, 145, 0.18), transparent 30%),
+    radial-gradient(circle at 58% 92%, rgba(127, 90, 240, 0.18), transparent 34%),
+    linear-gradient(135deg, #09111f 0%, #101827 45%, #14131f 100%);
+}
+
+.sider {
+  background:
+    linear-gradient(180deg, rgba(8, 18, 33, 0.98) 0%, rgba(18, 21, 44, 0.98) 100%),
+    linear-gradient(135deg, rgba(0, 229, 255, 0.16), rgba(255, 61, 145, 0.14));
+  border-right: 1px solid rgba(0, 229, 255, 0.22);
+  box-shadow: 12px 0 38px rgba(0, 0, 0, 0.28);
+}
+
+.sider :deep(.arco-layout-sider-children) {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.sider-footer {
+  margin-top: auto;
+}
+
+.logo {
+  border-bottom-color: rgba(0, 229, 255, 0.24);
+}
+
+.logo-icon {
+  background: linear-gradient(135deg, #00e5ff 0%, #7f5af0 52%, #ff3d91 100%);
+  box-shadow: 0 0 24px rgba(0, 229, 255, 0.42);
+}
+
+.header {
+  background: rgba(10, 18, 32, 0.78);
+  border-bottom: 1px solid rgba(0, 229, 255, 0.2);
+  color: #e8f6ff;
+  backdrop-filter: blur(18px);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.24);
+}
+
+.header :deep(.arco-typography) {
+  color: #e8f6ff;
+}
+
+.content {
+  background:
+    linear-gradient(rgba(0, 229, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 61, 145, 0.035) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.task-form-full-page {
+  max-width: 1180px;
+}
+
+.task-create-form {
+  gap: 20px;
+}
+
+.task-base-config-row,
+.advanced-config-card,
+.table-mapping-panel,
+.table-selector-panel,
+.transfer-pane,
+.task-list-card,
+.task-filter-summary,
+.task-card-inner {
+  border-color: rgba(91, 205, 255, 0.24) !important;
+  background: linear-gradient(180deg, rgba(18, 28, 48, 0.92), rgba(10, 18, 32, 0.9)) !important;
+  box-shadow:
+    0 18px 46px rgba(0, 0, 0, 0.26),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  color: #e8f6ff;
+}
+
+.task-base-config-row {
+  position: relative;
+  overflow: hidden;
+  padding: 28px 30px 10px;
+}
+
+.task-base-config-row::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, rgba(0, 229, 255, 0.22), transparent 22%, transparent 72%, rgba(255, 61, 145, 0.18)),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent 18%);
+  opacity: 0.85;
+}
+
+.task-base-config-row > :deep(.arco-col) {
+  position: relative;
+  z-index: 1;
+}
+
+.task-base-config-row :deep(.arco-form-item-label-col > label),
+.transfer-header .title,
+.table-mapping-title,
+.task-list-title-wrap :deep(.arco-typography),
+.task-title :deep(.arco-typography) {
+  color: #e8f6ff;
+}
+
+.task-base-config-row :deep(.arco-input-wrapper),
+.task-base-config-row :deep(.arco-select-view),
+.advanced-config-card :deep(.arco-input-wrapper),
+.advanced-config-card :deep(.arco-input-number),
+.table-selector-panel :deep(.arco-input-wrapper),
+.table-mapping-panel :deep(.arco-input-wrapper),
+.transfer-pane :deep(.arco-input-wrapper),
+.transfer-pane :deep(.arco-select-view) {
+  border-color: rgba(0, 229, 255, 0.2);
+  background: rgba(7, 14, 28, 0.72);
+  color: #e8f6ff;
+}
+
+.task-base-config-row :deep(.arco-input),
+.advanced-config-card :deep(.arco-input),
+.table-selector-panel :deep(.arco-input),
+.table-mapping-panel :deep(.arco-input),
+.transfer-pane :deep(.arco-input) {
+  color: #e8f6ff;
+}
+
+.task-base-config-row :deep(.arco-input-wrapper:hover),
+.task-base-config-row :deep(.arco-select-view:hover),
+.transfer-pane :deep(.arco-input-wrapper:hover),
+.table-selector-panel :deep(.arco-input-wrapper:hover),
+.table-mapping-panel :deep(.arco-input-wrapper:hover) {
+  border-color: rgba(0, 229, 255, 0.72);
+  background: rgba(12, 24, 44, 0.88);
+  box-shadow: 0 0 0 3px rgba(0, 229, 255, 0.1);
+}
+
+.task-base-config-row :deep(.arco-radio) {
+  border-color: rgba(0, 229, 255, 0.22);
+  background: rgba(7, 14, 28, 0.68);
+  color: #c9d9e8;
+}
+
+.task-base-config-row :deep(.arco-radio:hover),
+.task-base-config-row :deep(.arco-radio-checked) {
+  border-color: rgba(0, 229, 255, 0.78);
+  background: linear-gradient(135deg, rgba(0, 229, 255, 0.16), rgba(127, 90, 240, 0.18));
+  box-shadow: 0 0 24px rgba(0, 229, 255, 0.16);
+}
+
+.db-transfer-container,
+.table-source-transfer-container {
+  height: 360px;
+  margin-top: 8px;
+  margin-bottom: 22px;
+  padding: 16px;
+  border: 1px solid rgba(0, 229, 255, 0.22);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(0, 229, 255, 0.12), rgba(255, 61, 145, 0.08)),
+    rgba(7, 14, 28, 0.52);
+  box-shadow: inset 0 0 40px rgba(0, 229, 255, 0.05);
+}
+
+.transfer-pane {
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.transfer-header {
+  min-height: 46px;
+  border-bottom-color: rgba(0, 229, 255, 0.18);
+  background: linear-gradient(90deg, rgba(0, 229, 255, 0.14), rgba(127, 90, 240, 0.08), rgba(255, 61, 145, 0.12));
+}
+
+.transfer-header-tip,
+.transfer-list-header,
+.transfer-search {
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+  background: rgba(6, 12, 24, 0.45);
+  color: #8fb3c9;
+}
+
+.transfer-content.bg-white,
+.transfer-content {
+  background: rgba(7, 14, 28, 0.52);
+}
+
+.transfer-list-item,
+.mapped-item,
+.table-mapping-item {
+  color: #d8ebf7;
+}
+
+.transfer-list-item:hover,
+.mapped-item:hover,
+.table-mapping-item:hover {
+  background: rgba(0, 229, 255, 0.08);
+}
+
+.mapped-item {
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+
+.mapped-item .source-name,
+.table-mapping-source {
+  color: #e8f6ff;
+}
+
+.transfer-arrow {
+  color: #00e5ff;
+  filter: drop-shadow(0 0 12px rgba(0, 229, 255, 0.7));
+}
+
+.advanced-config-card :deep(.arco-card-body) {
+  color: #e8f6ff;
+}
+
+.table-config-row {
+  margin-top: 0;
+}
+
+.table-target-mapping-panel,
+.table-selector-panel {
+  height: 540px;
+  min-height: 540px;
+  max-height: 540px;
+  border-radius: 8px;
+}
+
+.table-target-mapping-panel {
+  margin: 0;
+}
+
+.table-list-panel,
+.table-db-collapse {
+  border-color: rgba(0, 229, 255, 0.18);
+  background: rgba(7, 14, 28, 0.58);
+}
+
+.table-db-collapse :deep(.arco-collapse-item-header) {
+  background: rgba(0, 229, 255, 0.07);
+  color: #e8f6ff;
+}
+
+.table-db-collapse :deep(.arco-collapse-item-content) {
+  background: rgba(5, 11, 22, 0.4);
+  color: #d8ebf7;
+}
+
+.table-list-item {
+  padding: 5px 7px;
+  border-radius: 6px;
+}
+
+.table-list-item:hover {
+  background: rgba(255, 61, 145, 0.08);
+}
+
+.table-name-text {
+  color: #d8ebf7;
+}
+
+.table-selector-form-item :deep(.arco-form-item-label-col) {
+  margin-bottom: 12px;
+}
+
+.table-selector-form-item :deep(.arco-form-item-label-col > label) {
+  color: #e8f6ff;
+  font-weight: 600;
+}
+
+.table-selector-panel :deep(.arco-alert-info) {
+  border-color: rgba(0, 229, 255, 0.22);
+  background: rgba(0, 229, 255, 0.08);
+  color: #c9d9e8;
+}
+
+.advanced-config-row {
+  margin-top: 0;
+}
+
+.task-base-config-row :deep(.arco-btn-primary),
+.header-right :deep(.arco-btn-primary) {
+  border: 0;
+  background: linear-gradient(135deg, #00e5ff 0%, #7f5af0 54%, #ff3d91 100%);
+  box-shadow: 0 0 26px rgba(0, 229, 255, 0.24);
+}
+
+/* Keep text readable on the dark sci-fi surface */
+.task-base-config-row :deep(.arco-form-item-label-col > label),
+.advanced-config-card :deep(.arco-form-item-label-col > label),
+.table-mapping-panel :deep(.arco-form-item-label-col > label),
+.table-selector-panel :deep(.arco-form-item-label-col > label),
+.task-base-config-row :deep(.arco-typography),
+.advanced-config-card :deep(.arco-typography),
+.table-mapping-panel :deep(.arco-typography),
+.table-selector-panel :deep(.arco-typography),
+.task-base-config-row :deep(.arco-checkbox-label),
+.advanced-config-card :deep(.arco-checkbox-label),
+.table-selector-panel :deep(.arco-checkbox-label),
+.task-base-config-row :deep(.arco-radio-label),
+.task-base-config-row :deep(.arco-select-view-value) {
+  color: #eef8ff !important;
+}
+
+.task-base-config-row :deep(.arco-typography-secondary),
+.advanced-config-card :deep(.arco-typography-secondary),
+.table-mapping-panel :deep(.arco-typography-secondary),
+.table-selector-panel :deep(.arco-typography-secondary),
+.task-base-config-row :deep(.arco-form-item-extra),
+.advanced-config-card :deep(.arco-form-item-extra),
+.task-base-config-row :deep(.arco-checkbox-disabled .arco-checkbox-label),
+.advanced-config-card :deep(.arco-checkbox-disabled .arco-checkbox-label),
+.task-base-config-row :deep(.arco-radio-disabled .arco-radio-label) {
+  color: #b9cbe0 !important;
+}
+
+.task-base-config-row :deep(.arco-radio-disabled),
+.task-base-config-row :deep(.arco-checkbox-disabled),
+.advanced-config-card :deep(.arco-checkbox-disabled) {
+  opacity: 1;
+}
+
+.task-base-config-row :deep(.arco-input::placeholder),
+.advanced-config-card :deep(.arco-input::placeholder),
+.table-mapping-panel :deep(.arco-input::placeholder),
+.table-selector-panel :deep(.arco-input::placeholder),
+.transfer-pane :deep(.arco-input::placeholder) {
+  color: #8da9bf !important;
+}
+
+.task-base-config-row :deep(.arco-input-number),
+.advanced-config-card :deep(.arco-input-number),
+.task-base-config-row :deep(.arco-input-number input),
+.advanced-config-card :deep(.arco-input-number input),
+.task-base-config-row :deep(.arco-checkbox),
+.advanced-config-card :deep(.arco-checkbox),
+.table-selector-panel :deep(.arco-checkbox) {
+  color: #eef8ff;
+}
+
+.advanced-config-card :deep(.arco-card-header),
+.advanced-config-card :deep(.arco-card-body),
+.task-base-config-row :deep(.arco-form-item-content),
+.advanced-config-card :deep(.arco-form-item-content),
+.table-selector-panel :deep(.arco-form-item-content) {
+  color: #eef8ff;
+}
+
+/* Unified deep-blue theme pass */
+.layout-container {
+  --app-bg: #07111f;
+  --app-surface: rgba(12, 24, 42, 0.94);
+  --app-surface-soft: rgba(16, 33, 56, 0.9);
+  --app-surface-strong: rgba(8, 17, 31, 0.98);
+  --app-border: rgba(72, 188, 226, 0.28);
+  --app-border-soft: rgba(113, 168, 199, 0.16);
+  --app-text: #edf7ff;
+  --app-muted: #9fb5c9;
+  --app-accent: #20c7e8;
+  --app-accent-2: #3b82f6;
+  --app-glow: rgba(32, 199, 232, 0.24);
+  background:
+    radial-gradient(circle at 15% 12%, rgba(32, 199, 232, 0.16), transparent 30%),
+    radial-gradient(circle at 82% 8%, rgba(59, 130, 246, 0.12), transparent 28%),
+    linear-gradient(135deg, #06101d 0%, #091728 48%, #0b1322 100%);
+}
+
+.sider {
+  background: linear-gradient(180deg, #07111f 0%, #0a1728 56%, #081220 100%);
+  border-right-color: var(--app-border);
+  box-shadow: 10px 0 34px rgba(0, 0, 0, 0.28);
+}
+
+.logo {
+  border-bottom-color: var(--app-border);
+}
+
+.logo-icon {
+  background: linear-gradient(135deg, #22d3ee 0%, #3b82f6 100%);
+  box-shadow: 0 0 22px rgba(34, 211, 238, 0.3);
+}
+
+.sider-menu :deep(.arco-menu-item:hover) {
+  background: rgba(32, 199, 232, 0.12) !important;
+}
+
+.sider-menu :deep(.arco-menu-item.arco-menu-selected) {
+  background: rgba(148, 163, 184, 0.22) !important;
+  box-shadow: inset 3px 0 0 var(--app-accent);
+}
+
+.header {
+  background: rgba(7, 17, 31, 0.9);
+  border-bottom-color: var(--app-border);
+}
+
+.content {
+  background:
+    linear-gradient(rgba(59, 130, 246, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(32, 199, 232, 0.035) 1px, transparent 1px);
+  background-size: 30px 30px;
+}
+
+.stat-card,
+.task-list-card,
+.task-filter-panel,
+.task-filter-summary,
+.empty-state--card,
+.task-card-inner,
+.advanced-filter-collapse,
+.task-base-config-row,
+.advanced-config-card,
+.table-mapping-panel,
+.table-selector-panel,
+.transfer-pane {
+  border: 1px solid var(--app-border) !important;
+  background:
+    linear-gradient(180deg, rgba(18, 35, 58, 0.96) 0%, rgba(10, 22, 39, 0.96) 100%) !important;
+  box-shadow:
+    0 16px 38px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
+  color: var(--app-text);
+}
+
+.stat-card :deep(.arco-card-body) {
+  color: var(--app-text);
+  padding: 20px 18px;
+}
+
+.stat-card :deep(.arco-statistic-title),
+.task-filter-panel__desc,
+.task-filter-summary__empty,
+.task-list-title-wrap :deep(.arco-typography-secondary),
+.empty-state :deep(.arco-empty-description) {
+  color: var(--app-muted) !important;
+}
+
+.stat-card :deep(.arco-statistic-value),
+.task-filter-panel__title,
+.task-filter-summary__title,
+.task-list-title-wrap :deep(.arco-typography),
+.empty-state :deep(.arco-empty-image) {
+  color: var(--app-text) !important;
+}
+
+.task-list-card :deep(.arco-card-header),
+.task-filter-panel :deep(.arco-card-header),
+.task-filter-panel :deep(.arco-card-body),
+.advanced-filter-collapse :deep(.arco-collapse-item-header),
+.advanced-filter-collapse :deep(.arco-collapse-item-content) {
+  border-color: var(--app-border-soft) !important;
+  background: transparent !important;
+  color: var(--app-text);
+}
+
+.advanced-filter-collapse :deep(.arco-collapse-item-header-title),
+.advanced-filter-collapse :deep(.arco-collapse-item-icon-hover) {
+  color: var(--app-text);
+}
+
+.task-filter-summary {
+  background: rgba(7, 17, 31, 0.64) !important;
+}
+
+.filter-chip :deep(.arco-tag),
+.task-filter-summary :deep(.arco-tag),
+.task-list-card :deep(.arco-tag),
+.task-filter-panel :deep(.arco-tag) {
+  border-color: rgba(32, 199, 232, 0.32);
+  background: rgba(32, 199, 232, 0.12) !important;
+  color: #dff8ff !important;
+}
+
+.task-list-card :deep(.arco-input-wrapper),
+.task-list-card :deep(.arco-select-view),
+.task-filter-panel :deep(.arco-input-wrapper),
+.task-filter-panel :deep(.arco-select-view),
+.advanced-filter-collapse :deep(.arco-input-wrapper),
+.advanced-filter-collapse :deep(.arco-select-view) {
+  border-color: var(--app-border-soft);
+  background: rgba(6, 14, 26, 0.64);
+  color: var(--app-text);
+}
+
+.task-list-card :deep(.arco-input),
+.task-filter-panel :deep(.arco-input),
+.advanced-filter-collapse :deep(.arco-input),
+.task-list-card :deep(.arco-select-view-value),
+.task-filter-panel :deep(.arco-select-view-value),
+.advanced-filter-collapse :deep(.arco-select-view-value) {
+  color: var(--app-text);
+}
+
+.task-list-card :deep(.arco-input::placeholder),
+.task-filter-panel :deep(.arco-input::placeholder),
+.advanced-filter-collapse :deep(.arco-input::placeholder) {
+  color: var(--app-muted) !important;
+}
+
+.header-right :deep(.arco-btn-primary),
+.task-base-config-row :deep(.arco-btn-primary),
+.empty-state :deep(.arco-btn-primary) {
+  border: 1px solid rgba(125, 211, 252, 0.24);
+  background: linear-gradient(135deg, var(--app-accent) 0%, var(--app-accent-2) 100%) !important;
+  box-shadow: 0 10px 26px rgba(32, 199, 232, 0.2);
+}
+
+.task-list-card :deep(.arco-btn-text),
+.task-filter-panel :deep(.arco-btn-text) {
+  color: #7dd3fc;
+}
+
+.empty-state--card {
+  border-style: dashed !important;
+  min-height: 228px;
+}
+
+.empty-state--card :deep(.arco-empty) {
+  color: var(--app-muted);
+}
+
+.task-list-card :deep(.arco-collapse),
+.advanced-filter-collapse {
+  background: transparent !important;
+}
+
+.task-filter-form-row :deep(.arco-form-item-label-col),
+.task-filter-form-row :deep(.arco-form-item-label-col > label) {
+  color: var(--app-muted) !important;
+}
+
+:global(.arco-message) {
+  border: 1px solid rgba(72, 188, 226, 0.28) !important;
+  background: rgba(12, 24, 42, 0.96) !important;
+  color: #edf7ff !important;
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.24) !important;
+}
+
+:global(.arco-message-content),
+:global(.arco-message .arco-icon) {
+  color: #edf7ff !important;
+}
+
+/* Clear target-type selection and filter panel typography */
+.select-type-page {
+  max-width: 860px;
+  margin: 56px auto 72px;
+  padding: 0 28px;
+}
+
+.select-type-header {
+  margin-bottom: 34px;
+  padding: 18px 0 6px;
+  text-align: center;
+}
+
+.select-type-header :deep(.arco-typography) {
+  color: var(--app-text) !important;
+}
+
+.select-type-header :deep(h1.arco-typography),
+.select-type-header :deep(h2.arco-typography),
+.select-type-header :deep(h3.arco-typography) {
+  margin: 0 0 10px !important;
+  color: #f3fbff !important;
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-shadow: 0 0 18px rgba(32, 199, 232, 0.18);
+}
+
+.select-type-header :deep(.arco-typography-secondary) {
+  color: #b9cbe0 !important;
+  font-size: 14px;
+}
+
+.type-cards-container {
+  gap: 22px;
+}
+
+.type-card {
+  min-height: 126px;
+  border: 1px solid var(--app-border) !important;
+  background:
+    linear-gradient(180deg, rgba(18, 35, 58, 0.96), rgba(10, 22, 39, 0.96)) !important;
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.22);
+  color: var(--app-text);
+  overflow: hidden;
+}
+
+.type-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(125, 211, 252, 0.64) !important;
+  background:
+    linear-gradient(180deg, rgba(22, 47, 76, 0.98), rgba(11, 29, 50, 0.98)) !important;
+  box-shadow: 0 18px 38px rgba(32, 199, 232, 0.14);
+}
+
+.type-card :deep(.arco-card-body) {
+  align-items: center;
+  padding: 24px;
+  color: var(--app-text);
+}
+
+.type-content {
+  min-width: 0;
+}
+
+.type-content :deep(.arco-typography),
+.type-content :deep(h5.arco-typography) {
+  color: #f3fbff !important;
+}
+
+.type-content :deep(h5.arco-typography) {
+  margin-bottom: 8px !important;
+  font-size: 20px;
+  line-height: 1.35;
+}
+
+.type-content :deep(.arco-typography-secondary) {
+  color: #b9cbe0 !important;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.type-icon {
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  background: rgba(32, 199, 232, 0.12) !important;
+  color: #7dd3fc !important;
+}
+
+.kafka-icon {
+  background: rgba(59, 130, 246, 0.12) !important;
+  color: #93c5fd !important;
+}
+
+.webhook-icon {
+  background: rgba(20, 184, 166, 0.12) !important;
+  color: #5eead4 !important;
+}
+
+.multi-icon {
+  background: rgba(148, 163, 184, 0.12) !important;
+  color: #cbd5e1 !important;
+}
+
+.task-filter-panel {
+  overflow: visible;
+}
+
+.task-filter-panel :deep(.arco-card-header) {
+  min-height: 76px;
+  padding: 20px 20px 18px !important;
+}
+
+.task-filter-panel :deep(.arco-card-body) {
+  line-height: 20px;
+}
+
+.task-filter-panel__header {
+  align-items: center;
+  min-height: 38px;
+}
+
+.task-filter-panel__title {
+  color: #f3fbff !important;
+  font-size: 16px;
+  line-height: 22px;
+}
+
+.task-filter-panel__desc {
+  margin-top: 6px;
+  color: #b9cbe0 !important;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+@media (max-width: 1200px) {
+  .task-form-full-page {
+    max-width: 980px;
+  }
+
+  .task-card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .task-card-actions {
+    width: 100%;
+    min-height: auto;
+    padding: 16px 0 0;
+    border-left: 0;
+    border-top: 1px solid var(--app-border-soft, #edf2f7);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-auto-rows: 32px;
+  }
+
+  .task-info-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .table-target-mapping-panel,
+  .table-selector-panel {
+    height: 500px;
+    min-height: 500px;
+    max-height: 500px;
+  }
+}
+
+@media (max-width: 768px) {
+  .layout-container {
+    height: auto;
+    min-height: 100vh;
+    flex-direction: column;
+  }
+
+  .sider {
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    flex: 0 0 auto !important;
+    height: auto;
+  }
+
+  .sider :deep(.arco-layout-sider-children) {
+    min-height: 0;
+  }
+
+  .logo {
+    height: 56px;
+  }
+
+  .sider-menu {
+    flex: 0 0 auto;
+    padding: 8px 10px;
+  }
+
+  .sider-menu :deep(.arco-menu-inner) {
+    flex-direction: row !important;
+    gap: 8px;
+  }
+
+  .sider-menu :deep(.arco-menu-item) {
+    width: auto !important;
+    flex: 1 1 0;
+    margin: 0;
+    text-align: center;
+  }
+
+  .sider-footer {
+    display: none;
+  }
+
+  .header {
+    min-height: 64px;
+    height: auto;
+    padding: 12px;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .content {
+    padding: 14px 12px 28px;
+  }
+
+  .task-form-full-page {
+    width: 100%;
+    padding: 12px 0 36px;
+  }
+
+  .task-base-config-row {
+    padding: 18px 14px 2px;
+  }
+
+  .db-transfer-container,
+  .table-source-transfer-container {
+    align-items: stretch;
+    gap: 12px;
+    height: auto;
+    min-height: 620px;
+    width: 100%;
+    padding: 12px;
+  }
+
+  .db-transfer-container .transfer-pane,
+  .table-source-transfer-container .transfer-pane {
+    width: 100%;
+    flex: 0 0 auto;
+  }
+
+  .db-transfer-container .transfer-arrow,
+  .table-source-transfer-container .transfer-arrow {
+    align-self: center;
+    width: 100%;
+  }
+
+  .table-target-mapping-panel,
+  .table-selector-panel {
+    height: 520px;
+    min-height: 520px;
+    max-height: 520px;
+  }
+
+  .table-config-row > :deep(.arco-col) {
+    flex: 0 0 100%;
+    max-width: 100%;
+    margin-bottom: 16px;
+  }
+
+  .table-list-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .task-title,
+  .task-info-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .task-info-cell,
+  .task-info-cell--count {
+    justify-self: stretch;
+  }
+
+  .task-card-actions {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Theme selector in system config */
+.theme-config-card {
+  margin-bottom: 16px;
+}
+
+.theme-option-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.theme-option {
+  min-height: 86px;
+  padding: 12px;
+  border: 1px solid rgba(120, 144, 166, 0.24);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  text-align: left;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+
+.theme-option:hover,
+.theme-option.is-active {
+  border-color: var(--app-accent, #165dff);
+  box-shadow: 0 0 0 3px rgba(32, 199, 232, 0.12);
+  transform: translateY(-1px);
+}
+
+.theme-option__swatch {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr;
+  gap: 4px;
+  height: 18px;
+}
+
+.theme-option__swatch span {
+  border-radius: 4px;
+}
+
+.theme-option__content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.theme-option__title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.theme-option__desc,
+.theme-option__checked {
+  color: var(--app-muted, #86909c);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.theme-option__checked {
+  color: var(--app-accent, #165dff);
+}
+
+.theme-option--default .theme-option__swatch span:nth-child(1) { background: #ffffff; border: 1px solid #e5e6eb; }
+.theme-option--default .theme-option__swatch span:nth-child(2) { background: #f5f7fa; }
+.theme-option--default .theme-option__swatch span:nth-child(3) { background: #165dff; }
+.theme-option--blue .theme-option__swatch span:nth-child(1) { background: #07111f; }
+.theme-option--blue .theme-option__swatch span:nth-child(2) { background: #12233a; }
+.theme-option--blue .theme-option__swatch span:nth-child(3) { background: #20c7e8; }
+.theme-option--gray .theme-option__swatch span:nth-child(1) { background: #14181f; }
+.theme-option--gray .theme-option__swatch span:nth-child(2) { background: #252c36; }
+.theme-option--gray .theme-option__swatch span:nth-child(3) { background: #94a3b8; }
+.theme-option--black .theme-option__swatch span:nth-child(1) { background: #000000; }
+.theme-option--black .theme-option__swatch span:nth-child(2) { background: #0a0a0a; }
+.theme-option--black .theme-option__swatch span:nth-child(3) { background: #38bdf8; }
+.theme-option--dark .theme-option__swatch span:nth-child(1) { background: #111827; }
+.theme-option--dark .theme-option__swatch span:nth-child(2) { background: #1f2937; }
+.theme-option--dark .theme-option__swatch span:nth-child(3) { background: #60a5fa; }
+
+.theme-blue {
+  --app-bg: #07111f;
+  --app-surface: rgba(18, 35, 58, 0.96);
+  --app-surface-soft: rgba(10, 22, 39, 0.96);
+  --app-surface-strong: rgba(7, 17, 31, 0.98);
+  --app-border: rgba(72, 188, 226, 0.28);
+  --app-border-soft: rgba(113, 168, 199, 0.16);
+  --app-text: #edf7ff;
+  --app-muted: #9fb5c9;
+  --app-accent: #20c7e8;
+  --app-accent-2: #3b82f6;
+  --app-glow: rgba(32, 199, 232, 0.24);
+}
+
+.theme-gray {
+  --app-bg: #111827;
+  --app-surface: rgba(31, 41, 55, 0.96);
+  --app-surface-soft: rgba(38, 48, 63, 0.94);
+  --app-surface-strong: rgba(17, 24, 39, 0.98);
+  --app-border: rgba(148, 163, 184, 0.28);
+  --app-border-soft: rgba(148, 163, 184, 0.16);
+  --app-text: #f1f5f9;
+  --app-muted: #cbd5e1;
+  --app-accent: #94a3b8;
+  --app-accent-2: #64748b;
+  --app-glow: rgba(148, 163, 184, 0.18);
+}
+
+.theme-black {
+  --app-bg: #000000;
+  --app-surface: rgba(10, 10, 10, 0.98);
+  --app-surface-soft: rgba(18, 18, 18, 0.96);
+  --app-surface-strong: rgba(0, 0, 0, 0.98);
+  --app-border: rgba(125, 211, 252, 0.3);
+  --app-border-soft: rgba(125, 211, 252, 0.16);
+  --app-text: #f8fafc;
+  --app-muted: #cbd5e1;
+  --app-accent: #38bdf8;
+  --app-accent-2: #2563eb;
+  --app-glow: rgba(56, 189, 248, 0.2);
+}
+
+.theme-dark {
+  --app-bg: #0f172a;
+  --app-surface: rgba(30, 41, 59, 0.96);
+  --app-surface-soft: rgba(39, 52, 73, 0.94);
+  --app-surface-strong: rgba(15, 23, 42, 0.98);
+  --app-border: rgba(96, 165, 250, 0.3);
+  --app-border-soft: rgba(96, 165, 250, 0.16);
+  --app-text: #f8fafc;
+  --app-muted: #cbd5e1;
+  --app-accent: #60a5fa;
+  --app-accent-2: #818cf8;
+  --app-glow: rgba(96, 165, 250, 0.2);
+}
+
+.theme-blue,
+.theme-gray,
+.theme-black,
+.theme-dark {
+  background:
+    radial-gradient(circle at 14% 10%, var(--app-glow), transparent 30%),
+    linear-gradient(135deg, var(--app-bg), var(--app-surface-strong));
+}
+
+.theme-blue .sider,
+.theme-gray .sider,
+.theme-black .sider,
+.theme-dark .sider,
+.theme-blue .header,
+.theme-gray .header,
+.theme-black .header,
+.theme-dark .header {
+  background: var(--app-surface-strong);
+  border-color: var(--app-border);
+}
+
+.theme-blue .stat-card,
+.theme-gray .stat-card,
+.theme-black .stat-card,
+.theme-dark .stat-card,
+.theme-blue .task-list-card,
+.theme-gray .task-list-card,
+.theme-black .task-list-card,
+.theme-dark .task-list-card,
+.theme-blue .task-filter-panel,
+.theme-gray .task-filter-panel,
+.theme-black .task-filter-panel,
+.theme-dark .task-filter-panel,
+.theme-blue .task-filter-summary,
+.theme-gray .task-filter-summary,
+.theme-black .task-filter-summary,
+.theme-dark .task-filter-summary,
+.theme-blue .empty-state--card,
+.theme-gray .empty-state--card,
+.theme-black .empty-state--card,
+.theme-dark .empty-state--card,
+.theme-blue .type-card,
+.theme-gray .type-card,
+.theme-black .type-card,
+.theme-dark .type-card,
+.theme-blue .config-summary-card,
+.theme-gray .config-summary-card,
+.theme-black .config-summary-card,
+.theme-dark .config-summary-card,
+.theme-blue .config-page-card,
+.theme-gray .config-page-card,
+.theme-black .config-page-card,
+.theme-dark .config-page-card,
+.theme-blue .config-section-card,
+.theme-gray .config-section-card,
+.theme-black .config-section-card,
+.theme-dark .config-section-card {
+  border-color: var(--app-border) !important;
+  background: linear-gradient(180deg, var(--app-surface), var(--app-surface-soft)) !important;
+  color: var(--app-text);
+}
+
+.theme-blue .header-right :deep(.arco-btn-primary),
+.theme-gray .header-right :deep(.arco-btn-primary),
+.theme-black .header-right :deep(.arco-btn-primary),
+.theme-dark .header-right :deep(.arco-btn-primary),
+.theme-blue .task-base-config-row :deep(.arco-btn-primary),
+.theme-gray .task-base-config-row :deep(.arco-btn-primary),
+.theme-black .task-base-config-row :deep(.arco-btn-primary),
+.theme-dark .task-base-config-row :deep(.arco-btn-primary) {
+  background: linear-gradient(135deg, var(--app-accent), var(--app-accent-2)) !important;
+}
+
+/* Non-default themes: make every Arco data/control surface readable */
+.layout-container:not(.theme-default),
+.layout-container:not(.theme-default) :deep(.arco-layout),
+.layout-container:not(.theme-default) :deep(.arco-card),
+.layout-container:not(.theme-default) :deep(.arco-card-body),
+.layout-container:not(.theme-default) :deep(.arco-card-header),
+.layout-container:not(.theme-default) :deep(.arco-list),
+.layout-container:not(.theme-default) :deep(.arco-list-item),
+.layout-container:not(.theme-default) :deep(.arco-form),
+.layout-container:not(.theme-default) :deep(.arco-form-item),
+.layout-container:not(.theme-default) :deep(.arco-form-item-content),
+.layout-container:not(.theme-default) :deep(.arco-collapse),
+.layout-container:not(.theme-default) :deep(.arco-collapse-item),
+.layout-container:not(.theme-default) :deep(.arco-collapse-item-content),
+.layout-container:not(.theme-default) :deep(.arco-collapse-item-content-box) {
+  color: var(--app-text) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-typography),
+.layout-container:not(.theme-default) :deep(.arco-form-item-label-col > label),
+.layout-container:not(.theme-default) :deep(.arco-checkbox-label),
+.layout-container:not(.theme-default) :deep(.arco-radio-label),
+.layout-container:not(.theme-default) :deep(.arco-statistic-value),
+.layout-container:not(.theme-default) :deep(.arco-collapse-item-header-title),
+.layout-container:not(.theme-default) :deep(.arco-descriptions-title),
+.layout-container:not(.theme-default) :deep(.arco-descriptions-item-value),
+.layout-container:not(.theme-default) :deep(.arco-table-td),
+.layout-container:not(.theme-default) :deep(.arco-table-th) {
+  color: var(--app-text) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-typography-secondary),
+.layout-container:not(.theme-default) :deep(.arco-statistic-title),
+.layout-container:not(.theme-default) :deep(.arco-form-item-extra),
+.layout-container:not(.theme-default) :deep(.arco-descriptions-item-label),
+.layout-container:not(.theme-default) :deep(.arco-empty-description),
+.layout-container:not(.theme-default) :deep(.arco-pagination-total),
+.layout-container:not(.theme-default) :deep(.arco-pagination-jumper),
+.layout-container:not(.theme-default) :deep(.arco-table-cell-with-sorter) {
+  color: var(--app-muted) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-card),
+.layout-container:not(.theme-default) :deep(.arco-table),
+.layout-container:not(.theme-default) :deep(.arco-table-container),
+.layout-container:not(.theme-default) :deep(.arco-descriptions-view),
+.layout-container:not(.theme-default) :deep(.arco-alert),
+.layout-container:not(.theme-default) :deep(.arco-collapse),
+.layout-container:not(.theme-default) :deep(.arco-collapse-item-header),
+.layout-container:not(.theme-default) :deep(.arco-collapse-item-content),
+.layout-container:not(.theme-default) :deep(.arco-list),
+.layout-container:not(.theme-default) :deep(.arco-list-item) {
+  border-color: var(--app-border-soft) !important;
+  background: transparent !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-table-th),
+.layout-container:not(.theme-default) :deep(.arco-table-td),
+.layout-container:not(.theme-default) :deep(.arco-descriptions-item-label-block),
+.layout-container:not(.theme-default) :deep(.arco-descriptions-item-value-block),
+.layout-container:not(.theme-default) :deep(.arco-descriptions-cell),
+.layout-container:not(.theme-default) :deep(.arco-descriptions-table) {
+  border-color: var(--app-border-soft) !important;
+  background: rgba(6, 14, 26, 0.34) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-table-tr:hover .arco-table-td),
+.layout-container:not(.theme-default) :deep(.arco-list-item:hover) {
+  background: rgba(32, 199, 232, 0.08) !important;
+}
+
+/* Task card alignment: reserve fixed action column and stable info columns */
+.task-list {
+  --task-action-width: 224px;
+  --task-action-button-height: 28px;
+  --task-action-gap: 8px;
+  --task-action-slot-count: 6;
+}
+
+.task-card-inner {
+  min-height: 148px;
+}
+
+.task-card-inner :deep(.arco-card-body) {
+  padding: 18px 20px;
+}
+
+.task-card-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--task-action-width);
+  gap: 22px;
+  align-items: stretch;
+  min-height: calc(
+    var(--task-action-slot-count) * var(--task-action-button-height) +
+    (var(--task-action-slot-count) - 1) * var(--task-action-gap)
+  );
+}
+
+.task-card-main {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 14px;
+  padding-right: 8px;
+}
+
+.task-header {
+  min-height: 28px;
+  margin-bottom: 0;
+}
+
+.task-title {
+  display: grid;
+  grid-template-columns: minmax(220px, auto) auto auto auto;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+}
+
+.task-title :deep(.arco-typography) {
+  min-width: 0;
+  max-width: 520px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-status-tag {
+  margin: 0;
+  justify-self: start;
+}
+
+.task-info-grid {
+  display: grid;
+  grid-template-columns:
+    minmax(120px, 0.8fr)
+    minmax(260px, 1.5fr)
+    minmax(260px, 1.5fr)
+    minmax(96px, 0.7fr);
+  align-items: center;
+  column-gap: 28px;
+  row-gap: 12px;
+  min-height: 54px;
+}
+
+.task-info-cell {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: 12px;
+  min-width: 0;
+}
+
+.task-info-label {
+  color: var(--app-muted, #86909c);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.task-info-value {
+  min-width: 0;
+  color: var(--app-text, #1d2129);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.theme-default .task-info-label {
+  color: #86909c;
+}
+
+.theme-default .task-info-value {
+  color: #1d2129;
+}
+
+.task-info-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 24px;
+  overflow: hidden;
+}
+
+.task-info-tags .inline-tag {
+  margin: 0;
+  max-width: 180px;
+}
+
+.task-info-tags :deep(.arco-tag-content) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-info-cell--count {
+  justify-self: end;
+}
+
+.task-card-actions {
+  width: var(--task-action-width);
+  min-height: calc(
+    var(--task-action-slot-count) * var(--task-action-button-height) +
+    (var(--task-action-slot-count) - 1) * var(--task-action-gap)
+  );
+  padding: 0 0 0 18px;
+  border-left: 1px solid var(--app-border-soft, #edf2f7);
+  display: grid;
+  grid-auto-rows: var(--task-action-button-height);
+  align-content: start;
+  gap: var(--task-action-gap);
+}
+
+.theme-default .task-card-actions {
+  border-left-color: #edf2f7;
+}
+
+.task-card-actions :deep(.arco-btn) {
+  width: 100%;
+  height: var(--task-action-button-height);
+  justify-content: center;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-input-wrapper),
+.layout-container:not(.theme-default) :deep(.arco-input-number),
+.layout-container:not(.theme-default) :deep(.arco-input-tag),
+.layout-container:not(.theme-default) :deep(.arco-select-view),
+.layout-container:not(.theme-default) :deep(.arco-textarea-wrapper),
+.layout-container:not(.theme-default) :deep(.arco-picker) {
+  border-color: var(--app-border-soft) !important;
+  background: rgba(6, 14, 26, 0.62) !important;
+  color: var(--app-text) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-input),
+.layout-container:not(.theme-default) :deep(.arco-input-number input),
+.layout-container:not(.theme-default) :deep(.arco-textarea),
+.layout-container:not(.theme-default) :deep(.arco-select-view-value),
+.layout-container:not(.theme-default) :deep(.arco-select-view-input),
+.layout-container:not(.theme-default) :deep(.arco-input-tag-input),
+.layout-container:not(.theme-default) :deep(.arco-picker-input input) {
+  color: var(--app-text) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-input::placeholder),
+.layout-container:not(.theme-default) :deep(.arco-textarea::placeholder),
+.layout-container:not(.theme-default) :deep(.arco-select-view-placeholder),
+.layout-container:not(.theme-default) :deep(.arco-picker-input input::placeholder) {
+  color: var(--app-muted) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-input-wrapper:hover),
+.layout-container:not(.theme-default) :deep(.arco-input-number:hover),
+.layout-container:not(.theme-default) :deep(.arco-select-view:hover),
+.layout-container:not(.theme-default) :deep(.arco-textarea-wrapper:hover),
+.layout-container:not(.theme-default) :deep(.arco-picker:hover) {
+  border-color: var(--app-accent) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--app-accent) 16%, transparent);
+}
+
+.layout-container:not(.theme-default) :deep(.arco-tag) {
+  border-color: color-mix(in srgb, var(--app-accent) 42%, transparent) !important;
+  background: color-mix(in srgb, var(--app-accent) 14%, transparent) !important;
+  color: var(--app-text) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-tag-content) {
+  color: inherit !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-btn:not(.arco-btn-primary):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success)) {
+  border-color: var(--app-border-soft);
+  background: rgba(6, 14, 26, 0.38);
+  color: var(--app-text);
+}
+
+.layout-container:not(.theme-default) :deep(.arco-btn-text) {
+  background: transparent !important;
+  color: var(--app-accent) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-pagination-item),
+.layout-container:not(.theme-default) :deep(.arco-pagination-jumper-input),
+.layout-container:not(.theme-default) :deep(.arco-pagination-options .arco-select-view) {
+  border-color: var(--app-border-soft) !important;
+  background: rgba(6, 14, 26, 0.5) !important;
+  color: var(--app-text) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-pagination-item-active) {
+  border-color: var(--app-accent) !important;
+  color: var(--app-accent) !important;
+}
+
+.layout-container:not(.theme-default) :deep(.arco-divider-text) {
+  color: var(--app-muted) !important;
+  background: transparent !important;
+}
+
+:global(html:not([data-ui-theme="default"]) .arco-trigger-popup),
+:global(html:not([data-ui-theme="default"]) .arco-select-popup),
+:global(html:not([data-ui-theme="default"]) .arco-dropdown),
+:global(html:not([data-ui-theme="default"]) .arco-popover),
+:global(html:not([data-ui-theme="default"]) .arco-modal),
+:global(html:not([data-ui-theme="default"]) .arco-drawer),
+:global(html:not([data-ui-theme="default"]) .arco-picker-container) {
+  border-color: rgba(125, 211, 252, 0.24) !important;
+  background: rgba(12, 24, 42, 0.98) !important;
+  color: #edf7ff !important;
+}
+
+:global(html:not([data-ui-theme="default"]) .arco-modal-header),
+:global(html:not([data-ui-theme="default"]) .arco-modal-body),
+:global(html:not([data-ui-theme="default"]) .arco-modal-footer),
+:global(html:not([data-ui-theme="default"]) .arco-drawer-header),
+:global(html:not([data-ui-theme="default"]) .arco-drawer-body),
+:global(html:not([data-ui-theme="default"]) .arco-drawer-footer),
+:global(html:not([data-ui-theme="default"]) .arco-select-option),
+:global(html:not([data-ui-theme="default"]) .arco-dropdown-option),
+:global(html:not([data-ui-theme="default"]) .arco-popover-content) {
+  border-color: rgba(125, 211, 252, 0.16) !important;
+  background: transparent !important;
+  color: #edf7ff !important;
+}
+
+:global(html:not([data-ui-theme="default"]) .arco-select-option-hover),
+:global(html:not([data-ui-theme="default"]) .arco-select-option-active),
+:global(html:not([data-ui-theme="default"]) .arco-dropdown-option:hover) {
+  background: rgba(32, 199, 232, 0.12) !important;
+  color: #edf7ff !important;
+}
+
+:global(html:not([data-ui-theme="default"]) .arco-modal-title),
+:global(html:not([data-ui-theme="default"]) .arco-drawer-title),
+:global(html:not([data-ui-theme="default"]) .arco-select-option-content),
+:global(html:not([data-ui-theme="default"]) .arco-dropdown-option-content),
+:global(html:not([data-ui-theme="default"]) .arco-modal .arco-typography),
+:global(html:not([data-ui-theme="default"]) .arco-drawer .arco-typography) {
+  color: #edf7ff !important;
+}
+
+/* Original light theme */
+.layout-container.theme-default {
+  --app-accent: #165dff;
+  --app-muted: #86909c;
+  background: #f5f7fa;
+}
+
+.theme-default .sider {
+  background: linear-gradient(180deg, #1d2129 0%, #165dff 100%);
+  border-right: 0;
+  box-shadow: none;
+}
+
+.theme-default .logo {
+  border-bottom-color: rgba(255, 255, 255, 0.1);
+}
+
+.theme-default .logo-icon {
+  background: rgba(255, 255, 255, 0.2);
+  box-shadow: none;
+}
+
+.theme-default .header {
+  background: #fff;
+  color: #1d2129;
+  border-bottom: 0;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+  backdrop-filter: none;
+}
+
+.theme-default .header :deep(.arco-typography) {
+  color: #1d2129;
+}
+
+.theme-default .content {
+  background: #f5f7fa;
+}
+
+.theme-default .stat-card,
+.theme-default .task-list-card,
+.theme-default .task-filter-panel,
+.theme-default .task-filter-summary,
+.theme-default .empty-state--card,
+.theme-default .task-card-inner,
+.theme-default .advanced-filter-collapse,
+.theme-default .task-base-config-row,
+.theme-default .advanced-config-card,
+.theme-default .table-mapping-panel,
+.theme-default .table-selector-panel,
+.theme-default .transfer-pane,
+.theme-default .type-card,
+.theme-default .config-summary-card,
+.theme-default .config-page-card,
+.theme-default .config-section-card {
+  border-color: #e5e8ef !important;
+  background: #fff !important;
+  color: #1d2129 !important;
+  box-shadow: 0 8px 22px rgba(29, 33, 41, 0.05) !important;
+}
+
+.theme-default .task-base-config-row::before {
+  display: none;
+}
+
+.theme-default .select-type-header :deep(.arco-typography),
+.theme-default .type-content :deep(.arco-typography),
+.theme-default .task-filter-panel__title,
+.theme-default .task-filter-summary__title,
+.theme-default .task-list-title-wrap :deep(.arco-typography),
+.theme-default .task-base-config-row :deep(.arco-form-item-label-col > label),
+.theme-default .advanced-config-card :deep(.arco-form-item-label-col > label),
+.theme-default .table-selector-form-item :deep(.arco-form-item-label-col > label),
+.theme-default .transfer-header .title,
+.theme-default .table-mapping-title {
+  color: #1d2129 !important;
+  text-shadow: none;
+}
+
+.theme-default .select-type-header :deep(.arco-typography-secondary),
+.theme-default .type-content :deep(.arco-typography-secondary),
+.theme-default .task-filter-panel__desc,
+.theme-default .task-filter-summary__empty,
+.theme-default .task-list-title-wrap :deep(.arco-typography-secondary),
+.theme-default .advanced-config-card :deep(.arco-typography-secondary) {
+  color: #86909c !important;
+}
+
+.theme-default .task-base-config-row :deep(.arco-input-wrapper),
+.theme-default .task-base-config-row :deep(.arco-select-view),
+.theme-default .advanced-config-card :deep(.arco-input-wrapper),
+.theme-default .advanced-config-card :deep(.arco-input-number),
+.theme-default .table-selector-panel :deep(.arco-input-wrapper),
+.theme-default .table-mapping-panel :deep(.arco-input-wrapper),
+.theme-default .transfer-pane :deep(.arco-input-wrapper),
+.theme-default .task-list-card :deep(.arco-input-wrapper),
+.theme-default .task-list-card :deep(.arco-select-view),
+.theme-default .task-filter-panel :deep(.arco-input-wrapper),
+.theme-default .task-filter-panel :deep(.arco-select-view),
+.theme-default .advanced-filter-collapse :deep(.arco-input-wrapper),
+.theme-default .advanced-filter-collapse :deep(.arco-select-view) {
+  border-color: #edf0f5;
+  background: #f7f9fc;
+  color: #1d2129;
+}
+
+.theme-default .task-base-config-row :deep(.arco-input),
+.theme-default .advanced-config-card :deep(.arco-input),
+.theme-default .table-selector-panel :deep(.arco-input),
+.theme-default .table-mapping-panel :deep(.arco-input),
+.theme-default .transfer-pane :deep(.arco-input),
+.theme-default .task-list-card :deep(.arco-input),
+.theme-default .task-filter-panel :deep(.arco-input),
+.theme-default .advanced-filter-collapse :deep(.arco-input),
+.theme-default .task-base-config-row :deep(.arco-select-view-value),
+.theme-default .task-list-card :deep(.arco-select-view-value),
+.theme-default .task-filter-panel :deep(.arco-select-view-value) {
+  color: #1d2129 !important;
+}
+
+.theme-default .transfer-header,
+.theme-default .transfer-header-tip,
+.theme-default .transfer-list-header,
+.theme-default .transfer-search,
+.theme-default .table-list-panel,
+.theme-default .table-db-collapse,
+.theme-default .advanced-filter-collapse :deep(.arco-collapse-item-header),
+.theme-default .advanced-filter-collapse :deep(.arco-collapse-item-content) {
+  background: #fbfcff !important;
+  border-color: #edf0f5 !important;
+  color: #4e5969 !important;
+}
+
+.theme-default .type-icon {
+  border: 0;
+}
+
+.theme-default .mysql-icon { background: #e8f3ff !important; color: rgb(var(--primary-6)) !important; }
+.theme-default .kafka-icon { background: #fff3e8 !important; color: rgb(var(--orange-6)) !important; }
+.theme-default .webhook-icon { background: #e8ffee !important; color: rgb(var(--green-6)) !important; }
+.theme-default .multi-icon { background: #f2f3f5 !important; color: var(--color-text-1) !important; }
+
+.theme-default .header-right :deep(.arco-btn-primary),
+.theme-default .task-base-config-row :deep(.arco-btn-primary),
+.theme-default .empty-state :deep(.arco-btn-primary) {
+  border: 1px solid #165dff;
+  background: #165dff !important;
+  box-shadow: none;
+}
+
+.theme-default .sider-menu :deep(.arco-menu-item:hover) {
+  background: rgba(255, 255, 255, 0.15) !important;
+}
+
+.theme-default .sider-menu :deep(.arco-menu-item.arco-menu-selected) {
+  background: rgba(255, 255, 255, 0.25) !important;
+  box-shadow: none;
+}
+
+@media (max-width: 920px) {
+  .theme-option-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>
