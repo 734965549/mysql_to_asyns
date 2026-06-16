@@ -1,4 +1,4 @@
-<script setup>
+﻿<script setup>
 import { ref, onMounted, onUnmounted, watch, computed } from "vue";
 
 import { Message, Modal } from "@arco-design/web-vue";
@@ -5355,16 +5355,26 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
 .task-list-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
   flex-wrap: wrap;
+}
+
+.task-list-card :deep(.arco-card-header-title) {
+  overflow: visible;
+  white-space: normal;
+  text-overflow: clip;
+  flex: 1;
+  min-width: 0;
 }
 
 .task-list-title-wrap {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
+  line-height: 1.5;
 }
 
 .task-list-toolbar {
@@ -6689,11 +6699,11 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   z-index: 1;
 }
 
-.task-base-config-row :deep(.arco-form-item-label-col > label),
-.transfer-header .title,
-.table-mapping-title,
-.task-list-title-wrap :deep(.arco-typography),
-.task-title :deep(.arco-typography) {
+.layout-container:not(.theme-default) .task-base-config-row :deep(.arco-form-item-label-col > label),
+.layout-container:not(.theme-default) .transfer-header .title,
+.layout-container:not(.theme-default) .table-mapping-title,
+.layout-container:not(.theme-default) .task-list-title-wrap :deep(.arco-typography),
+.layout-container:not(.theme-default) .task-title :deep(.arco-typography) {
   color: #e8f6ff;
 }
 
@@ -7285,8 +7295,11 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
     padding: 16px 0 0;
     border-left: 0;
     border-top: 1px solid var(--app-border-soft, #edf2f7);
+    display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     grid-auto-rows: 32px;
+    justify-content: stretch;
+    align-content: start;
   }
 
   .task-info-grid {
@@ -7831,16 +7844,18 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .task-card-actions {
-  width: var(--task-action-width);
+  width: 100%;
+  box-sizing: border-box;
   min-height: calc(
     var(--task-action-slot-count) * var(--task-action-button-height) +
     (var(--task-action-slot-count) - 1) * var(--task-action-gap)
   );
   padding: 0 0 0 18px;
   border-left: 1px solid var(--app-border-soft, #edf2f7);
-  display: grid;
-  grid-auto-rows: var(--task-action-button-height);
-  align-content: start;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: stretch;
   gap: var(--task-action-gap);
 }
 
@@ -7848,10 +7863,15 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   border-left-color: #edf2f7;
 }
 
-.task-card-actions :deep(.arco-btn) {
+.task-card-actions :deep(.arco-btn),
+.task-card-actions :deep(.arco-tooltip) {
   width: 100%;
+}
+
+.task-card-actions :deep(.arco-btn) {
   height: var(--task-action-button-height);
   justify-content: center;
+  flex-shrink: 0;
 }
 
 .layout-container:not(.theme-default) :deep(.arco-input-wrapper),
@@ -8050,6 +8070,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .theme-default .task-filter-panel__title,
 .theme-default .task-filter-summary__title,
 .theme-default .task-list-title-wrap :deep(.arco-typography),
+.theme-default .task-title :deep(.arco-typography),
 .theme-default .task-base-config-row :deep(.arco-form-item-label-col > label),
 .theme-default .advanced-config-card :deep(.arco-form-item-label-col > label),
 .theme-default .table-selector-form-item :deep(.arco-form-item-label-col > label),
