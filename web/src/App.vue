@@ -4415,7 +4415,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                       <a-input-number v-model="configForm.http.port" :min="1" :max="65535" style="width: 100%" />
                     </a-form-item>
 
-                    <a-divider orientation="left" style="margin: 16px 0">Redis 状态持久化</a-divider>
+                    <a-divider orientation="left" class="config-section-divider">Redis 状态持久化</a-divider>
 
                     <a-form-item label="Redis 主机">
                       <a-input v-model="configForm.redis.host" placeholder="127.0.0.1" />
@@ -4471,7 +4471,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                       <div class="config-hint">修改日志级别或输出开关后点击此按钮，配置即刻生效并持久化到配置文件。</div>
                     </a-form-item>
 
-                    <a-divider orientation="left" style="margin: 16px 0">默认数据库环境</a-divider>
+                    <a-divider orientation="left" class="config-section-divider">默认数据库环境</a-divider>
 
                     <a-form-item label="默认源库地址">
                       <a-input v-model="configForm.datasource.host" />
@@ -5346,7 +5346,11 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
 .task-list-card :deep(.arco-card-header) {
   border-bottom: 1px solid #edf2f7;
-  padding: 20px 24px 16px;
+  padding: 20px 24px 18px;
+  height: auto;
+  min-height: 72px;
+  overflow: visible;
+  align-items: center;
 }
 
 .task-list-card :deep(.arco-card-body) {
@@ -5354,11 +5358,11 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .task-list-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 20px 24px;
+  width: 100%;
 }
 
 .task-list-card :deep(.arco-card-header-title) {
@@ -5367,22 +5371,55 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   text-overflow: clip;
   flex: 1;
   min-width: 0;
+  height: auto;
+  line-height: 1.5;
 }
 
 .task-list-title-wrap {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
   min-width: 0;
+  padding: 2px 0;
+}
+
+.task-list-title-wrap :deep(.arco-typography),
+.task-list-title-wrap :deep(.arco-typography-secondary) {
+  overflow: visible;
+  white-space: normal;
   line-height: 1.5;
+  margin: 0;
+}
+
+.task-list-title-wrap :deep(h6.arco-typography) {
+  line-height: 1.4;
 }
 
 .task-list-toolbar {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 12px;
-  flex-wrap: wrap;
+  gap: 10px;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
+}
+
+.task-list-toolbar :deep(.arco-select),
+.task-list-toolbar :deep(.arco-input-search) {
+  flex-shrink: 0;
+}
+
+.task-list-toolbar :deep(.arco-select-view-single),
+.task-list-toolbar :deep(.arco-input-wrapper) {
+  height: 32px;
+}
+
+.task-list-toolbar :deep(.arco-tag) {
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  margin: 0;
 }
 
 .task-filter-panel {
@@ -6517,7 +6554,10 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .task-list-card :deep(.arco-card-header) {
-  padding: 18px 20px 14px;
+  padding: 20px 24px 18px;
+  height: auto;
+  min-height: 72px;
+  overflow: visible;
 }
 
 .task-list-card :deep(.arco-card-body) {
@@ -7285,6 +7325,18 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
     max-width: 980px;
   }
 
+  .task-list-header {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+    gap: 14px;
+  }
+
+  .task-list-toolbar {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    row-gap: 10px;
+  }
+
   .task-card-grid {
     grid-template-columns: 1fr;
   }
@@ -7434,6 +7486,65 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 /* Theme selector in system config */
+.config-page-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.config-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.config-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--app-muted, #86909c);
+}
+
+.config-summary-row {
+  margin-bottom: 4px;
+}
+
+.config-page-card :deep(.arco-card-body) {
+  padding: 20px 24px 24px;
+}
+
+.config-section-card :deep(.arco-card-header) {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--app-border-soft, #edf2f7);
+}
+
+.config-section-card :deep(.arco-card-header-title) {
+  color: var(--app-text, #1d2129);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 22px;
+}
+
+.config-section-card :deep(.arco-card-body) {
+  padding: 16px 20px 20px;
+}
+
+.config-section-divider {
+  margin: 22px 0 16px !important;
+  border-color: var(--app-border-soft, #e5e8ef) !important;
+}
+
+.config-section-divider :deep(.arco-divider-text) {
+  padding: 0 12px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 20px;
+  color: var(--app-text, #1d2129);
+  background: var(--app-surface-soft, #fbfcff);
+}
+
 .theme-config-card {
   margin-bottom: 16px;
 }
@@ -7663,6 +7774,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .layout-container:not(.theme-default) :deep(.arco-typography),
+.layout-container:not(.theme-default) :deep(.arco-card-header-title),
 .layout-container:not(.theme-default) :deep(.arco-form-item-label-col > label),
 .layout-container:not(.theme-default) :deep(.arco-checkbox-label),
 .layout-container:not(.theme-default) :deep(.arco-radio-label),
@@ -7697,6 +7809,21 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .layout-container:not(.theme-default) :deep(.arco-list),
 .layout-container:not(.theme-default) :deep(.arco-list-item) {
   border-color: var(--app-border-soft) !important;
+  background: transparent !important;
+}
+
+.layout-container:not(.theme-default) .config-page-card,
+.layout-container:not(.theme-default) .config-section-card,
+.layout-container:not(.theme-default) .config-summary-card,
+.layout-container:not(.theme-default) .theme-config-card {
+  border-color: var(--app-border) !important;
+  background: linear-gradient(180deg, var(--app-surface), var(--app-surface-soft)) !important;
+}
+
+.layout-container:not(.theme-default) .config-page-card :deep(.arco-card-body),
+.layout-container:not(.theme-default) .config-section-card :deep(.arco-card-body),
+.layout-container:not(.theme-default) .config-summary-card :deep(.arco-card-body),
+.layout-container:not(.theme-default) .theme-config-card :deep(.arco-card-body) {
   background: transparent !important;
 }
 
@@ -7945,9 +8072,38 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   color: var(--app-accent) !important;
 }
 
+.layout-container:not(.theme-default) :deep(.arco-divider-horizontal) {
+  border-color: var(--app-border-soft) !important;
+}
+
 .layout-container:not(.theme-default) :deep(.arco-divider-text) {
+  color: var(--app-text) !important;
+  background: var(--app-surface-soft) !important;
+  padding: 0 12px;
+  font-weight: 600;
+}
+
+.layout-container:not(.theme-default) .config-hero :deep(.arco-typography) {
+  color: var(--app-text) !important;
+}
+
+.layout-container:not(.theme-default) .config-hero :deep(.arco-typography-secondary),
+.layout-container:not(.theme-default) .config-hint {
   color: var(--app-muted) !important;
-  background: transparent !important;
+}
+
+.layout-container:not(.theme-default) .config-section-card :deep(.arco-card-header),
+.layout-container:not(.theme-default) .config-page-card :deep(.arco-card-header),
+.layout-container:not(.theme-default) .theme-config-card :deep(.arco-card-header) {
+  border-bottom-color: var(--app-border-soft) !important;
+}
+
+.layout-container:not(.theme-default) .config-section-card :deep(.arco-card-header-title),
+.layout-container:not(.theme-default) .config-page-card :deep(.arco-card-header-title),
+.layout-container:not(.theme-default) .theme-config-card :deep(.arco-card-header-title),
+.layout-container:not(.theme-default) .config-section-divider :deep(.arco-divider-text) {
+  color: var(--app-text) !important;
+  background: var(--app-surface-soft) !important;
 }
 
 :global(html:not([data-ui-theme="default"]) .arco-trigger-popup),
