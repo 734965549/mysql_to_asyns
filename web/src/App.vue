@@ -2439,7 +2439,7 @@ watch(
           class="task-form-full-page"
         >
           <a-form :model="taskForm" layout="vertical">
-            <a-row :gutter="32">
+            <a-row :gutter="32" class="task-base-config-row">
               <a-col :span="12">
                 <a-form-item label="任务名称" required>
                   <a-input
@@ -2785,7 +2785,16 @@ watch(
                   </a-col>
                 </a-row>
 
-                <div v-if="selectedSyncLevel === 'table'" class="table-mapping-panel">
+              </a-col>
+            </a-row>
+
+            <a-row
+              v-if="selectedSyncLevel === 'table'"
+              :gutter="24"
+              class="table-config-row"
+            >
+              <a-col :span="12">
+                <div class="table-mapping-panel table-target-mapping-panel">
                   <div class="table-mapping-title">表级别同步目标表配置</div>
 
                   <a-empty
@@ -2939,7 +2948,9 @@ watch(
                                   :key="`${db}.${table.table_name}`"
                                 >
                                   <a-checkbox :value="table.table_name">
-                                    {{ table.table_name }}
+                                    <span class="table-name-text" :title="table.table_name">
+                                      {{ table.table_name }}
+                                    </span>
 
                                     <a-tag size="small" color="gray"
                                       >{{ table.table_row_count }} 行</a-tag
@@ -3879,7 +3890,7 @@ watch(
 
               <a-collapse class="advanced-filter-collapse" :default-active-key="['advanced']">
                 <a-collapse-item key="advanced" header="高级筛选">
-                  <a-row :gutter="12">
+                  <a-row :gutter="12" class="task-filter-form-row">
                     <a-col :span="8">
                       <a-form-item label="快速筛选">
                         <a-select v-model="taskFilters.status" allow-clear placeholder="按状态筛选">
@@ -5891,5 +5902,212 @@ watch(
   white-space: nowrap;
   display: inline-block;
   vertical-align: bottom;
+}
+/* Layout refinements for task list filters and table-level sync configuration */
+.task-base-config-row {
+  align-items: flex-start;
+}
+
+.table-config-row {
+  margin-top: 4px;
+  align-items: stretch;
+}
+
+.table-config-row > :deep(.arco-col) {
+  display: flex;
+  min-width: 0;
+}
+
+.table-target-mapping-panel,
+.table-selector-panel {
+  width: 100%;
+  height: 560px;
+  min-height: 560px;
+  max-height: 560px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.table-target-mapping-panel .table-mapping-title,
+.table-toolbar {
+  flex: 0 0 auto;
+}
+
+.table-target-mapping-panel .table-db-collapse {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.table-target-mapping-panel :deep(.arco-collapse-item-content-box) {
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.table-target-mapping-panel > :deep(.arco-empty) {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.table-mapping-list {
+  min-width: 0;
+}
+
+.table-mapping-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px minmax(160px, 220px);
+  width: 100%;
+  align-items: center;
+}
+
+.table-mapping-source {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.table-mapping-item :deep(.arco-input-wrapper) {
+  width: 100% !important;
+  min-width: 0;
+}
+
+.table-selector-form-item,
+.table-selector-form-item :deep(.arco-form-item-content-wrapper),
+.table-selector-form-item :deep(.arco-form-item-content) {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.table-list-panel {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+}
+
+.table-list-item :deep(.arco-checkbox) {
+  display: flex;
+  align-items: flex-start;
+  width: 100%;
+  min-width: 0;
+}
+
+.table-list-item :deep(.arco-checkbox-label) {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.table-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-filter-summary {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  min-height: 50px;
+}
+
+.task-filter-summary__title {
+  margin-bottom: 0;
+  line-height: 24px;
+  white-space: nowrap;
+}
+
+.task-filter-summary__chips {
+  max-height: 58px;
+  overflow-y: auto;
+  padding-right: 4px;
+  align-content: flex-start;
+}
+
+.filter-chip {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.filter-chip :deep(.arco-tag-content) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-filter-form-row :deep(.arco-col) {
+  min-width: 0;
+}
+
+.task-filter-form-row :deep(.arco-form-item) {
+  margin-bottom: 0;
+}
+
+.task-filter-form-row :deep(.arco-form-item-label-col) {
+  height: 22px;
+  line-height: 22px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-filter-form-row :deep(.arco-form-item-content-wrapper),
+.task-filter-form-row :deep(.arco-select),
+.task-filter-form-row :deep(.arco-input-wrapper) {
+  width: 100%;
+  min-width: 0;
+}
+
+.task-header {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.task-title {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.task-title :deep(.arco-typography) {
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-status-tag {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 1200px) {
+  .table-config-row > :deep(.arco-col) {
+    flex: 0 0 100%;
+    max-width: 100%;
+    margin-bottom: 16px;
+  }
+
+  .table-target-mapping-panel,
+  .table-selector-panel {
+    height: 520px;
+    min-height: 520px;
+    max-height: 520px;
+  }
+
+  .task-filter-summary {
+    grid-template-columns: 1fr;
+  }
 }
 </style>
