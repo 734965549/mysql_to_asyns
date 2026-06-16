@@ -2438,7 +2438,7 @@ watch(
           v-if="taskFormPage === 'create' || taskFormPage === 'edit'"
           class="task-form-full-page"
         >
-          <a-form :model="taskForm" layout="vertical">
+          <a-form :model="taskForm" layout="vertical" class="task-create-form">
             <a-row :gutter="32" class="task-base-config-row">
               <a-col :span="24">
                 <a-form-item label="任务名称" required>
@@ -6092,6 +6092,221 @@ watch(
   flex: 0 0 auto;
 }
 
+/* Polished create task layout */
+.task-form-full-page {
+  max-width: 980px;
+  padding: 24px 16px 56px;
+}
+
+.task-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.task-base-config-row,
+.table-config-row,
+.advanced-config-row {
+  margin: 0;
+}
+
+.task-base-config-row {
+  padding: 26px 28px 8px;
+  border: 1px solid #e5e8ef;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 10px 28px rgba(29, 33, 41, 0.06);
+}
+
+.task-base-config-row > .arco-col,
+.advanced-config-row > .arco-col {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+}
+
+.task-base-config-row :deep(.arco-form-item) {
+  margin-bottom: 22px;
+}
+
+.task-base-config-row :deep(.arco-form-item-label-col) {
+  margin-bottom: 8px;
+}
+
+.task-base-config-row :deep(.arco-form-item-label-col > label) {
+  color: #1d2129;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.task-base-config-row :deep(.arco-input-wrapper),
+.task-base-config-row :deep(.arco-select-view) {
+  min-height: 40px;
+  border-color: #edf0f5;
+  border-radius: 6px;
+  background: #f7f9fc;
+}
+
+.task-base-config-row :deep(.arco-input-wrapper:hover),
+.task-base-config-row :deep(.arco-select-view:hover) {
+  border-color: #bedaff;
+  background: #fff;
+}
+
+.task-base-config-row :deep(.arco-input-wrapper.arco-input-focus),
+.task-base-config-row :deep(.arco-select-view-focus) {
+  border-color: #4080ff;
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(64, 128, 255, 0.12);
+}
+
+.task-base-config-row :deep(.arco-radio-group) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.task-base-config-row :deep(.arco-radio) {
+  min-height: 38px;
+  margin-right: 0;
+  padding: 8px 14px;
+  border: 1px solid #e5e8ef;
+  border-radius: 6px;
+  background: #f7f9fc;
+  transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.task-base-config-row :deep(.arco-radio:hover),
+.task-base-config-row :deep(.arco-radio-checked) {
+  border-color: #4080ff;
+  background: #eef6ff;
+}
+
+.task-base-config-row :deep(.arco-radio-checked) {
+  box-shadow: 0 4px 12px rgba(64, 128, 255, 0.12);
+}
+
+.task-base-config-row :deep(.arco-tag) {
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+.db-transfer-container {
+  margin-top: 6px;
+  margin-bottom: 22px;
+  padding: 16px;
+  border: 1px solid #e5e8ef;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.transfer-pane {
+  border-color: #e5e8ef;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 4px 14px rgba(29, 33, 41, 0.04);
+}
+
+.transfer-header {
+  min-height: 44px;
+  padding: 0 14px;
+  border-bottom-color: #edf0f5;
+  background: #fbfcff;
+}
+
+.transfer-header .title,
+.table-mapping-title {
+  color: #1d2129;
+  font-weight: 600;
+}
+
+.transfer-search {
+  padding: 12px 14px;
+}
+
+.transfer-list-item,
+.mapped-item {
+  min-height: 40px;
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+.transfer-arrow {
+  width: 42px;
+  min-width: 42px;
+  padding-top: 52px;
+  color: #4080ff;
+}
+
+.table-mapping-panel {
+  margin: 16px 0 22px;
+  padding: 16px;
+  border: 1px solid #e5e8ef;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.table-mapping-title {
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+
+.table-mapping-item {
+  min-height: 42px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #f7f9fc;
+}
+
+.table-mapping-source {
+  min-width: 160px;
+  overflow: hidden;
+  color: #1d2129;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.advanced-config-card {
+  border: 1px solid #e5e8ef;
+  border-radius: 8px;
+  box-shadow: 0 8px 22px rgba(29, 33, 41, 0.05);
+}
+
+.advanced-config-card :deep(.arco-card-body) {
+  padding: 22px 24px;
+}
+
+@media (max-width: 768px) {
+  .task-form-full-page {
+    padding: 16px 10px 40px;
+  }
+
+  .task-base-config-row {
+    padding: 18px 16px 4px;
+  }
+
+  .db-transfer-container {
+    flex-direction: column;
+  }
+
+  .transfer-arrow {
+    width: 100%;
+    height: 34px;
+    min-width: 0;
+    padding-top: 0;
+  }
+
+  .table-mapping-item {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .table-mapping-source {
+    min-width: 0;
+  }
+}
 @media (max-width: 1200px) {
   .table-config-row > :deep(.arco-col) {
     flex: 0 0 100%;
