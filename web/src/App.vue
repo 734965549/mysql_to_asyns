@@ -7975,7 +7975,16 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 /* Original light theme */
 .layout-container.theme-default {
   --app-accent: #165dff;
+  --app-accent-2: #4080ff;
+  --app-bg: #f5f7fa;
+  --app-surface: #ffffff;
+  --app-surface-soft: #fbfcff;
+  --app-surface-strong: #ffffff;
+  --app-border: #e5e8ef;
+  --app-border-soft: #edf0f5;
+  --app-text: #1d2129;
   --app-muted: #86909c;
+  --app-glow: rgba(22, 93, 255, 0.08);
   background: #f5f7fa;
 }
 
@@ -8119,6 +8128,44 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   border: 1px solid #165dff;
   background: #165dff !important;
   box-shadow: none;
+}
+
+.theme-default .task-list-card :deep(.arco-tag),
+.theme-default .task-filter-panel :deep(.arco-tag),
+.theme-default .task-card-inner :deep(.arco-tag),
+.theme-default .filter-chip :deep(.arco-tag),
+.theme-default .task-filter-summary :deep(.arco-tag) {
+  border-color: #d9e3f0 !important;
+  background: #f2f7ff !important;
+  color: #1d2129 !important;
+}
+
+.theme-default .task-card-inner :deep(.arco-tag[color="green"]),
+.theme-default .task-card-inner :deep(.arco-tag-green) {
+  border-color: #7bcf96 !important;
+  background: #f0fff4 !important;
+  color: #16803a !important;
+}
+
+.theme-default .task-card-inner :deep(.arco-tag[color="red"]),
+.theme-default .task-card-inner :deep(.arco-tag-red) {
+  border-color: #f5a8a8 !important;
+  background: #fff1f0 !important;
+  color: #c92a2a !important;
+}
+
+.theme-default .task-card-inner :deep(.arco-tag[color="orange"]),
+.theme-default .task-card-inner :deep(.arco-tag-orange) {
+  border-color: #f8c88c !important;
+  background: #fff7ed !important;
+  color: #b45309 !important;
+}
+
+.layout-container:not(.theme-default) .content {
+  background:
+    radial-gradient(circle at 14% 10%, var(--app-glow), transparent 30%),
+    linear-gradient(135deg, var(--app-bg), var(--app-surface-strong));
+  background-size: auto;
 }
 
 .theme-default .sider-menu :deep(.arco-menu-item:hover) {
