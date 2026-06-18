@@ -22,7 +22,7 @@
 ## 测试目录结构
 
 ```
-mysql-to-async/
+mysql-to-sync/
 ├── internal/
 │   ├── config/
 │   │   └── config_test.go

@@ -8,11 +8,11 @@ import ( // 导入外部包和内部模块
 	"github.com/gin-gonic/gin"                                // 导入Gin框架，用于构建HTTP API
 	"github.com/prometheus/client_golang/prometheus/promhttp" // 导入Prometheus HTTP处理器
 
-	"mysql-to-async/internal/api/handler"                          // 导入处理器模块
-	"mysql-to-async/internal/config"                               // 导入配置模块
-	"mysql-to-async/internal/metadata/domain/service"              // 导入元数据领域服务
-	"mysql-to-async/internal/metrics"                              // 导入指标模块
-	taskService "mysql-to-async/internal/task/application/service" // 导入任务应用服务
+	"mysql-to-sync/internal/api/handler"                          // 导入处理器模块
+	"mysql-to-sync/internal/config"                               // 导入配置模块
+	"mysql-to-sync/internal/metadata/domain/service"              // 导入元数据领域服务
+	"mysql-to-sync/internal/metrics"                              // 导入指标模块
+	taskService "mysql-to-sync/internal/task/application/service" // 导入任务应用服务
 )
 
 // SetupRouter 设置路由函数

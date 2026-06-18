@@ -13,12 +13,12 @@ import ( // 导入外部包和内部模块
 	"github.com/gin-gonic/gin"         // 导入Gin框架，用于构建HTTP API
 	_ "github.com/go-sql-driver/mysql" // 导入MySQL驱动，下划线表示仅导入init函数
 
-	"mysql-to-async/internal/api/router"                           // 导入路由模块
-	"mysql-to-async/internal/config"                               // 导入配置模块
-	"mysql-to-async/internal/metadata/domain/service"              // 导入元数据领域服务
-	"mysql-to-async/internal/metadata/infrastructure"              // 导入元数据基础设施
-	taskService "mysql-to-async/internal/task/application/service" // 导入任务应用服务
-	"mysql-to-async/pkg/logger"                                    // 导入logger包，用于日志输出
+	"mysql-to-sync/internal/api/router"                           // 导入路由模块
+	"mysql-to-sync/internal/config"                               // 导入配置模块
+	"mysql-to-sync/internal/metadata/domain/service"              // 导入元数据领域服务
+	"mysql-to-sync/internal/metadata/infrastructure"              // 导入元数据基础设施
+	taskService "mysql-to-sync/internal/task/application/service" // 导入任务应用服务
+	"mysql-to-sync/pkg/logger"                                    // 导入logger包，用于日志输出
 )
 
 func main() { // main函数是程序的入口点

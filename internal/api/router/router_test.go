@@ -1,4 +1,4 @@
-﻿package router
+package router
 
 import (
 	"net/http"
@@ -7,9 +7,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"mysql-to-async/internal/config"
-	metadataEntity "mysql-to-async/internal/metadata/domain/entity"
-	taskService "mysql-to-async/internal/task/application/service"
+	"mysql-to-sync/internal/config"
+	metadataEntity "mysql-to-sync/internal/metadata/domain/entity"
+	taskService "mysql-to-sync/internal/task/application/service"
 )
 
 // MockAnalyzer 妯℃嫙 IdentityAnalyzer

@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"mysql-to-async/internal/audit"
-	"mysql-to-async/internal/checkpoint"
-	"mysql-to-async/internal/config"
-	"mysql-to-async/internal/metadata/domain/entity"
-	taskEntity "mysql-to-async/internal/task/domain/entity"
+	"mysql-to-sync/internal/audit"
+	"mysql-to-sync/internal/checkpoint"
+	"mysql-to-sync/internal/config"
+	"mysql-to-sync/internal/metadata/domain/entity"
+	taskEntity "mysql-to-sync/internal/task/domain/entity"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-mysql-org/go-mysql/mysql"

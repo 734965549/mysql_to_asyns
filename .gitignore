@@ -10,6 +10,8 @@
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+coverage*
+coverage_*
 
 # Dependency directories
 vendor/
@@ -29,8 +31,8 @@ go.work
 Thumbs.db
 
 # Project specific
-mysql-to-async
-mysql-to-async.exe
+mysql-to-sync
+mysql-to-sync.exe
 data/
 logs/
 *.log

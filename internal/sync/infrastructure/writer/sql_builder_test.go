@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"mysql-to-async/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metadata/domain/entity"
 )
 
 func createTestIdentity(strategy entity.IdentityStrategy, tableName string, columns []entity.ColumnMeta, identifyCols []string) *entity.TableIdentity {

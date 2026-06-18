@@ -1,6 +1,6 @@
 # Kubernetes 部署说明
 
-本目录包含 `mysql-to-async` 的基础部署清单：
+本目录包含 `mysql-to-sync` 的基础部署清单：
 
 - `configmap.yaml`：非敏感配置（环境变量）
 - `secret.yaml`：敏感配置（用户名/密码）
@@ -13,7 +13,7 @@
 请先修改以下内容：
 
 1. `deployment.yaml` 中镜像地址
-   - `image: your-registry/mysql-to-async:latest`
+   - `image: your-registry/mysql-to-sync:latest`
 2. `secret.yaml` 中密码账号及加密密钥
    - `MYSQL_TO_ASYNC_DATASOURCE_USERNAME`
    - `MYSQL_TO_ASYNC_DATASOURCE_PASSWORD`
@@ -35,9 +35,9 @@ kubectl apply -f k8s/ingress.yaml
 ## 3. 查看状态
 
 ```bash
-kubectl get pods -l app=mysql-to-async
-kubectl get svc mysql-to-async
-kubectl logs -f deploy/mysql-to-async
+kubectl get pods -l app=mysql-to-sync
+kubectl get svc mysql-to-sync
+kubectl logs -f deploy/mysql-to-sync
 ```
 
 ## 4. 访问方式（NodePort）
@@ -78,24 +78,24 @@ ClusterIP 只允许集群内访问，通常需要配合 Ingress 或网关对外�
 `ingress.yaml` 默认配置：
 
 - `ingressClassName: nginx`
-- 域名：`mysql-to-async.local`
-- 后端服务：`mysql-to-async:8080`
+- 域名：`mysql-to-sync.local`
+- 后端服务：`mysql-to-sync:8080`
 
 应用 Ingress：
 
 ```bash
 kubectl apply -f k8s/ingress.yaml
-kubectl get ingress mysql-to-async
+kubectl get ingress mysql-to-sync
 ```
 
 如果你在本机测试，可在 hosts 中加入（将 IP 改为你的 Ingress 对外地址）：
 
 ```text
-<INGRESS_IP> mysql-to-async.local
+<INGRESS_IP> mysql-to-sync.local
 ```
 
 访问：
 
-- `http://mysql-to-async.local/health`
-- `http://mysql-to-async.local/api/health`
-- `http://mysql-to-async.local/api/tasks`
+- `http://mysql-to-sync.local/health`
+- `http://mysql-to-sync.local/api/health`
+- `http://mysql-to-sync.local/api/tasks`

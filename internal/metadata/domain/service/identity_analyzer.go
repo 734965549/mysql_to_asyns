@@ -1,7 +1,7 @@
 package service // 声明当前文件属于service包，用于业务服务层
 
 import ( // 导入外部包和标准库
-	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
+	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
 )
 
 // IdentityAnalyzer 标识分析器接口

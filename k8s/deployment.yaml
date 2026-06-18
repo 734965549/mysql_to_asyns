@@ -1,31 +1,31 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mysql-to-async
+  name: mysql-to-sync
   labels:
-    app: mysql-to-async
+    app: mysql-to-sync
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mysql-to-async
+      app: mysql-to-sync
   template:
     metadata:
       labels:
-        app: mysql-to-async
+        app: mysql-to-sync
     spec:
       containers:
-        - name: mysql-to-async
-          image: your-registry/mysql-to-async:latest
+        - name: mysql-to-sync
+          image: your-registry/mysql-to-sync:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
               name: http
           envFrom:
             - configMapRef:
-                name: mysql-to-async-config
+                name: mysql-to-sync-config
             - secretRef:
-                name: mysql-to-async-secret
+                name: mysql-to-sync-secret
           volumeMounts:
             - name: data
               mountPath: /app/data

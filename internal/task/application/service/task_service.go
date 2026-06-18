@@ -13,7 +13,7 @@ import (
 
 	"fmt" // 格式化输出
 
-	"mysql-to-async/pkg/logger" // 日志记录
+	"mysql-to-sync/pkg/logger" // 日志记录
 
 	"os" // 操作系统接口
 
@@ -35,27 +35,27 @@ import (
 
 	cron "github.com/robfig/cron/v3"
 
-	"mysql-to-async/internal/audit" // 审计日志包
+	"mysql-to-sync/internal/audit" // 审计日志包
 
-	"mysql-to-async/internal/checkpoint" // 检查点管理包
+	"mysql-to-sync/internal/checkpoint" // 检查点管理包
 
-	"mysql-to-async/internal/config" // 配置管理包
+	"mysql-to-sync/internal/config" // 配置管理包
 
-	"mysql-to-async/internal/metadata/domain/entity" // 元数据实体包
+	"mysql-to-sync/internal/metadata/domain/entity" // 元数据实体包
 
-	"mysql-to-async/internal/metadata/domain/service" // 元数据服务包
+	"mysql-to-sync/internal/metadata/domain/service" // 元数据服务包
 
-	"mysql-to-async/internal/metadata/infrastructure" // 元数据基础设施包
+	"mysql-to-sync/internal/metadata/infrastructure" // 元数据基础设施包
 
-	syncApp "mysql-to-async/internal/sync/application" // 同步应用包
+	syncApp "mysql-to-sync/internal/sync/application" // 同步应用包
 
-	"mysql-to-async/internal/sync/infrastructure/reader" // 同步读取器包
+	"mysql-to-sync/internal/sync/infrastructure/reader" // 同步读取器包
 
-	"mysql-to-async/internal/sync/infrastructure/readonly" // 只读管理包
+	"mysql-to-sync/internal/sync/infrastructure/readonly" // 只读管理包
 
-	"mysql-to-async/internal/sync/infrastructure/writer" // 同步写入器包
+	"mysql-to-sync/internal/sync/infrastructure/writer" // 同步写入器包
 
-	taskEntity "mysql-to-async/internal/task/domain/entity" // 任务实体包
+	taskEntity "mysql-to-sync/internal/task/domain/entity" // 任务实体包
 
 	// MySQL binlog 位置
 

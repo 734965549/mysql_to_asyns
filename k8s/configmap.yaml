@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: mysql-to-async-config
+  name: mysql-to-sync-config
 data:
   MYSQL_TO_ASYNC_HTTP_HOST: "0.0.0.0"
   MYSQL_TO_ASYNC_HTTP_PORT: "8080"

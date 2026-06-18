@@ -1,4 +1,4 @@
-﻿# P1级别优化完成报告
+# P1级别优化完成报告
 
 ## ✅ 已完成的优化项
 
@@ -146,7 +146,7 @@ async function handleApiError(response, defaultMsg = '操作失败') {
 ## 🎯 测试结果
 
 `ash
-✅ 编译成功: go build -o mysql-to-async.exe
+✅ 编译成功: go build -o mysql-to-sync.exe
 ✅ 无编译错误
 ✅ 无语法错误
 `
@@ -159,7 +159,7 @@ async function handleApiError(response, defaultMsg = '操作失败') {
 
 `ash
 # 启动服务
-./mysql-to-async.exe
+./mysql-to-sync.exe
 
 # 创建并启动一个任务
 # 按下 Ctrl+C

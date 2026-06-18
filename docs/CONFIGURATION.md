@@ -55,17 +55,17 @@ env:
   - name: MYSQL_TO_ASYNC_DATASOURCE_HOST
     valueFrom:
       configMapKeyRef:
-        name: mysql-to-async-config
+        name: mysql-to-sync-config
         key: datasource_host
   - name: MYSQL_TO_ASYNC_DATASOURCE_PASSWORD
     valueFrom:
       secretKeyRef:
-        name: mysql-to-async-secret
+        name: mysql-to-sync-secret
         key: datasource_password
   - name: MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY
     valueFrom:
       secretKeyRef:
-        name: mysql-to-async-secret
+        name: mysql-to-sync-secret
         key: security_encrypt_key
 ```
 
@@ -342,7 +342,7 @@ env:
 ### 查看同步进度
 ```bash
 # 实时查看日志
-tail -f logs/mysql-to-async.log
+tail -f logs/mysql-to-sync.log
 ```
 
 ### 关键日志信息

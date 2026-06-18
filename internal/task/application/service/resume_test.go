@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	taskEntity "mysql-to-async/internal/task/domain/entity"
+	taskEntity "mysql-to-sync/internal/task/domain/entity"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

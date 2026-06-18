@@ -1,7 +1,7 @@
 package strategy // 声明当前文件属于strategy包，用于匹配策略
 
 import ( // 导入外部包和标准库
-	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
+	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
 )
 
 // MatchStrategy 匹配策略接口

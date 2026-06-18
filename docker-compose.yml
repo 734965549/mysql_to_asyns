@@ -55,7 +55,7 @@ services:
     build:
       context: .
       target: backend
-    container_name: mysql-to-async
+    container_name: mysql-to-sync
     expose:
       - "8080"
     volumes:
@@ -77,7 +77,7 @@ services:
     build:
       context: .
       target: frontend
-    container_name: mysql-to-async-web
+    container_name: mysql-to-sync-web
     ports:
       - "80:80"
     depends_on:

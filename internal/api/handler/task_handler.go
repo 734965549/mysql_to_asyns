@@ -18,13 +18,13 @@ import (
 	"github.com/gin-gonic/gin"
 	_ "github.com/go-sql-driver/mysql"
 
-	"mysql-to-async/internal/config"
-	"mysql-to-async/internal/metadata/domain/service"
-	metadataService "mysql-to-async/internal/metadata/domain/service"
-	"mysql-to-async/internal/metadata/infrastructure"
-	taskService "mysql-to-async/internal/task/application/service"
-	taskEntity "mysql-to-async/internal/task/domain/entity"
-	"mysql-to-async/pkg/logger"
+	"mysql-to-sync/internal/config"
+	"mysql-to-sync/internal/metadata/domain/service"
+	metadataService "mysql-to-sync/internal/metadata/domain/service"
+	"mysql-to-sync/internal/metadata/infrastructure"
+	taskService "mysql-to-sync/internal/task/application/service"
+	taskEntity "mysql-to-sync/internal/task/domain/entity"
+	"mysql-to-sync/pkg/logger"
 )
 
 // TaskHandler 任务处理器结构体

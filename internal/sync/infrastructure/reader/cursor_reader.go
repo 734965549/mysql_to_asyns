@@ -6,7 +6,7 @@ import ( // 导入外部包和标准库
 	"database/sql/driver"                            // 导入driver包，用于驱动接口
 	"errors"                                         // 导入errors包，用于错误处理
 	"fmt"                                            // 导入fmt包，用于格式化输入输出
-	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
+	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
 	"strings"                                        // 导入strings包，用于字符串操作
 	"time"                                           // 导入time包，用于时间处理
 )

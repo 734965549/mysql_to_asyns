@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"bytes"
@@ -10,11 +10,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"mysql-to-async/internal/config"
-	metadataEntity "mysql-to-async/internal/metadata/domain/entity"
-	taskService "mysql-to-async/internal/task/application/service"
+	"mysql-to-sync/internal/config"
+	metadataEntity "mysql-to-sync/internal/metadata/domain/entity"
+	taskService "mysql-to-sync/internal/task/application/service"
 
-	taskEntity "mysql-to-async/internal/task/domain/entity"
+	taskEntity "mysql-to-sync/internal/task/domain/entity"
 )
 
 func newTestTaskService() *taskService.TaskService {

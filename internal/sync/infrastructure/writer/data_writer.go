@@ -4,10 +4,10 @@ import ( // 导入外部包和标准库
 	"context"                                        // 导入context包，用于上下文管理
 	"database/sql"                                   // 导入database/sql包，用于数据库操作
 	"fmt"                                            // 导入fmt包，用于格式化输入输出
-	"mysql-to-async/internal/audit"                  // 导入审计包
-	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
-	"mysql-to-async/internal/metrics"                // 导入指标包，用于零行匹配等漂移指标
-	"mysql-to-async/pkg/logger"                      // 导入log包，用于日志输出
+	"mysql-to-sync/internal/audit"                  // 导入审计包
+	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
+	"mysql-to-sync/internal/metrics"                // 导入指标包，用于零行匹配等漂移指标
+	"mysql-to-sync/pkg/logger"                      // 导入log包，用于日志输出
 	"sync"                                           // 导入sync包，用于并发控制
 	"time"                                           // 导入time包，用于时间处理
 )

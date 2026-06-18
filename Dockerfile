@@ -8,7 +8,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o mysql-to-async .
+RUN CGO_ENABLED=0 GOOS=linux go build -o mysql-to-sync .
 
 
 FROM node:20-alpine AS frontend-builder
@@ -28,14 +28,14 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-COPY --from=backend-builder /app/mysql-to-async ./
+COPY --from=backend-builder /app/mysql-to-sync ./
 COPY --from=backend-builder /app/etc ./etc
 
 RUN mkdir -p /app/data /app/logs/audit
 
 EXPOSE 8080
 
-CMD ["./mysql-to-async"]
+CMD ["./mysql-to-sync"]
 
 
 FROM nginx:1.27-alpine AS frontend

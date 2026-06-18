@@ -1,11 +1,11 @@
-﻿package service
+package service
 
 import (
 	"fmt"
 	"os"
 	"testing"
 
-	taskEntity "mysql-to-async/internal/task/domain/entity"
+	taskEntity "mysql-to-sync/internal/task/domain/entity"
 )
 
 func TestTaskStorage_Save(t *testing.T) {

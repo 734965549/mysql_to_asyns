@@ -4,7 +4,7 @@ import ( // 导入外部包
 	"database/sql" // 导入database/sql包，用于数据库操作
 	"time" // 导入time包，用于时间处理
 
-	"mysql-to-async/pkg/logger" // 导入自定义日志包，用于日志输出
+	"mysql-to-sync/pkg/logger" // 导入自定义日志包，用于日志输出
 )
 
 // ApplySyncMySQLPool 为同步/元数据使用的 *sql.DB 设置连接池函数。max_open 未配置时默认 256，避免驱动默认 max_idle 过小导致高并发时频繁建连。

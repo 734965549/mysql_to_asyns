@@ -1,4 +1,4 @@
-﻿# P2级别优化完成报告
+# P2级别优化完成报告
 
 ## ✅ 已完成的优化项
 
@@ -104,7 +104,7 @@ FROM golang:1.24-alpine AS builder
 FROM alpine:latest
 # 运行应用
 EXPOSE 8081
-CMD ["./mysql-to-async"]
+CMD ["./mysql-to-sync"]
 `
 
 #### 3.2 docker-compose.yml
@@ -235,7 +235,7 @@ go test ./internal/task/domain/entity -v
 go test -cover ./...
 
 # 输出:
-# ok      mysql-to-async/internal/task/domain/entity    0.123s    coverage: 85.7%
+# ok      mysql-to-sync/internal/task/domain/entity    0.123s    coverage: 85.7%
 `
 
 ---
@@ -255,7 +255,7 @@ go test -cover ./...
 ## 🎯 编译测试结果
 
 `ash
-✅ 编译成功: go build -o mysql-to-async.exe
+✅ 编译成功: go build -o mysql-to-sync.exe
 ✅ 依赖安装: go mod tidy
 ✅ Prometheus集成: github.com/prometheus/client_golang
 ✅ 无编译错误
@@ -267,7 +267,7 @@ go test -cover ./...
 
 ### 新增文件
 `
-mysql-to-async/
+mysql-to-sync/
 ├── internal/
 │   ├── config/
 │   │   └── validator.go              # 配置验证器
@@ -298,7 +298,7 @@ mysql-to-async/
 
 `ash
 # 启动时会自动验证
-./mysql-to-async.exe
+./mysql-to-sync.exe
 
 # 输出：
 Validating configuration...
@@ -320,7 +320,7 @@ docker-compose ps
 # mysql-source   docker-entrypoint.sh mysqld   Up      0.0.0.0:3306->3306/tcp
 # mysql-target   docker-entrypoint.sh mysqld   Up      0.0.0.0:3307->3306/tcp
 # redis          docker-entrypoint.sh redis... Up      0.0.0.0:6379->6379/tcp
-# app            ./mysql-to-async              Up      0.0.0.0:8080->8080/tcp
+# app            ./mysql-to-sync              Up      0.0.0.0:8080->8080/tcp
 `
 
 ### 3. Prometheus监控
@@ -347,7 +347,7 @@ go test ./internal/task/domain/entity -v
 # === RUN   TestNewSyncTask
 # --- PASS: TestNewSyncTask (0.00s)
 # PASS
-# ok      mysql-to-async/internal/task/domain/entity    0.123s
+# ok      mysql-to-sync/internal/task/domain/entity    0.123s
 `
 
 ---

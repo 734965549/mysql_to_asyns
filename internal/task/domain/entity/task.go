@@ -5,7 +5,7 @@ import ( // 导入外部包和标准库
 	"strings"
 	"time" // 导入time包，用于时间处理
 
-	"mysql-to-async/pkg/crypto"
+	"mysql-to-sync/pkg/crypto"
 )
 
 // TaskStatus 任务状态

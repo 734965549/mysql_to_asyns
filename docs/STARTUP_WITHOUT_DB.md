@@ -45,7 +45,7 @@
 #### 2. 启动服务
 
 ```bash
-./mysql-to-async
+./mysql-to-sync
 ```
 
 #### 3. 创建任务时指定数据库
@@ -113,7 +113,7 @@ curl -X POST http://localhost:8080/api/tasks \
 #### 2. 启动服务
 
 ```bash
-./mysql-to-async
+./mysql-to-sync
 ```
 
 #### 3. 创建任务（使用默认数据库配置）

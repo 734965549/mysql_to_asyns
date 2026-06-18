@@ -1,4 +1,4 @@
-﻿# P0级别优化完成报告
+# P0级别优化完成报告
 
 ## ✅ 已完成的优化项
 
@@ -153,7 +153,7 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 
 ## 🎯 测试结果
 
-✅ 编译成功: go build -o mysql-to-async.exe
+✅ 编译成功: go build -o mysql-to-sync.exe
 ✅ 无编译错误
 ✅ 无语法错误
 

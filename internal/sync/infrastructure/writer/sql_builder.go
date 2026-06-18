@@ -2,8 +2,8 @@ package writer // 声明当前文件属于writer包，用于数据写入
 
 import ( // 导入外部包和标准库
 	"fmt" // 导入fmt包，用于格式化输入输出
-	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
-	"mysql-to-async/internal/sync/domain/strategy" // 导入策略包
+	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
+	"mysql-to-sync/internal/sync/domain/strategy" // 导入策略包
 	"strings" // 导入strings包，用于字符串操作
 )
 

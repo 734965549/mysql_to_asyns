@@ -1,4 +1,4 @@
-module mysql-to-async
+module mysql-to-sync
 
 go 1.24.0
 

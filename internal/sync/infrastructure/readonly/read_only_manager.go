@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"mysql-to-async/pkg/logger"
+	"mysql-to-sync/pkg/logger"
 	"sync"
 )
 

@@ -8,11 +8,11 @@ import (
 
 	"database/sql"
 
-	"mysql-to-async/internal/metadata/domain/entity"
-	"mysql-to-async/internal/sync/infrastructure/reader"
-	"mysql-to-async/internal/sync/infrastructure/writer"
-	taskEntity "mysql-to-async/internal/task/domain/entity"
-	"mysql-to-async/pkg/logger"
+	"mysql-to-sync/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/sync/infrastructure/reader"
+	"mysql-to-sync/internal/sync/infrastructure/writer"
+	taskEntity "mysql-to-sync/internal/task/domain/entity"
+	"mysql-to-sync/pkg/logger"
 )
 
 // BatchTask 批次任务结构

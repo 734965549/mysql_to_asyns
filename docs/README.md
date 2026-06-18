@@ -38,7 +38,7 @@
 ## 📂 项目结构
 
 ```
-mysql-to-async/
+mysql-to-sync/
 ├── README.md                    # 项目主文档
 ├── docs/                        # 文档目录
 │   ├── optimization/            # 优化报告

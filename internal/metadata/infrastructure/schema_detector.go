@@ -4,8 +4,8 @@ import ( // 导入外部包和标准库
 	"database/sql"                                    // 导入database/sql包，用于数据库操作
 	"fmt"                                             // 导入fmt包，用于格式化输入输出
 	"strings"                                         // 字符串处理
-	"mysql-to-async/internal/metadata/domain/entity"  // 导入实体包
-	"mysql-to-async/internal/metadata/domain/service" // 导入服务包
+	"mysql-to-sync/internal/metadata/domain/entity"  // 导入实体包
+	"mysql-to-sync/internal/metadata/domain/service" // 导入服务包
 )
 
 // SchemaDetector Schema探测器实现

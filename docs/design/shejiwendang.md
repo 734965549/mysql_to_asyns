@@ -15,7 +15,7 @@
 
 ### 技术栈
 *   **后端**: Go 1.21+, Gin, GORM, `go-mysql-org/go-mysql`。
-*   **前端**: Vue 3 + Element Plus + Pinia。
+*   **前端**: Vue 3 + Arco Design Vue。
 *   **存储**: Redis（保存 Checkpoint 位点）、MySQL（元数据与任务配置）。
 
 ---

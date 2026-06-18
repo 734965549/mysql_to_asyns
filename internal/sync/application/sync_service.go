@@ -7,19 +7,19 @@ import (
 
 	"fmt"
 
-	"mysql-to-async/internal/checkpoint"
+	"mysql-to-sync/internal/checkpoint"
 
-	"mysql-to-async/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metadata/domain/entity"
 
-	"mysql-to-async/internal/metadata/domain/service"
+	"mysql-to-sync/internal/metadata/domain/service"
 
-	"mysql-to-async/internal/metrics"
+	"mysql-to-sync/internal/metrics"
 
-	"mysql-to-async/internal/sync/infrastructure/writer"
+	"mysql-to-sync/internal/sync/infrastructure/writer"
 
-	"mysql-to-async/pkg/binlog"
+	"mysql-to-sync/pkg/binlog"
 
-	"mysql-to-async/pkg/logger"
+	"mysql-to-sync/pkg/logger"
 
 	"sync"
 

@@ -1,4 +1,4 @@
-﻿# MySQL-to-Async 数据同步工具
+# MySQL-to-Async 数据同步工具
 
 
 
@@ -197,9 +197,9 @@ FLUSH PRIVILEGES;
 
 ``bash
 
-git clone https://github.com/yourusername/mysql-to-async.git
+git clone https://github.com/yourusername/mysql-to-sync.git
 
-cd mysql-to-async
+cd mysql-to-sync
 
 ``
 
@@ -312,17 +312,17 @@ go run main.go
 
 # Linux/macOS
 
-go build -o mysql-to-async
+go build -o mysql-to-sync
 
-./mysql-to-async
+./mysql-to-sync
 
 
 
 # Windows
 
-go build -o mysql-to-async.exe
+go build -o mysql-to-sync.exe
 
-.\mysql-to-async.exe
+.\mysql-to-sync.exe
 
 ``
 
@@ -902,7 +902,7 @@ curl -X POST http://localhost:8080/api/tasks \
 
 ``tree
 
-mysql-to-async/
+mysql-to-sync/
 
 ├── main.go                      # 程序入口
 
@@ -1622,9 +1622,9 @@ GET /api/tasks/:id
 
 # 克隆项目
 
-git clone https://github.com/yourusername/mysql-to-async.git
+git clone https://github.com/yourusername/mysql-to-sync.git
 
-cd mysql-to-async
+cd mysql-to-sync
 
 
 
@@ -1782,7 +1782,7 @@ go tool cover -html=coverage.out
 
 - **文档**: [INCREMENTAL_SYNC_GUIDE.md](INCREMENTAL_SYNC_GUIDE.md)
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/mysql-to-async/issues)
+- **Issues**: [GitHub Issues](https://github.com/yourusername/mysql-to-sync/issues)
 
 
 

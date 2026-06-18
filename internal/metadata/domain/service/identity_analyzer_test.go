@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"mysql-to-async/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metadata/domain/entity"
 )
 
 // MockTableMetadataRepository 模拟表元数据仓库

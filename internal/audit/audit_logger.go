@@ -3,7 +3,7 @@ package audit // 声明当前文件属于audit包，用于审计日志管理
 import ( // 导入外部包和标准库
 	"encoding/json" // 导入encoding/json包，用于JSON编码解码
 	"fmt" // 导入fmt包，用于格式化输入输出
-	"mysql-to-async/pkg/logger" // 导入log包，用于日志输出
+	"mysql-to-sync/pkg/logger" // 导入log包，用于日志输出
 	"os" // 导入os包，用于操作系统接口
 	"path/filepath" // 导入path/filepath包，用于文件路径操作
 	"strings" // 导入strings包，用于字符串操作

@@ -1,4 +1,4 @@
-﻿package writer
+package writer
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"mysql-to-async/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metadata/domain/entity"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"

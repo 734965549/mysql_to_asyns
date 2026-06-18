@@ -959,7 +959,7 @@ MySQL 主机: 127.0.0.1
 - **项目文档**: [README.md](../../README.md)
 - **配置指南**: [CONFIGURATION.md](../CONFIGURATION.md)
 - **增量同步指南**: [guides/INCREMENTAL_SYNC_GUIDE.md](INCREMENTAL_SYNC_GUIDE.md)
-- **问题反馈**: [GitHub Issues](https://github.com/yourusername/mysql-to-async/issues)
+- **问题反馈**: [GitHub Issues](https://github.com/yourusername/mysql-to-sync/issues)
 
 ---
 
