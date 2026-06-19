@@ -174,6 +174,97 @@ ALTER TABLE sys_sync_tasks
 
 ---
 
+### 任务运行时进度接口
+
+任务运行时进度接口用于在任务同步期间获取实时的表级进度信息，包括当前同步到哪张表、每张表的行数、进度百分比、同步速度等。
+
+#### 接口定义
+
+```
+GET /api/tasks/:id/progress
+```
+
+#### 请求示例
+
+```bash
+curl http://localhost:8080/api/tasks/abc123/progress
+```
+
+#### 响应示例
+
+```json
+{
+  "current_table": "production.orders",
+  "tables": [
+    {
+      "schema": "production",
+      "table": "users",
+      "total_rows": 50000,
+      "processed_rows": 50000,
+      "progress_pct": 100,
+      "speed_rows_sec": 1250.5,
+      "status": "completed",
+      "started_at": "2026-06-19T10:00:00Z",
+      "completed_at": "2026-06-19T10:00:40Z"
+    },
+    {
+      "schema": "production",
+      "table": "orders",
+      "total_rows": 200000,
+      "processed_rows": 85000,
+      "progress_pct": 42.5,
+      "speed_rows_sec": 980.3,
+      "status": "running",
+      "started_at": "2026-06-19T10:00:41Z"
+    },
+    {
+      "schema": "production",
+      "table": "products",
+      "total_rows": 10000,
+      "processed_rows": 0,
+      "progress_pct": 0,
+      "speed_rows_sec": 0,
+      "status": "pending"
+    }
+  ],
+  "overall_speed": 1050.8,
+  "elapsed_seconds": 127.5,
+  "estimated_remain": 119.3,
+  "phase": "full",
+  "updated_at": "2026-06-19T10:02:08Z"
+}
+```
+
+#### 响应字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `current_table` | string | 当前正在同步的表，格式 `schema.table` |
+| `tables` | array | 所有表的进度列表 |
+| `tables[].schema` | string | 源库名 |
+| `tables[].table` | string | 表名 |
+| `tables[].total_rows` | int64 | 该表估算总行数 |
+| `tables[].processed_rows` | int64 | 该表已处理行数 |
+| `tables[].progress_pct` | float64 | 该表进度百分比 (0-100) |
+| `tables[].speed_rows_sec` | float64 | 该表同步速度（行/秒） |
+| `tables[].status` | string | 表状态：`pending` / `running` / `completed` / `failed` |
+| `tables[].started_at` | string | 该表开始同步时间（ISO 8601） |
+| `tables[].completed_at` | string | 该表完成时间（ISO 8601） |
+| `overall_speed` | float64 | 整体同步速度（行/秒） |
+| `elapsed_seconds` | float64 | 已耗时（秒） |
+| `estimated_remain` | float64 | 预估剩余时间（秒），-1 表示无法估算 |
+| `phase` | string | 当前阶段：`full`（全量）/ `incremental`（增量） |
+| `updated_at` | string | 最后更新时间（ISO 8601） |
+
+#### 前端轮询建议
+
+- 建议轮询间隔：**1-2 秒**
+- 进度数据仅存在于内存中，任务完成/暂停/停止后会被清除
+- 任务未运行时调用此接口会返回 404
+- 可配合 `GET /api/tasks/:id/metrics` 获取持久化的整体指标
+
+---
+
 ## 创建同步任务
 
 ### 打开创建页面

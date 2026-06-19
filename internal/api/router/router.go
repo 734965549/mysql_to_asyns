@@ -66,6 +66,7 @@ func SetupRouter(taskSvc *taskService.TaskService, analyzer service.IdentityAnal
 			tasks.POST("/:id/start", taskHandler.StartTask)                // 启动任务路由：POST /api/tasks/:id/start
 			tasks.POST("/:id/pause", taskHandler.PauseTask)                // 暂停任务路由：POST /api/tasks/:id/pause
 			tasks.GET("/:id/metrics", taskHandler.GetTaskMetrics)          // 获取任务指标路由：GET /api/tasks/:id/metrics
+			tasks.GET("/:id/progress", taskHandler.GetTaskProgress)        // 获取任务运行时进度路由：GET /api/tasks/:id/progress
 			tasks.POST("/:id/skip", taskHandler.SkipError)                 // 跳过错误路由：POST /api/tasks/:id/skip
 			tasks.POST("/:id/cancel-schedule", taskHandler.CancelSchedule) // 取消定时启动路由：POST /api/tasks/:id/cancel-schedule
 		} // 分组结束

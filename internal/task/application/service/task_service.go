@@ -63,6 +63,13 @@ import (
 	"github.com/redis/go-redis/v9" // Redis 客户端
 )
 
+// tableEntry 全量同步表条目（用于进度追踪初始化）
+type tableEntry struct {
+	schema   string
+	table    string
+	identity *entity.TableIdentity
+}
+
 // TaskService 任务服务结构体
 
 // TaskService is the application boundary for task lifecycle and sync
@@ -115,6 +122,9 @@ type TaskService struct {
 
 	schedulerStop chan struct{} // 定时调度器停止信号
 
+	// 运行时进度追踪（仅内存，不持久化）
+	runningProgress map[string]*taskEntity.RunningProgress // 任务ID -> 运行时进度
+	progressMu      sync.RWMutex                           // 保护 runningProgress 的读写
 }
 
 // taskRuntime contains resources that must not be shared across running tasks.
@@ -598,6 +608,8 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService), // 初始化增量同步映射
 
+		runningProgress: make(map[string]*taskEntity.RunningProgress), // 初始化运行时进度映射
+
 		config: cfg, // 设置配置
 
 		auditLogger: audit.NewAuditLogger("logs/audit"), // 创建审计日志器
@@ -681,6 +693,8 @@ func NewTaskServiceWithDB(sourceDB, targetDB *sql.DB, analyzer service.IdentityA
 
 		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService), // 初始化增量同步映射
 
+		runningProgress: make(map[string]*taskEntity.RunningProgress), // 初始化运行时进度映射
+
 		auditLogger: audit.NewAuditLogger("logs/audit"), // 创建审计日志器
 
 	}
@@ -722,6 +736,8 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 		enableReadOnly: true, // 默认启用只读限制
 
 		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService),
+
+		runningProgress: make(map[string]*taskEntity.RunningProgress),
 
 		config: cfg,
 
@@ -2056,12 +2072,6 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 	var estimatedRows int64
 
-	type tableEntry struct {
-		schema   string
-		table    string
-		identity *entity.TableIdentity
-	}
-
 	var allTableEntries []tableEntry
 
 	for _, p := range pairs {
@@ -2126,6 +2136,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	s.updateTaskTotalRows(taskID, estimatedRows)
 
 	logger.Info("[Task %s] Fast estimated total rows: %d (via information_schema)", taskID, estimatedRows)
+
+	// 初始化运行时进度追踪（供前端实时展示）
+	s.initRunningProgress(taskID, allTableEntries, "full")
 
 	// 后台异步获取精确行数，完成后更新（不阻塞同步启动）
 	go func() {
@@ -2487,9 +2500,14 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				// 已完整同步过的表：直接跳过数据同步与索引处理（索引在首次完成时已恢复）。
 				if tableProgress != nil && tableProgress.Done {
 					logger.Info("[Task %s] Resume: table %s.%s already completed, skipping", taskID, sourceSchema, tableName)
+					s.completeTableProgress(taskID, sourceSchema, tableName)
 					return
 				}
 			}
+
+			// 标记该表开始同步（前端进度展示）
+			tableStartTime := time.Now()
+			s.startTableProgress(taskID, sourceSchema, tableName, 0)
 
 			savedIndexes := append([]map[string]interface{}(nil), preparedIndexes...)
 
@@ -2819,6 +2837,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					tableProcessedRows += int64(len(rows))
 
 					s.incrementTaskProgress(taskID, int64(len(rows)), mark)
+					s.updateTableProgress(taskID, sourceSchema, tableName, int64(len(rows)), time.Since(tableStartTime).Seconds())
 
 				}
 
@@ -3178,6 +3197,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							atomic.AddInt64(&atomicProcessed, n)
 
 							s.incrementTaskProgress(taskID, n, rangeMark)
+							s.updateTableProgress(taskID, sourceSchema, tableName, n, time.Since(tableStartTime).Seconds())
 
 							// 更新 lastID 为最后一条记录的主键值，确保连续性
 
@@ -3480,6 +3500,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							atomic.AddInt64(&atomicProcessed, n)
 
 							s.incrementTaskProgress(taskID, n, mark)
+							s.updateTableProgress(taskID, sourceSchema, tableName, n, time.Since(tableStartTime).Seconds())
 
 							// 更新 lastID：复合主键需要传完整的 []interface{} 给 ReadBatchByKeys
 							if len(cursorCols) == 1 {
@@ -3743,6 +3764,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					tableProcessedRows += int64(len(rows))
 
 					s.incrementTaskProgress(taskID, int64(len(rows)), mark)
+					s.updateTableProgress(taskID, sourceSchema, tableName, int64(len(rows)), time.Since(tableStartTime).Seconds())
 
 				}
 
@@ -3790,6 +3812,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			}
 
 			logger.Info("[Task %s] Table %s.%s -> %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, targetSchema, targetTableName, tableProcessedRows)
+
+			s.completeTableProgress(taskID, sourceSchema, tableName)
+			s.refreshOverallProgress(taskID, task.Context.StartTime)
 
 		}(r.name, r.targetName, r.identity, r.savedIndexes)
 
@@ -5071,6 +5096,189 @@ func (s *TaskService) markTableDone(taskID, tableKey string) {
 	}
 }
 
+// ============================================================
+// 运行时进度追踪（仅内存，不持久化，供前端实时展示）
+// ============================================================
+
+// initRunningProgress 初始化任务的运行时进度追踪。
+// 在 executeFullSync 开始时调用，填充所有待同步表的初始状态。
+func (s *TaskService) initRunningProgress(taskID string, tables []tableEntry, phase string) {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+
+	rp := &taskEntity.RunningProgress{
+		Phase:     phase,
+		UpdatedAt: time.Now(),
+	}
+
+	for _, entry := range tables {
+		ti := &taskEntity.TableProgressInfo{
+			Schema:    entry.schema,
+			Table:     entry.table,
+			TotalRows: 0,
+			Status:    "pending",
+		}
+		rp.Tables = append(rp.Tables, ti)
+	}
+
+	s.runningProgress[taskID] = rp
+}
+
+// startTableProgress 标记某表开始同步，记录开始时间。
+func (s *TaskService) startTableProgress(taskID, schema, table string, totalRows int64) {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+
+	rp, exists := s.runningProgress[taskID]
+	if !exists {
+		return
+	}
+
+	key := schema + "." + table
+	rp.CurrentTable = key
+	rp.UpdatedAt = time.Now()
+
+	for _, ti := range rp.Tables {
+		if ti.Schema == schema && ti.Table == table {
+			now := time.Now()
+			ti.Status = "running"
+			ti.StartedAt = &now
+			ti.TotalRows = totalRows
+			return
+		}
+	}
+}
+
+// updateTableProgress 更新某表的已处理行数和速度。
+// delta: 本次新增行数
+// elapsed: 该表从开始到现在的耗时（秒）
+func (s *TaskService) updateTableProgress(taskID, schema, table string, delta int64, elapsedSec float64) {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+
+	rp, exists := s.runningProgress[taskID]
+	if !exists {
+		return
+	}
+
+	key := schema + "." + table
+	rp.CurrentTable = key
+	rp.UpdatedAt = time.Now()
+
+	for _, ti := range rp.Tables {
+		if ti.Schema == schema && ti.Table == table {
+			ti.ProcessedRows += delta
+			if ti.TotalRows > 0 {
+				ti.ProgressPct = float64(ti.ProcessedRows) / float64(ti.TotalRows) * 100
+				if ti.ProgressPct > 100 {
+					ti.ProgressPct = 100
+				}
+			}
+			if elapsedSec > 0 {
+				ti.SpeedRowsSec = float64(ti.ProcessedRows) / elapsedSec
+			}
+			return
+		}
+	}
+}
+
+// completeTableProgress 标记某表同步完成。
+func (s *TaskService) completeTableProgress(taskID, schema, table string) {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+
+	rp, exists := s.runningProgress[taskID]
+	if !exists {
+		return
+	}
+
+	rp.UpdatedAt = time.Now()
+
+	for _, ti := range rp.Tables {
+		if ti.Schema == schema && ti.Table == table {
+			now := time.Now()
+			ti.Status = "completed"
+			ti.CompletedAt = &now
+			ti.ProgressPct = 100
+			return
+		}
+	}
+}
+
+// failTableProgress 标记某表同步失败。
+func (s *TaskService) failTableProgress(taskID, schema, table string) {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+
+	rp, exists := s.runningProgress[taskID]
+	if !exists {
+		return
+	}
+
+	rp.UpdatedAt = time.Now()
+
+	for _, ti := range rp.Tables {
+		if ti.Schema == schema && ti.Table == table {
+			ti.Status = "failed"
+			return
+		}
+	}
+}
+
+// refreshOverallProgress 刷新整体进度统计（速度、耗时、预估剩余时间）。
+func (s *TaskService) refreshOverallProgress(taskID string, startTime time.Time) {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+
+	rp, exists := s.runningProgress[taskID]
+	if !exists {
+		return
+	}
+
+	rp.UpdatedAt = time.Now()
+	rp.ElapsedSeconds = time.Since(startTime).Seconds()
+
+	var totalRows, processedRows int64
+	var activeTable string
+	for _, ti := range rp.Tables {
+		totalRows += ti.TotalRows
+		processedRows += ti.ProcessedRows
+		if ti.Status == "running" {
+			activeTable = ti.Schema + "." + ti.Table
+		}
+	}
+	rp.CurrentTable = activeTable
+
+	if rp.ElapsedSeconds > 0 {
+		rp.OverallSpeed = float64(processedRows) / rp.ElapsedSeconds
+	}
+
+	if rp.OverallSpeed > 0 && totalRows > processedRows {
+		rp.EstimatedRemain = float64(totalRows-processedRows) / rp.OverallSpeed
+	} else {
+		rp.EstimatedRemain = -1
+	}
+}
+
+// GetTaskProgress 获取任务的运行时进度快照（供API查询）。
+func (s *TaskService) GetTaskProgress(taskID string) (*taskEntity.RunningProgress, error) {
+	s.progressMu.RLock()
+	defer s.progressMu.RUnlock()
+
+	rp, exists := s.runningProgress[taskID]
+	if !exists {
+		return nil, fmt.Errorf("task progress not found: %s", taskID)
+	}
+	return rp, nil
+}
+
+// clearRunningProgress 清除任务的运行时进度（任务完成/停止时调用）。
+func (s *TaskService) clearRunningProgress(taskID string) {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+	delete(s.runningProgress, taskID)
+}
+
 // updateTaskProgress 更新任务进度
 
 func (s *TaskService) updateTaskProgress(taskID string, processedRows int64, position string) {
@@ -5183,6 +5391,9 @@ func (s *TaskService) completeTask(taskID string) {
 
 	defer s.mu.Unlock()
 
+	// 清除运行时进度（任务完成）
+	defer s.clearRunningProgress(taskID)
+
 	if task, exists := s.tasks[taskID]; exists {
 
 		task.Complete()
@@ -5223,6 +5434,9 @@ func (s *TaskService) PauseTask(taskID string) error {
 	s.mu.Lock()
 
 	defer s.mu.Unlock()
+
+	// 清除运行时进度（任务暂停/停止）
+	s.clearRunningProgress(taskID)
 
 	task, exists := s.tasks[taskID]
 

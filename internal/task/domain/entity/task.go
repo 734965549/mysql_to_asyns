@@ -504,3 +504,29 @@ type Checkpoint struct { // 定义检查点结构体
 	BinlogPos  uint32    `json:"binlog_pos"`  // Binlog位置
 	LastUpdate time.Time `json:"last_update"` // 最后更新时间
 }
+
+// TableProgressInfo 单表实时同步进度（仅内存，不持久化到任务存档）。
+// 用于前端任务详情页展示"当前同步到哪个表、该表进度、速度"等实时信息。
+type TableProgressInfo struct {
+	Schema        string     `json:"schema"`                    // 源库名
+	Table         string     `json:"table"`                     // 表名
+	TotalRows     int64      `json:"total_rows"`                // 该表估算总行数
+	ProcessedRows int64      `json:"processed_rows"`            // 该表已处理行数
+	ProgressPct   float64    `json:"progress_pct"`              // 该表进度百分比 0-100
+	SpeedRowsSec  float64    `json:"speed_rows_sec"`            // 该表同步速度（行/秒）
+	Status        string     `json:"status"`                    // pending / running / completed / failed
+	StartedAt     *time.Time `json:"started_at,omitempty"`      // 该表开始同步时间
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`    // 该表完成时间
+}
+
+// RunningProgress 任务运行时进度快照（仅内存，不持久化）。
+// 聚合所有表的进度信息，用于前端实时展示。
+type RunningProgress struct {
+	CurrentTable    string               `json:"current_table"`     // 当前正在同步的表 "schema.table"
+	Tables          []*TableProgressInfo `json:"tables"`            // 所有表的进度列表
+	OverallSpeed    float64              `json:"overall_speed"`     // 整体同步速度（行/秒）
+	ElapsedSeconds  float64              `json:"elapsed_seconds"`   // 已耗时（秒）
+	EstimatedRemain float64              `json:"estimated_remain"`  // 预估剩余时间（秒），-1 表示无法估算
+	Phase           string               `json:"phase"`             // 当前阶段：full / incremental
+	UpdatedAt       time.Time            `json:"updated_at"`        // 最后更新时间
+}

@@ -411,6 +411,19 @@ func (h *TaskHandler) GetTaskMetrics(c *gin.Context) { // 获取任务指标
 	c.JSON(http.StatusOK, metrics) // 返回任务指标
 }
 
+// GetTaskProgress 获取任务运行时进度方法
+func (h *TaskHandler) GetTaskProgress(c *gin.Context) {
+	taskID := c.Param("id")
+
+	progress, err := h.taskService.GetTaskProgress(taskID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, progress)
+}
+
 // SkipError 跳过错误方法
 func (h *TaskHandler) SkipError(c *gin.Context) { // 跳过当前错误
 	taskID := c.Param("id") // 获取任务ID参数

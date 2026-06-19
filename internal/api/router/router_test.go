@@ -196,6 +196,25 @@ func TestTaskByIDEndpoints(t *testing.T) {
 	}
 }
 
+func TestTaskProgressEndpoint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	taskSvc := taskService.NewTaskService(testConfig())
+	analyzer := &MockAnalyzer{}
+	cfg := testConfig()
+
+	router := SetupRouter(taskSvc, analyzer, cfg)
+
+	// GET /api/tasks/nonexistent/progress — 应返回 404
+	req := httptest.NewRequest("GET", "/api/tasks/nonexistent/progress", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("GET /api/tasks/nonexistent/progress: expected status 404, got %d", w.Code)
+	}
+}
+
 func TestMetadataEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

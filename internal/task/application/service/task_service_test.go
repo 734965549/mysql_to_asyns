@@ -119,9 +119,10 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepsAutoIncrementKey(t *testing.T)
 func newTestTaskService(dataDir string) *TaskService {
 	storage := NewFileTaskStorage(dataDir)
 	return &TaskService{
-		tasks:    make(map[string]*taskEntity.SyncTask),
-		runtimes: make(map[string]*taskRuntime),
-		storage:  storage,
+		tasks:           make(map[string]*taskEntity.SyncTask),
+		runtimes:        make(map[string]*taskRuntime),
+		runningProgress: make(map[string]*taskEntity.RunningProgress),
+		storage:         storage,
 	}
 }
 
@@ -2411,4 +2412,379 @@ func TestStopSchedulerIsIdempotent(t *testing.T) {
 		ts.StopScheduler()
 		ts.StopScheduler()
 	})
+}
+
+// ============================================================
+// 运行时进度追踪单元测试
+// ============================================================
+
+func TestInitRunningProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_init_progress"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+		{schema: "db1", table: "orders", identity: nil},
+		{schema: "db2", table: "products", identity: nil},
+	}
+
+	ts.initRunningProgress(taskID, entries, "full")
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+	assert.Equal(t, "full", rp.Phase)
+	assert.Len(t, rp.Tables, 3)
+
+	// 验证所有表初始状态为 pending
+	for _, ti := range rp.Tables {
+		assert.Equal(t, "pending", ti.Status)
+		assert.Equal(t, int64(0), ti.ProcessedRows)
+		assert.Equal(t, float64(0), ti.ProgressPct)
+	}
+}
+
+func TestStartTableProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_start_table"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+
+	ts.startTableProgress(taskID, "db1", "users", 10000)
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+	assert.Equal(t, "db1.users", rp.CurrentTable)
+
+	var found bool
+	for _, ti := range rp.Tables {
+		if ti.Schema == "db1" && ti.Table == "users" {
+			found = true
+			assert.Equal(t, "running", ti.Status)
+			assert.Equal(t, int64(10000), ti.TotalRows)
+			assert.NotNil(t, ti.StartedAt)
+		}
+	}
+	assert.True(t, found, "should find the users table")
+}
+
+func TestStartTableProgress_NonExistentTable(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_start_nonexist"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+
+	// 启动一个不存在的表，不应 panic
+	assert.NotPanics(t, func() {
+		ts.startTableProgress(taskID, "db1", "nonexistent", 0)
+	})
+}
+
+func TestUpdateTableProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_update_progress"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+	ts.startTableProgress(taskID, "db1", "users", 10000)
+
+	// 模拟处理了 2000 行，耗时 2 秒
+	ts.updateTableProgress(taskID, "db1", "users", 2000, 2.0)
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+
+	for _, ti := range rp.Tables {
+		if ti.Schema == "db1" && ti.Table == "users" {
+			assert.Equal(t, int64(2000), ti.ProcessedRows)
+			assert.Equal(t, 20.0, ti.ProgressPct)
+			assert.Equal(t, 1000.0, ti.SpeedRowsSec)
+		}
+	}
+}
+
+func TestUpdateTableProgress_ProgressCappedAt100(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_progress_capped"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+	ts.startTableProgress(taskID, "db1", "users", 100)
+
+	// 处理超过总行数
+	ts.updateTableProgress(taskID, "db1", "users", 150, 1.0)
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+
+	for _, ti := range rp.Tables {
+		if ti.Schema == "db1" && ti.Table == "users" {
+			assert.Equal(t, int64(150), ti.ProcessedRows)
+			assert.Equal(t, 100.0, ti.ProgressPct) // 封顶 100
+		}
+	}
+}
+
+func TestUpdateTableProgress_ZeroElapsed(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_zero_elapsed"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+	ts.startTableProgress(taskID, "db1", "users", 10000)
+
+	// elapsed=0 时不应计算速度（避免除零）
+	assert.NotPanics(t, func() {
+		ts.updateTableProgress(taskID, "db1", "users", 100, 0)
+	})
+
+	rp, _ := ts.GetTaskProgress(taskID)
+	for _, ti := range rp.Tables {
+		if ti.Schema == "db1" && ti.Table == "users" {
+			assert.Equal(t, float64(0), ti.SpeedRowsSec)
+		}
+	}
+}
+
+func TestCompleteTableProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_complete_table"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+	ts.startTableProgress(taskID, "db1", "users", 10000)
+	ts.completeTableProgress(taskID, "db1", "users")
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+
+	for _, ti := range rp.Tables {
+		if ti.Schema == "db1" && ti.Table == "users" {
+			assert.Equal(t, "completed", ti.Status)
+			assert.Equal(t, 100.0, ti.ProgressPct)
+			assert.NotNil(t, ti.CompletedAt)
+		}
+	}
+}
+
+func TestFailTableProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_fail_table"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+	ts.startTableProgress(taskID, "db1", "users", 10000)
+	ts.failTableProgress(taskID, "db1", "users")
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+
+	for _, ti := range rp.Tables {
+		if ti.Schema == "db1" && ti.Table == "users" {
+			assert.Equal(t, "failed", ti.Status)
+		}
+	}
+}
+
+func TestRefreshOverallProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_refresh_overall"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+		{schema: "db1", table: "orders", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+
+	// 第一张表完成
+	ts.startTableProgress(taskID, "db1", "users", 1000)
+	ts.updateTableProgress(taskID, "db1", "users", 1000, 1.0)
+	ts.completeTableProgress(taskID, "db1", "users")
+
+	// 第二张表进行中
+	ts.startTableProgress(taskID, "db1", "orders", 2000)
+	ts.updateTableProgress(taskID, "db1", "orders", 500, 2.0)
+
+	startTime := time.Now().Add(-10 * time.Second)
+	ts.refreshOverallProgress(taskID, startTime)
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "db1.orders", rp.CurrentTable)
+	assert.GreaterOrEqual(t, rp.ElapsedSeconds, 10.0)
+	assert.Greater(t, rp.OverallSpeed, 0.0)
+	assert.Greater(t, rp.EstimatedRemain, 0.0)
+}
+
+func TestRefreshOverallProgress_NoRemaining(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_no_remaining"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+	ts.startTableProgress(taskID, "db1", "users", 1000)
+	ts.updateTableProgress(taskID, "db1", "users", 1000, 1.0)
+	ts.completeTableProgress(taskID, "db1", "users")
+
+	startTime := time.Now().Add(-5 * time.Second)
+	ts.refreshOverallProgress(taskID, startTime)
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+	// 全部完成时，预估剩余应为 -1
+	assert.Equal(t, float64(-1), rp.EstimatedRemain)
+}
+
+func TestGetTaskProgress_NotFound(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	_, err := ts.GetTaskProgress("non_existent")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "task progress not found")
+}
+
+func TestClearRunningProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_clear"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+
+	// 确认存在
+	_, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+
+	// 清除
+	ts.clearRunningProgress(taskID)
+
+	// 确认已清除
+	_, err = ts.GetTaskProgress(taskID)
+	assert.Error(t, err)
+}
+
+func TestProgressMethods_NoRunningProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_no_rp"
+
+	// 所有方法在无 RunningProgress 时不应 panic
+	assert.NotPanics(t, func() {
+		ts.startTableProgress(taskID, "db1", "users", 100)
+		ts.updateTableProgress(taskID, "db1", "users", 100, 1.0)
+		ts.completeTableProgress(taskID, "db1", "users")
+		ts.failTableProgress(taskID, "db1", "users")
+		ts.refreshOverallProgress(taskID, time.Now())
+		ts.clearRunningProgress(taskID)
+	})
+}
+
+func TestCompleteTask_ClearsRunningProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_complete_clears"
+	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: taskID, Name: "Test"})
+
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+
+	// 完成任务
+	ts.completeTask(taskID)
+
+	// 进度应被清除
+	_, err := ts.GetTaskProgress(taskID)
+	assert.Error(t, err)
+}
+
+func TestPauseTask_ClearsRunningProgress(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_pause_clears"
+	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: taskID, Name: "Test"})
+
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+
+	// 暂停任务
+	_ = ts.PauseTask(taskID)
+
+	// 进度应被清除
+	_, err := ts.GetTaskProgress(taskID)
+	assert.Error(t, err)
+}
+
+func TestRunningProgress_ConcurrentAccess(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_concurrent"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+		{schema: "db1", table: "orders", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+	ts.startTableProgress(taskID, "db1", "users", 10000)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ts.updateTableProgress(taskID, "db1", "users", 100, 1.0)
+		}()
+	}
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ts.GetTaskProgress(taskID)
+		}()
+	}
+	wg.Wait()
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+	for _, ti := range rp.Tables {
+		if ti.Schema == "db1" && ti.Table == "users" {
+			assert.Equal(t, int64(1000), ti.ProcessedRows)
+		}
+	}
 }
