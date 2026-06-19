@@ -65,6 +65,13 @@ import (
 
 // TaskService 任务服务结构体
 
+// TaskService is the application boundary for task lifecycle and sync
+// orchestration.
+//
+// It owns durable task state, scheduling, per-task runtime isolation, and the
+// handoff between full sync and incremental sync. Low-level SQL construction,
+// schema inspection, and binlog subscription are delegated to metadata, sync,
+// and checkpoint packages.
 type TaskService struct {
 	mu sync.RWMutex // 读写锁，保护并发访问
 
@@ -110,6 +117,10 @@ type TaskService struct {
 
 }
 
+// taskRuntime contains resources that must not be shared across running tasks.
+//
+// Each StartTask call creates an isolated runtime so one task's DB pools,
+// analyzer, read-only manager, or cancellation path cannot affect another task.
 type taskRuntime struct {
 	sourceDB *sql.DB
 
@@ -158,6 +169,10 @@ type sourceQueryer interface {
 
 // TaskStorage 任务存储接口
 
+// TaskStorage persists SyncTask archives.
+//
+// Implementations must preserve plaintext passwords in memory while encrypting
+// only the serialized form when an encryption key is configured.
 type TaskStorage interface {
 	Save(task *taskEntity.SyncTask) error // 保存任务
 
@@ -354,28 +369,27 @@ func (s *MySQLTaskStorage) Save(task *taskEntity.SyncTask) error {
 
 	}
 
-	query := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content), pk_id = LAST_INSERT_ID(pk_id)" // 构建插入或更新SQL
-
-	res, err := s.db.Exec(query, task.Config.ID, task.Config.Name, data) // 执行SQL
-
-	if err != nil {
-
-		fallbackQuery := "INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), content = VALUES(content)" // 构建备用SQL
-
-		if _, fbErr := s.db.Exec(fallbackQuery, task.Config.ID, task.Config.Name, data); fbErr != nil { // 执行备用SQL
-
-			return err // 返回原始错误
-
+	// 先尝试 UPDATE，命中则不消耗自增值；未命中再 INSERT
+	updRes, updErr := s.db.Exec("UPDATE sys_sync_tasks SET name = ?, content = ? WHERE id = ?", task.Config.Name, data, task.Config.ID)
+	if updErr != nil {
+		return updErr
+	}
+	rowsAffected, _ := updRes.RowsAffected()
+	if rowsAffected > 0 {
+		// UPDATE 命中，查询已有的 pk_id
+		if err := s.db.QueryRow("SELECT pk_id FROM sys_sync_tasks WHERE id = ?", task.Config.ID).Scan(&task.Config.StorageID); err != nil {
+			logger.Warn("Warning: failed to query pk_id after update: %v", err)
 		}
-
-		return nil // 返回成功
-
+		return nil
 	}
 
-	if storageID, idErr := res.LastInsertId(); idErr == nil && storageID > 0 { // 获取插入的ID
-
-		task.Config.StorageID = storageID // 设置存储ID
-
+	// 不存在则插入
+	res, err := s.db.Exec("INSERT INTO sys_sync_tasks (id, name, content) VALUES (?, ?, ?)", task.Config.ID, task.Config.Name, data)
+	if err != nil {
+		return err
+	}
+	if storageID, idErr := res.LastInsertId(); idErr == nil && storageID > 0 {
+		task.Config.StorageID = storageID
 	}
 
 	return nil // 返回成功
@@ -1038,39 +1052,71 @@ func (s *TaskService) getTasksPageFromMemory(page, pageSize int, status, keyword
 		createdAtB := taskDisplayTime(b)
 		switch sortBy {
 		case "created_at_asc":
-			if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }
+			if createdAtA.Equal(createdAtB) {
+				return a.Config.ID > b.Config.ID
+			}
 			return createdAtA.Before(createdAtB)
 		case "name_asc":
-			if a.Config.Name == b.Config.Name { return a.Config.ID < b.Config.ID }
+			if a.Config.Name == b.Config.Name {
+				return a.Config.ID < b.Config.ID
+			}
 			return a.Config.Name < b.Config.Name
 		case "name_desc":
-			if a.Config.Name == b.Config.Name { return a.Config.ID > b.Config.ID }
+			if a.Config.Name == b.Config.Name {
+				return a.Config.ID > b.Config.ID
+			}
 			return a.Config.Name > b.Config.Name
 		case "status_asc":
 			aStatus, bStatus := taskStatusRank(a.Context.Status), taskStatusRank(b.Context.Status)
-			if aStatus == bStatus { if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }; return createdAtA.After(createdAtB) }
+			if aStatus == bStatus {
+				if createdAtA.Equal(createdAtB) {
+					return a.Config.ID > b.Config.ID
+				}
+				return createdAtA.After(createdAtB)
+			}
 			return aStatus < bStatus
 		case "status_desc":
 			aStatus, bStatus := taskStatusRank(a.Context.Status), taskStatusRank(b.Context.Status)
-			if aStatus == bStatus { if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }; return createdAtA.After(createdAtB) }
+			if aStatus == bStatus {
+				if createdAtA.Equal(createdAtB) {
+					return a.Config.ID > b.Config.ID
+				}
+				return createdAtA.After(createdAtB)
+			}
 			return aStatus > bStatus
 		case "progress_asc":
-			if a.Context.ProgressPercent == b.Context.ProgressPercent { if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }; return createdAtA.After(createdAtB) }
+			if a.Context.ProgressPercent == b.Context.ProgressPercent {
+				if createdAtA.Equal(createdAtB) {
+					return a.Config.ID > b.Config.ID
+				}
+				return createdAtA.After(createdAtB)
+			}
 			return a.Context.ProgressPercent < b.Context.ProgressPercent
 		case "progress_desc":
-			if a.Context.ProgressPercent == b.Context.ProgressPercent { if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }; return createdAtA.After(createdAtB) }
+			if a.Context.ProgressPercent == b.Context.ProgressPercent {
+				if createdAtA.Equal(createdAtB) {
+					return a.Config.ID > b.Config.ID
+				}
+				return createdAtA.After(createdAtB)
+			}
 			return a.Context.ProgressPercent > b.Context.ProgressPercent
 		default:
-			if createdAtA.Equal(createdAtB) { return a.Config.ID > b.Config.ID }
+			if createdAtA.Equal(createdAtB) {
+				return a.Config.ID > b.Config.ID
+			}
 			return createdAtA.After(createdAtB)
 		}
 	})
 
 	total := len(tasks)
 	start := (page - 1) * pageSize
-	if start >= total { return []*taskEntity.SyncTask{}, total, page, pageSize }
+	if start >= total {
+		return []*taskEntity.SyncTask{}, total, page, pageSize
+	}
 	end := start + pageSize
-	if end > total { end = total }
+	if end > total {
+		end = total
+	}
 	return tasks[start:end], total, page, pageSize
 }
 

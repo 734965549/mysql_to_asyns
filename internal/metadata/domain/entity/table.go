@@ -4,12 +4,17 @@ package entity // 声明当前文件属于entity包，用于定义数据实体
 type IdentityStrategy string // 定义标识策略为字符串类型
 
 const ( // 定义常量
-	PKStrategy          IdentityStrategy = "PK_STRATEGY" // 主键策略：使用主键作为标识
-	UKStrategy          IdentityStrategy = "UK_STRATEGY" // 唯一键策略：使用唯一键作为标识
+	PKStrategy          IdentityStrategy = "PK_STRATEGY"           // 主键策略：使用主键作为标识
+	UKStrategy          IdentityStrategy = "UK_STRATEGY"           // 唯一键策略：使用唯一键作为标识
 	FullColumnsStrategy IdentityStrategy = "FULL_COLUMNS_STRATEGY" // 全列匹配策略：使用所有列作为标识
 )
 
 // TableIdentity 表标识信息 - 值对象
+// TableIdentity is the metadata decision shared by readers and writers.
+//
+// IdentifyCols are used to match target rows for UPDATE/DELETE. CursorCols are
+// used by full-sync readers for keyset/range pagination and can differ from
+// IdentifyCols when a composite key contains an auto-increment column.
 type TableIdentity struct { // 定义表标识结构体，用于唯一标识一条记录
 	TableName    string           // 表名
 	Strategy     IdentityStrategy // 标识策略：使用何种方式标识记录
@@ -34,9 +39,9 @@ func (t *TableIdentity) EffectiveCursorCols() []string {
 
 // ColumnMeta 列元数据
 type ColumnMeta struct { // 定义列元数据结构体，存储列的详细信息
-	Name         string // 列名：列的名称
-	DataType     string // 数据类型：列的数据类型
-	IsNullable   bool   // 是否可空：列是否允许为空值
+	Name            string // 列名：列的名称
+	DataType        string // 数据类型：列的数据类型
+	IsNullable      bool   // 是否可空：列是否允许为空值
 	IsPrimaryKey    bool   // 是否主键：列是否为主键
 	IsUnique        bool   // 是否唯一：列是否有唯一约束
 	IsAutoIncrement bool   // 是否自增：EXTRA 含 auto_increment

@@ -1,14 +1,14 @@
 package reader // 声明当前文件属于reader包，用于数据读取
 
 import ( // 导入外部包和标准库
-	"context"                                        // 导入context包，用于上下文管理
-	"database/sql"                                   // 导入database/sql包，用于数据库操作
-	"database/sql/driver"                            // 导入driver包，用于驱动接口
-	"errors"                                         // 导入errors包，用于错误处理
-	"fmt"                                            // 导入fmt包，用于格式化输入输出
+	"context"                                       // 导入context包，用于上下文管理
+	"database/sql"                                  // 导入database/sql包，用于数据库操作
+	"database/sql/driver"                           // 导入driver包，用于驱动接口
+	"errors"                                        // 导入errors包，用于错误处理
+	"fmt"                                           // 导入fmt包，用于格式化输入输出
 	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
-	"strings"                                        // 导入strings包，用于字符串操作
-	"time"                                           // 导入time包，用于时间处理
+	"strings"                                       // 导入strings包，用于字符串操作
+	"time"                                          // 导入time包，用于时间处理
 )
 
 type queryExecutor interface {
@@ -99,6 +99,11 @@ func normalizeScannedValue(val interface{}) interface{} { // 规范化扫描值�
 }
 
 // DataReader 数据读取器接口
+// DataReader is the full-sync source read contract.
+//
+// Implementations return source rows as column-name maps. They do not advance
+// task resume cursors; TaskService records cursors only after the corresponding
+// target write transaction commits.
 type DataReader interface { // 定义数据读取器接口
 	// ReadBatch 批量读取数据方法
 	ReadBatch(ctx context.Context, offset, limit int64) ([]map[string]interface{}, error) // 批量读取数据

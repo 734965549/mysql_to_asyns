@@ -43,6 +43,7 @@ const ( // 定义常量
 // 恢复决策分两层：
 //   - 阶段级：要不要重跑全量、能不能直接接增量 → 看 SyncPhase（HasFullSyncEverCompleted / FullSyncIncomplete）
 //   - 全量表级/行级：暂停后续传从哪张表、哪个主键继续 → 看 FullSyncResume（见 docs/guides/FULL_SYNC_RESUME_GUIDE.md）
+//
 // 增量 binlog 位点由 checkpoint.Manager 管理，与 FullSyncResume 无关。
 type SyncPhase string
 
@@ -64,6 +65,12 @@ type DatabaseConfig struct { // 定义数据库连接配置结构体
 }
 
 // TaskConfig 任务配置
+// TaskConfig is the durable input contract for a sync task.
+//
+// API handlers build this value from JSON requests, TaskService uses it to
+// initialize per-task runtime resources, and storage serializes it as part of
+// SyncTask. Do not put live resources such as DB handles or cancel functions in
+// this struct.
 type TaskConfig struct { // 定义任务配置结构体
 	StorageID                int64           `json:"storage_id,omitempty"`         // 存储ID
 	ID                       string          `json:"id"`                           // 任务ID
@@ -89,6 +96,12 @@ type TaskConfig struct { // 定义任务配置结构体
 }
 
 // ProcessContext 处理上下文
+// ProcessContext is the durable execution state of a task.
+//
+// TaskStatus is the external lifecycle state. SyncPhase is the internal sync
+// stage used to decide whether full sync can resume or incremental sync can
+// take over. FullSyncResume belongs here because full-sync resume must survive
+// service restarts with the task archive.
 type ProcessContext struct { // 定义处理上下文结构体
 	Status              TaskStatus  `json:"status"`                 // 任务状态
 	CurrentPosition     string      `json:"current_position"`       // 当前位点
@@ -158,8 +171,8 @@ func NewSyncTask(config TaskConfig) *SyncTask { // 创建同步任务实例
 	return &SyncTask{ // 返回任务实例
 		Config: config, // 设置配置
 		Context: ProcessContext{ // 初始化上下文
-			Status:    TaskStatusPending, // 设置初始状态为待执行
-			CreatedAt: now,
+			Status:         TaskStatusPending, // 设置初始状态为待执行
+			CreatedAt:      now,
 			LastUpdateTime: now,
 		},
 	}

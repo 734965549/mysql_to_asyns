@@ -35,6 +35,11 @@ type PositionPersister func(taskID string, pos mysql.Position)
 
 // IncrementalSyncService 增量同步服务
 
+// IncrementalSyncService replays ROW binlog events into the target database.
+//
+// It owns binlog subscription, target writers, table identities, and incremental
+// checkpoint writes. It does not own task lifecycle; TaskService starts/stops it
+// and optionally receives throttled position snapshots for task archives.
 type IncrementalSyncService struct {
 	sourceDB *sql.DB
 

@@ -1,21 +1,26 @@
 package writer // 声明当前文件属于writer包，用于数据写入
 
 import ( // 导入外部包和标准库
-	"context"                                        // 导入context包，用于上下文管理
-	"database/sql"                                   // 导入database/sql包，用于数据库操作
-	"fmt"                                            // 导入fmt包，用于格式化输入输出
+	"context"                                       // 导入context包，用于上下文管理
+	"database/sql"                                  // 导入database/sql包，用于数据库操作
+	"fmt"                                           // 导入fmt包，用于格式化输入输出
 	"mysql-to-sync/internal/audit"                  // 导入审计包
 	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
 	"mysql-to-sync/internal/metrics"                // 导入指标包，用于零行匹配等漂移指标
 	"mysql-to-sync/pkg/logger"                      // 导入log包，用于日志输出
-	"sync"                                           // 导入sync包，用于并发控制
-	"time"                                           // 导入time包，用于时间处理
+	"sync"                                          // 导入sync包，用于并发控制
+	"time"                                          // 导入time包，用于时间处理
 )
 
 // mysqlMaxPreparedPlaceholders MySQL 单条预处理语句占位符上限（留余量）
 const mysqlMaxPreparedPlaceholders = 62000 // MySQL预处理语句占位符上限
 
 // DataWriter 数据写入器接口
+// DataWriter is the target write contract used by full and incremental sync.
+//
+// Full sync normally calls WriteBatch with INSERT IGNORE semantics. Incremental
+// sync enables upsert on buffered writers for PK/UK tables and uses before-image
+// matching for no-primary-key UPDATE events.
 type DataWriter interface { // 定义数据写入器接口
 	// WriteBatch 批量写入数据方法
 	WriteBatch(ctx context.Context, rows []map[string]interface{}) error // 批量写入数据
@@ -33,6 +38,11 @@ type SQLExecutor interface { // 定义SQL执行器接口
 }
 
 // BatchWriter 批量写入器
+// BatchWriter executes deterministic SQL generated from TableIdentity.
+//
+// useUpsert is deliberately opt-in: full sync keeps INSERT IGNORE semantics,
+// while incremental sync must enable upsert so repeated PK/UK INSERT events
+// converge to the source row.
 type BatchWriter struct { // 定义批量写入器结构体
 	db          SQLExecutor        // SQL执行器
 	sqlBuilder  *SQLBuilder        // SQL构建器

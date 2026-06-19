@@ -166,6 +166,22 @@ const detailDrawerVisible = ref(false);
 
 const selectedTaskForDetail = ref(null);
 
+// 任务详情独立标签页（在新标签页中全屏展示任务详情、进度、日志等）
+
+const isTaskDetailPage = ref(false);
+
+const detailPageTaskId = ref("");
+
+const detailPageTask = ref(null);
+
+const detailPageMetrics = ref({});
+
+const detailPageLoading = ref(false);
+
+const detailPageActiveTab = ref("progress");
+
+let detailPageRefreshInterval = null;
+
 // 自定义数据库配置开关
 
 const useCustomSourceDB = ref(false);
@@ -1275,6 +1291,7 @@ async function confirmStartTask() {
       fetchTasks();
       Message.success(successMsg);
       startModalVisible.value = false;
+      refreshDetailPage();
     } else {
       const errorMsg = await handleApiError(res, failMsg);
       Message.error(errorMsg);
@@ -1369,12 +1386,126 @@ async function deleteTask(taskId) {
   });
 }
 
-// 显示任务详情
+// 显示任务详情：在新标签页中打开，展示更完整的进度/日志/表进度等信息
 
 function showTaskDetail(task) {
-  selectedTaskForDetail.value = task;
+  const url = new URL(window.location.href);
 
-  detailDrawerVisible.value = true;
+  url.search = "";
+
+  url.hash = `#/task-detail/${task.config.id}`;
+
+  window.open(url.toString(), "_blank");
+}
+
+// 同步阶段文案
+
+function syncPhaseText(phase) {
+  const map = {
+    "": "未开始",
+
+    FULL_STARTED: "全量进行中",
+
+    FULL_COMPLETED: "全量已完成",
+
+    FULL_FAILED: "全量失败",
+
+    INCREMENTAL_STARTED: "增量进行中",
+  };
+
+  return map[phase] ?? (phase || "未开始");
+}
+
+// 全量断点续传表进度列表
+
+function resumeTableList(task) {
+  const resume = task?.context?.full_sync_resume;
+
+  if (!resume || typeof resume !== "object") return [];
+
+  return Object.entries(resume).map(([key, p]) => ({
+    key,
+
+    done: !!p.done,
+
+    readPath: p.read_path || "-",
+
+    processedRows: p.processed_rows || 0,
+
+    intraWorkers: p.intra_workers || 0,
+  }));
+}
+
+// 加载任务详情页数据（任务详情 + 指标）
+
+async function fetchTaskDetailPage(taskId) {
+  if (!taskId) return;
+
+  detailPageLoading.value = true;
+
+  try {
+    const [taskRes, metricsRes] = await Promise.allSettled([
+      fetch(`${API_BASE}/tasks/${taskId}`),
+
+      fetch(`${API_BASE}/tasks/${taskId}/metrics`),
+    ]);
+
+    if (taskRes.status === "fulfilled") {
+      if (taskRes.value.ok) {
+        detailPageTask.value = await taskRes.value.json();
+      } else if (taskRes.value.status === 404) {
+        detailPageTask.value = null;
+      }
+    }
+
+    if (metricsRes.status === "fulfilled" && metricsRes.value.ok) {
+      detailPageMetrics.value = await metricsRes.value.json();
+    }
+  } catch (e) {
+    console.error("加载任务详情失败:", e);
+  } finally {
+    detailPageLoading.value = false;
+  }
+}
+
+// 刷新任务详情页
+
+function refreshDetailPage() {
+  if (isTaskDetailPage.value && detailPageTaskId.value) {
+    fetchTaskDetailPage(detailPageTaskId.value);
+  }
+}
+
+// 关闭任务详情标签页
+
+function closeTaskDetailPage() {
+  window.close();
+
+  // 兜底：若 window.close() 无效（非脚本打开的标签页），回到主页
+
+  const url = new URL(window.location.href);
+
+  url.hash = "";
+
+  url.search = "";
+
+  window.location.href = url.toString();
+}
+
+// 详情页：暂停任务后刷新
+
+async function detailPagePause() {
+  await pauseTask(detailPageTaskId.value);
+
+  refreshDetailPage();
+}
+
+// 详情页：取消定时后刷新
+
+async function detailPageCancelSchedule() {
+  await cancelSchedule(detailPageTaskId.value);
+
+  refreshDetailPage();
 }
 
 // 将已有任务配置写入表单（创建副本与编辑共用）
@@ -1943,6 +2074,25 @@ onMounted(async () => {
     uiTheme.value = savedTheme;
   }
 
+  // 任务详情独立标签页：仅加载单个任务并定时刷新，不加载任务列表等主界面资源
+  const detailMatch = window.location.hash.match(/^#\/task-detail\/(.+)$/);
+
+  if (detailMatch) {
+    isTaskDetailPage.value = true;
+
+    detailPageTaskId.value = decodeURIComponent(detailMatch[1]);
+
+    document.title = "任务详情";
+
+    await fetchTaskDetailPage(detailPageTaskId.value);
+
+    detailPageRefreshInterval = setInterval(() => {
+      fetchTaskDetailPage(detailPageTaskId.value);
+    }, 3000);
+
+    return;
+  }
+
   window.addEventListener("popstate", handlePopState);
 
   await fetchDefaultConfig();
@@ -1965,6 +2115,8 @@ onUnmounted(() => {
   window.removeEventListener("popstate", handlePopState);
 
   if (refreshInterval) clearInterval(refreshInterval);
+
+  if (detailPageRefreshInterval) clearInterval(detailPageRefreshInterval);
 });
 
 // 菜单点击处理
@@ -1973,6 +2125,13 @@ function onMenuClick(key) {
   console.log("Menu item clicked:", key);
 
   const prevKey = selectedKey.value[0];
+
+  // 如果当前处于任务编辑/创建表单页面，先退出表单页面再跳转
+  if (taskFormPage.value !== "none") {
+    taskFormPage.value = "none";
+    resetForm();
+    window.history.pushState({}, "", "#/" + key);
+  }
 
   selectedKey.value = [key];
 
@@ -2283,7 +2442,462 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 </script>
 
 <template>
-  <a-layout class="layout-container" :class="appThemeClass">
+  <!-- 任务详情独立标签页 -->
+  <a-layout v-if="isTaskDetailPage" class="task-detail-page-layout" :class="appThemeClass">
+    <a-layout-header class="detail-page-header">
+      <div class="detail-header-left">
+        <a-button type="text" @click="closeTaskDetailPage">
+          <template #icon><icon-close /></template>
+          关闭
+        </a-button>
+        <a-divider direction="vertical" />
+        <icon-storage style="font-size: 18px; color: var(--color-text-2)" />
+        <a-typography-text strong style="margin-left: 8px; font-size: 16px">
+          {{ detailPageTask?.config?.name || detailPageTaskId }}
+        </a-typography-text>
+        <a-tag
+          v-if="detailPageTask"
+          :color="getStatusColor(detailPageTask.context.status)"
+          style="margin-left: 12px"
+        >
+          {{ getStatusText(detailPageTask.context.status) }}
+        </a-tag>
+        <a-tag
+          v-if="detailPageTask?.context?.sync_phase"
+          color="cyan"
+          style="margin-left: 8px"
+        >
+          {{ syncPhaseText(detailPageTask.context.sync_phase) }}
+        </a-tag>
+        <a-typography-text
+          v-if="detailPageLoading"
+          type="secondary"
+          style="margin-left: 12px; font-size: 12px"
+        >
+          <icon-refresh /> 刷新中…
+        </a-typography-text>
+      </div>
+      <div class="detail-header-right">
+        <a-space>
+          <a-button
+            v-if="detailPageTask && ['PENDING', 'PAUSED', 'FAILED'].includes(detailPageTask.context.status)"
+            type="primary"
+            status="success"
+            @click="openStartTaskModal(detailPageTaskId, 'immediate')"
+          >
+            <template #icon><icon-play-arrow /></template>
+            启动
+          </a-button>
+          <a-button
+            v-if="detailPageTask && ['PENDING', 'PAUSED', 'FAILED'].includes(detailPageTask.context.status)"
+            @click="openStartTaskModal(detailPageTaskId, 'cron')"
+          >
+            <template #icon><icon-clock-circle /></template>
+            定时启动
+          </a-button>
+          <a-button
+            v-if="detailPageTask?.context?.status === 'SCHEDULED'"
+            status="warning"
+            @click="detailPageCancelSchedule"
+          >
+            <template #icon><icon-clock-circle /></template>
+            取消定时
+          </a-button>
+          <a-button
+            v-if="detailPageTask?.context?.status === 'RUNNING'"
+            status="warning"
+            @click="detailPagePause"
+          >
+            <template #icon><icon-pause /></template>
+            暂停
+          </a-button>
+          <a-button type="text" @click="refreshDetailPage">
+            <template #icon><icon-refresh /></template>
+          </a-button>
+        </a-space>
+      </div>
+    </a-layout-header>
+
+    <a-layout-content class="detail-page-content">
+      <a-spin
+        :loading="detailPageLoading && !detailPageTask"
+        tip="加载中…"
+        style="width: 100%"
+      >
+        <div v-if="detailPageTask" class="detail-page-body">
+          <!-- 概览卡片 -->
+          <a-row :gutter="16" class="detail-overview-row">
+            <a-col :xs="12" :md="6">
+              <a-card class="overview-card">
+                <div class="overview-label">同步进度</div>
+                <div class="overview-value">{{ getProgress(detailPageTask) }}%</div>
+                <a-progress
+                  :percent="getProgress(detailPageTask)"
+                  :status="detailPageTask.context.status === 'FAILED' ? 'danger' : 'normal'"
+                  :show-text="false"
+                  style="margin-top: 8px"
+                />
+              </a-card>
+            </a-col>
+            <a-col :xs="12" :md="6">
+              <a-card class="overview-card">
+                <div class="overview-label">已处理 / 总行数</div>
+                <div class="overview-value">{{ detailPageTask.context.processed_rows || 0 }}</div>
+                <div class="overview-sub">
+                  总行数：{{ detailPageTask.context.total_rows || 0 }}
+                </div>
+              </a-card>
+            </a-col>
+            <a-col :xs="12" :md="6">
+              <a-card class="overview-card">
+                <div class="overview-label">运行时长</div>
+                <div class="overview-value overview-value-sm">
+                  {{ calculateDuration(detailPageTask.context.start_time, detailPageTask.context.end_time) }}
+                </div>
+                <div class="overview-sub">
+                  开始：{{ formatTime(detailPageTask.context.start_time) }}
+                </div>
+              </a-card>
+            </a-col>
+            <a-col :xs="12" :md="6">
+              <a-card class="overview-card">
+                <div class="overview-label">增量位点 / 延迟</div>
+                <div class="overview-value overview-value-sm">
+                  {{ detailPageMetrics.lag != null ? detailPageMetrics.lag + 's' : '-' }}
+                </div>
+                <div class="overview-sub">
+                  {{
+                    detailPageMetrics.binlog_file
+                      ? `${detailPageMetrics.binlog_file}:${detailPageMetrics.binlog_pos}`
+                      : (detailPageTask.context.current_position || '-')
+                  }}
+                </div>
+              </a-card>
+            </a-col>
+          </a-row>
+
+          <a-tabs v-model:active-key="detailPageActiveTab" class="detail-tabs">
+            <!-- 执行进度 -->
+            <a-tab-pane key="progress" title="执行进度">
+              <a-progress
+                :percent="getProgress(detailPageTask)"
+                :status="detailPageTask.context.status === 'FAILED' ? 'danger' : 'normal'"
+                style="margin-bottom: 20px"
+              />
+              <a-descriptions :column="3" bordered>
+                <a-descriptions-item label="任务状态">
+                  <a-tag :color="getStatusColor(detailPageTask.context.status)">
+                    {{ getStatusText(detailPageTask.context.status) }}
+                  </a-tag>
+                  <span
+                    v-if="detailPageTask.context.status === 'SCHEDULED' && detailPageTask.context.scheduled_at"
+                    style="margin-left: 8px; color: #165dff; font-size: 13px"
+                  >
+                    <icon-clock-circle /> {{ formatScheduledTime(detailPageTask) }}
+                  </span>
+                </a-descriptions-item>
+                <a-descriptions-item label="同步阶段">
+                  {{ syncPhaseText(detailPageTask.context.sync_phase) }}
+                </a-descriptions-item>
+                <a-descriptions-item label="进度">
+                  {{ getProgress(detailPageTask) }}%
+                </a-descriptions-item>
+                <a-descriptions-item label="已处理行数">
+                  {{ detailPageTask.context.processed_rows || 0 }}
+                </a-descriptions-item>
+                <a-descriptions-item label="总行数">
+                  {{ detailPageTask.context.total_rows || 0 }}
+                </a-descriptions-item>
+                <a-descriptions-item label="已完成表数">
+                  {{ resumeTableList(detailPageTask).filter((t) => t.done).length }} /
+                  {{ resumeTableList(detailPageTask).length || (detailPageMetrics.tables_total || 0) }}
+                </a-descriptions-item>
+                <a-descriptions-item label="当前位点">
+                  {{ detailPageTask.context.current_position || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="运行时长">
+                  {{ calculateDuration(detailPageTask.context.start_time, detailPageTask.context.end_time) }}
+                </a-descriptions-item>
+                <a-descriptions-item label="最后更新">
+                  {{ formatTime(detailPageTask.context.last_update_time) }}
+                </a-descriptions-item>
+                <a-descriptions-item label="开始时间">
+                  {{ formatTime(detailPageTask.context.start_time) }}
+                </a-descriptions-item>
+                <a-descriptions-item label="结束时间">
+                  {{ formatTime(detailPageTask.context.end_time) }}
+                </a-descriptions-item>
+                <a-descriptions-item label="创建时间">
+                  {{ formatTime(detailPageTask.context.created_at) }}
+                </a-descriptions-item>
+              </a-descriptions>
+
+              <a-descriptions
+                v-if="detailPageMetrics.binlog_file || detailPageMetrics.lag != null"
+                title="增量同步指标"
+                :column="3"
+                bordered
+                style="margin-top: 20px"
+              >
+                <a-descriptions-item label="Binlog 文件">
+                  {{ detailPageMetrics.binlog_file || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="Binlog 位点">
+                  {{ detailPageMetrics.binlog_pos || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="延迟">
+                  {{ detailPageMetrics.lag != null ? detailPageMetrics.lag : '-' }}
+                </a-descriptions-item>
+              </a-descriptions>
+
+              <a-descriptions
+                v-if="detailPageTask.context.schedule_mode || detailPageTask.context.cron_expression"
+                title="定时调度"
+                :column="2"
+                bordered
+                style="margin-top: 20px"
+              >
+                <a-descriptions-item label="调度模式">
+                  {{ detailPageTask.context.schedule_mode || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="Cron 表达式">
+                  {{ detailPageTask.context.cron_expression || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item v-if="detailPageTask.context.scheduled_at" label="下次执行">
+                  {{ formatScheduledTime(detailPageTask) }}
+                </a-descriptions-item>
+                <a-descriptions-item v-if="detailPageTask.context.repeat_remaining" label="剩余次数">
+                  {{ detailPageTask.context.repeat_remaining }} /
+                  {{ detailPageTask.context.repeat_count }}
+                </a-descriptions-item>
+              </a-descriptions>
+            </a-tab-pane>
+
+            <!-- 表同步进度 -->
+            <a-tab-pane key="tables" title="表同步进度">
+              <a-table
+                :columns="[
+                  { title: '表名', dataIndex: 'key' },
+                  { title: '读取路径', dataIndex: 'readPath' },
+                  { title: '状态', slotName: 'done' },
+                  { title: '已处理行数', dataIndex: 'processedRows' },
+                  { title: '表内并发', dataIndex: 'intraWorkers' },
+                ]"
+                :data="resumeTableList(detailPageTask)"
+                :pagination="false"
+                size="medium"
+              >
+                <template #done="{ record }">
+                  <a-tag :color="record.done ? 'green' : 'orange'">
+                    {{ record.done ? '已完成' : '进行中' }}
+                  </a-tag>
+                </template>
+              </a-table>
+              <a-empty
+                v-if="resumeTableList(detailPageTask).length === 0"
+                description="暂无表级断点续传数据（任务尚未进入全量同步或为库级同步）"
+                style="margin-top: 24px"
+              />
+            </a-tab-pane>
+
+            <!-- 基本信息 -->
+            <a-tab-pane key="basic" title="基本信息">
+              <a-descriptions title="基本信息" :column="2" bordered>
+                <a-descriptions-item label="任务ID">
+                  {{ detailPageTask.config.id }}
+                </a-descriptions-item>
+                <a-descriptions-item label="任务名称">
+                  {{ detailPageTask.config.name }}
+                </a-descriptions-item>
+                <a-descriptions-item label="同步级别">
+                  {{ detailPageTask.config.sync_level === 'DATABASE' ? '库级别' : '表级别' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="同步模式">
+                  <a-tag v-if="detailPageTask.config.mode === 'FULL'" color="blue">全量同步</a-tag>
+                  <a-tag v-else-if="detailPageTask.config.mode === 'INCREMENTAL'" color="green">增量同步</a-tag>
+                  <a-tag v-else color="purple">全量+增量</a-tag>
+                </a-descriptions-item>
+                <a-descriptions-item label="批量大小">
+                  {{ detailPageTask.config.batch_size }}
+                </a-descriptions-item>
+                <a-descriptions-item label="表并发数">
+                  {{ detailPageTask.config.worker_count }}
+                </a-descriptions-item>
+                <a-descriptions-item label="单表内并发">
+                  {{
+                    detailPageTask.config.intra_table_worker_count > 0
+                      ? detailPageTask.config.intra_table_worker_count
+                      : '默认（≤16）'
+                  }}
+                </a-descriptions-item>
+                <a-descriptions-item label="无主键 LIMIT 1">
+                  {{ detailPageTask.config.enable_limit_one ? '开启' : '关闭' }}
+                </a-descriptions-item>
+              </a-descriptions>
+
+              <a-descriptions title="源数据库配置" :column="2" bordered style="margin-top: 20px">
+                <a-descriptions-item label="主机地址">
+                  {{ detailPageTask.config.source_db?.host || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="端口">
+                  {{ detailPageTask.config.source_db?.port || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="用户名">
+                  {{ detailPageTask.config.source_db?.username || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="数据库">
+                  <a-space wrap>
+                    <a-tag
+                      v-for="db in (detailPageTask.config.source_databases || [])"
+                      :key="db"
+                      color="arcoblue"
+                      >{{ db }}</a-tag
+                    >
+                    <span v-if="!(detailPageTask.config.source_databases || []).length">{{
+                      detailPageTask.config.source_schema || '-'
+                    }}</span>
+                  </a-space>
+                </a-descriptions-item>
+              </a-descriptions>
+
+              <a-descriptions title="目标数据库配置" :column="2" bordered style="margin-top: 20px">
+                <template
+                  v-if="!detailPageTask.config.sink_configs || detailPageTask.config.sink_configs.length === 0"
+                >
+                  <a-descriptions-item label="主机地址">
+                    {{ detailPageTask.config.target_db?.host || '-' }}
+                  </a-descriptions-item>
+                  <a-descriptions-item label="端口">
+                    {{ detailPageTask.config.target_db?.port || '-' }}
+                  </a-descriptions-item>
+                  <a-descriptions-item label="用户名">
+                    {{ detailPageTask.config.target_db?.username || '-' }}
+                  </a-descriptions-item>
+                  <a-descriptions-item label="数据库映射">
+                    <a-space wrap>
+                      <span
+                        v-for="mapping in getTaskDatabaseMappings(detailPageTask)"
+                        :key="mapping.source"
+                        style="display: inline-flex; align-items: center; margin-right: 12px"
+                      >
+                        <a-tag color="blue">{{ mapping.source }}</a-tag>
+                        <span style="margin: 0 4px">→</span>
+                        <a-tag color="green">{{ mapping.target }}</a-tag>
+                      </span>
+                    </a-space>
+                  </a-descriptions-item>
+                </template>
+                <template v-else>
+                  <a-descriptions-item
+                    v-for="(sink, idx) in detailPageTask.config.sink_configs"
+                    :key="idx"
+                    :label="`目标端 ${sink.type}`"
+                    :span="2"
+                  >
+                    <div v-if="sink.type === 'MYSQL'">
+                      主机：{{ sink.options?.host || '-' }} 端口：{{ sink.options?.port || '-' }} 用户：{{
+                        sink.options?.username || '-'
+                      }}
+                    </div>
+                    <div v-else-if="sink.type === 'KAFKA'">
+                      Brokers：{{
+                        Array.isArray(sink.options?.brokers)
+                          ? sink.options.brokers.join(', ')
+                          : sink.options?.brokers || '-'
+                      }}
+                      Topic：{{ sink.options?.topic || '-' }}
+                    </div>
+                    <div v-else-if="sink.type === 'HTTP_WEBHOOK'">
+                      URL：{{ sink.options?.url || '-' }} Method：{{ sink.options?.method || '-' }}
+                    </div>
+                  </a-descriptions-item>
+                </template>
+              </a-descriptions>
+
+              <a-descriptions
+                v-if="detailPageTask.config.sync_level !== 'DATABASE'"
+                title="同步表"
+                :column="1"
+                bordered
+                style="margin-top: 20px"
+              >
+                <a-descriptions-item label="表列表">
+                  <a-space wrap>
+                    <a-tag v-for="table in (detailPageTask.config.tables || [])" :key="table">{{
+                      table
+                    }}</a-tag>
+                    <span
+                      v-if="!detailPageTask.config.tables || detailPageTask.config.tables.length === 0"
+                      >全库同步</span
+                    >
+                  </a-space>
+                </a-descriptions-item>
+              </a-descriptions>
+            </a-tab-pane>
+
+            <!-- 日志与错误 -->
+            <a-tab-pane key="logs" title="日志与错误">
+              <a-alert
+                v-if="detailPageTask.context.error_stack"
+                type="error"
+                :show-icon="true"
+                style="margin-bottom: 16px"
+                title="任务错误堆栈"
+              >
+                <pre style="margin: 0; white-space: pre-wrap; word-break: break-word">{{
+                  detailPageTask.context.error_stack
+                }}</pre>
+              </a-alert>
+
+              <a-alert
+                v-if="detailPageTask.context.full_sync_failed_reason"
+                type="warning"
+                :show-icon="true"
+                style="margin-bottom: 16px"
+                title="全量同步失败原因"
+              >
+                {{ detailPageTask.context.full_sync_failed_reason }}
+              </a-alert>
+
+              <a-descriptions title="同步阶段时间线" :column="2" bordered>
+                <a-descriptions-item label="全量开始时间">
+                  {{ formatTime(detailPageTask.context.full_sync_started_at) }}
+                </a-descriptions-item>
+                <a-descriptions-item label="全量完成时间">
+                  {{ formatTime(detailPageTask.context.full_sync_completed_at) }}
+                </a-descriptions-item>
+                <a-descriptions-item label="全量起始位点" :span="2">
+                  {{ detailPageTask.context.full_sync_start_position || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="最近增量位点" :span="2">
+                  {{ detailPageTask.context.last_incremental_position || '-' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="当前位点" :span="2">
+                  {{ detailPageTask.context.current_position || '-' }}
+                </a-descriptions-item>
+              </a-descriptions>
+
+              <a-alert
+                v-if="!detailPageTask.context.error_stack && !detailPageTask.context.full_sync_failed_reason"
+                type="info"
+                :show-icon="true"
+                style="margin-top: 16px"
+                title="暂无错误日志"
+                description="任务当前没有记录到错误堆栈或全量失败原因。"
+              />
+            </a-tab-pane>
+          </a-tabs>
+        </div>
+        <a-empty
+          v-else-if="!detailPageLoading"
+          description="任务不存在或已被删除"
+          style="margin-top: 80px"
+        />
+      </a-spin>
+    </a-layout-content>
+  </a-layout>
+
+  <a-layout v-if="!isTaskDetailPage" class="layout-container" :class="appThemeClass">
     <!-- 左侧导航栏 -->
 
     <a-layout-sider :width="220" :collapsible="false" class="sider">
@@ -2815,7 +3429,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                         >
                           <div class="source-name" :title="mapping.source">
                             <icon-storage
-                              style="margin-right: 4px; color: #00e5ff"
+                              style="margin-right: 4px; color: var(--app-accent)"
                             />
 
                             {{ mapping.source }}
@@ -4991,60 +5605,60 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
         </div>
       </div>
     </a-drawer>
+  </a-layout>
 
-    <!-- 启动任务弹窗 -->
-    <a-modal
-      v-model:visible="startModalVisible"
-      :title="startMode === 'immediate' ? '确认立即启动' : 'Cron 定时启动'"
-      @ok="confirmStartTask"
-      @cancel="startModalVisible = false"
-      ok-text="确认"
-      cancel-text="取消"
-      :width="720"
-    >
-      <a-form layout="vertical">
+  <!-- 启动任务弹窗（全局，主界面与任务详情页共用） -->
+  <a-modal
+    v-model:visible="startModalVisible"
+    :title="startMode === 'immediate' ? '确认立即启动' : 'Cron 定时启动'"
+    @ok="confirmStartTask"
+    @cancel="startModalVisible = false"
+    ok-text="确认"
+    cancel-text="取消"
+    :width="720"
+  >
+    <a-form layout="vertical">
+      <a-alert
+        v-if="startMode === 'immediate'"
+        type="warning"
+        :show-icon="true"
+        style="margin-bottom: 16px"
+        title="确认后将立即启动任务"
+        description="如果你希望设置定时启动，请切换到定时启动方式后再提交。"
+      />
+
+      <template v-else>
         <a-alert
-          v-if="startMode === 'immediate'"
-          type="warning"
+          type="info"
           :show-icon="true"
           style="margin-bottom: 16px"
-          title="确认后将立即启动任务"
-          description="如果你希望设置定时启动，请切换到定时启动方式后再提交。"
+          title="Cron 支持标准语法，并兼容 L / W / #"
+          description="例如：0 9 * * 1-5 表示每周一到周五 09:00；0 0 L * * 表示每月最后一天 00:00。"
         />
 
-        <template v-else>
-          <a-alert
-            type="info"
-            :show-icon="true"
-            style="margin-bottom: 16px"
-            title="Cron 支持标准语法，并兼容 L / W / #"
-            description="例如：0 9 * * 1-5 表示每周一到周五 09:00；0 0 L * * 表示每月最后一天 00:00。"
-          />
+        <a-form-item label="Cron 表达式">
+          <a-input v-model="scheduleCron" placeholder="例如：0 9 * * 1-5" />
+        </a-form-item>
 
-          <a-form-item label="Cron 表达式">
-            <a-input v-model="scheduleCron" placeholder="例如：0 9 * * 1-5" />
-          </a-form-item>
+        <a-form-item label="时区">
+          <a-input v-model="scheduleTimezone" placeholder="例如：Asia/Shanghai" />
+        </a-form-item>
 
-          <a-form-item label="时区">
-            <a-input v-model="scheduleTimezone" placeholder="例如：Asia/Shanghai" />
-          </a-form-item>
+        <a-form-item label="快捷模板">
+          <a-space wrap>
+            <a-button size="small" @click="scheduleCron = '0 9 * * 1-5'">工作日 9:00</a-button>
+            <a-button size="small" @click="scheduleCron = '30 9 * * 1-5'">工作日 9:30</a-button>
+            <a-button size="small" @click="scheduleCron = '0 0 L * *'">每月最后一个工作日 00:00</a-button>
+            <a-button size="small" @click="scheduleCron = '0 10 ? * 1#1'">每月第一个周一 10:00</a-button>
+          </a-space>
+        </a-form-item>
 
-          <a-form-item label="快捷模板">
-            <a-space wrap>
-              <a-button size="small" @click="scheduleCron = '0 9 * * 1-5'">工作日 9:00</a-button>
-              <a-button size="small" @click="scheduleCron = '30 9 * * 1-5'">工作日 9:30</a-button>
-              <a-button size="small" @click="scheduleCron = '0 0 L * *'">每月最后一个工作日 00:00</a-button>
-              <a-button size="small" @click="scheduleCron = '0 10 ? * 1#1'">每月第一个周一 10:00</a-button>
-            </a-space>
-          </a-form-item>
-
-          <a-typography-text type="secondary" style="font-size: 12px">
-            支持标准 cron 与扩展语义。提交后系统会保存原始表达式，并据此计算下一次触发时间。
-          </a-typography-text>
-        </template>
-      </a-form>
-    </a-modal>
-  </a-layout>
+        <a-typography-text type="secondary" style="font-size: 12px">
+          支持标准 cron 与扩展语义。提交后系统会保存原始表达式，并据此计算下一次触发时间。
+        </a-typography-text>
+      </template>
+    </a-form>
+  </a-modal>
 </template>
 
 <style scoped>
@@ -5052,6 +5666,106 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   height: 100vh;
 
   background: #f5f7fa;
+}
+
+.task-detail-page-layout {
+  height: 100vh;
+
+  background: #f5f7fa;
+}
+
+.detail-page-header {
+  display: flex;
+
+  align-items: center;
+
+  justify-content: space-between;
+
+  padding: 0 20px;
+
+  background: #fff;
+
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+
+  height: 56px;
+
+  position: sticky;
+
+  top: 0;
+
+  z-index: 10;
+}
+
+.detail-header-left {
+  display: flex;
+
+  align-items: center;
+}
+
+.detail-header-right {
+  display: flex;
+
+  align-items: center;
+}
+
+.detail-page-content {
+  padding: 20px;
+
+  overflow-y: auto;
+}
+
+.detail-page-body {
+  max-width: 1400px;
+
+  margin: 0 auto;
+}
+
+.detail-overview-row {
+  margin-bottom: 16px;
+}
+
+.overview-card {
+  height: 100%;
+}
+
+.overview-label {
+  font-size: 13px;
+
+  color: #86909c;
+
+  margin-bottom: 8px;
+}
+
+.overview-value {
+  font-size: 28px;
+
+  font-weight: 600;
+
+  color: #1d2129;
+
+  line-height: 1.2;
+}
+
+.overview-value-sm {
+  font-size: 20px;
+}
+
+.overview-sub {
+  margin-top: 8px;
+
+  font-size: 12px;
+
+  color: #86909c;
+
+  word-break: break-all;
+}
+
+.detail-tabs {
+  background: #fff;
+
+  border-radius: 4px;
+
+  padding: 16px;
 }
 
 .task-form-full-page {
@@ -5340,12 +6054,12 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .task-list-card {
   border-radius: 16px;
   box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
-  border: 1px solid rgba(229, 231, 235, 0.9);
+  border: 1px solid var(--app-border-soft);
   overflow: hidden;
 }
 
 .task-list-card :deep(.arco-card-header) {
-  border-bottom: 1px solid #edf2f7;
+  border-bottom: 1px solid var(--app-border-soft);
   padding: 20px 24px 18px;
   height: auto;
   min-height: 72px;
@@ -5489,7 +6203,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
 .task-filter-summary__empty {
   font-size: 12px;
-  color: #86909c;
+  color: var(--app-muted);
 }
 
 .empty-state {
@@ -5499,8 +6213,8 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .empty-state--card {
-  background: #fbfcfe;
-  border: 1px dashed #dfe5ef;
+  background: var(--app-surface-soft);
+  border: 1px dashed var(--app-border);
   border-radius: 14px;
   margin: 4px 0 18px;
 }
@@ -5691,11 +6405,11 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
   flex-direction: column;
 
-  border: 1px solid #e5e6eb;
+  border: 1px solid var(--app-border);
 
   border-radius: 4px;
 
-  background: #fff;
+  background: var(--app-surface);
 
   height: 100%;
 
@@ -5705,9 +6419,9 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .transfer-header {
   padding: 8px 12px;
 
-  border-bottom: 1px solid #e5e6eb;
+  border-bottom: 1px solid var(--app-border-soft);
 
-  background: #f7f8fa;
+  background: var(--app-surface-soft);
 
   display: flex;
 
@@ -5721,7 +6435,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
   font-size: 14px;
 
-  color: #1d2129;
+  color: var(--app-text);
 }
 
 .transfer-header-tip {
@@ -5729,13 +6443,13 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
   padding: 6px 12px;
 
-  background: #fff;
+  background: var(--app-surface);
 
-  border-bottom: 1px solid #f2f3f5;
+  border-bottom: 1px solid var(--app-border-soft);
 
   font-size: 12px;
 
-  color: #86909c;
+  color: var(--app-muted);
 }
 
 .transfer-header-tip span {
@@ -5745,7 +6459,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .transfer-search {
   padding: 8px 12px;
 
-  border-bottom: 1px solid #e5e6eb;
+  border-bottom: 1px solid var(--app-border-soft);
 }
 
 .table-toolbar {
@@ -5801,13 +6515,13 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
   overflow-y: auto;
 
-  border: 1px solid #e5e6eb;
+  border: 1px solid var(--app-border-soft);
 
   border-radius: 6px;
 
   padding: 10px;
 
-  background: #fafafa;
+  background: var(--app-surface-soft);
 
   display: block;
 }
@@ -6029,7 +6743,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
   height: 100%;
 
-  color: #86909c;
+  color: var(--app-muted);
 
   padding-top: 40px; /* 稍微下移一点，对齐内容区 */
 }
@@ -6350,7 +7064,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .task-base-config-row :deep(.arco-form-item-label-col > label) {
-  color: #1d2129;
+  color: var(--app-text);
   font-size: 13px;
   font-weight: 600;
 }
@@ -6358,22 +7072,22 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .task-base-config-row :deep(.arco-input-wrapper),
 .task-base-config-row :deep(.arco-select-view) {
   min-height: 40px;
-  border-color: #edf0f5;
+  border-color: var(--app-border-soft);
   border-radius: 6px;
-  background: #f7f9fc;
+  background: var(--app-surface-soft);
 }
 
 .task-base-config-row :deep(.arco-input-wrapper:hover),
 .task-base-config-row :deep(.arco-select-view:hover) {
-  border-color: #bedaff;
-  background: #fff;
+  border-color: var(--app-accent);
+  background: var(--app-surface);
 }
 
 .task-base-config-row :deep(.arco-input-wrapper.arco-input-focus),
 .task-base-config-row :deep(.arco-select-view-focus) {
-  border-color: #4080ff;
-  background: #fff;
-  box-shadow: 0 0 0 3px rgba(64, 128, 255, 0.12);
+  border-color: var(--app-accent);
+  background: var(--app-surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--app-accent) 12%, transparent);
 }
 
 .task-base-config-row :deep(.arco-radio-group) {
@@ -6453,15 +7167,15 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   width: 42px;
   min-width: 42px;
   padding-top: 52px;
-  color: #4080ff;
+  color: var(--app-accent);
 }
 
 .table-mapping-panel {
   margin: 16px 0 22px;
   padding: 16px;
-  border: 1px solid #e5e8ef;
+  border: 1px solid var(--app-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--app-surface);
 }
 
 .table-mapping-title {
@@ -6473,20 +7187,20 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   min-height: 42px;
   padding: 8px 10px;
   border-radius: 6px;
-  background: #f7f9fc;
+  background: var(--app-surface-soft);
 }
 
 .table-mapping-source {
   min-width: 160px;
   overflow: hidden;
-  color: #1d2129;
+  color: var(--app-text);
   font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .advanced-config-card {
-  border: 1px solid #e5e8ef;
+  border: 1px solid var(--app-border);
   border-radius: 8px;
   box-shadow: 0 8px 22px rgba(29, 33, 41, 0.05);
 }
@@ -6638,20 +7352,16 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   }
 }
 
-/* Sci-fi create task surface */
+/* Sci-fi create task surface - uses CSS variables for theme-awareness */
 .layout-container {
   background:
-    radial-gradient(circle at 12% 8%, rgba(0, 229, 255, 0.22), transparent 28%),
-    radial-gradient(circle at 88% 16%, rgba(255, 61, 145, 0.18), transparent 30%),
-    radial-gradient(circle at 58% 92%, rgba(127, 90, 240, 0.18), transparent 34%),
-    linear-gradient(135deg, #09111f 0%, #101827 45%, #14131f 100%);
+    radial-gradient(circle at 12% 8%, var(--app-glow), transparent 28%),
+    linear-gradient(135deg, var(--app-bg) 0%, var(--app-surface-strong) 100%);
 }
 
 .sider {
-  background:
-    linear-gradient(180deg, rgba(8, 18, 33, 0.98) 0%, rgba(18, 21, 44, 0.98) 100%),
-    linear-gradient(135deg, rgba(0, 229, 255, 0.16), rgba(255, 61, 145, 0.14));
-  border-right: 1px solid rgba(0, 229, 255, 0.22);
+  background: linear-gradient(180deg, var(--app-surface-strong) 0%, var(--app-surface) 100%);
+  border-right: 1px solid var(--app-border);
   box-shadow: 12px 0 38px rgba(0, 0, 0, 0.28);
 }
 
@@ -6666,30 +7376,30 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .logo {
-  border-bottom-color: rgba(0, 229, 255, 0.24);
+  border-bottom-color: var(--app-border);
 }
 
 .logo-icon {
-  background: linear-gradient(135deg, #00e5ff 0%, #7f5af0 52%, #ff3d91 100%);
-  box-shadow: 0 0 24px rgba(0, 229, 255, 0.42);
+  background: linear-gradient(135deg, var(--app-accent) 0%, var(--app-accent-2) 100%);
+  box-shadow: 0 0 24px var(--app-glow);
 }
 
 .header {
-  background: rgba(10, 18, 32, 0.78);
-  border-bottom: 1px solid rgba(0, 229, 255, 0.2);
-  color: #e8f6ff;
+  background: var(--app-surface-strong);
+  border-bottom: 1px solid var(--app-border);
+  color: var(--app-text);
   backdrop-filter: blur(18px);
   box-shadow: 0 12px 34px rgba(0, 0, 0, 0.24);
 }
 
 .header :deep(.arco-typography) {
-  color: #e8f6ff;
+  color: var(--app-text);
 }
 
 .content {
   background:
-    linear-gradient(rgba(0, 229, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 61, 145, 0.035) 1px, transparent 1px);
+    linear-gradient(color-mix(in srgb, var(--app-accent) 3.5%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--app-accent-2) 3.5%, transparent) 1px, transparent 1px);
   background-size: 28px 28px;
 }
 
@@ -6709,12 +7419,12 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .task-list-card,
 .task-filter-summary,
 .task-card-inner {
-  border-color: rgba(91, 205, 255, 0.24) !important;
-  background: linear-gradient(180deg, rgba(18, 28, 48, 0.92), rgba(10, 18, 32, 0.9)) !important;
+  border-color: var(--app-border) !important;
+  background: linear-gradient(180deg, var(--app-surface), var(--app-surface-soft)) !important;
   box-shadow:
     0 18px 46px rgba(0, 0, 0, 0.26),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  color: #e8f6ff;
+  color: var(--app-text);
 }
 
 .task-base-config-row {
@@ -6729,7 +7439,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   inset: 0;
   pointer-events: none;
   background:
-    linear-gradient(90deg, rgba(0, 229, 255, 0.22), transparent 22%, transparent 72%, rgba(255, 61, 145, 0.18)),
+    linear-gradient(90deg, color-mix(in srgb, var(--app-accent) 22%, transparent), transparent 22%, transparent 72%, color-mix(in srgb, var(--app-accent-2) 18%, transparent)),
     linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent 18%);
   opacity: 0.85;
 }
@@ -6743,8 +7453,22 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .layout-container:not(.theme-default) .transfer-header .title,
 .layout-container:not(.theme-default) .table-mapping-title,
 .layout-container:not(.theme-default) .task-list-title-wrap :deep(.arco-typography),
-.layout-container:not(.theme-default) .task-title :deep(.arco-typography) {
-  color: #e8f6ff;
+.layout-container:not(.theme-default) .task-title :deep(.arco-typography),
+.layout-container:not(.theme-default) .table-mapping-source,
+.layout-container:not(.theme-default) .mapped-item .source-name,
+.layout-container:not(.theme-default) .transfer-list-item,
+.layout-container:not(.theme-default) .table-name-text,
+.layout-container:not(.theme-default) .select-type-header :deep(.arco-typography),
+.layout-container:not(.theme-default) .type-content :deep(.arco-typography) {
+  color: var(--app-text);
+}
+
+.layout-container:not(.theme-default) .transfer-list-header,
+.layout-container:not(.theme-default) .transfer-header-tip,
+.layout-container:not(.theme-default) .select-type-header :deep(.arco-typography-secondary),
+.layout-container:not(.theme-default) .type-content :deep(.arco-typography-secondary),
+.layout-container:not(.theme-default) .type-content span {
+  color: var(--app-muted);
 }
 
 .task-base-config-row :deep(.arco-input-wrapper),
@@ -6755,9 +7479,9 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .table-mapping-panel :deep(.arco-input-wrapper),
 .transfer-pane :deep(.arco-input-wrapper),
 .transfer-pane :deep(.arco-select-view) {
-  border-color: rgba(0, 229, 255, 0.2);
-  background: rgba(7, 14, 28, 0.72);
-  color: #e8f6ff;
+  border-color: var(--app-border-soft);
+  background: var(--app-surface-strong);
+  color: var(--app-text);
 }
 
 .task-base-config-row :deep(.arco-input),
@@ -6765,7 +7489,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .table-selector-panel :deep(.arco-input),
 .table-mapping-panel :deep(.arco-input),
 .transfer-pane :deep(.arco-input) {
-  color: #e8f6ff;
+  color: var(--app-text);
 }
 
 .task-base-config-row :deep(.arco-input-wrapper:hover),
@@ -6773,22 +7497,22 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .transfer-pane :deep(.arco-input-wrapper:hover),
 .table-selector-panel :deep(.arco-input-wrapper:hover),
 .table-mapping-panel :deep(.arco-input-wrapper:hover) {
-  border-color: rgba(0, 229, 255, 0.72);
-  background: rgba(12, 24, 44, 0.88);
-  box-shadow: 0 0 0 3px rgba(0, 229, 255, 0.1);
+  border-color: var(--app-accent);
+  background: var(--app-surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--app-accent) 10%, transparent);
 }
 
 .task-base-config-row :deep(.arco-radio) {
-  border-color: rgba(0, 229, 255, 0.22);
-  background: rgba(7, 14, 28, 0.68);
-  color: #c9d9e8;
+  border-color: var(--app-border);
+  background: var(--app-surface-strong);
+  color: var(--app-muted);
 }
 
 .task-base-config-row :deep(.arco-radio:hover),
 .task-base-config-row :deep(.arco-radio-checked) {
-  border-color: rgba(0, 229, 255, 0.78);
-  background: linear-gradient(135deg, rgba(0, 229, 255, 0.16), rgba(127, 90, 240, 0.18));
-  box-shadow: 0 0 24px rgba(0, 229, 255, 0.16);
+  border-color: var(--app-accent);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--app-accent) 16%, transparent), color-mix(in srgb, var(--app-accent-2) 18%, transparent));
+  box-shadow: 0 0 24px color-mix(in srgb, var(--app-accent) 16%, transparent);
 }
 
 .db-transfer-container,
@@ -6797,12 +7521,10 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   margin-top: 8px;
   margin-bottom: 22px;
   padding: 16px;
-  border: 1px solid rgba(0, 229, 255, 0.22);
+  border: 1px solid var(--app-border);
   border-radius: 8px;
-  background:
-    linear-gradient(135deg, rgba(0, 229, 255, 0.12), rgba(255, 61, 145, 0.08)),
-    rgba(7, 14, 28, 0.52);
-  box-shadow: inset 0 0 40px rgba(0, 229, 255, 0.05);
+  background: var(--app-surface-strong);
+  box-shadow: inset 0 0 40px color-mix(in srgb, var(--app-accent) 5%, transparent);
 }
 
 .transfer-pane {
@@ -6812,51 +7534,51 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
 .transfer-header {
   min-height: 46px;
-  border-bottom-color: rgba(0, 229, 255, 0.18);
-  background: linear-gradient(90deg, rgba(0, 229, 255, 0.14), rgba(127, 90, 240, 0.08), rgba(255, 61, 145, 0.12));
+  border-bottom-color: var(--app-border-soft);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--app-accent) 14%, transparent), color-mix(in srgb, var(--app-accent-2) 8%, transparent), color-mix(in srgb, var(--app-accent) 12%, transparent));
 }
 
 .transfer-header-tip,
 .transfer-list-header,
 .transfer-search {
-  border-bottom-color: rgba(255, 255, 255, 0.08);
-  background: rgba(6, 12, 24, 0.45);
-  color: #8fb3c9;
+  border-bottom-color: var(--app-border-soft);
+  background: var(--app-surface-strong);
+  color: var(--app-muted);
 }
 
 .transfer-content.bg-white,
 .transfer-content {
-  background: rgba(7, 14, 28, 0.52);
+  background: var(--app-surface-strong);
 }
 
 .transfer-list-item,
 .mapped-item,
 .table-mapping-item {
-  color: #d8ebf7;
+  color: var(--app-text);
 }
 
 .transfer-list-item:hover,
 .mapped-item:hover,
 .table-mapping-item:hover {
-  background: rgba(0, 229, 255, 0.08);
+  background: var(--app-glow);
 }
 
 .mapped-item {
-  border-bottom-color: rgba(255, 255, 255, 0.08);
+  border-bottom-color: var(--app-border-soft);
 }
 
 .mapped-item .source-name,
 .table-mapping-source {
-  color: #e8f6ff;
+  color: var(--app-text);
 }
 
 .transfer-arrow {
-  color: #00e5ff;
-  filter: drop-shadow(0 0 12px rgba(0, 229, 255, 0.7));
+  color: var(--app-accent);
+  filter: drop-shadow(0 0 12px var(--app-glow));
 }
 
 .advanced-config-card :deep(.arco-card-body) {
-  color: #e8f6ff;
+  color: var(--app-text);
 }
 
 .table-config-row {
@@ -6877,18 +7599,18 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
 .table-list-panel,
 .table-db-collapse {
-  border-color: rgba(0, 229, 255, 0.18);
-  background: rgba(7, 14, 28, 0.58);
+  border-color: var(--app-border-soft);
+  background: var(--app-surface-strong);
 }
 
 .table-db-collapse :deep(.arco-collapse-item-header) {
-  background: rgba(0, 229, 255, 0.07);
-  color: #e8f6ff;
+  background: color-mix(in srgb, var(--app-accent) 7%, transparent);
+  color: var(--app-text);
 }
 
 .table-db-collapse :deep(.arco-collapse-item-content) {
-  background: rgba(5, 11, 22, 0.4);
-  color: #d8ebf7;
+  background: var(--app-surface-strong);
+  color: var(--app-text);
 }
 
 .table-list-item {
@@ -6897,11 +7619,11 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .table-list-item:hover {
-  background: rgba(255, 61, 145, 0.08);
+  background: var(--app-glow);
 }
 
 .table-name-text {
-  color: #d8ebf7;
+  color: var(--app-text);
 }
 
 .table-selector-form-item :deep(.arco-form-item-label-col) {
@@ -6909,14 +7631,14 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .table-selector-form-item :deep(.arco-form-item-label-col > label) {
-  color: #e8f6ff;
+  color: var(--app-text);
   font-weight: 600;
 }
 
 .table-selector-panel :deep(.arco-alert-info) {
-  border-color: rgba(0, 229, 255, 0.22);
-  background: rgba(0, 229, 255, 0.08);
-  color: #c9d9e8;
+  border-color: var(--app-border);
+  background: color-mix(in srgb, var(--app-accent) 8%, transparent);
+  color: var(--app-muted);
 }
 
 .advanced-config-row {
@@ -6926,11 +7648,11 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .task-base-config-row :deep(.arco-btn-primary),
 .header-right :deep(.arco-btn-primary) {
   border: 0;
-  background: linear-gradient(135deg, #00e5ff 0%, #7f5af0 54%, #ff3d91 100%);
-  box-shadow: 0 0 26px rgba(0, 229, 255, 0.24);
+  background: linear-gradient(135deg, var(--app-accent) 0%, var(--app-accent-2) 100%);
+  box-shadow: 0 0 26px var(--app-glow);
 }
 
-/* Keep text readable on the dark sci-fi surface */
+/* Keep text readable on the surface */
 .task-base-config-row :deep(.arco-form-item-label-col > label),
 .advanced-config-card :deep(.arco-form-item-label-col > label),
 .table-mapping-panel :deep(.arco-form-item-label-col > label),
@@ -6944,7 +7666,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .table-selector-panel :deep(.arco-checkbox-label),
 .task-base-config-row :deep(.arco-radio-label),
 .task-base-config-row :deep(.arco-select-view-value) {
-  color: #eef8ff !important;
+  color: var(--app-text) !important;
 }
 
 .task-base-config-row :deep(.arco-typography-secondary),
@@ -6956,7 +7678,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .task-base-config-row :deep(.arco-checkbox-disabled .arco-checkbox-label),
 .advanced-config-card :deep(.arco-checkbox-disabled .arco-checkbox-label),
 .task-base-config-row :deep(.arco-radio-disabled .arco-radio-label) {
-  color: #b9cbe0 !important;
+  color: var(--app-muted) !important;
 }
 
 .task-base-config-row :deep(.arco-radio-disabled),
@@ -6970,7 +7692,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .table-mapping-panel :deep(.arco-input::placeholder),
 .table-selector-panel :deep(.arco-input::placeholder),
 .transfer-pane :deep(.arco-input::placeholder) {
-  color: #8da9bf !important;
+  color: var(--app-muted) !important;
 }
 
 .task-base-config-row :deep(.arco-input-number),
@@ -6980,7 +7702,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .task-base-config-row :deep(.arco-checkbox),
 .advanced-config-card :deep(.arco-checkbox),
 .table-selector-panel :deep(.arco-checkbox) {
-  color: #eef8ff;
+  color: var(--app-text);
 }
 
 .advanced-config-card :deep(.arco-card-header),
@@ -6988,10 +7710,10 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 .task-base-config-row :deep(.arco-form-item-content),
 .advanced-config-card :deep(.arco-form-item-content),
 .table-selector-panel :deep(.arco-form-item-content) {
-  color: #eef8ff;
+  color: var(--app-text);
 }
 
-/* Unified deep-blue theme pass */
+/* Unified theme pass - default variables (overridden by theme classes) */
 .layout-container {
   --app-bg: #07111f;
   --app-surface: rgba(12, 24, 42, 0.94);
@@ -7005,13 +7727,12 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   --app-accent-2: #3b82f6;
   --app-glow: rgba(32, 199, 232, 0.24);
   background:
-    radial-gradient(circle at 15% 12%, rgba(32, 199, 232, 0.16), transparent 30%),
-    radial-gradient(circle at 82% 8%, rgba(59, 130, 246, 0.12), transparent 28%),
-    linear-gradient(135deg, #06101d 0%, #091728 48%, #0b1322 100%);
+    radial-gradient(circle at 15% 12%, var(--app-glow), transparent 30%),
+    linear-gradient(135deg, var(--app-bg) 0%, var(--app-surface-strong) 100%);
 }
 
 .sider {
-  background: linear-gradient(180deg, #07111f 0%, #0a1728 56%, #081220 100%);
+  background: linear-gradient(180deg, var(--app-surface-strong) 0%, var(--app-surface) 100%);
   border-right-color: var(--app-border);
   box-shadow: 10px 0 34px rgba(0, 0, 0, 0.28);
 }
@@ -7021,28 +7742,28 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .logo-icon {
-  background: linear-gradient(135deg, #22d3ee 0%, #3b82f6 100%);
-  box-shadow: 0 0 22px rgba(34, 211, 238, 0.3);
+  background: linear-gradient(135deg, var(--app-accent) 0%, var(--app-accent-2) 100%);
+  box-shadow: 0 0 22px var(--app-glow);
 }
 
 .sider-menu :deep(.arco-menu-item:hover) {
-  background: rgba(32, 199, 232, 0.12) !important;
+  background: color-mix(in srgb, var(--app-accent) 12%, transparent) !important;
 }
 
 .sider-menu :deep(.arco-menu-item.arco-menu-selected) {
-  background: rgba(148, 163, 184, 0.22) !important;
+  background: color-mix(in srgb, var(--app-muted) 22%, transparent) !important;
   box-shadow: inset 3px 0 0 var(--app-accent);
 }
 
 .header {
-  background: rgba(7, 17, 31, 0.9);
+  background: var(--app-surface-strong);
   border-bottom-color: var(--app-border);
 }
 
 .content {
   background:
-    linear-gradient(rgba(59, 130, 246, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(32, 199, 232, 0.035) 1px, transparent 1px);
+    linear-gradient(color-mix(in srgb, var(--app-accent-2) 3.5%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--app-accent) 3.5%, transparent) 1px, transparent 1px);
   background-size: 30px 30px;
 }
 
@@ -7104,16 +7825,16 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .task-filter-summary {
-  background: rgba(7, 17, 31, 0.64) !important;
+  background: var(--app-surface-strong) !important;
 }
 
 .filter-chip :deep(.arco-tag),
 .task-filter-summary :deep(.arco-tag),
 .task-list-card :deep(.arco-tag),
 .task-filter-panel :deep(.arco-tag) {
-  border-color: rgba(32, 199, 232, 0.32);
-  background: rgba(32, 199, 232, 0.12) !important;
-  color: #dff8ff !important;
+  border-color: color-mix(in srgb, var(--app-accent) 32%, transparent);
+  background: color-mix(in srgb, var(--app-accent) 12%, transparent) !important;
+  color: var(--app-text) !important;
 }
 
 .task-list-card :deep(.arco-input-wrapper),
@@ -7174,16 +7895,16 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   color: var(--app-muted) !important;
 }
 
-:global(.arco-message) {
-  border: 1px solid rgba(72, 188, 226, 0.28) !important;
-  background: rgba(12, 24, 42, 0.96) !important;
-  color: #edf7ff !important;
+:global(html:not([data-ui-theme="default"]) .arco-message) {
+  border: 1px solid var(--app-border, rgba(72, 188, 226, 0.28)) !important;
+  background: var(--app-surface, rgba(12, 24, 42, 0.96)) !important;
+  color: var(--app-text, #edf7ff) !important;
   box-shadow: 0 16px 34px rgba(0, 0, 0, 0.24) !important;
 }
 
-:global(.arco-message-content),
-:global(.arco-message .arco-icon) {
-  color: #edf7ff !important;
+:global(html:not([data-ui-theme="default"]) .arco-message-content),
+:global(html:not([data-ui-theme="default"]) .arco-message .arco-icon) {
+  color: var(--app-text, #edf7ff) !important;
 }
 
 /* Clear target-type selection and filter panel typography */
@@ -7227,7 +7948,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   min-height: 126px;
   border: 1px solid var(--app-border) !important;
   background:
-    linear-gradient(180deg, rgba(18, 35, 58, 0.96), rgba(10, 22, 39, 0.96)) !important;
+    linear-gradient(180deg, var(--app-surface), var(--app-surface-soft)) !important;
   box-shadow: 0 16px 34px rgba(0, 0, 0, 0.22);
   color: var(--app-text);
   overflow: hidden;
@@ -7235,10 +7956,10 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
 .type-card:hover {
   transform: translateY(-3px);
-  border-color: rgba(125, 211, 252, 0.64) !important;
+  border-color: var(--app-accent) !important;
   background:
-    linear-gradient(180deg, rgba(22, 47, 76, 0.98), rgba(11, 29, 50, 0.98)) !important;
-  box-shadow: 0 18px 38px rgba(32, 199, 232, 0.14);
+    linear-gradient(180deg, var(--app-surface-soft), var(--app-surface-strong)) !important;
+  box-shadow: 0 18px 38px var(--app-glow);
 }
 
 .type-card :deep(.arco-card-body) {
@@ -7263,30 +7984,30 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .type-content :deep(.arco-typography-secondary) {
-  color: #b9cbe0 !important;
+  color: var(--app-muted) !important;
   font-size: 13px;
   line-height: 1.65;
 }
 
 .type-icon {
-  border: 1px solid rgba(125, 211, 252, 0.18);
-  background: rgba(32, 199, 232, 0.12) !important;
-  color: #7dd3fc !important;
+  border: 1px solid var(--app-border-soft);
+  background: color-mix(in srgb, var(--app-accent) 12%, transparent) !important;
+  color: var(--app-accent) !important;
 }
 
 .kafka-icon {
-  background: rgba(59, 130, 246, 0.12) !important;
-  color: #93c5fd !important;
+  background: color-mix(in srgb, var(--app-accent-2) 12%, transparent) !important;
+  color: var(--app-accent-2) !important;
 }
 
 .webhook-icon {
-  background: rgba(20, 184, 166, 0.12) !important;
-  color: #5eead4 !important;
+  background: color-mix(in srgb, var(--app-accent) 12%, transparent) !important;
+  color: var(--app-accent) !important;
 }
 
 .multi-icon {
-  background: rgba(148, 163, 184, 0.12) !important;
-  color: #cbd5e1 !important;
+  background: color-mix(in srgb, var(--app-muted) 12%, transparent) !important;
+  color: var(--app-muted) !important;
 }
 
 .task-filter-panel {
@@ -7308,14 +8029,14 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 }
 
 .task-filter-panel__title {
-  color: #f3fbff !important;
+  color: var(--app-text) !important;
   font-size: 16px;
   line-height: 22px;
 }
 
 .task-filter-panel__desc {
   margin-top: 6px;
-  color: #b9cbe0 !important;
+  color: var(--app-muted) !important;
   font-size: 13px;
   line-height: 20px;
 }
