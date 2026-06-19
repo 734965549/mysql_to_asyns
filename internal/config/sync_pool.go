@@ -7,7 +7,7 @@ import ( // 导入外部包
 	"mysql-to-sync/pkg/logger" // 导入自定义日志包，用于日志输出
 )
 
-// ApplySyncMySQLPool 为同步/元数据使用的 *sql.DB 设置连接池函数。max_open 未配置时默认 256，避免驱动默认 max_idle 过小导致高并发时频繁建连。
+// ApplySyncMySQLPool 为同步/元数据使用的 *sql.DB 设置连接池函数。max_open 未配置时默认 32，避免驱动默认 max_idle 过小导致高并发时频繁建连。
 func ApplySyncMySQLPool(db *sql.DB, tune *SyncTuneConfig, source bool, logLabel string) { // 为数据库连接设置连接池参数
 	if db == nil { // 如果数据库连接为空
 		return // 直接返回
@@ -24,7 +24,7 @@ func ApplySyncMySQLPool(db *sql.DB, tune *SyncTuneConfig, source bool, logLabel 
 		lifeSec = tune.ConnMaxLifetimeSeconds // 设置连接最大存活时间
 	}
 	if maxOpen <= 0 { // 如果最大连接数未设置
-		maxOpen = 256 // 使用默认值256
+		maxOpen = 32 // 使用默认值32
 	}
 	db.SetMaxOpenConns(maxOpen) // 设置最大打开连接数
 	if maxIdle <= 0 { // 如果最大空闲连接数未设置

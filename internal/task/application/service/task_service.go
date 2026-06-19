@@ -125,6 +125,9 @@ type TaskService struct {
 	// 运行时进度追踪（仅内存，不持久化）
 	runningProgress map[string]*taskEntity.RunningProgress // 任务ID -> 运行时进度
 	progressMu      sync.RWMutex                           // 保护 runningProgress 的读写
+
+	// 进度持久化节流：记录每个任务上次落盘时间，避免每批都写存储
+	lastProgressPersist map[string]time.Time
 }
 
 // taskRuntime contains resources that must not be shared across running tasks.
@@ -610,6 +613,8 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 		runningProgress: make(map[string]*taskEntity.RunningProgress), // 初始化运行时进度映射
 
+		lastProgressPersist: make(map[string]time.Time), // 初始化进度持久化节流
+
 		config: cfg, // 设置配置
 
 		auditLogger: audit.NewAuditLogger("logs/audit"), // 创建审计日志器
@@ -695,6 +700,8 @@ func NewTaskServiceWithDB(sourceDB, targetDB *sql.DB, analyzer service.IdentityA
 
 		runningProgress: make(map[string]*taskEntity.RunningProgress), // 初始化运行时进度映射
 
+		lastProgressPersist: make(map[string]time.Time), // 初始化进度持久化节流
+
 		auditLogger: audit.NewAuditLogger("logs/audit"), // 创建审计日志器
 
 	}
@@ -738,6 +745,8 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 		incrementalSyncs: make(map[string]*syncApp.IncrementalSyncService),
 
 		runningProgress: make(map[string]*taskEntity.RunningProgress),
+
+		lastProgressPersist: make(map[string]time.Time),
 
 		config: cfg,
 
@@ -2555,7 +2564,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			}
 
-			const txCommitEveryN = 40 // 每 40 批 commit 一次，减少 fsync 频率、提高吞吐
+			const txCommitEveryN = 200 // 每 200 批 commit 一次，减少 fsync 频率、提高吞吐
 
 			const txCommitEveryNParallel = 5 // 并行 worker 每 5 批 commit，减少锁持有时间，避免 lock wait timeout
 
@@ -2748,6 +2757,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							txW.SetAuditLogger(s.auditLogger, taskID, targetSchema, targetTableName)
 
+						}
+
+						if task.Config.EnableDropTableBeforeDDL {
+							txW.EnablePlainInsert()
 						}
 
 						txBatchN = 0
@@ -3023,6 +3036,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 										txW.SetAuditLogger(s.auditLogger, taskID, targetSchema, targetTableName)
 
+									}
+
+									if task.Config.EnableDropTableBeforeDDL {
+										txW.EnablePlainInsert()
 									}
 
 									txBatchN = 0
@@ -3374,6 +3391,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 									}
 
+									if task.Config.EnableDropTableBeforeDDL {
+										txW.EnablePlainInsert()
+									}
+
 									txBatchN = 0
 
 									txStartMark = mark
@@ -3634,6 +3655,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							txW.SetAuditLogger(s.auditLogger, taskID, targetSchema, targetTableName)
 
+						}
+
+						if task.Config.EnableDropTableBeforeDDL {
+							txW.EnablePlainInsert()
 						}
 
 						txBatchN = 0
@@ -5297,8 +5322,8 @@ func (s *TaskService) updateTaskProgress(taskID string, processedRows int64, pos
 
 }
 
-// incrementTaskProgress 原子增加任务进度
-
+// incrementTaskProgress 原子增加任务进度。
+// 内存进度每批都更新，但存储落盘按 1 秒节流，避免高频 I/O。
 func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position string) {
 
 	s.mu.Lock()
@@ -5319,7 +5344,13 @@ func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position
 
 		}
 
-		s.storage.Save(task)
+		// 节流：至少间隔 1 秒才落盘一次，减少存储 I/O
+		now := time.Now()
+		last, ok := s.lastProgressPersist[taskID]
+		if !ok || now.Sub(last) >= time.Second {
+			s.lastProgressPersist[taskID] = now
+			s.storage.Save(task)
+		}
 
 	}
 

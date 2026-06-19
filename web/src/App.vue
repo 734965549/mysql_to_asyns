@@ -176,11 +176,15 @@ const detailPageTask = ref(null);
 
 const detailPageMetrics = ref({});
 
+const detailPageProgress = ref(null); // 任务运行时进度（仅内存，任务运行时才有）
+
 const detailPageLoading = ref(false);
 
-const detailPageActiveTab = ref("progress");
+const detailPageActiveTab = ref("runtime");
 
 let detailPageRefreshInterval = null;
+
+let detailPageProgressInterval = null;
 
 // 自定义数据库配置开关
 
@@ -1461,10 +1465,30 @@ async function fetchTaskDetailPage(taskId) {
     if (metricsRes.status === "fulfilled" && metricsRes.value.ok) {
       detailPageMetrics.value = await metricsRes.value.json();
     }
+
+    // 运行时进度接口仅任务运行时有效（404 表示任务未运行）
+    await fetchTaskDetailProgress(taskId);
   } catch (e) {
     console.error("加载任务详情失败:", e);
   } finally {
     detailPageLoading.value = false;
+  }
+}
+
+// 获取任务运行时进度（仅内存，任务运行时返回数据，否则 404）
+
+async function fetchTaskDetailProgress(taskId) {
+  if (!taskId) return;
+  try {
+    const res = await fetch(`${API_BASE}/tasks/${taskId}/progress`);
+    if (res.ok) {
+      detailPageProgress.value = await res.json();
+    } else if (res.status === 404) {
+      // 任务未运行，进度数据被清除
+      detailPageProgress.value = null;
+    }
+  } catch (e) {
+    // 进度接口失败时静默处理，不影响主详情展示
   }
 }
 
@@ -1813,6 +1837,51 @@ function calculateDuration(startTime, endTime) {
   return `${hours}小时${minutes}分`;
 }
 
+// 格式化同步速度（行/秒）
+
+function formatSpeed(rowsPerSec) {
+  if (rowsPerSec == null || rowsPerSec <= 0) return "0";
+  if (rowsPerSec >= 10000) return `${(rowsPerSec / 1000).toFixed(1)}k`;
+  if (rowsPerSec >= 1000) return `${rowsPerSec.toFixed(0)}`;
+  return `${rowsPerSec.toFixed(1)}`;
+}
+
+// 格式化秒数为可读时长（-1 表示无法估算）
+
+function formatSeconds(seconds) {
+  if (seconds == null) return "-";
+  if (seconds === -1) return "无法估算";
+  if (seconds < 0) return "-";
+  if (seconds < 60) return `${seconds.toFixed(0)}秒`;
+  if (seconds < 3600)
+    return `${Math.floor(seconds / 60)}分${Math.floor(seconds % 60)}秒`;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return `${hours}小时${minutes}分`;
+}
+
+// 运行时表进度状态文案与颜色
+
+function runtimeStatusColor(status) {
+  const map = {
+    pending: "gray",
+    running: "blue",
+    completed: "green",
+    failed: "red",
+  };
+  return map[status] || "gray";
+}
+
+function runtimeStatusText(status) {
+  const map = {
+    pending: "待同步",
+    running: "同步中",
+    completed: "已完成",
+    failed: "失败",
+  };
+  return map[status] || status;
+}
+
 // 获取状态颜色
 
 function getStatusColor(status) {
@@ -2090,6 +2159,11 @@ onMounted(async () => {
       fetchTaskDetailPage(detailPageTaskId.value);
     }, 3000);
 
+    // 实时进度按 2 秒轮询，比整体刷新更频繁，保证进度条/速度的流畅度
+    detailPageProgressInterval = setInterval(() => {
+      fetchTaskDetailProgress(detailPageTaskId.value);
+    }, 2000);
+
     return;
   }
 
@@ -2117,6 +2191,8 @@ onUnmounted(() => {
   if (refreshInterval) clearInterval(refreshInterval);
 
   if (detailPageRefreshInterval) clearInterval(detailPageRefreshInterval);
+
+  if (detailPageProgressInterval) clearInterval(detailPageProgressInterval);
 });
 
 // 菜单点击处理
@@ -2577,6 +2653,146 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
           </a-row>
 
           <a-tabs v-model:active-key="detailPageActiveTab" class="detail-tabs">
+            <!-- 实时进度 -->
+            <a-tab-pane key="runtime" title="实时进度">
+              <a-empty
+                v-if="!detailPageProgress"
+                description="任务未运行，暂无实时进度数据（进度数据仅在任务同步期间存在）"
+                style="margin-top: 24px"
+              />
+              <template v-else>
+                <!-- 实时概览卡片 -->
+                <a-row :gutter="16" class="runtime-overview-row">
+                  <a-col :xs="12" :md="6">
+                    <a-card class="overview-card">
+                      <div class="overview-label">当前同步表</div>
+                      <div
+                        class="overview-value overview-value-sm runtime-current-table"
+                        :title="detailPageProgress.current_table || '-'"
+                      >
+                        {{ detailPageProgress.current_table || '-' }}
+                      </div>
+                      <div class="overview-sub">
+                        阶段：
+                        <a-tag
+                          :color="detailPageProgress.phase === 'incremental' ? 'green' : 'blue'"
+                          size="small"
+                        >
+                          {{ detailPageProgress.phase === 'incremental' ? '增量同步' : '全量同步' }}
+                        </a-tag>
+                      </div>
+                    </a-card>
+                  </a-col>
+                  <a-col :xs="12" :md="6">
+                    <a-card class="overview-card">
+                      <div class="overview-label">整体速度</div>
+                      <div class="overview-value">
+                        {{ formatSpeed(detailPageProgress.overall_speed) }}
+                        <span class="overview-unit">行/秒</span>
+                      </div>
+                      <div class="overview-sub">
+                        最后更新：{{ formatTime(detailPageProgress.updated_at) }}
+                      </div>
+                    </a-card>
+                  </a-col>
+                  <a-col :xs="12" :md="6">
+                    <a-card class="overview-card">
+                      <div class="overview-label">已耗时</div>
+                      <div class="overview-value overview-value-sm">
+                        {{ formatSeconds(detailPageProgress.elapsed_seconds) }}
+                      </div>
+                      <div class="overview-sub">自任务开始同步起累计</div>
+                    </a-card>
+                  </a-col>
+                  <a-col :xs="12" :md="6">
+                    <a-card class="overview-card">
+                      <div class="overview-label">预估剩余</div>
+                      <div class="overview-value overview-value-sm">
+                        {{ formatSeconds(detailPageProgress.estimated_remain) }}
+                      </div>
+                      <div class="overview-sub">
+                        {{
+                          detailPageProgress.estimated_remain === -1
+                            ? '数据不足，暂无法估算'
+                            : '基于当前速度估算'
+                        }}
+                      </div>
+                    </a-card>
+                  </a-col>
+                </a-row>
+
+                <!-- 表级实时进度 -->
+                <div class="runtime-section-title">
+                  <icon-storage />
+                  <span>表级实时进度</span>
+                  <a-tag color="arcoblue" size="small" style="margin-left: 8px">
+                    共 {{ (detailPageProgress.tables || []).length }} 张表
+                  </a-tag>
+                </div>
+                <a-table
+                  :columns="[
+                    { title: '表名', slotName: 'tableName', width: 240 },
+                    { title: '状态', slotName: 'status', width: 110 },
+                    { title: '进度', slotName: 'progress', width: 200 },
+                    { title: '已处理 / 总行数', slotName: 'rows', width: 200 },
+                    { title: '速度', slotName: 'speed', width: 130 },
+                    { title: '时间', slotName: 'timeRange' },
+                  ]"
+                  :data="detailPageProgress.tables || []"
+                  :pagination="false"
+                  size="medium"
+                  :scroll="{ y: 480 }"
+                  row-key="table"
+                >
+                  <template #tableName="{ record }">
+                    <a-space>
+                      <icon-table />
+                      <span class="runtime-table-name">{{ record.schema }}.{{ record.table }}</span>
+                    </a-space>
+                  </template>
+                  <template #status="{ record }">
+                    <a-tag :color="runtimeStatusColor(record.status)">
+                      {{ runtimeStatusText(record.status) }}
+                    </a-tag>
+                  </template>
+                  <template #progress="{ record }">
+                    <a-progress
+                      :percent="record.progress_pct"
+                      :status="
+                        record.status === 'failed'
+                          ? 'danger'
+                          : record.status === 'completed'
+                            ? 'success'
+                            : 'normal'
+                      "
+                      :show-text="true"
+                      size="mini"
+                    />
+                  </template>
+                  <template #rows="{ record }">
+                    <span class="runtime-rows">
+                      {{ (record.processed_rows || 0).toLocaleString() }}
+                      <span class="runtime-rows-total">/ {{ (record.total_rows || 0).toLocaleString() }}</span>
+                    </span>
+                  </template>
+                  <template #speed="{ record }">
+                    <span v-if="record.speed_rows_sec > 0" class="runtime-speed">
+                      {{ formatSpeed(record.speed_rows_sec) }} <span class="overview-unit">行/秒</span>
+                    </span>
+                    <span v-else class="runtime-speed-muted">-</span>
+                  </template>
+                  <template #timeRange="{ record }">
+                    <div class="runtime-time-cell">
+                      <div>{{ formatTime(record.started_at) }}</div>
+                      <div v-if="record.completed_at" class="runtime-time-end">
+                        → {{ formatTime(record.completed_at) }}
+                      </div>
+                    </div>
+                  </template>
+                </a-table>
+              </template>
+            </a-tab-pane>
+
             <!-- 执行进度 -->
             <a-tab-pane key="progress" title="执行进度">
               <a-progress
@@ -5758,6 +5974,76 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
   color: #86909c;
 
   word-break: break-all;
+}
+
+.overview-unit {
+  font-size: 13px;
+
+  font-weight: 400;
+
+  color: #86909c;
+
+  margin-left: 2px;
+}
+
+.runtime-overview-row {
+  margin-bottom: 16px;
+}
+
+.runtime-current-table {
+  word-break: break-all;
+
+  cursor: help;
+}
+
+.runtime-section-title {
+  display: flex;
+
+  align-items: center;
+
+  gap: 6px;
+
+  font-size: 15px;
+
+  font-weight: 600;
+
+  color: #1d2129;
+
+  margin: 4px 0 12px;
+}
+
+.runtime-table-name {
+  font-weight: 500;
+}
+
+.runtime-rows {
+  font-variant-numeric: tabular-nums;
+}
+
+.runtime-rows-total {
+  color: #86909c;
+}
+
+.runtime-speed {
+  color: #165dff;
+
+  font-variant-numeric: tabular-nums;
+}
+
+.runtime-speed-muted {
+  color: #c9cdd4;
+}
+
+.runtime-time-cell {
+  font-size: 12px;
+
+  line-height: 1.6;
+
+  color: #4e5969;
+}
+
+.runtime-time-end {
+  color: #86909c;
 }
 
 .detail-tabs {

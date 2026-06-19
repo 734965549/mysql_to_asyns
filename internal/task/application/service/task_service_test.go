@@ -119,10 +119,11 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepsAutoIncrementKey(t *testing.T)
 func newTestTaskService(dataDir string) *TaskService {
 	storage := NewFileTaskStorage(dataDir)
 	return &TaskService{
-		tasks:           make(map[string]*taskEntity.SyncTask),
-		runtimes:        make(map[string]*taskRuntime),
-		runningProgress: make(map[string]*taskEntity.RunningProgress),
-		storage:         storage,
+		tasks:              make(map[string]*taskEntity.SyncTask),
+		runtimes:           make(map[string]*taskRuntime),
+		runningProgress:    make(map[string]*taskEntity.RunningProgress),
+		lastProgressPersist: make(map[string]time.Time),
+		storage:            storage,
 	}
 }
 

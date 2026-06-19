@@ -40,43 +40,32 @@ func isConnRetryable(err error) bool { // 判断连接错误是否可重试函�
 		strings.Contains(s, "connection was bad") // 检查是否包含连接错误
 }
 
-// drainQueryWithRetry 对池中已失效连接（如超过 wait_timeout）导致的读失败做有限次重试。
-func drainQueryWithRetry(ctx context.Context, open func() (*sql.Rows, error), scan func(*sql.Rows) ([]map[string]interface{}, error)) ([]map[string]interface{}, error) { // 带重试的查询执行函数
-	const maxAttempts = 4                                // 最大重试次数
-	var lastErr error                                    // 记录最后一次错误
-	for attempt := 0; attempt < maxAttempts; attempt++ { // 尝试循环
-		if attempt > 0 { // 如果不是第一次尝试
-			select { // 等待重试
-			case <-ctx.Done(): // 如果上下文取消
-				return nil, ctx.Err() // 返回上下文错误
-			case <-time.After(time.Duration(25+attempt*25) * time.Millisecond): // 等待递增的退避时间
+// retryableQuery 先直接查询；仅在连接失效等可重试错误时进入重试循环。
+// 正常路径无闭包分配和循环开销。
+func retryableQuery(ctx context.Context, db queryExecutor, query string, scan func(*sql.Rows) ([]map[string]interface{}, error), args ...interface{}) ([]map[string]interface{}, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil && isConnRetryable(err) {
+		const maxRetries = 3
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(25+attempt*25) * time.Millisecond):
+			}
+			rows, err = db.QueryContext(ctx, query, args...)
+			if err == nil || !isConnRetryable(err) {
+				break
 			}
 		}
-		rows, err := open() // 打开查询
-		if err != nil {     // 如果打开失败
-			lastErr = err                                        // 记录错误
-			if isConnRetryable(err) && attempt < maxAttempts-1 { // 如果可重试且未达到最大次数
-				continue // 继续重试
-			}
-			return nil, err // 返回错误
-		}
-		results, sErr := scan(rows)                           // 扫描结果
-		if cErr := rows.Close(); cErr != nil && sErr == nil { // 关闭结果集
-			sErr = cErr // 记录关闭错误
-		}
-		if sErr != nil { // 如果扫描失败
-			lastErr = sErr                                        // 记录错误
-			if isConnRetryable(sErr) && attempt < maxAttempts-1 { // 如果可重试且未达到最大次数
-				continue // 继续重试
-			}
-			return nil, sErr // 返回错误
-		}
-		return results, nil // 返回结果
 	}
-	if lastErr == nil { // 如果没有错误
-		lastErr = fmt.Errorf("unknown") // 设置未知错误
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr) // 返回重试失败错误
+	results, sErr := scan(rows)
+	if cErr := rows.Close(); cErr != nil && sErr == nil {
+		sErr = cErr
+	}
+	return results, sErr
 }
 
 // selectExprForColumn 构建 SELECT 列表项。JSON/BLOB/TEXT 等原样读取，避免 CAST 在服务端物化整段大字段拖慢 IO；Scan 后经 normalizeScannedValue 处理 []byte。
@@ -91,9 +80,9 @@ func normalizeScannedValue(val interface{}) interface{} { // 规范化扫描值�
 		return nil // 返回空
 	}
 	if b, ok := val.([]byte); ok { // 如果是字节数组
-		out := make([]byte, len(b)) // 创建新的字节数组
-		copy(out, b)                // 拷贝数据
-		return string(out)          // 转换为字符串
+		// string([]byte) 会分配新内存并拷贝，生成不可变 string，不受 driver 底层缓冲复用影响。
+		// 不需要先 make+copy 再 string，避免重复拷贝。
+		return string(b)
 	}
 	return val // 返回原值
 }
@@ -250,9 +239,7 @@ func (r *RangeShardingReader) ReadBatch(ctx context.Context, minID, maxID int64)
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` >= ? AND `%s` < ?", // 构建查询
 		columns, r.schema, r.table, r.pkColumn, r.pkColumn) // 查询指定范围
-	return drainQueryWithRetry(ctx, func() (*sql.Rows, error) { // 执行带重试的查询
-		return r.db.QueryContext(ctx, query, minID, maxID) // 返回查询结果
-	}, r.scanRows) // 扫描行数据
+	return retryableQuery(ctx, r.db, query, r.scanRows, minID, maxID)
 }
 
 // ReadBatchByKeys 批量读取数据方法（Keyset Pagination，支持单列和复合主键）
@@ -305,9 +292,7 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 		}
 	}
 
-	return drainQueryWithRetry(ctx, func() (*sql.Rows, error) { // 执行带重试的查询
-		return r.db.QueryContext(ctx, query, args...) // 返回查询结果
-	}, r.scanRows) // 扫描行数据
+	return retryableQuery(ctx, r.db, query, r.scanRows, args...)
 }
 
 // ReadBatchInRange 批量读取数据方法（指定范围内，且带 LIMIT）
@@ -322,9 +307,7 @@ func (r *RangeShardingReader) ReadBatchInRange(ctx context.Context, startID, end
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` >= ? AND `%s` < ? ORDER BY `%s` ASC LIMIT ?", // 构建查询
 		columns, r.schema, r.table, r.pkColumn, r.pkColumn, r.pkColumn) // 查询指定范围
-	return drainQueryWithRetry(ctx, func() (*sql.Rows, error) { // 执行带重试的查询
-		return r.db.QueryContext(ctx, query, startID, endID, limit) // 返回查询结果
-	}, r.scanRows) // 扫描行数据
+	return retryableQuery(ctx, r.db, query, r.scanRows, startID, endID, limit)
 }
 
 // ReadByRange 按范围读取方法

@@ -610,6 +610,47 @@ func TestSQLBuilder_BuildBatchInsert_UnchangedSemantics(t *testing.T) {
 	}
 }
 
+// TestSQLBuilder_BuildBatchInsertPlain 验证普通 INSERT（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
+func TestSQLBuilder_BuildBatchInsertPlain(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "id", IsPrimaryKey: true},
+		{Name: "name", IsPrimaryKey: false},
+	}
+	identity := createTestIdentity(entity.PKStrategy, "users", columns, []string{"id"})
+	builder := NewSQLBuilder(identity)
+
+	rows := []map[string]interface{}{
+		{"id": 1, "name": "Alice"},
+		{"id": 2, "name": "Bob"},
+	}
+
+	query, args := builder.BuildBatchInsertPlain(rows)
+
+	if !strings.Contains(query, "INSERT INTO `users`") {
+		t.Errorf("expected INSERT INTO, got: %s", query)
+	}
+	if strings.Contains(query, "IGNORE") {
+		t.Errorf("BuildBatchInsertPlain must NOT contain IGNORE, got: %s", query)
+	}
+	if strings.Contains(query, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("BuildBatchInsertPlain must NOT contain ON DUPLICATE KEY UPDATE, got: %s", query)
+	}
+	if len(args) != 4 {
+		t.Errorf("expected 4 args (2 rows * 2 cols), got %d", len(args))
+	}
+}
+
+// TestSQLBuilder_BuildBatchInsertPlain_Empty 空切片安全返回。
+func TestSQLBuilder_BuildBatchInsertPlain_Empty(t *testing.T) {
+	identity := createTestIdentity(entity.PKStrategy, "tbl", []entity.ColumnMeta{}, []string{})
+	builder := NewSQLBuilder(identity)
+
+	query, args := builder.BuildBatchInsertPlain(nil)
+	if query != "" || args != nil {
+		t.Errorf("empty rows must return empty, got query=%q args=%v", query, args)
+	}
+}
+
 // TestSQLBuilder_BuildBatchUpsert_EmptyRowsReturnsEmpty 空切片应安全返回，避免拼出非法 SQL。
 func TestSQLBuilder_BuildBatchUpsert_EmptyRowsReturnsEmpty(t *testing.T) {
 	columns := []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}}

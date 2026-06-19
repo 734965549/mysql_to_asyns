@@ -580,3 +580,60 @@ func TestBufferedWriter_EnableUpsert_ForwardsToBatchWriter(t *testing.T) {
 	assert.NoError(t, bw.Close())
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+// TestBatchWriter_WriteBatch_PlainInsertMode 全量同步 + enable_drop_table_before_ddl=true 时，
+// 应发出普通 INSERT INTO（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
+func TestBatchWriter_WriteBatch_PlainInsertMode(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	mock.ExpectExec("INSERT INTO `users` (`id`, `name`) VALUES (?, ?)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := NewBatchWriter(db, identity, 100)
+	w.EnablePlainInsert()
+	err = w.WriteBatch(context.Background(), []map[string]interface{}{{"id": 1, "name": "Alice"}})
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBatchWriter_WriteBatch_PlainInsertOverridesUpsert usePlainInsert 优先级高于 useUpsert。
+func TestBatchWriter_WriteBatch_PlainInsertOverridesUpsert(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	// 即使同时启用了 upsert，plain insert 应优先生效
+	mock.ExpectExec("INSERT INTO `users` (`id`, `name`) VALUES (?, ?)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := NewBatchWriter(db, identity, 100)
+	w.EnableUpsert()
+	w.EnablePlainInsert()
+	err = w.WriteBatch(context.Background(), []map[string]interface{}{{"id": 1, "name": "Alice"}})
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}

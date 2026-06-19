@@ -32,7 +32,7 @@
 
 # 全量同步吞吐与连接池（实例资源充足时可加大；需小于 MySQL max_connections，并留余量给其它客户端）
 [sync]
-  # 源/目标 sql.DB 最大连接数；0 或未写则默认 256
+  # 源/目标 sql.DB 最大连接数；0 或未写则默认 32
   # source_max_open_conns = 512
   # target_max_open_conns = 512
   # source_max_idle_conns = 256

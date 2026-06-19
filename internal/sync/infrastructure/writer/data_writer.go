@@ -56,12 +56,26 @@ type BatchWriter struct { // 定义批量写入器结构体
 	// 全量同步路径默认 false（INSERT IGNORE）；增量同步路径必须设为 true，否则同一行的重复 INSERT 事件
 	// 不会更新已有行（破坏修复 10/11 的幂等承诺）。
 	useUpsert bool
+
+	// usePlainInsert 控制 WriteBatch 是否使用普通 INSERT（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
+	// 仅在全量同步且 enable_drop_table_before_ddl=true 时启用：目标表已被 DROP+CREATE 重建为空表。
+	// 优先级高于 useUpsert。
+	usePlainInsert bool
 }
 
 // EnableUpsert 切换 WriteBatch 进入 upsert 语义。增量同步路径必须调用此方法，否则
 // 同一 PK/UK 的后续 INSERT 事件会被 IGNORE 而不更新行内容。
 func (w *BatchWriter) EnableUpsert() {
 	w.useUpsert = true
+}
+
+// EnablePlainInsert 切换 WriteBatch 进入普通 INSERT 语义（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
+//
+// 仅在全量同步且 enable_drop_table_before_ddl=true 时调用：目标表已被 DROP+CREATE 重建，
+// 确认为空表，INSERT IGNORE 的唯一键检查是纯开销。
+// 与 useUpsert 互斥：usePlainInsert 优先级最高，其次是 useUpsert，默认 INSERT IGNORE。
+func (w *BatchWriter) EnablePlainInsert() {
+	w.usePlainInsert = true
 }
 
 // NewBatchWriter 创建批量写入器函数
@@ -139,11 +153,15 @@ func (w *BatchWriter) WriteBatch(ctx context.Context, rows []map[string]interfac
 		}
 		chunk := rows[start:end] // 获取当前批次
 		// 修复 10/11：增量路径 useUpsert=true → ON DUPLICATE KEY UPDATE，保证 INSERT 事件可重复执行
+		// usePlainInsert 优先级最高：全量同步 + enable_drop_table_before_ddl=true 时目标表为空，
+		// 使用普通 INSERT 省去 IGNORE 的唯一键检查开销。
 		var (
 			query string
 			args  []interface{}
 		)
-		if w.useUpsert {
+		if w.usePlainInsert {
+			query, args = w.sqlBuilder.BuildBatchInsertPlain(chunk)
+		} else if w.useUpsert {
 			query, args = w.sqlBuilder.BuildBatchUpsert(chunk)
 		} else {
 			query, args = w.sqlBuilder.BuildBatchInsert(chunk)
@@ -386,6 +404,14 @@ func (w *BufferedWriter) Close() error { // 关闭写入器
 func (w *BufferedWriter) EnableUpsert() {
 	if w.writer != nil {
 		w.writer.EnableUpsert()
+	}
+}
+
+// EnablePlainInsert 转发到底层 BatchWriter，让缓冲 INSERT 走普通 INSERT 语义。
+// 仅在全量同步 + enable_drop_table_before_ddl=true 时调用。
+func (w *BufferedWriter) EnablePlainInsert() {
+	if w.writer != nil {
+		w.writer.EnablePlainInsert()
 	}
 }
 
