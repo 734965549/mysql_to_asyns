@@ -100,7 +100,9 @@ func expectTargetTableRecreateOnDrop(mock sqlmock.Sqlmock, targetSchema, table s
 }
 
 func expectTargetWriteSession(mock sqlmock.Sqlmock, insertSQL string) {
-	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableChecksSQL)).
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableForeignKeyChecksSQL)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableUniqueChecksSQL)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(regexp.QuoteMeta(fullSyncVerifyChecksSQL)).
 		WillReturnRows(sqlmock.NewRows([]string{"foreign_key_checks", "unique_checks"}).AddRow(0, 0))
@@ -108,19 +110,25 @@ func expectTargetWriteSession(mock sqlmock.Sqlmock, insertSQL string) {
 	mock.ExpectExec(regexp.QuoteMeta(insertSQL)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
-	mock.ExpectExec(regexp.QuoteMeta(fullSyncRestoreChecksSQL)).
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncRestoreForeignKeyChecksSQL)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncRestoreUniqueChecksSQL)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
 func expectParallelTargetWriteSessions(mock sqlmock.Sqlmock, insertSQL string, workers int) {
 	for i := 0; i < workers; i++ {
-		mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableChecksSQL)).
+		mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableForeignKeyChecksSQL)).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableUniqueChecksSQL)).
 			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery(regexp.QuoteMeta(fullSyncVerifyChecksSQL)).
 			WillReturnRows(sqlmock.NewRows([]string{"foreign_key_checks", "unique_checks"}).AddRow(0, 0))
 		mock.ExpectExec(regexp.QuoteMeta(fullSyncLockWaitTimeoutSQL)).
 			WillReturnResult(sqlmock.NewResult(0, 0))
-		mock.ExpectExec(regexp.QuoteMeta(fullSyncRestoreChecksSQL)).
+		mock.ExpectExec(regexp.QuoteMeta(fullSyncRestoreForeignKeyChecksSQL)).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec(regexp.QuoteMeta(fullSyncRestoreUniqueChecksSQL)).
 			WillReturnResult(sqlmock.NewResult(0, 0))
 	}
 	mock.ExpectBegin()
@@ -214,7 +222,7 @@ func TestDisableFullSyncWriteSession_FailsWhenSetFails(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableChecksSQL)).
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableForeignKeyChecksSQL)).
 		WillReturnError(errors.New("access denied"))
 
 	conn, err := db.Conn(context.Background())
@@ -223,7 +231,7 @@ func TestDisableFullSyncWriteSession_FailsWhenSetFails(t *testing.T) {
 
 	err = disableFullSyncWriteSession(context.Background(), conn, "tgt.child")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "disable foreign key and unique checks")
+	require.Contains(t, err.Error(), "disable foreign key checks")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -232,7 +240,9 @@ func TestDisableFullSyncWriteSession_FailsWhenVerifyStillEnabled(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableChecksSQL)).
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableForeignKeyChecksSQL)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableUniqueChecksSQL)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(regexp.QuoteMeta(fullSyncVerifyChecksSQL)).
 		WillReturnRows(sqlmock.NewRows([]string{"foreign_key_checks", "unique_checks"}).AddRow(1, 0))
@@ -244,6 +254,27 @@ func TestDisableFullSyncWriteSession_FailsWhenVerifyStillEnabled(t *testing.T) {
 	err = disableFullSyncWriteSession(context.Background(), conn, "tgt.child")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "FOREIGN_KEY_CHECKS=1")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDisableFullSyncWriteSession_AllowsUniqueChecksStillEnabled(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer db.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableForeignKeyChecksSQL)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableUniqueChecksSQL)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(regexp.QuoteMeta(fullSyncVerifyChecksSQL)).
+		WillReturnRows(sqlmock.NewRows([]string{"foreign_key_checks", "unique_checks"}).AddRow(0, 1))
+
+	conn, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = disableFullSyncWriteSession(context.Background(), conn, "tgt.child")
+	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
