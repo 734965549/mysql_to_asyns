@@ -4516,7 +4516,7 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource
 			if err != nil {
 				return nil, fmt.Errorf("sample point %d failed: %v", i, err)
 			}
-			samples[i] = pk
+			samples[i] = normalizePKBoundaryValue(pk)
 		} else {
 			// 复合主键：返回 []interface{} 包含所有列值
 			vals := make([]interface{}, len(pkCols))
@@ -4533,7 +4533,9 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource
 				return nil, fmt.Errorf("sample point %d failed: %v", i, err)
 			}
 			result := make([]interface{}, len(vals))
-			copy(result, vals)
+			for j, val := range vals {
+				result[j] = normalizePKBoundaryValue(val)
+			}
 			samples[i] = result
 		}
 
@@ -4817,9 +4819,9 @@ func comparePKValues(a, b interface{}) int {
 
 	}
 
-	as := fmt.Sprintf("%v", a)
+	as := dbScanToString(a)
 
-	bs := fmt.Sprintf("%v", b)
+	bs := dbScanToString(b)
 
 	switch {
 
@@ -4856,6 +4858,13 @@ func dbScanToString(v interface{}) string {
 	}
 }
 
+func normalizePKBoundaryValue(v interface{}) interface{} {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return v
+}
+
 // dbScanToInt 将数据库扫描结果（interface{}）安全转换为整数
 func dbScanToInt(v interface{}) int {
 	if v == nil {
@@ -4883,11 +4892,11 @@ func boundaryToString(v interface{}) string {
 	if vals, ok := v.([]interface{}); ok {
 		parts := make([]string, len(vals))
 		for i, val := range vals {
-			parts[i] = fmt.Sprintf("%v", val)
+			parts[i] = dbScanToString(val)
 		}
 		return strings.Join(parts, "\x00")
 	}
-	return fmt.Sprintf("%v", v)
+	return dbScanToString(v)
 }
 
 // comparePKWithBoundary 比较一行数据的主键值与边界值，返回 -1 / 0 / +1
@@ -4901,8 +4910,8 @@ func comparePKWithBoundary(pkCols []string, row map[string]interface{}, boundary
 			if i >= len(boundaryVals) {
 				break
 			}
-			rowStr := fmt.Sprintf("%v", row[col])
-			bndStr := fmt.Sprintf("%v", boundaryVals[i])
+			rowStr := dbScanToString(row[col])
+			bndStr := dbScanToString(boundaryVals[i])
 			if rowStr < bndStr {
 				return -1
 			}
@@ -4913,8 +4922,8 @@ func comparePKWithBoundary(pkCols []string, row map[string]interface{}, boundary
 		return 0
 	}
 	// 单值边界：与第一列比较
-	rowStr := fmt.Sprintf("%v", row[pkCols[0]])
-	bndStr := fmt.Sprintf("%v", boundary)
+	rowStr := dbScanToString(row[pkCols[0]])
+	bndStr := dbScanToString(boundary)
 	if rowStr < bndStr {
 		return -1
 	}

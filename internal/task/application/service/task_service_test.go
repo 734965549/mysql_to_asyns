@@ -119,11 +119,11 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepsAutoIncrementKey(t *testing.T)
 func newTestTaskService(dataDir string) *TaskService {
 	storage := NewFileTaskStorage(dataDir)
 	return &TaskService{
-		tasks:              make(map[string]*taskEntity.SyncTask),
-		runtimes:           make(map[string]*taskRuntime),
-		runningProgress:    make(map[string]*taskEntity.RunningProgress),
+		tasks:               make(map[string]*taskEntity.SyncTask),
+		runtimes:            make(map[string]*taskRuntime),
+		runningProgress:     make(map[string]*taskEntity.RunningProgress),
 		lastProgressPersist: make(map[string]time.Time),
-		storage:            storage,
+		storage:             storage,
 	}
 }
 
@@ -1627,6 +1627,8 @@ func TestComparePKValues(t *testing.T) {
 	assert.Equal(t, -1, comparePKValues("abc", "def"))
 	assert.Equal(t, 0, comparePKValues("same", "same"))
 	assert.Equal(t, 1, comparePKValues("z", "a"))
+	assert.Equal(t, 0, comparePKValues("556273a8b5467ad9b287b74fab12b346", []byte("556273a8b5467ad9b287b74fab12b346")))
+	assert.Equal(t, -1, comparePKValues("556273a8b5467ad9b287b74fab12b346", []byte("5580fe5946606ff3a02b8a99baea9efc")))
 
 	// mixed: both convertible to int64
 	assert.Equal(t, 0, comparePKValues(int64(42), "42"))
@@ -1645,8 +1647,13 @@ func TestComparePKWithBoundary(t *testing.T) {
 
 	t.Run("single column boundary less (string comparison)", func(t *testing.T) {
 		row := map[string]interface{}{"id": "10"}
-		// comparePKWithBoundary uses fmt.Sprintf("%v",...) string comparison
 		assert.Equal(t, -1, comparePKWithBoundary([]string{"id"}, row, "20"))
+	})
+
+	t.Run("single column byte boundary compares as string", func(t *testing.T) {
+		row := map[string]interface{}{"id": "556273a8b5467ad9b287b74fab12b346"}
+		assert.Equal(t, -1, comparePKWithBoundary([]string{"id"}, row, []byte("5580fe5946606ff3a02b8a99baea9efc")))
+		assert.Equal(t, 0, comparePKWithBoundary([]string{"id"}, row, []byte("556273a8b5467ad9b287b74fab12b346")))
 	})
 
 	t.Run("single column boundary equal", func(t *testing.T) {
@@ -1691,8 +1698,9 @@ func TestBoundaryToString(t *testing.T) {
 	assert.Equal(t, "", boundaryToString(nil))
 	assert.Equal(t, "42", boundaryToString(42))
 	assert.Equal(t, "hello", boundaryToString("hello"))
+	assert.Equal(t, "hello", boundaryToString([]byte("hello")))
 	// composite
-	result := boundaryToString([]interface{}{"a", "b", "c"})
+	result := boundaryToString([]interface{}{"a", []byte("b"), "c"})
 	assert.Equal(t, "a\x00b\x00c", result)
 }
 
