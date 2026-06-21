@@ -274,8 +274,11 @@ func (cse *ChannelSyncExecutor) processBatchTask(ctx context.Context, task *task
 	defer conn.Close()
 
 	// 设置会话参数
-	conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
-	defer conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
+	writeSessionLabel := fmt.Sprintf("%s.%s worker %d", targetSchema, tableName, batchTask.WorkerID)
+	if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+		return err
+	}
+	defer restoreFullSyncWriteSession(conn, writeSessionLabel)
 
 	// 处理批次写入
 	var curTx *sql.Tx

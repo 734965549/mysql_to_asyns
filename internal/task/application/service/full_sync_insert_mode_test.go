@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"testing"
 
@@ -82,7 +83,7 @@ func expectTargetTableAlreadyExists(mock sqlmock.Sqlmock, targetSchema, table st
 		WithArgs(targetSchema).
 		WillReturnRows(sqlmock.NewRows([]string{"schema_name"}).AddRow(targetSchema))
 	mock.ExpectQuery(regexp.QuoteMeta(
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = '"+targetSchema+"' AND table_name = '"+table+"'",
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = '" + targetSchema + "' AND table_name = '" + table + "'",
 	)).WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow(table))
 }
 
@@ -99,27 +100,28 @@ func expectTargetTableRecreateOnDrop(mock sqlmock.Sqlmock, targetSchema, table s
 }
 
 func expectTargetWriteSession(mock sqlmock.Sqlmock, insertSQL string) {
-	mock.ExpectExec("SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0").
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableChecksSQL)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(regexp.QuoteMeta(fullSyncVerifyChecksSQL)).
+		WillReturnRows(sqlmock.NewRows([]string{"foreign_key_checks", "unique_checks"}).AddRow(0, 0))
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(insertSQL)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
-	mock.ExpectExec("SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1").
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncRestoreChecksSQL)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
 func expectParallelTargetWriteSessions(mock sqlmock.Sqlmock, insertSQL string, workers int) {
-	setFK0 := mock.ExpectExec("SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	setTimeout := mock.ExpectExec("SET SESSION innodb_lock_wait_timeout=300").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	setFK1 := mock.ExpectExec("SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	for i := 1; i < workers; i++ {
-		setFK0.WillReturnResult(sqlmock.NewResult(0, 0))
-		setTimeout.WillReturnResult(sqlmock.NewResult(0, 0))
-		setFK1.WillReturnResult(sqlmock.NewResult(0, 0))
+	for i := 0; i < workers; i++ {
+		mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableChecksSQL)).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery(regexp.QuoteMeta(fullSyncVerifyChecksSQL)).
+			WillReturnRows(sqlmock.NewRows([]string{"foreign_key_checks", "unique_checks"}).AddRow(0, 0))
+		mock.ExpectExec(regexp.QuoteMeta(fullSyncLockWaitTimeoutSQL)).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec(regexp.QuoteMeta(fullSyncRestoreChecksSQL)).
+			WillReturnResult(sqlmock.NewResult(0, 0))
 	}
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(insertSQL)).
@@ -205,6 +207,44 @@ func runSyncDatabasePairInsertModeTest(
 
 func insertPlainSQL(ignoreSQL string) string {
 	return regexp.MustCompile(`INSERT IGNORE `).ReplaceAllString(ignoreSQL, "INSERT ")
+}
+
+func TestDisableFullSyncWriteSession_FailsWhenSetFails(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer db.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableChecksSQL)).
+		WillReturnError(errors.New("access denied"))
+
+	conn, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = disableFullSyncWriteSession(context.Background(), conn, "tgt.child")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "disable foreign key and unique checks")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDisableFullSyncWriteSession_FailsWhenVerifyStillEnabled(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer db.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta(fullSyncDisableChecksSQL)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(regexp.QuoteMeta(fullSyncVerifyChecksSQL)).
+		WillReturnRows(sqlmock.NewRows([]string{"foreign_key_checks", "unique_checks"}).AddRow(1, 0))
+
+	conn, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = disableFullSyncWriteSession(context.Background(), conn, "tgt.child")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "FOREIGN_KEY_CHECKS=1")
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 // TestSyncDatabasePair_KeysetPath_InsertMode 单 worker keyset 回退路径（task_service.go ~3666）。

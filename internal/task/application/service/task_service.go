@@ -2715,15 +2715,19 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
-				defer func() {
-
-					conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
-
+				writeSessionLabel := fmt.Sprintf("%s.%s", targetSchema, targetTableName)
+				if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
 					conn.Close()
-
+					errMsg := fmt.Sprintf("Failed to configure target write session for `%s`.`%s`: %v", targetSchema, targetTableName, err)
+					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+					errChan <- err
+					return
+				}
+				defer func() {
+					restoreFullSyncWriteSession(conn, writeSessionLabel)
+					conn.Close()
 				}()
-
-				conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
 
 				var curTx *sql.Tx
 
@@ -2991,16 +2995,22 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}
 
-						conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
-						conn.ExecContext(ctx, "SET SESSION innodb_lock_wait_timeout=300")
+						writeSessionLabel := fmt.Sprintf("%s.%s w%d", targetSchema, targetTableName, wIdx)
+						if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+							conn.Close()
+							syncErrChan <- err
+							return
+						}
 
 						defer func() {
-
-							conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
-
+							restoreFullSyncWriteSession(conn, writeSessionLabel)
 							conn.Close()
-
 						}()
+
+						if err := setFullSyncLockWaitTimeout(ctx, conn, writeSessionLabel); err != nil {
+							syncErrChan <- err
+							return
+						}
 
 						var curTx *sql.Tx
 
@@ -3344,16 +3354,22 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}
 
-						conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
-						conn.ExecContext(ctx, "SET SESSION innodb_lock_wait_timeout=300")
+						writeSessionLabel := fmt.Sprintf("%s.%s w%d", targetSchema, targetTableName, wIdx)
+						if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+							conn.Close()
+							syncErrChan <- err
+							return
+						}
 
 						defer func() {
-
-							conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
-
+							restoreFullSyncWriteSession(conn, writeSessionLabel)
 							conn.Close()
-
 						}()
+
+						if err := setFullSyncLockWaitTimeout(ctx, conn, writeSessionLabel); err != nil {
+							syncErrChan <- err
+							return
+						}
 
 						var curTx *sql.Tx
 
@@ -3609,15 +3625,19 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
-				defer func() {
-
-					conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
-
+				writeSessionLabel := fmt.Sprintf("%s.%s", targetSchema, targetTableName)
+				if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
 					conn.Close()
-
+					errMsg := fmt.Sprintf("Failed to configure target write session for `%s`.`%s`: %v", targetSchema, targetTableName, err)
+					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+					errChan <- err
+					return
+				}
+				defer func() {
+					restoreFullSyncWriteSession(conn, writeSessionLabel)
+					conn.Close()
 				}()
-
-				conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
 
 				var curTx *sql.Tx
 
