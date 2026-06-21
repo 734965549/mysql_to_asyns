@@ -322,7 +322,8 @@ env:
 {
   "batch_size": 5000,           // 覆盖全局 batch_size
   "worker_count": 8,            // 覆盖全局 worker_count
-  "optimize_index": true         // 覆盖全局 optimize_index
+  "optimize_index": true,        // 覆盖全局 optimize_index
+  "tx_commit_every_n_parallel": 50  // 并行 worker 每 N 批提交一次事务（0=默认5）
 }
 ```
 
@@ -336,6 +337,32 @@ env:
 > 注：历史上提供过 `enable_consistent_snapshot` 任务级开关（用于"严格全局快照
 > + 长事务连接池"模式），现已下线。当前实现统一使用"短锁取位点 + 全量短查询"
 > 模式，避免长事务长期持有源库 `MDL_SHARED_READ`。
+
+### 并行事务提交间隔（tx_commit_every_n_parallel）
+
+控制并行 worker（range 分片 / sample 采样）每 N 批提交一次事务。
+
+- **串行路径**（keyset / nopk）：固定每 200 批提交一次，减少 fsync 频率提高吞吐。
+- **并行路径**（range / sample）：默认每 5 批提交一次，减少锁持有时间避免 lock wait timeout。
+
+对于大表 range/sample 并行同步场景，默认值 5 可能偏保守，fsync 频率偏高。
+如果目标库锁等待不严重，可以适当调大此值以提高吞吐：
+
+```json
+{
+  "tx_commit_every_n_parallel": 50
+}
+```
+
+| 值 | 行为 |
+|---|---|
+| 0（默认） | 使用内置默认值 5 |
+| 1-5 | 更频繁提交，降低锁等待，适合高并发写入场景 |
+| 10-50 | 减少 fsync 频率，提高大表吞吐 |
+| 100+ | 长事务，仅适合目标库无并发写入且磁盘性能极好的场景 |
+
+> 注意：此参数仅影响并行路径。串行路径（keyset/nopk）的提交间隔固定为 200，
+> 不受此参数影响。
 
 ## 监控和日志
 

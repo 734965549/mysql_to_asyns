@@ -132,6 +132,7 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	OptimizeIndex            bool                   `json:"optimize_index"`               // 索引优化：先删后建
 	EnableReadOnly           bool                   `json:"enable_read_only"`             // 同步前关闭目标只读，同步后恢复
 	EnableDropTableBeforeDDL bool                   `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS
+	TxCommitEveryNParallel   int                    `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
 }
@@ -209,6 +210,7 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		OptimizeIndex:            req.OptimizeIndex,             // 设置索引优化开关
 		EnableReadOnly:           req.EnableReadOnly,            // 设置只读管理开关
 		EnableDropTableBeforeDDL: req.EnableDropTableBeforeDDL,  // 设置DDL前DROP TABLE开关
+		TxCommitEveryNParallel:   req.TxCommitEveryNParallel,    // 设置并行事务提交间隔
 		SourceDB:                 sourceDB,                      // 设置源数据库配置
 		TargetDB:                 targetDB,                      // 设置目标数据库配置
 	}
@@ -785,6 +787,9 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.EnableDropTableBeforeDDL != nil { // 如果提供了DDL前DROP TABLE开关
 		task.Config.EnableDropTableBeforeDDL = *req.EnableDropTableBeforeDDL // 更新DDL前DROP TABLE开关
 	}
+	if req.TxCommitEveryNParallel != nil { // 如果提供了并行事务提交间隔
+		task.Config.TxCommitEveryNParallel = *req.TxCommitEveryNParallel // 更新并行事务提交间隔
+	}
 
 	// 更新数据库配置
 	if req.SourceDB != nil { // 如果提供了源数据库配置
@@ -856,6 +861,7 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`               // 索引优化（可选）
 	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`             // 只读管理（可选）
 	EnableDropTableBeforeDDL *bool                  `json:"enable_drop_table_before_ddl,omitempty"` // DDL前是否先DROP TABLE（可选）
+	TxCommitEveryNParallel   *int                   `json:"tx_commit_every_n_parallel,omitempty"`   // 并行 worker 每 N 批提交一次事务（可选）
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                    // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                    // 目标数据库配置（可选）
 }

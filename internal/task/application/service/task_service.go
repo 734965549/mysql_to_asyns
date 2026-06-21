@@ -1209,6 +1209,9 @@ func (s *TaskService) DeleteTask(taskID string) error {
 
 	delete(s.tasks, taskID)
 
+	// 清理进度持久化节流记录
+	delete(s.lastProgressPersist, taskID)
+
 	// 从存储删除
 
 	if err := s.storage.Delete(taskID); err != nil {
@@ -2566,7 +2569,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			const txCommitEveryN = 200 // 每 200 批 commit 一次，减少 fsync 频率、提高吞吐
 
-			const txCommitEveryNParallel = 5 // 并行 worker 每 5 批 commit，减少锁持有时间，避免 lock wait timeout
+			txCommitEveryNParallel := task.Config.TxCommitEveryNParallel
+			if txCommitEveryNParallel <= 0 {
+				txCommitEveryNParallel = 5 // 默认每 5 批 commit，减少锁持有时间，避免 lock wait timeout
+			}
 
 			const parallelWriteMaxRetries = 3 // 并行写入遇到锁超时/死锁时最大重试次数
 
@@ -5304,6 +5310,11 @@ func (s *TaskService) clearRunningProgress(taskID string) {
 	delete(s.runningProgress, taskID)
 }
 
+// clearLastProgressPersistLocked 清理进度持久化节流记录；调用方必须已持有 s.mu。
+func (s *TaskService) clearLastProgressPersistLocked(taskID string) {
+	delete(s.lastProgressPersist, taskID)
+}
+
 // updateTaskProgress 更新任务进度
 
 func (s *TaskService) updateTaskProgress(taskID string, processedRows int64, position string) {
@@ -5424,6 +5435,7 @@ func (s *TaskService) completeTask(taskID string) {
 
 	// 清除运行时进度（任务完成）
 	defer s.clearRunningProgress(taskID)
+	defer s.clearLastProgressPersistLocked(taskID)
 
 	if task, exists := s.tasks[taskID]; exists {
 
@@ -5467,7 +5479,8 @@ func (s *TaskService) PauseTask(taskID string) error {
 	defer s.mu.Unlock()
 
 	// 清除运行时进度（任务暂停/停止）
-	s.clearRunningProgress(taskID)
+	defer s.clearRunningProgress(taskID)
+	defer s.clearLastProgressPersistLocked(taskID)
 
 	task, exists := s.tasks[taskID]
 

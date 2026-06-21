@@ -468,6 +468,8 @@ Content-Type: application/json
 
 | worker_count | int | 否 | 工作线程数，默认4 |
 
+| tx_commit_every_n_parallel | int | 否 | 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐 |
+
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
 
 | enable_drop_table_before_ddl | bool | 否 | 同步 DDL 前先执行 `DROP TABLE IF EXISTS`，适用于库级别/表级别同步，默认false |
@@ -491,6 +493,8 @@ Content-Type: application/json
 - 该行为会在库级别同步和表级别同步中生效，适合“每次都以源表结构重建目标表”的场景。
 
 - 注意：开启后会删除目标表及其数据，请确认目标库允许覆盖。
+
+- 写入与续传副作用：目标表被 DROP+CREATE 重建为空表后，全量写改用普通 `INSERT`（省去 `INSERT IGNORE` 的唯一键检查开销，提升性能），同时自动禁用全量续传——因为目标表已重建，续传游标不再有意义。默认（关闭该开关时）全量写仍使用 `INSERT IGNORE` 以保证幂等。
 
 
 
@@ -1052,7 +1056,7 @@ mysql-to-sync/
 
 3. 分批读取源表数据
 
-4. 批量写入目标表（`INSERT IGNORE`，幂等）
+4. 批量写入目标表（默认 `INSERT IGNORE`，幂等）
 
 5. 更新进度；事务提交成功后写入 `full_sync_resume` 游标
 
@@ -1068,7 +1072,7 @@ mysql-to-sync/
 
 - 无主键表：单协程流式读取（仅表级续传，中断后整表重跑）
 
-- 批量插入：使用批量 `INSERT IGNORE` 语句
+- 批量插入：默认使用批量 `INSERT IGNORE` 语句；`enable_drop_table_before_ddl=true` 时目标表已 DROP 重建为空表，改用普通 INSERT 省去唯一键检查开销，同时自动禁用全量续传
 
 
 

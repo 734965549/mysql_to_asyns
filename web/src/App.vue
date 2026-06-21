@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { ref, onMounted, onUnmounted, watch, computed } from "vue";
 
 import { Message, Modal } from "@arco-design/web-vue";
@@ -311,6 +311,7 @@ const taskForm = ref({
   enable_read_only: false,
 
   enable_drop_table_before_ddl: false,
+  tx_commit_every_n_parallel: 0,
 });
 
 // 刷新状态
@@ -760,6 +761,8 @@ function resetForm() {
     enable_read_only: false,
 
     enable_drop_table_before_ddl: false,
+
+    tx_commit_every_n_parallel: 0,
   };
 
   selectedSyncLevel.value = "database";
@@ -1563,6 +1566,7 @@ function fillTaskFormFromTask(task) {
     enable_read_only: task.config.enable_read_only || false,
 
     enable_drop_table_before_ddl: task.config.enable_drop_table_before_ddl || false,
+    tx_commit_every_n_parallel: task.config.tx_commit_every_n_parallel ?? 0,
   };
 
   if (task.config.sync_level === "DATABASE") {
@@ -4008,6 +4012,32 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                           intra_table_legacy_cap）；有主键且可并行时按此值拆范围读。实际并发还受连接池与
                           MySQL max_connections 限制，上限见 application.toml
                           [sync].intra_table_hard_max。
+                        </a-typography-text>
+                      </a-form-item>
+                    </a-col>
+
+                    <a-col :span="12">
+                      <a-form-item label="并行事务提交间隔">
+                        <a-input-number
+                          :model-value="taskForm.tx_commit_every_n_parallel"
+                          @change="
+                            (v) => (taskForm.tx_commit_every_n_parallel = v ?? 0)
+                          "
+                          :min="0"
+                          :max="1000"
+                          style="width: 100%"
+                        />
+
+                        <a-typography-text
+                          type="secondary"
+                          style="
+                            font-size: 12px;
+                            display: block;
+                            margin-top: 4px;
+                          "
+                        >
+                          并行 worker 每 N 批提交一次事务；0 为默认值 5。减小可降低锁等待避免 lock wait
+                          timeout，增大可减少 fsync 频率提高大表吞吐。
                         </a-typography-text>
                       </a-form-item>
                     </a-col>

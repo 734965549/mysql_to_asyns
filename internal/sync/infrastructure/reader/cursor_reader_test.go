@@ -3,6 +3,7 @@ package reader
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	"mysql-to-sync/internal/metadata/domain/entity"
@@ -490,4 +491,144 @@ func TestRangeShardingReader_EmptyIdentifyCols(t *testing.T) {
 	reader := NewRangeShardingReader(db, "test_db", "users", identity)
 	assert.NotNil(t, reader)
 	assert.Equal(t, "", reader.pkColumn) // pkColumn 应该为空
+}
+
+// TestRetryableQuery_RecoversFromCloseError 验证 scan/Close 阶段遇到 invalid connection 时能重试恢复。
+// 第一次查询成功但 rows.Close() 返回 invalid connection 错误，第二次查询成功。
+func TestRetryableQuery_RecoversFromCloseError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	// 第一次查询：QueryContext 成功，但 rows.Close() 返回 invalid connection
+	rows1 := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(1, "Alice").
+		CloseError(fmt.Errorf("invalid connection"))
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
+		WithArgs(int64(0), int64(100)).
+		WillReturnRows(rows1)
+
+	// 第二次查询：完全成功
+	rows2 := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(1, "Alice")
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
+		WithArgs(int64(0), int64(100)).
+		WillReturnRows(rows2)
+
+	reader := NewRangeShardingReader(db, "test_db", "users", identity)
+	results, err := reader.ReadBatch(context.Background(), 0, 100)
+
+	assert.NoError(t, err)
+	assert.Len(t, results, 1)
+	assert.Equal(t, "Alice", results[0]["name"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRetryableQuery_RecoversFromRowError 验证 rows.Scan/Next 阶段遇到 bad connection 时能重试恢复。
+// 第一次查询成功但行数据返回 bad connection 错误，第二次查询成功。
+func TestRetryableQuery_RecoversFromRowError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	// 第一次查询：QueryContext 成功，但 RowError 返回 bad connection
+	rows1 := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(1, "Alice").
+		RowError(0, fmt.Errorf("bad connection"))
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
+		WithArgs(int64(0), int64(100)).
+		WillReturnRows(rows1)
+
+	// 第二次查询：完全成功
+	rows2 := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(1, "Alice")
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
+		WithArgs(int64(0), int64(100)).
+		WillReturnRows(rows2)
+
+	reader := NewRangeShardingReader(db, "test_db", "users", identity)
+	results, err := reader.ReadBatch(context.Background(), 0, 100)
+
+	assert.NoError(t, err)
+	assert.Len(t, results, 1)
+	assert.Equal(t, "Alice", results[0]["name"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRetryableQuery_QueryContextRetry 验证 QueryContext 阶段的连接错误重试（原有行为保留）。
+func TestRetryableQuery_QueryContextRetry(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	// 第一次 QueryContext 返回 invalid connection
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
+		WithArgs(int64(0), int64(100)).
+		WillReturnError(fmt.Errorf("invalid connection"))
+
+	// 第二次 QueryContext 成功
+	rows := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(1, "Alice")
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
+		WithArgs(int64(0), int64(100)).
+		WillReturnRows(rows)
+
+	reader := NewRangeShardingReader(db, "test_db", "users", identity)
+	results, err := reader.ReadBatch(context.Background(), 0, 100)
+
+	assert.NoError(t, err)
+	assert.Len(t, results, 1)
+	assert.Equal(t, "Alice", results[0]["name"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRetryableQuery_NonRetryableError 验证非连接错误不重试，直接返回。
+func TestRetryableQuery_NonRetryableError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	// 非连接错误（如语法错误），不应重试
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` >= .* AND `id` < .*").
+		WithArgs(int64(0), int64(100)).
+		WillReturnError(fmt.Errorf("syntax error"))
+
+	reader := NewRangeShardingReader(db, "test_db", "users", identity)
+	_, err = reader.ReadBatch(context.Background(), 0, 100)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "syntax error")
+	assert.NoError(t, mock.ExpectationsWereMet())
 }

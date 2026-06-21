@@ -40,32 +40,41 @@ func isConnRetryable(err error) bool { // 判断连接错误是否可重试函�
 		strings.Contains(s, "connection was bad") // 检查是否包含连接错误
 }
 
-// retryableQuery 先直接查询；仅在连接失效等可重试错误时进入重试循环。
+// retryableQuery 先直接查询；在 QueryContext 或 scan/Close 阶段遇到连接失效等可重试错误时进入重试循环。
 // 正常路径无闭包分配和循环开销。
 func retryableQuery(ctx context.Context, db queryExecutor, query string, scan func(*sql.Rows) ([]map[string]interface{}, error), args ...interface{}) ([]map[string]interface{}, error) {
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil && isConnRetryable(err) {
-		const maxRetries = 3
-		for attempt := 1; attempt <= maxRetries; attempt++ {
+	const maxRetries = 3
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(time.Duration(25+attempt*25) * time.Millisecond):
 			}
-			rows, err = db.QueryContext(ctx, query, args...)
-			if err == nil || !isConnRetryable(err) {
-				break
-			}
 		}
+
+		rows, err := db.QueryContext(ctx, query, args...)
+		if err != nil {
+			if isConnRetryable(err) && attempt < maxRetries {
+				continue
+			}
+			return nil, err
+		}
+
+		results, sErr := scan(rows)
+		if cErr := rows.Close(); cErr != nil && sErr == nil {
+			sErr = cErr
+		}
+
+		if sErr != nil && isConnRetryable(sErr) && attempt < maxRetries {
+			continue
+		}
+
+		return results, sErr
 	}
-	if err != nil {
-		return nil, err
-	}
-	results, sErr := scan(rows)
-	if cErr := rows.Close(); cErr != nil && sErr == nil {
-		sErr = cErr
-	}
-	return results, sErr
+
+	return nil, fmt.Errorf("retryableQuery: max retries exceeded")
 }
 
 // selectExprForColumn 构建 SELECT 列表项。JSON/BLOB/TEXT 等原样读取，避免 CAST 在服务端物化整段大字段拖慢 IO；Scan 后经 normalizeScannedValue 处理 []byte。

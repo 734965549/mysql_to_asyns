@@ -261,7 +261,7 @@ FULL_FAILED
 7. 根据身份策略选择 reader：
    - PK/UK：RangeShardingReader，支持 keyset/range。
    - no-PK：CursorReader，流式读，表级续传。
-8. BatchWriter 写目标库；全量批量写使用 INSERT IGNORE。
+8. BatchWriter 写目标库；全量批量写默认使用 INSERT IGNORE（`enable_drop_table_before_ddl=true` 时目标表已重建，改用普通 INSERT 并禁用续传）。
 9. 写事务提交后才能推进 full_sync_resume 游标。
 10. 表完成后 MarkTableDone。
 11. 全部完成后 MarkFullSyncCompleted。
@@ -284,7 +284,7 @@ FULL_FAILED
 ```text
 T0: 短暂 FTWRL，读取 SHOW MASTER STATUS 得到 P0，然后立即 UNLOCK
 T1: 将 P0 保存到 checkpoint.Manager，作为后续增量订阅起点
-T2: 全量阶段用普通短 SELECT 读取源表，用 INSERT IGNORE 写目标表
+T2: 全量阶段用普通短 SELECT 读取源表，默认 INSERT IGNORE 写目标表（`enable_drop_table_before_ddl=true` 时改用普通 INSERT）
 T3: 全量完成后，ALL 模式启动增量订阅，从 P0 RunFrom
 T4: 回放 P0 之后发生过的 INSERT/UPDATE/DELETE，把全量期间的变化追平
 ```
@@ -295,13 +295,13 @@ T4: 回放 P0 之后发生过的 INSERT/UPDATE/DELETE，把全量期间的变化
 
 | 场景 | 处理方式 | 结果 |
 |---|---|---|
-| 全量重复写同一 PK/UK 行 | 全量 `INSERT IGNORE` | 跳过重复键，保持全量幂等 |
+| 全量重复写同一 PK/UK 行 | 默认全量 `INSERT IGNORE`；`enable_drop_table_before_ddl=true` 时为普通 INSERT | 默认跳过重复键保持幂等；DROP 重建场景目标表为空，无重复键风险 |
 | 增量 INSERT 重复到达 PK/UK 行 | 增量 writer 启用 `ON DUPLICATE KEY UPDATE` | 后到事件覆盖旧值，收敛到源库状态 |
 | 增量 UPDATE/DELETE PK/UK 行 | 使用 PK/UK WHERE | 精确匹配目标行 |
 | 无主键表 UPDATE/DELETE | 使用 before image / 行镜像做全列 WHERE | 尽力匹配，依赖 `binlog_row_image=FULL` |
 | 无主键表 INSERT | 退化为 `INSERT IGNORE`，没有真正冲突键 | 不能保证去重，推荐补 PK/UK |
 
-这不是“所有重复都跳过”。全量阶段主要靠 `INSERT IGNORE` 跳过重复；增量阶段对 PK/UK 表必须是 upsert，否则全量期间同一行的后续 INSERT/UPDATE 不能可靠收敛。无主键表因为没有冲突键，只能使用全列匹配降低 UPDATE/DELETE 风险，无法获得真正的 INSERT 去重语义。
+这不是“所有重复都跳过”。全量阶段默认靠 `INSERT IGNORE` 跳过重复（`enable_drop_table_before_ddl=true` 时改用普通 INSERT）；增量阶段对 PK/UK 表必须是 upsert，否则全量期间同一行的后续 INSERT/UPDATE 不能可靠收敛。无主键表因为没有冲突键，只能使用全列匹配降低 UPDATE/DELETE 风险，无法获得真正的 INSERT 去重语义。
 
 ## 8. 增量同步流程
 

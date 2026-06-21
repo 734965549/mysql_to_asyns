@@ -1128,6 +1128,154 @@ func TestIncrementTaskProgress(t *testing.T) {
 	assert.Equal(t, 30.0, retrievedTask.Context.ProgressPercent)
 }
 
+// spyTaskStorage 包装真实 FileTaskStorage，统计 Save 调用次数，用于测试持久化节流行为。
+type spyTaskStorage struct {
+	*FileTaskStorage
+	saveCount int
+	mu        sync.Mutex
+}
+
+func (s *spyTaskStorage) Save(task *taskEntity.SyncTask) error {
+	s.mu.Lock()
+	s.saveCount++
+	s.mu.Unlock()
+	return s.FileTaskStorage.Save(task)
+}
+
+func (s *spyTaskStorage) SaveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveCount
+}
+
+func (s *spyTaskStorage) ResetCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saveCount = 0
+}
+
+// newTestTaskServiceWithSpy 创建带 spy storage 的测试服务，用于观测 Save 调用次数。
+func newTestTaskServiceWithSpy(dataDir string) (*TaskService, *spyTaskStorage) {
+	real := NewFileTaskStorage(dataDir)
+	spy := &spyTaskStorage{FileTaskStorage: real}
+	return &TaskService{
+		tasks:               make(map[string]*taskEntity.SyncTask),
+		runtimes:            make(map[string]*taskRuntime),
+		runningProgress:     make(map[string]*taskEntity.RunningProgress),
+		lastProgressPersist: make(map[string]time.Time),
+		storage:             spy,
+	}, spy
+}
+
+// TestIncrementTaskProgress_Throttle 验证进度持久化节流：
+// 1. 同一秒内多次 incrementTaskProgress 只触发一次 Save
+// 2. 超过 1 秒后再次调用会触发新的 Save
+func TestIncrementTaskProgress_Throttle(t *testing.T) {
+	dataDir := "./test_task_service_throttle_unique"
+	defer os.RemoveAll(dataDir)
+
+	ts, spy := newTestTaskServiceWithSpy(dataDir)
+
+	// 创建任务（CreateTask 内部会调用一次 Save，重置计数器）
+	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	task.Context.TotalRows = 1000
+	spy.ResetCount()
+
+	// 第 1 次调用：首次，应触发 Save
+	ts.incrementTaskProgress("task_1", 100, "pos_1")
+	assert.Equal(t, 1, spy.SaveCount(), "首次调用应触发 Save")
+
+	// 第 2 次调用：同一秒内，不应再触发 Save
+	ts.incrementTaskProgress("task_1", 200, "pos_2")
+	assert.Equal(t, 1, spy.SaveCount(), "1 秒内第二次调用不应触发 Save")
+
+	// 第 3 次调用：同一秒内，仍不应触发 Save
+	ts.incrementTaskProgress("task_1", 50, "pos_3")
+	assert.Equal(t, 1, spy.SaveCount(), "1 秒内第三次调用不应触发 Save")
+
+	// 验证内存值已正确累加（不受节流影响）
+	retrievedTask, _ := ts.GetTask("task_1")
+	assert.Equal(t, int64(350), retrievedTask.Context.ProcessedRows)
+	assert.Equal(t, "pos_3", retrievedTask.Context.CurrentPosition)
+	assert.Equal(t, 35.0, retrievedTask.Context.ProgressPercent)
+
+	// 等待超过 1 秒，再次调用应触发新的 Save
+	time.Sleep(1100 * time.Millisecond)
+	ts.incrementTaskProgress("task_1", 150, "pos_4")
+	assert.Equal(t, 2, spy.SaveCount(), "超过 1 秒后应触发新的 Save")
+
+	// 验证内存值继续累加
+	retrievedTask, _ = ts.GetTask("task_1")
+	assert.Equal(t, int64(500), retrievedTask.Context.ProcessedRows)
+	assert.Equal(t, "pos_4", retrievedTask.Context.CurrentPosition)
+	assert.Equal(t, 50.0, retrievedTask.Context.ProgressPercent)
+}
+
+// TestIncrementTaskProgress_ThrottleReset 验证任务完成时会清理节流记录，
+// 确保同一 taskID 快速重复运行时首秒能正常落盘。
+func TestIncrementTaskProgress_ThrottleReset(t *testing.T) {
+	dataDir := "./test_task_service_throttle_reset_unique"
+	defer os.RemoveAll(dataDir)
+
+	ts, spy := newTestTaskServiceWithSpy(dataDir)
+
+	// 创建任务
+	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	task.Context.TotalRows = 1000
+	spy.ResetCount()
+
+	// 第一次运行：调用一次 progress
+	ts.incrementTaskProgress("task_1", 100, "pos_1")
+	assert.Equal(t, 1, spy.SaveCount())
+
+	// 模拟任务完成时的清理路径（s.mu 下清理节流记录，progressMu 下清理运行时进度）
+	ts.mu.Lock()
+	ts.clearLastProgressPersistLocked("task_1")
+	ts.mu.Unlock()
+	ts.clearRunningProgress("task_1")
+
+	// 验证 lastProgressPersist 已清理
+	_, exists := ts.lastProgressPersist["task_1"]
+	assert.False(t, exists, "任务完成时应清理 lastProgressPersist 记录")
+
+	// 重新创建任务（模拟同一 taskID 快速重复运行）
+	task2, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	task2.Context.TotalRows = 1000
+	spy.ResetCount()
+
+	// 新运行首次调用应触发 Save（因为节流记录已被清理）
+	ts.incrementTaskProgress("task_1", 200, "pos_2")
+	assert.Equal(t, 1, spy.SaveCount(), "清理节流记录后，新运行首次调用应触发 Save")
+}
+
+// TestDeleteTask_CleansThrottleRecord 验证 DeleteTask 会清理 lastProgressPersist。
+func TestDeleteTask_CleansThrottleRecord(t *testing.T) {
+	dataDir := "./test_task_service_delete_throttle_unique"
+	defer os.RemoveAll(dataDir)
+
+	ts, spy := newTestTaskServiceWithSpy(dataDir)
+
+	// 创建任务
+	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	spy.ResetCount()
+
+	// 调用一次 progress 以在 lastProgressPersist 中留下记录
+	ts.incrementTaskProgress("task_1", 100, "pos_1")
+	assert.Equal(t, 1, spy.SaveCount())
+
+	// 验证记录存在
+	_, exists := ts.lastProgressPersist["task_1"]
+	assert.True(t, exists, "调用 incrementTaskProgress 后应存在节流记录")
+
+	// 删除任务
+	err := ts.DeleteTask("task_1")
+	assert.NoError(t, err)
+
+	// 验证节流记录已被清理
+	_, exists = ts.lastProgressPersist["task_1"]
+	assert.False(t, exists, "DeleteTask 应清理 lastProgressPersist 记录")
+}
+
 func TestUpdateTaskTotalRows(t *testing.T) {
 	dataDir := "./test_task_service_totalrows_unique"
 	defer os.RemoveAll(dataDir)

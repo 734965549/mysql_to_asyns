@@ -109,14 +109,14 @@ StartTask
 ```text
 1. 全量开始前短锁拿到 binlog 位点 P0。
 2. 立即解锁，并把 P0 保存为增量 checkpoint。
-3. 全量阶段执行普通短查询，目标端使用 INSERT IGNORE 写入。
+3. 全量阶段执行普通短查询，目标端默认使用 INSERT IGNORE 写入（`enable_drop_table_before_ddl=true` 时改用普通 INSERT）。
 4. ALL 模式全量完成后，增量从 P0 开始回放。
 5. P0 之后发生的变更会再次应用到目标库，用于追平全量读取期间的时间差。
 ```
 
 重复处理不是单一的“全部跳过”：
 
-- 全量批量写使用 `INSERT IGNORE`，重复键跳过，保证全量重跑或续跑幂等。
+- 全量批量写默认使用 `INSERT IGNORE`，重复键跳过，保证全量重跑或续跑幂等；`enable_drop_table_before_ddl=true` 时目标表已重建为空表，改用普通 `INSERT` 提升性能并禁用续传。
 - 增量 PK/UK 表的 INSERT 使用 `INSERT ... ON DUPLICATE KEY UPDATE`，重复到达时要覆盖旧值，保证最终收敛。
 - 增量 UPDATE/DELETE 使用 PK/UK 定位；无主键表使用 before image 或行镜像做全列 WHERE。
 - 无主键表 INSERT 没有真正冲突键，无法可靠去重，仍建议给表补主键或唯一键。
@@ -132,7 +132,9 @@ StartTask
 
 ### 写入语义
 
-全量写使用 `INSERT IGNORE`。这是为了让重复执行具备幂等性，并降低目标表已有重复键时的失败概率。全量不是增量回放，不使用 upsert 作为默认语义。
+全量写默认使用 `INSERT IGNORE`。这是为了让重复执行具备幂等性，并降低目标表已有重复键时的失败概率。全量不是增量回放，不使用 upsert 作为默认语义。
+
+例外：`enable_drop_table_before_ddl=true` 时目标表已被 DROP+CREATE 重建为空表，确认为空、不存在主键/唯一键冲突风险，此时全量写改用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE），省去唯一键检查的纯开销以提升性能；同时自动禁用全量续传，因为目标表已重建、续传游标不再有意义。
 
 ## 4. 全量续传设计
 
