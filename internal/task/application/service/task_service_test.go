@@ -1704,6 +1704,54 @@ func TestBoundaryToString(t *testing.T) {
 	assert.Equal(t, "a\x00b\x00c", result)
 }
 
+func TestSamplePKBoundariesImproved_DirectBoundariesForAllWorkers(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	defer db.Close()
+
+	const workers = 16
+	const totalRows int64 = 160
+	query := "SELECT `id` FROM `src`.`events` ORDER BY `id` LIMIT 1 OFFSET ?"
+	for i := 1; i < workers; i++ {
+		offset := totalRows * int64(i) / int64(workers)
+		mock.ExpectQuery(query).
+			WithArgs(offset).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(fmt.Sprintf("%03d", offset)))
+	}
+
+	var ts TaskService
+	boundaries, err := ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, totalRows, workers)
+	require.NoError(t, err)
+	require.Len(t, boundaries, workers-1)
+	for i := 1; i < len(boundaries); i++ {
+		assert.Less(t, compareBoundaryValues(boundaries[i-1], boundaries[i]), 0)
+	}
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSamplePKBoundariesImproved_SkipsNonIncreasingBoundaries(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	defer db.Close()
+
+	query := "SELECT `id` FROM `src`.`events` ORDER BY `id` LIMIT 1 OFFSET ?"
+	mock.ExpectQuery(query).
+		WithArgs(int64(2)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("a"))
+	mock.ExpectQuery(query).
+		WithArgs(int64(4)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("a"))
+	mock.ExpectQuery(query).
+		WithArgs(int64(6)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("c"))
+
+	var ts TaskService
+	boundaries, err := ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, 8, 4)
+	require.NoError(t, err)
+	require.Equal(t, []interface{}{"a", "c"}, boundaries)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 // ==================== isRetryableLockError ====================
 
 func TestIsRetryableLockError(t *testing.T) {

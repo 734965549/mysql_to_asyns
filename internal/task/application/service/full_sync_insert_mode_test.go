@@ -351,11 +351,8 @@ func TestSyncDatabasePair_ParallelSamplePath_InsertMode(t *testing.T) {
 		mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `" + fullSyncSrcSchema + "`.`events`").
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(100)))
 		mock.ExpectQuery("SELECT `code` FROM `" + fullSyncSrcSchema + "`.`events` ORDER BY `code` LIMIT 1 OFFSET \\?").
-			WithArgs(int64(0)).
-			WillReturnRows(sqlmock.NewRows([]string{"code"}).AddRow("aaa"))
-		mock.ExpectQuery("SELECT `code` FROM `" + fullSyncSrcSchema + "`.`events` ORDER BY `code` LIMIT 1 OFFSET \\?").
-			WithArgs(int64(99)).
-			WillReturnRows(sqlmock.NewRows([]string{"code"}).AddRow("zzz"))
+			WithArgs(int64(50)).
+			WillReturnRows(sqlmock.NewRows([]string{"code"}).AddRow("mmm"))
 
 		rowsW0 := sqlmock.NewRows([]string{"code", "payload"}).AddRow("aaa", "p0")
 		mock.ExpectQuery("SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` ORDER BY `code` ASC LIMIT \\?").

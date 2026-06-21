@@ -2663,6 +2663,19 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						logger.Info("[Task %s] Boundary sampling failed for %s.%s: %v", taskID, sourceSchema, tableName, bErr)
 
+					} else if len(sampleBoundaries) == 0 {
+
+						canParallelSample = false
+
+						logger.Info("[Task %s] Boundary sampling produced no usable split for %s.%s; falling back to sequential keyset", taskID, sourceSchema, tableName)
+
+					} else if effectiveWorkers := len(sampleBoundaries) + 1; effectiveWorkers < intraWorkers {
+
+						logger.Info("[Task %s] Boundary sampling reduced sample workers for %s.%s from %d to %d (usable boundaries=%d)",
+							taskID, sourceSchema, tableName, intraWorkers, effectiveWorkers, len(sampleBoundaries))
+
+						intraWorkers = effectiveWorkers
+
 					}
 
 				}
@@ -4472,6 +4485,12 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource
 
 	}
 
+	if n < 2 {
+
+		return nil, fmt.Errorf("parallel worker count must be at least 2: %d", n)
+
+	}
+
 	if totalRows < int64(n)*2 {
 
 		// 数据量太少，不值得并行
@@ -4487,23 +4506,19 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource
 	}
 	colList := strings.Join(quotedCols, ", ")
 
-	boundaries := make([]interface{}, n-1)
+	boundaries := make([]interface{}, 0, n-1)
 
-	// 使用动态采样：先获取几个采样点来评估分布
+	for i := 1; i < n; i++ {
 
-	samplePoints := min(10, n) // 最多采样10个点
-
-	samples := make([]interface{}, samplePoints)
-
-	for i := 0; i < samplePoints; i++ {
-
-		offset := totalRows * int64(i) / int64(samplePoints-1)
+		offset := totalRows * int64(i) / int64(n)
 
 		if offset >= totalRows {
 
 			offset = totalRows - 1
 
 		}
+
+		var boundary interface{}
 
 		if len(pkCols) == 1 {
 			// 单列主键：返回单值
@@ -4516,7 +4531,7 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource
 			if err != nil {
 				return nil, fmt.Errorf("sample point %d failed: %v", i, err)
 			}
-			samples[i] = normalizePKBoundaryValue(pk)
+			boundary = normalizePKBoundaryValue(pk)
 		} else {
 			// 复合主键：返回 []interface{} 包含所有列值
 			vals := make([]interface{}, len(pkCols))
@@ -4536,94 +4551,27 @@ func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource
 			for j, val := range vals {
 				result[j] = normalizePKBoundaryValue(val)
 			}
-			samples[i] = result
+			boundary = result
 		}
+
+		if len(boundaries) > 0 && compareBoundaryValues(boundaries[len(boundaries)-1], boundary) >= 0 {
+
+			logger.Warn("[SampleBoundary] Skip non-increasing boundary for %s.%s at offset=%d: prev=%v current=%v",
+				schema, table, offset, boundaries[len(boundaries)-1], boundary)
+
+			continue
+
+		}
+
+		boundaries = append(boundaries, boundary)
 
 	}
 
-	// 基于采样点智能分配边界
+	logger.Info("Dynamic boundary sampling: totalRows=%d, requestedWorkers=%d, effectiveWorkers=%d, pkCols=%v, boundaries=%v",
 
-	if n <= 2 {
-
-		// 2个worker：直接在中点分割
-
-		if len(samples) > 1 {
-
-			// 确保边界不等于第一个采样点
-
-			for i := 1; i < len(samples); i++ {
-
-				if boundaryToString(samples[i]) != boundaryToString(samples[0]) {
-
-					boundaries[0] = samples[i]
-
-					break
-
-				}
-
-			}
-
-		}
-
-	} else {
-
-		// 多个worker：均匀分布边界点，确保不重复
-
-		step := float64(samplePoints-1) / float64(n-1)
-
-		for i := 1; i < n; i++ {
-
-			sampleIdx := int(step * float64(i))
-
-			if sampleIdx >= len(samples) {
-
-				sampleIdx = len(samples) - 1
-
-			}
-
-			// 确保边界不重复且递增
-
-			if i > 1 {
-
-				prevBoundary := boundaries[i-2]
-
-				for sampleIdx < len(samples) &&
-
-					boundaryToString(samples[sampleIdx]) == boundaryToString(prevBoundary) {
-
-					sampleIdx++
-
-				}
-
-			}
-
-			if sampleIdx < len(samples) {
-
-				boundaries[i-1] = samples[sampleIdx]
-
-			}
-
-		}
-
-	}
-
-	logger.Info("Dynamic boundary sampling: totalRows=%d, workers=%d, pkCols=%v, boundaries=%v",
-
-		totalRows, n, pkCols, boundaries)
+		totalRows, n, len(boundaries)+1, pkCols, boundaries)
 
 	return boundaries, nil
-
-}
-
-func min(a, b int) int {
-
-	if a < b {
-
-		return a
-
-	}
-
-	return b
 
 }
 
@@ -4897,6 +4845,47 @@ func boundaryToString(v interface{}) string {
 		return strings.Join(parts, "\x00")
 	}
 	return dbScanToString(v)
+}
+
+func compareBoundaryValues(a, b interface{}) int {
+	compareScalar := func(x, y interface{}) int {
+		xs := dbScanToString(x)
+		ys := dbScanToString(y)
+		switch {
+		case xs < ys:
+			return -1
+		case xs > ys:
+			return 1
+		default:
+			return 0
+		}
+	}
+
+	aVals, aComposite := a.([]interface{})
+	bVals, bComposite := b.([]interface{})
+	if aComposite && bComposite {
+		n := len(aVals)
+		if len(bVals) < n {
+			n = len(bVals)
+		}
+		for i := 0; i < n; i++ {
+			if c := compareScalar(aVals[i], bVals[i]); c != 0 {
+				return c
+			}
+		}
+		switch {
+		case len(aVals) < len(bVals):
+			return -1
+		case len(aVals) > len(bVals):
+			return 1
+		default:
+			return 0
+		}
+	}
+	if !aComposite && !bComposite {
+		return compareScalar(a, b)
+	}
+	return compareScalar(boundaryToString(a), boundaryToString(b))
 }
 
 // comparePKWithBoundary 比较一行数据的主键值与边界值，返回 -1 / 0 / +1
