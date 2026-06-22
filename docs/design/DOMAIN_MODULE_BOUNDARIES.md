@@ -273,9 +273,23 @@ FULL_FAILED
 | read_path | 典型场景 | 续传粒度 |
 |---|---|---|
 | `keyset` | 单 worker 主键/唯一键顺序读 | 行级 |
-| `range` | 数值单列主键分片并行 | 行级，按 shard cursor |
-| `sample` | 采样边界并行 | 表级 |
+| `range` | 数值单列主键分片并行（每 worker 独立读） | 行级，按 shard cursor |
+| `sample` | 采样边界并行（每 worker 独立读） | 表级 |
 | `nopk` | 无主键流式读 | 表级 |
+| `channel` | 单 reader + channel 多 worker 写（`ChannelSyncExecutor`，预留未接入） | 行级（设计上与 keyset 游标兼容） |
+
+并行读写的两种模型：
+
+```text
+range / sample（当前生产路径）：
+  worker0 reader ──► worker0 writer
+  worker1 reader ──► worker1 writer
+  … 各分片独立读，无共享 batch channel
+
+channel（预留路径，见 channel_sync.go）：
+  单 reader ──► batchChan（容量默认 intraWorkers×4）──► N writers
+  用于读慢、写快时的削峰；扩大 buffer 不解决长期写入瓶颈
+```
 
 ### 7.1 短锁起点与增量追平原理
 

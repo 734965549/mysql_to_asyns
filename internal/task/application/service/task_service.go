@@ -2872,8 +2872,8 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					tableProcessedRows += int64(len(rows))
 
-					s.incrementTaskProgress(taskID, int64(len(rows)), mark)
-					s.updateTableProgress(taskID, sourceSchema, tableName, int64(len(rows)), time.Since(tableStartTime).Seconds())
+					taskTotalRows := s.incrementTaskProgress(taskID, int64(len(rows)), mark)
+					s.updateTableProgress(taskID, sourceSchema, tableName, int64(len(rows)), time.Since(tableStartTime).Seconds(), task.Context.StartTime, taskTotalRows)
 
 				}
 
@@ -3242,8 +3242,8 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							atomic.AddInt64(&atomicProcessed, n)
 
-							s.incrementTaskProgress(taskID, n, rangeMark)
-							s.updateTableProgress(taskID, sourceSchema, tableName, n, time.Since(tableStartTime).Seconds())
+							taskTotalRows := s.incrementTaskProgress(taskID, n, rangeMark)
+							s.updateTableProgress(taskID, sourceSchema, tableName, n, time.Since(tableStartTime).Seconds(), task.Context.StartTime, taskTotalRows)
 
 							// 更新 lastID 为最后一条记录的主键值，确保连续性
 
@@ -3555,8 +3555,8 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							atomic.AddInt64(&atomicProcessed, n)
 
-							s.incrementTaskProgress(taskID, n, mark)
-							s.updateTableProgress(taskID, sourceSchema, tableName, n, time.Since(tableStartTime).Seconds())
+							taskTotalRows := s.incrementTaskProgress(taskID, n, mark)
+							s.updateTableProgress(taskID, sourceSchema, tableName, n, time.Since(tableStartTime).Seconds(), task.Context.StartTime, taskTotalRows)
 
 							// 更新 lastID：复合主键需要传完整的 []interface{} 给 ReadBatchByKeys
 							if len(cursorCols) == 1 {
@@ -3827,8 +3827,8 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 					tableProcessedRows += int64(len(rows))
 
-					s.incrementTaskProgress(taskID, int64(len(rows)), mark)
-					s.updateTableProgress(taskID, sourceSchema, tableName, int64(len(rows)), time.Since(tableStartTime).Seconds())
+					taskTotalRows := s.incrementTaskProgress(taskID, int64(len(rows)), mark)
+					s.updateTableProgress(taskID, sourceSchema, tableName, int64(len(rows)), time.Since(tableStartTime).Seconds(), task.Context.StartTime, taskTotalRows)
 
 				}
 
@@ -3878,7 +3878,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			logger.Info("[Task %s] Table %s.%s -> %s.%s completed, processed %d rows", taskID, sourceSchema, tableName, targetSchema, targetTableName, tableProcessedRows)
 
 			s.completeTableProgress(taskID, sourceSchema, tableName)
-			s.refreshOverallProgress(taskID, task.Context.StartTime)
+			s.refreshOverallProgress(taskID, task.Context.StartTime, s.getTaskTotalRows(taskID))
 
 		}(r.name, r.targetName, r.identity, r.savedIndexes)
 
@@ -5198,10 +5198,10 @@ func (s *TaskService) startTableProgress(taskID, schema, table string, totalRows
 	}
 }
 
-// updateTableProgress 更新某表的已处理行数和速度。
+// updateTableProgress 更新某表的已处理行数、速度和整体 ETA。
 // delta: 本次新增行数
 // elapsed: 该表从开始到现在的耗时（秒）
-func (s *TaskService) updateTableProgress(taskID, schema, table string, delta int64, elapsedSec float64) {
+func (s *TaskService) updateTableProgress(taskID, schema, table string, delta int64, elapsedSec float64, taskStartTime time.Time, taskTotalRows int64) {
 	s.progressMu.Lock()
 	defer s.progressMu.Unlock()
 
@@ -5226,6 +5226,7 @@ func (s *TaskService) updateTableProgress(taskID, schema, table string, delta in
 			if elapsedSec > 0 {
 				ti.SpeedRowsSec = float64(ti.ProcessedRows) / elapsedSec
 			}
+			s.refreshOverallProgressLocked(rp, taskStartTime, taskTotalRows)
 			return
 		}
 	}
@@ -5274,16 +5275,8 @@ func (s *TaskService) failTableProgress(taskID, schema, table string) {
 	}
 }
 
-// refreshOverallProgress 刷新整体进度统计（速度、耗时、预估剩余时间）。
-func (s *TaskService) refreshOverallProgress(taskID string, startTime time.Time) {
-	s.progressMu.Lock()
-	defer s.progressMu.Unlock()
-
-	rp, exists := s.runningProgress[taskID]
-	if !exists {
-		return
-	}
-
+// refreshOverallProgressLocked 刷新整体进度统计。调用方必须持有 progressMu。
+func (s *TaskService) refreshOverallProgressLocked(rp *taskEntity.RunningProgress, startTime time.Time, taskTotalRows int64) {
 	rp.UpdatedAt = time.Now()
 	rp.ElapsedSeconds = time.Since(startTime).Seconds()
 
@@ -5302,11 +5295,29 @@ func (s *TaskService) refreshOverallProgress(taskID string, startTime time.Time)
 		rp.OverallSpeed = float64(processedRows) / rp.ElapsedSeconds
 	}
 
-	if rp.OverallSpeed > 0 && totalRows > processedRows {
-		rp.EstimatedRemain = float64(totalRows-processedRows) / rp.OverallSpeed
+	effectiveTotalRows := taskTotalRows
+	if effectiveTotalRows <= 0 {
+		effectiveTotalRows = totalRows
+	}
+
+	if rp.OverallSpeed > 0 && effectiveTotalRows > processedRows {
+		rp.EstimatedRemain = float64(effectiveTotalRows-processedRows) / rp.OverallSpeed
 	} else {
 		rp.EstimatedRemain = -1
 	}
+}
+
+// refreshOverallProgress 刷新整体进度统计（速度、耗时、预估剩余时间）。
+func (s *TaskService) refreshOverallProgress(taskID string, startTime time.Time, taskTotalRows int64) {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+
+	rp, exists := s.runningProgress[taskID]
+	if !exists {
+		return
+	}
+
+	s.refreshOverallProgressLocked(rp, startTime, taskTotalRows)
 }
 
 // GetTaskProgress 获取任务的运行时进度快照（供API查询）。
@@ -5351,9 +5362,9 @@ func (s *TaskService) updateTaskProgress(taskID string, processedRows int64, pos
 
 }
 
-// incrementTaskProgress 原子增加任务进度。
+// incrementTaskProgress 原子增加任务进度，并返回当前任务总行数供运行时 ETA 复用。
 // 内存进度每批都更新，但存储落盘按 1 秒节流，避免高频 I/O。
-func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position string) {
+func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position string) int64 {
 
 	s.mu.Lock()
 
@@ -5381,8 +5392,10 @@ func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position
 			s.storage.Save(task)
 		}
 
+		return task.Context.TotalRows
 	}
 
+	return 0
 }
 
 // updateTaskTotalRows 更新任务总行数
@@ -5403,6 +5416,16 @@ func (s *TaskService) updateTaskTotalRows(taskID string, totalRows int64) {
 
 	}
 
+}
+
+func (s *TaskService) getTaskTotalRows(taskID string) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if task, exists := s.tasks[taskID]; exists {
+		return task.Context.TotalRows
+	}
+	return 0
 }
 
 // updateTaskStatus 更新任务状态

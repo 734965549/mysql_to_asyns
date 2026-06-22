@@ -364,6 +364,42 @@ env:
 > 注意：此参数仅影响并行路径。串行路径（keyset/nopk）的提交间隔固定为 200，
 > 不受此参数影响。
 
+### 全量并行读取路径（与 channel buffer 的关系）
+
+当前 `task_service` 实际使用的全量并行模式如下：
+
+| 模式 | 读模型 | 是否用 `ChannelSync` |
+|------|--------|----------------------|
+| `range` | 按数值主键分片，每个 worker **独立 reader** 读自己的区间 | 否 |
+| `sample` | 按采样边界分片，每个 worker **独立 reader** | 否 |
+| `keyset` | 单 goroutine 顺序 keyset 读 | 否 |
+| `nopk` | 无主键流式读 | 否 |
+| `channel`（预留） | **单 reader** 顺序读 batch，经 channel 分发给多 worker 写 | 是（`ChannelSyncExecutor`，尚未接入主流程） |
+
+因此日常调 `intra_table_worker_count`、`tx_commit_every_n_parallel` 时，影响的是 **range/sample 分片并行**，与 channel buffer **无直接关系**。channel buffer 仅在未来或自定义接入 `ChannelSync` 路径时才有意义。
+
+### Channel 批次缓冲（channel_buffer_batches，内部参数）
+
+`ChannelSync` 用带缓冲 channel 连接「单线程读 batch」与「多 worker 写 batch」。缓冲容量单位是 **批次数**（每个元素是一批行，不是行数）。
+
+**当前状态**：该参数仅在代码层 `NewChannelSync(workerCount, batchSize, channelBufferBatches)` / `ExecuteFullSyncChannel(..., channelBufferBatches)` 中可传，**尚未**加入任务 JSON / Web UI / `application.toml`。
+
+**计算规则**（`EffectiveChannelBufferBatches`）：
+
+| `channelBufferBatches` | 实际 channel 容量 |
+|------------------------|-------------------|
+| `0` 或未配置（默认） | **`workerCount × 4`**（不是固定 4） |
+| `1` … `workerCount × 64` | 使用配置值 |
+| `> workerCount × 64` | 截断为 **`workerCount × 64`** |
+
+其中 `workerCount` 即表内并行 worker 数（与 `intraWorkers` / `intra_table_worker_count` 生效值一致）。
+
+示例：`intra_table_worker_count = 8` 且未配置 buffer → channel 容量 = **32** 个 batch；若显式配置 `channel_buffer_batches = 16` → 容量为 **16**。
+
+**内存提示**：每个缓冲槽持有约 `batch_size` 行数据。大表、大行、高 `batch_size` 时不宜把 buffer 设得过大；默认 `worker×4` 用于吸收读/写短暂抖动，不能替代目标库写入能力调优。
+
+**投递语义**：`AddBatch` 为带 `context` 的**阻塞投递**——channel 满时 reader 等待空位，直到 `ctx` 取消；不再使用「满则报错 + sleep 重试」。
+
 ## 监控和日志
 
 ### 查看同步进度

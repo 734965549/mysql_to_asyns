@@ -2705,7 +2705,7 @@ func TestUpdateTableProgress(t *testing.T) {
 	ts.startTableProgress(taskID, "db1", "users", 10000)
 
 	// 模拟处理了 2000 行，耗时 2 秒
-	ts.updateTableProgress(taskID, "db1", "users", 2000, 2.0)
+	ts.updateTableProgress(taskID, "db1", "users", 2000, 2.0, time.Now().Add(-2*time.Second), 10000)
 
 	rp, err := ts.GetTaskProgress(taskID)
 	assert.NoError(t, err)
@@ -2731,7 +2731,7 @@ func TestUpdateTableProgress_ProgressCappedAt100(t *testing.T) {
 	ts.startTableProgress(taskID, "db1", "users", 100)
 
 	// 处理超过总行数
-	ts.updateTableProgress(taskID, "db1", "users", 150, 1.0)
+	ts.updateTableProgress(taskID, "db1", "users", 150, 1.0, time.Now().Add(-time.Second), 100)
 
 	rp, err := ts.GetTaskProgress(taskID)
 	assert.NoError(t, err)
@@ -2757,7 +2757,7 @@ func TestUpdateTableProgress_ZeroElapsed(t *testing.T) {
 
 	// elapsed=0 时不应计算速度（避免除零）
 	assert.NotPanics(t, func() {
-		ts.updateTableProgress(taskID, "db1", "users", 100, 0)
+		ts.updateTableProgress(taskID, "db1", "users", 100, 0, time.Now().Add(-time.Second), 10000)
 	})
 
 	rp, _ := ts.GetTaskProgress(taskID)
@@ -2827,15 +2827,15 @@ func TestRefreshOverallProgress(t *testing.T) {
 
 	// 第一张表完成
 	ts.startTableProgress(taskID, "db1", "users", 1000)
-	ts.updateTableProgress(taskID, "db1", "users", 1000, 1.0)
+	ts.updateTableProgress(taskID, "db1", "users", 1000, 1.0, time.Now().Add(-10*time.Second), 3000)
 	ts.completeTableProgress(taskID, "db1", "users")
 
 	// 第二张表进行中
 	ts.startTableProgress(taskID, "db1", "orders", 2000)
-	ts.updateTableProgress(taskID, "db1", "orders", 500, 2.0)
+	ts.updateTableProgress(taskID, "db1", "orders", 500, 2.0, time.Now().Add(-10*time.Second), 3000)
 
 	startTime := time.Now().Add(-10 * time.Second)
-	ts.refreshOverallProgress(taskID, startTime)
+	ts.refreshOverallProgress(taskID, startTime, 3000)
 
 	rp, err := ts.GetTaskProgress(taskID)
 	assert.NoError(t, err)
@@ -2844,6 +2844,27 @@ func TestRefreshOverallProgress(t *testing.T) {
 	assert.GreaterOrEqual(t, rp.ElapsedSeconds, 10.0)
 	assert.Greater(t, rp.OverallSpeed, 0.0)
 	assert.Greater(t, rp.EstimatedRemain, 0.0)
+}
+
+func TestRefreshOverallProgress_UsesTaskTotalRowsWhenTableTotalsMissing(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	taskID := "test_refresh_task_total"
+	entries := []tableEntry{
+		{schema: "db1", table: "users", identity: nil},
+	}
+	ts.initRunningProgress(taskID, entries, "full")
+	ts.startTableProgress(taskID, "db1", "users", 0)
+
+	startTime := time.Now().Add(-10 * time.Second)
+	ts.updateTableProgress(taskID, "db1", "users", 1000, 10.0, startTime, 3000)
+
+	rp, err := ts.GetTaskProgress(taskID)
+	assert.NoError(t, err)
+	assert.Greater(t, rp.OverallSpeed, 0.0)
+	assert.Greater(t, rp.EstimatedRemain, 0.0)
+	assert.InDelta(t, 20.0, rp.EstimatedRemain, 2.0)
 }
 
 func TestRefreshOverallProgress_NoRemaining(t *testing.T) {
@@ -2856,11 +2877,11 @@ func TestRefreshOverallProgress_NoRemaining(t *testing.T) {
 	}
 	ts.initRunningProgress(taskID, entries, "full")
 	ts.startTableProgress(taskID, "db1", "users", 1000)
-	ts.updateTableProgress(taskID, "db1", "users", 1000, 1.0)
+	ts.updateTableProgress(taskID, "db1", "users", 1000, 1.0, time.Now().Add(-5*time.Second), 1000)
 	ts.completeTableProgress(taskID, "db1", "users")
 
 	startTime := time.Now().Add(-5 * time.Second)
-	ts.refreshOverallProgress(taskID, startTime)
+	ts.refreshOverallProgress(taskID, startTime, 1000)
 
 	rp, err := ts.GetTaskProgress(taskID)
 	assert.NoError(t, err)
@@ -2908,10 +2929,10 @@ func TestProgressMethods_NoRunningProgress(t *testing.T) {
 	// 所有方法在无 RunningProgress 时不应 panic
 	assert.NotPanics(t, func() {
 		ts.startTableProgress(taskID, "db1", "users", 100)
-		ts.updateTableProgress(taskID, "db1", "users", 100, 1.0)
+		ts.updateTableProgress(taskID, "db1", "users", 100, 1.0, time.Now().Add(-time.Second), 100)
 		ts.completeTableProgress(taskID, "db1", "users")
 		ts.failTableProgress(taskID, "db1", "users")
-		ts.refreshOverallProgress(taskID, time.Now())
+		ts.refreshOverallProgress(taskID, time.Now(), 100)
 		ts.clearRunningProgress(taskID)
 	})
 }
@@ -2973,7 +2994,7 @@ func TestRunningProgress_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ts.updateTableProgress(taskID, "db1", "users", 100, 1.0)
+			ts.updateTableProgress(taskID, "db1", "users", 100, 1.0, time.Now().Add(-time.Second), 10000)
 		}()
 	}
 	for i := 0; i < 5; i++ {
