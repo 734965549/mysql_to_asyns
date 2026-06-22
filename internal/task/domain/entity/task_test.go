@@ -130,6 +130,19 @@ func TestTaskComplete(t *testing.T) {
 	}
 }
 
+func TestTaskComplete_ReconcilesTotalRows(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "test_complete_rows", Name: "Test"})
+	task.Context.ProcessedRows = 507165220
+	task.Context.TotalRows = 507578780
+	task.Start()
+	task.Complete()
+
+	if task.Context.TotalRows != task.Context.ProcessedRows {
+		t.Errorf("expected total_rows reconciled to processed_rows %d, got %d",
+			task.Context.ProcessedRows, task.Context.TotalRows)
+	}
+}
+
 func TestTaskUpdateProgress(t *testing.T) {
 	config := TaskConfig{
 		ID:   "test_task_5",

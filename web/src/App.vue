@@ -1926,25 +1926,55 @@ function getStatusText(status) {
   return texts[status] || status;
 }
 
-// 计算进度
+// 计算进度（0-100，供文案展示）
 
 function getProgress(task) {
-  // 防止除零错误
+  if (!task?.context) return 0;
 
-  if (!task.context.total_rows || task.context.total_rows <= 0) {
+  const ctx = task.context;
+
+  // 已完成任务以服务端进度为准，避免估算总行数与实处理行数不一致
+  if (ctx.status === "COMPLETED") {
+    return 100;
+  }
+
+  if (ctx.progress_percent != null && ctx.progress_percent >= 0) {
+    const fromServer = Math.min(100, Math.max(0, ctx.progress_percent));
+    if (!ctx.total_rows || ctx.total_rows <= 0) {
+      return Number(fromServer.toFixed(2));
+    }
+  }
+
+  // 防止除零错误
+  if (!ctx.total_rows || ctx.total_rows <= 0) {
     return 0;
   }
 
   // 防止 processed_rows 为负数或异常值
-
-  const processed = Math.max(0, task.context.processed_rows || 0);
+  const processed = Math.max(0, ctx.processed_rows || 0);
 
   // 计算百分比，并限制在 0-100 之间，保留两位小数
-  let percent = (processed / task.context.total_rows) * 100;
+  let percent = (processed / ctx.total_rows) * 100;
   percent = Math.min(100, Math.max(0, percent));
 
-  // 如果正好是整数直接返回，否则保留两位小数
   return Number(percent.toFixed(2));
+}
+
+// Arco Progress 的 percent 取 0-1，与 getProgress 的 0-100 文案值分离
+function getProgressRatio(value) {
+  const pct = typeof value === "number" ? value : getProgress(value);
+  return Math.min(1, Math.max(0, pct / 100));
+}
+
+// 已完成任务的总行数可能与估算值不一致，展示时以实处理行数为准
+function getRowCounts(task) {
+  const ctx = task?.context;
+  if (!ctx) return { processed: 0, total: 0 };
+  const processed = Math.max(0, ctx.processed_rows || 0);
+  if (ctx.status === "COMPLETED" && processed > 0) {
+    return { processed, total: processed };
+  }
+  return { processed, total: Math.max(0, ctx.total_rows || 0) };
 }
 
 // 监听同步级别变化
@@ -2612,7 +2642,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                 <div class="overview-label">同步进度</div>
                 <div class="overview-value">{{ getProgress(detailPageTask) }}%</div>
                 <a-progress
-                  :percent="getProgress(detailPageTask)"
+                  :percent="getProgressRatio(detailPageTask)"
                   :status="detailPageTask.context.status === 'FAILED' ? 'danger' : 'normal'"
                   :show-text="false"
                   style="margin-top: 8px"
@@ -2622,9 +2652,9 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
             <a-col :xs="12" :md="6">
               <a-card class="overview-card">
                 <div class="overview-label">已处理 / 总行数</div>
-                <div class="overview-value">{{ detailPageTask.context.processed_rows || 0 }}</div>
+                <div class="overview-value">{{ getRowCounts(detailPageTask).processed }}</div>
                 <div class="overview-sub">
-                  总行数：{{ detailPageTask.context.total_rows || 0 }}
+                  总行数：{{ getRowCounts(detailPageTask).total }}
                 </div>
               </a-card>
             </a-col>
@@ -2761,7 +2791,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                   </template>
                   <template #progress="{ record }">
                     <a-progress
-                      :percent="record.progress_pct"
+                      :percent="getProgressRatio(record.progress_pct)"
                       :status="
                         record.status === 'failed'
                           ? 'danger'
@@ -2800,7 +2830,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
             <!-- 执行进度 -->
             <a-tab-pane key="progress" title="执行进度">
               <a-progress
-                :percent="getProgress(detailPageTask)"
+                :percent="getProgressRatio(detailPageTask)"
                 :status="detailPageTask.context.status === 'FAILED' ? 'danger' : 'normal'"
                 style="margin-bottom: 20px"
               />
@@ -2823,10 +2853,10 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                   {{ getProgress(detailPageTask) }}%
                 </a-descriptions-item>
                 <a-descriptions-item label="已处理行数">
-                  {{ detailPageTask.context.processed_rows || 0 }}
+                  {{ getRowCounts(detailPageTask).processed }}
                 </a-descriptions-item>
                 <a-descriptions-item label="总行数">
-                  {{ detailPageTask.context.total_rows || 0 }}
+                  {{ getRowCounts(detailPageTask).total }}
                 </a-descriptions-item>
                 <a-descriptions-item label="已完成表数">
                   {{ resumeTableList(detailPageTask).filter((t) => t.done).length }} /
@@ -5104,7 +5134,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                         class="task-progress"
                       >
                         <a-progress
-                          :percent="getProgress(task) / 100"
+                          :percent="getProgressRatio(task)"
                           :stroke-width="12"
                           status="normal"
                           :show-text="false"
@@ -5705,11 +5735,11 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
           </a-descriptions-item>
 
           <a-descriptions-item label="已处理行数">
-            {{ selectedTaskForDetail.context.processed_rows || 0 }}
+            {{ getRowCounts(selectedTaskForDetail).processed }}
           </a-descriptions-item>
 
           <a-descriptions-item label="总行数">
-            {{ selectedTaskForDetail.context.total_rows || 0 }}
+            {{ getRowCounts(selectedTaskForDetail).total }}
           </a-descriptions-item>
 
           <a-descriptions-item label="当前位置">

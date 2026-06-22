@@ -264,6 +264,10 @@ func (t *SyncTask) Complete() { // 完成任务
 	t.Context.EndTime = time.Now()         // 记录结束时间
 	t.Context.LastUpdateTime = time.Now()  // 更新最后更新时间
 	t.Context.ProgressPercent = 100        // 设置进度为100%
+	// 全量总行数可能来自 information_schema 估算，与实处理行数不一致；完成时以实处理为准
+	if t.Context.ProcessedRows > 0 {
+		t.Context.TotalRows = t.Context.ProcessedRows
+	}
 }
 
 // Fail 任务失败方法
