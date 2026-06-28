@@ -115,6 +115,41 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepsAutoIncrementKey(t *testing.T)
 	assert.False(t, strings.Contains(stripped, ",\n) ENGINE"))
 }
 
+func TestRestorePendingIndexes_ProcessesTablesSequentially(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	// sqlmock checks expectations in order by default. This guards the task-level
+	// contract that index builds are serialized in the order they were queued.
+	mock.ExpectExec("CREATE INDEX `idx_users_name` ON `target_db`.`users` \\(`name`\\)").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE UNIQUE INDEX `uk_orders_no` ON `target_db`.`orders` \\(`order_no`\\)").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ts := &TaskService{}
+	runtime := &taskRuntime{targetDB: targetDB}
+	pending := []pendingIndexRestore{
+		{
+			targetSchema: "target_db",
+			targetTable:  "users",
+			indexes: []map[string]interface{}{
+				{"name": "idx_users_name", "non_unique": 1, "type": "BTREE", "columns": "`name`"},
+			},
+		},
+		{
+			targetSchema: "target_db",
+			targetTable:  "orders",
+			indexes: []map[string]interface{}{
+				{"name": "uk_orders_no", "non_unique": 0, "type": "BTREE", "columns": "`order_no`"},
+			},
+		},
+	}
+
+	require.NoError(t, ts.restorePendingIndexes(runtime, "task-index-order", pending))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 // newTestTaskService 创建一个使用自定义数据目录的测试任务服务
 func newTestTaskService(dataDir string) *TaskService {
 	storage := NewFileTaskStorage(dataDir)

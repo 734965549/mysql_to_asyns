@@ -207,7 +207,7 @@ func runSyncDatabasePairInsertModeTest(
 		analyzer: &fixedIdentityAnalyzer{identity: identity},
 	}
 
-	err = ts.syncDatabasePair(context.Background(), task, runtime, fullSyncSrcSchema, fullSyncTgtSchema, []string{tableName})
+	err = ts.syncDatabasePair(context.Background(), task, runtime, fullSyncSrcSchema, fullSyncTgtSchema, []string{tableName}, nil)
 	require.NoError(t, err)
 	require.NoError(t, sourceMock.ExpectationsWereMet())
 	require.NoError(t, targetMock.ExpectationsWereMet())

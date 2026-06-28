@@ -4082,7 +4082,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                           type="secondary"
                           style="font-size: 12px"
                         >
-                          同步前删除非主键索引以提高写入性能，同步完成后自动重建
+                          同步前删除非主键索引以提高写入性能，所有表数据同步完成后按顺序统一重建
                         </a-typography-text>
                       </a-space>
                     </a-checkbox>
@@ -4091,14 +4091,15 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                   <a-form-item v-if="targetType === 'MYSQL'">
                     <a-checkbox v-model="taskForm.enable_read_only">
                       <a-space direction="vertical" :size="4">
-                        <span style="font-weight: 500">临时关闭目标库只读</span>
+                        <span style="font-weight: 500"
+                          >同步期间启用目标库只读保护</span
+                        >
 
                         <a-typography-text
                           type="secondary"
                           style="font-size: 12px"
                         >
-                          同步开始时自动关闭目标库 read_only /
-                          super_read_only，同步结束后自动恢复
+                          勾选后设置 read_only=ON、super_read_only=OFF，阻止普通账号写入；同步账号需具备相应权限，同步结束后恢复原状态。不勾选则不修改目标实例的只读状态
                         </a-typography-text>
                       </a-space>
                     </a-checkbox>

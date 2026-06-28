@@ -146,6 +146,16 @@ type taskRuntime struct {
 	cancel context.CancelFunc
 }
 
+// pendingIndexRestore records indexes removed for full-sync bulk loading.
+// Entries are accumulated across all database pairs and restored only after
+// every table has finished copying data, preventing index builds from
+// competing with still-running INSERT workloads.
+type pendingIndexRestore struct {
+	targetSchema string
+	targetTable  string
+	indexes      []map[string]interface{}
+}
+
 func (r *taskRuntime) Close() {
 
 	if r == nil {
@@ -2200,7 +2210,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		t.MarkFullSyncStarted(startPosStr)
 	})
 
-	// 依次同步每个库（库间串行，库内表间并行）
+	// 依次同步每个库（库间串行，库内表间并行）。索引恢复任务跨库累计，
+	// 必须等所有库、所有表的数据同步完成后再统一串行执行。
+	var pendingIndexRestores []pendingIndexRestore
 
 	for _, p := range pairs {
 
@@ -2218,7 +2230,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		}
 
-		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src]); err != nil {
+		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores); err != nil {
 
 			// 一并区分"被停止"和"真实失败"：库级 err 时再核查一次任务状态。
 			if s.isTaskStopped(taskID) {
@@ -2229,6 +2241,18 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		}
 
+	}
+
+	if task.Config.OptimizeIndex && len(pendingIndexRestores) > 0 {
+		if s.isTaskStopped(taskID) {
+			logger.Info("[Task %s] Full sync detected stop signal before restoring indexes", taskID)
+			return errFullSyncStoppedByUser
+		}
+		logger.Info("[Task %s] 阶段3: 所有表数据同步完成，开始按顺序恢复 %d 张表的索引...", taskID, len(pendingIndexRestores))
+		if err := s.restorePendingIndexes(runtime, taskID, pendingIndexRestores); err != nil {
+			return err
+		}
+		logger.Info("[Task %s] 阶段3完成：所有待恢复索引已按顺序处理", taskID)
 	}
 
 	// 完成前最后一次停止检查：避免末尾刚好用户按了暂停就被误标完成。
@@ -2356,9 +2380,9 @@ func adjustReadLimitForWideColumns(base int64, identity *entity.TableIdentity) i
 
 }
 
-// syncDatabasePair 同步单个源库到目标库（含全部或指定表）
-
-func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string) error {
+// syncDatabasePair 同步单个源库到目标库（含全部或指定表），只负责表结构准备和数据复制；索引恢复任务写入 pending，
+// 由全量同步最外层在所有数据库对完成后统一串行执行。
+func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, pending *[]pendingIndexRestore) error {
 
 	taskID := task.Config.ID
 
@@ -2449,6 +2473,20 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
+		// 对已存在且未重建的目标表，ensureTargetTable 不会返回索引定义。
+		// 在串行结构准备阶段统一删除并保存索引，避免各表数据 goroutine
+		// 并发执行 ALTER TABLE，也确保后续能集中恢复。
+		if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
+			logger.Info("[Task %s] Dropping non-primary indexes for target table %s.%s...", taskID, targetSchema, targetTableName)
+			indexes, dropErr := s.dropNonPrimaryKeyIndexes(runtime, targetSchema, targetTableName)
+			if dropErr != nil {
+				logger.Warn("[Task %s] Warning: Failed to drop indexes for %s.%s: %v", taskID, targetSchema, targetTableName, dropErr)
+			} else {
+				savedIndexes = indexes
+				logger.Info("[Task %s] Dropped %d indexes from target table %s.%s", taskID, len(savedIndexes), targetSchema, targetTableName)
+			}
+		}
+
 		logger.Info("[Task %s] Target table %s.%s is ready", taskID, targetSchema, targetTableName)
 
 		ready = append(ready, tableReady{name: tableName, targetName: targetTableName, identity: identity, savedIndexes: savedIndexes})
@@ -2469,7 +2507,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		wg.Add(1)
 
-		go func(sourceTableName, targetTableName string, identity *entity.TableIdentity, preparedIndexes []map[string]interface{}) {
+		go func(sourceTableName, targetTableName string, identity *entity.TableIdentity) {
 
 			defer wg.Done()
 
@@ -2520,28 +2558,6 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			// 标记该表开始同步（前端进度展示）
 			tableStartTime := time.Now()
 			s.startTableProgress(taskID, sourceSchema, tableName, 0)
-
-			savedIndexes := append([]map[string]interface{}(nil), preparedIndexes...)
-
-			if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
-
-				logger.Info("[Task %s] Dropping non-primary indexes for table %s...", taskID, sourceTableName)
-
-				indexes, err := s.dropNonPrimaryKeyIndexes(runtime, targetSchema, targetTableName)
-
-				if err != nil {
-
-					logger.Warn("[Task %s] Warning: Failed to drop indexes for %s: %v", taskID, sourceTableName, err)
-
-				} else {
-
-					savedIndexes = indexes
-
-					logger.Info("[Task %s] Dropped %d indexes from %s", taskID, len(savedIndexes), sourceTableName)
-
-				}
-
-			}
 
 			var tableProcessedRows int64
 
@@ -3854,22 +3870,6 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			}
 
-			if task.Config.OptimizeIndex && len(savedIndexes) > 0 {
-
-				logger.Info("[Task %s] Restoring indexes for target table %s.%s...", taskID, targetSchema, targetTableName)
-
-				if err := s.restoreIndexes(runtime, targetSchema, targetTableName, savedIndexes); err != nil {
-
-					logger.Warn("[Task %s] Warning: Failed to restore indexes for %s.%s: %v", taskID, targetSchema, targetTableName, err)
-
-				} else {
-
-					logger.Info("[Task %s] Restored indexes for target table %s.%s", taskID, targetSchema, targetTableName)
-
-				}
-
-			}
-
 			// 该表全量同步完成：记录断点为 Done，重启时直接跳过。
 			if canResume {
 				s.markTableDone(taskID, tableKey)
@@ -3880,7 +3880,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			s.completeTableProgress(taskID, sourceSchema, tableName)
 			s.refreshOverallProgress(taskID, task.Context.StartTime, s.getTaskTotalRows(taskID))
 
-		}(r.name, r.targetName, r.identity, r.savedIndexes)
+		}(r.name, r.targetName, r.identity)
 
 	}
 
@@ -3892,6 +3892,19 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		return <-errChan
 
+	}
+
+	if pending != nil && task.Config.OptimizeIndex {
+		for _, r := range ready {
+			if len(r.savedIndexes) == 0 {
+				continue
+			}
+			*pending = append(*pending, pendingIndexRestore{
+				targetSchema: targetSchema,
+				targetTable:  r.targetName,
+				indexes:      append([]map[string]interface{}(nil), r.savedIndexes...),
+			})
+		}
 	}
 
 	return nil
@@ -6475,6 +6488,23 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 	return savedIndexes, nil
 
+}
+
+// restorePendingIndexes 按表顺序恢复全量同步期间移除的索引。
+// 调用方必须确保所有表数据已经同步成功；这里刻意保持串行，避免多个
+// CREATE INDEX 同时争抢目标实例的 CPU、磁盘 IO 和临时空间。
+func (s *TaskService) restorePendingIndexes(runtime *taskRuntime, taskID string, pending []pendingIndexRestore) error {
+	for _, item := range pending {
+		if len(item.indexes) == 0 {
+			continue
+		}
+		logger.Info("[Task %s] Restoring indexes for target table %s.%s...", taskID, item.targetSchema, item.targetTable)
+		if err := s.restoreIndexes(runtime, item.targetSchema, item.targetTable, item.indexes); err != nil {
+			return fmt.Errorf("restore indexes for %s.%s: %w", item.targetSchema, item.targetTable, err)
+		}
+		logger.Info("[Task %s] Restored indexes for target table %s.%s", taskID, item.targetSchema, item.targetTable)
+	}
+	return nil
 }
 
 // restoreIndexes 恢复索引
