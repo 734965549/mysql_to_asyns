@@ -41,6 +41,7 @@
   # conn_max_lifetime_seconds = 120
   # intra_table_legacy_cap = 64
   # intra_table_hard_max = 512
+  # index_restore_hard_max = 16
   # api_default_worker_count = 32
   # api_default_batch_size = 2000
 

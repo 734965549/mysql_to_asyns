@@ -758,6 +758,8 @@ function resetForm() {
 
     optimize_index: false,
 
+    index_restore_worker_count: 0,
+
     enable_read_only: false,
 
     enable_drop_table_before_ddl: false,
@@ -1562,6 +1564,8 @@ function fillTaskFormFromTask(task) {
     enable_limit_one: task.config.enable_limit_one,
 
     optimize_index: task.config.optimize_index || false,
+
+    index_restore_worker_count: task.config.index_restore_worker_count ?? 0,
 
     enable_read_only: task.config.enable_read_only || false,
 
@@ -4086,6 +4090,33 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                         </a-typography-text>
                       </a-space>
                     </a-checkbox>
+                  </a-form-item>
+
+                  <a-form-item
+                    v-if="targetType === 'MYSQL' && taskForm.optimize_index"
+                    field="index_restore_worker_count"
+                    label="索引回放并发度"
+                  >
+                    <a-input-number
+                      :model-value="taskForm.index_restore_worker_count"
+                      @update:model-value="
+                        (v) => (taskForm.index_restore_worker_count = v ?? 0)
+                      "
+                      :min="0"
+                      :max="16"
+                      :step="1"
+                      :precision="0"
+                      placeholder="0=自动"
+                      allow-clear
+                    />
+                    <a-typography-text
+                      type="secondary"
+                      style="font-size: 12px; display: block; margin-top: 4px"
+                    >
+                      阶段3索引回放的表级并发度（不同表之间并行执行）。
+                      0 表示按 min(worker_count, 4) 自动推导；建议 ≤
+                      target_max_open_conns - 2。
+                    </a-typography-text>
                   </a-form-item>
 
                   <a-form-item v-if="targetType === 'MYSQL'">

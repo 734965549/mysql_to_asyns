@@ -72,23 +72,26 @@ type DatabaseConfig struct { // 定义数据库连接配置结构体
 // SyncTask. Do not put live resources such as DB handles or cancel functions in
 // this struct.
 type TaskConfig struct { // 定义任务配置结构体
-	StorageID                int64           `json:"storage_id,omitempty"`         // 存储ID
-	ID                       string          `json:"id"`                           // 任务ID
-	Name                     string          `json:"name"`                         // 任务名称
-	SyncLevel                SyncLevel       `json:"sync_level"`                   // 同步级别：DATABASE(全库) 或 TABLE(指定表)
-	SourceSchema             string          `json:"source_schema"`                // 源模式名
-	TargetSchema             string          `json:"target_schema"`                // 目标模式名
-	SourceDatabases          []string        `json:"source_databases"`             // 源数据库列表（库级别/表级别多库时使用）
-	TargetDatabase           string          `json:"target_database"`              // 目标数据库（库级别同步时，所有库同步到此库）
-	TargetDatabases          []string        `json:"target_databases"`             // 目标数据库列表（与 SourceDatabases 一一对应）
-	Tables                   []string        `json:"tables"`                       // 源表名列表
-	TargetTables             []string        `json:"target_tables"`                // 目标表名列表（与 Tables 一一对应；空则沿用源表名）
-	Mode                     SyncMode        `json:"mode"`                         // 同步模式
-	BatchSize                int             `json:"batch_size"`                   // 批处理大小
-	WorkerCount              int             `json:"worker_count"`                 // 工作线程数
-	IntraTableWorkerCount    int             `json:"intra_table_worker_count"`     // 单表内并行读/写 goroutine 数；0 表示沿用旧逻辑 min(worker_count,16)
-	EnableLimitOne           bool            `json:"enable_limit_one"`             // 无主键表LIMIT 1保护
-	OptimizeIndex            bool            `json:"optimize_index"`               // 索引优化：先删除非主键索引，数据迁移完成后再重建
+	StorageID             int64     `json:"storage_id,omitempty"`     // 存储ID
+	ID                    string    `json:"id"`                       // 任务ID
+	Name                  string    `json:"name"`                     // 任务名称
+	SyncLevel             SyncLevel `json:"sync_level"`               // 同步级别：DATABASE(全库) 或 TABLE(指定表)
+	SourceSchema          string    `json:"source_schema"`            // 源模式名
+	TargetSchema          string    `json:"target_schema"`            // 目标模式名
+	SourceDatabases       []string  `json:"source_databases"`         // 源数据库列表（库级别/表级别多库时使用）
+	TargetDatabase        string    `json:"target_database"`          // 目标数据库（库级别同步时，所有库同步到此库）
+	TargetDatabases       []string  `json:"target_databases"`         // 目标数据库列表（与 SourceDatabases 一一对应）
+	Tables                []string  `json:"tables"`                   // 源表名列表
+	TargetTables          []string  `json:"target_tables"`            // 目标表名列表（与 Tables 一一对应；空则沿用源表名）
+	Mode                  SyncMode  `json:"mode"`                     // 同步模式
+	BatchSize             int       `json:"batch_size"`               // 批处理大小
+	WorkerCount           int       `json:"worker_count"`             // 工作线程数
+	IntraTableWorkerCount int       `json:"intra_table_worker_count"` // 单表内并行读/写 goroutine 数；0 表示沿用旧逻辑 min(worker_count,16)
+	EnableLimitOne        bool      `json:"enable_limit_one"`         // 无主键表LIMIT 1保护
+	OptimizeIndex         bool      `json:"optimize_index"`           // 索引优化：先删除非主键索引，数据迁移完成后再重建
+	// IndexRestoreWorkerCount 阶段3索引回放的表级并发度；0 表示按 min(worker_count,4) 推导。
+	// 单表内多个索引仍串行重建，避免同表 MDL 锁竞争。建议 ≤ target_max_open_conns。
+	IndexRestoreWorkerCount  int             `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
 	EnableReadOnly           bool            `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
 	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后禁用全量断点续传
 	TxCommitEveryNParallel   int             `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐
@@ -453,6 +456,40 @@ func EffectiveIntraTableWorkers(intraConfigured, tableWorkerCount, legacyCap, ha
 	return intra // 返回表内worker数
 }
 
+// EffectiveIndexRestoreWorkers 计算阶段3索引回放的实际表级并发度。
+//   - configured: 任务配置 index_restore_worker_count
+//   - workerCount: 任务配置 worker_count（回退基准）
+//   - hardMax: 全局硬上限（来自 config.Sync.IndexRestoreHardMax，<=0 用内置 16）
+//
+// 推导规则：configured<=0 时取 min(workerCount,4)；再受 hardMax 封顶；最低 1。
+// 单表内多个索引不并发，仅表间并发。
+func EffectiveIndexRestoreWorkers(configured, workerCount, hardMax int) int {
+	const defaultCap = 4
+	const builtinHardMax = 16
+
+	n := configured
+	if n <= 0 {
+		n = workerCount
+		if n <= 0 {
+			n = defaultCap
+		}
+		if n > defaultCap {
+			n = defaultCap
+		}
+	}
+	max := hardMax
+	if max <= 0 {
+		max = builtinHardMax
+	}
+	if n > max {
+		n = max
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // EncryptPasswords 将任务中 SourceDB/TargetDB 的密码加密（存储前调用）
 // key 为空时不做任何加密操作
 func (t *SyncTask) EncryptPasswords(key string) error {
@@ -513,25 +550,25 @@ type Checkpoint struct { // 定义检查点结构体
 // TableProgressInfo 单表实时同步进度（仅内存，不持久化到任务存档）。
 // 用于前端任务详情页展示"当前同步到哪个表、该表进度、速度"等实时信息。
 type TableProgressInfo struct {
-	Schema        string     `json:"schema"`                    // 源库名
-	Table         string     `json:"table"`                     // 表名
-	TotalRows     int64      `json:"total_rows"`                // 该表估算总行数
-	ProcessedRows int64      `json:"processed_rows"`            // 该表已处理行数
-	ProgressPct   float64    `json:"progress_pct"`              // 该表进度百分比 0-100
-	SpeedRowsSec  float64    `json:"speed_rows_sec"`            // 该表同步速度（行/秒）
-	Status        string     `json:"status"`                    // pending / running / completed / failed
-	StartedAt     *time.Time `json:"started_at,omitempty"`      // 该表开始同步时间
-	CompletedAt   *time.Time `json:"completed_at,omitempty"`    // 该表完成时间
+	Schema        string     `json:"schema"`                 // 源库名
+	Table         string     `json:"table"`                  // 表名
+	TotalRows     int64      `json:"total_rows"`             // 该表估算总行数
+	ProcessedRows int64      `json:"processed_rows"`         // 该表已处理行数
+	ProgressPct   float64    `json:"progress_pct"`           // 该表进度百分比 0-100
+	SpeedRowsSec  float64    `json:"speed_rows_sec"`         // 该表同步速度（行/秒）
+	Status        string     `json:"status"`                 // pending / running / completed / failed
+	StartedAt     *time.Time `json:"started_at,omitempty"`   // 该表开始同步时间
+	CompletedAt   *time.Time `json:"completed_at,omitempty"` // 该表完成时间
 }
 
 // RunningProgress 任务运行时进度快照（仅内存，不持久化）。
 // 聚合所有表的进度信息，用于前端实时展示。
 type RunningProgress struct {
-	CurrentTable    string               `json:"current_table"`     // 当前正在同步的表 "schema.table"
-	Tables          []*TableProgressInfo `json:"tables"`            // 所有表的进度列表
-	OverallSpeed    float64              `json:"overall_speed"`     // 整体同步速度（行/秒）
-	ElapsedSeconds  float64              `json:"elapsed_seconds"`   // 已耗时（秒）
-	EstimatedRemain float64              `json:"estimated_remain"`  // 预估剩余时间（秒），-1 表示无法估算
-	Phase           string               `json:"phase"`             // 当前阶段：full / incremental
-	UpdatedAt       time.Time            `json:"updated_at"`        // 最后更新时间
+	CurrentTable    string               `json:"current_table"`    // 当前正在同步的表 "schema.table"
+	Tables          []*TableProgressInfo `json:"tables"`           // 所有表的进度列表
+	OverallSpeed    float64              `json:"overall_speed"`    // 整体同步速度（行/秒）
+	ElapsedSeconds  float64              `json:"elapsed_seconds"`  // 已耗时（秒）
+	EstimatedRemain float64              `json:"estimated_remain"` // 预估剩余时间（秒），-1 表示无法估算
+	Phase           string               `json:"phase"`            // 当前阶段：full / incremental
+	UpdatedAt       time.Time            `json:"updated_at"`       // 最后更新时间
 }

@@ -38,6 +38,8 @@ type SyncTuneConfig struct { // 定义同步调优配置结构体
 	IntraTableLegacyCap int `toml:"intra_table_legacy_cap" json:"intra_table_legacy_cap"` // 单表内并行封顶
 	// IntraTableHardMax 显式 intra 时的绝对上限；<=0 用内置 64
 	IntraTableHardMax int `toml:"intra_table_hard_max" json:"intra_table_hard_max"` // 单表内并行绝对上限
+	// IndexRestoreHardMax 阶段3索引回放表级并发的绝对上限；<=0 用内置 16
+	IndexRestoreHardMax int `toml:"index_restore_hard_max" json:"index_restore_hard_max"` // 索引回放并发绝对上限
 	// APIDefaultWorkerCount 创建任务未传 worker_count 时的默认表并发；<=0 则用 4
 	APIDefaultWorkerCount int `toml:"api_default_worker_count" json:"api_default_worker_count"` // API默认工作线程数
 	// APIDefaultBatchSize 创建任务未传 batch_size 时的默认批量；<=0 则用 1000

@@ -2248,11 +2248,16 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			logger.Info("[Task %s] Full sync detected stop signal before restoring indexes", taskID)
 			return errFullSyncStoppedByUser
 		}
-		logger.Info("[Task %s] 阶段3: 所有表数据同步完成，开始按顺序恢复 %d 张表的索引...", taskID, len(pendingIndexRestores))
-		if err := s.restorePendingIndexes(runtime, taskID, pendingIndexRestores); err != nil {
+		workers := taskEntity.EffectiveIndexRestoreWorkers(
+			task.Config.IndexRestoreWorkerCount,
+			task.Config.WorkerCount,
+			s.config.Sync.IndexRestoreHardMax,
+		)
+		logger.Info("[Task %s] 阶段3: 所有表数据同步完成，并发恢复 %d 张表索引 (workers=%d)...", taskID, len(pendingIndexRestores), workers)
+		if err := s.restorePendingIndexes(ctx, runtime, taskID, pendingIndexRestores, workers); err != nil {
 			return err
 		}
-		logger.Info("[Task %s] 阶段3完成：所有待恢复索引已按顺序处理", taskID)
+		logger.Info("[Task %s] 阶段3完成：所有待恢复索引已并发处理", taskID)
 	}
 
 	// 完成前最后一次停止检查：避免末尾刚好用户按了暂停就被误标完成。
@@ -2656,22 +2661,21 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			if canParallelSample {
 
-				var totalRows int64
-
-				if qErr := runtime.sourceDB.QueryRowContext(ctx,
-
-					fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", sourceSchema, tableName),
-				).Scan(&totalRows); qErr != nil || totalRows < int64(intraWorkers)*2 {
+				// 用 information_schema.TABLE_ROWS 替代 COUNT(*) 避免 88M 行的全索引扫描
+				// 估算值有 10%~40% 误差，但只用于计算 step，不影响分片正确性
+				estimatedReader := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity)
+				estimatedRows, estErr := estimatedReader.GetEstimatedCount(ctx)
+				if estErr != nil || estimatedRows < int64(intraWorkers)*2 {
 
 					canParallelSample = false
 
-					logger.Info("[Task %s] Skipping sample parallel for %s.%s", taskID, sourceSchema, tableName)
+					logger.Info("[Task %s] Skipping sample parallel for %s.%s (estimatedRows=%d, err=%v)", taskID, sourceSchema, tableName, estimatedRows, estErr)
 
 				} else {
 
 					var bErr error
 
-					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime.sourceDB, sourceSchema, tableName, cursorCols, totalRows, intraWorkers)
+					sampleBoundaries, bErr = s.samplePKBoundariesImproved(ctx, runtime.sourceDB, sourceSchema, tableName, cursorCols, estimatedRows, intraWorkers)
 
 					if bErr != nil {
 
@@ -4488,104 +4492,188 @@ func trimTrailingComma(line string) string {
 
 }
 
-// 并发采样边界计算：统一处理单列和复合主键
-
-func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource sourceQueryer, schema, table string, pkCols []string, totalRows int64, n int) ([]interface{}, error) {
-
+// 并发采样边界计算：keyset 步进 + 仅取 PK 列。
+//
+// 取代基于 LIMIT 1 OFFSET ? 的深分页串行循环，配合 information_schema.TABLE_ROWS
+// 估算行数，把预扫描从约 7.5× 全表索引扫描降为 ~1× 主键索引扫描，且每批是短查询、
+// 内存有界、可随 ctx 取消。详细设计见 docs/optimization/SAMPLE_BOUNDARY_OPTIMIZATION.md。
+//
+// 参数 estimatedRows 仅用于计算 step（每批扫描量），不参与分片正确性：
+//   - 估算偏小：循环提前结束，有效 worker 自动减少
+//   - 估算偏大：多扫一个 step 收敛，影响可忽略
+func (s *TaskService) samplePKBoundariesImproved(ctx context.Context, readSource sourceQueryer, schema, table string, pkCols []string, estimatedRows int64, n int) ([]interface{}, error) {
 	if readSource == nil {
-
 		return nil, fmt.Errorf("read source is not initialized")
-
 	}
-
 	if n < 2 {
-
 		return nil, fmt.Errorf("parallel worker count must be at least 2: %d", n)
-
 	}
-
-	if totalRows < int64(n)*2 {
-
+	if estimatedRows < int64(n)*2 {
 		// 数据量太少，不值得并行
-
-		return nil, fmt.Errorf("insufficient rows for parallel processing: %d", totalRows)
-
+		return nil, fmt.Errorf("insufficient rows for parallel processing: %d", estimatedRows)
+	}
+	if len(pkCols) == 0 {
+		return nil, fmt.Errorf("no primary key columns provided for %s.%s", schema, table)
 	}
 
-	// 构建 SELECT 和 ORDER BY 列列表
-	var quotedCols []string
-	for _, col := range pkCols {
-		quotedCols = append(quotedCols, fmt.Sprintf("`%s`", col))
+	// 构建 PK 列选择列表（仅取 PK 列，避免读全表列拖慢预扫描 IO）
+	quotedCols := make([]string, len(pkCols))
+	for i, c := range pkCols {
+		quotedCols[i] = fmt.Sprintf("`%s`", c)
 	}
 	colList := strings.Join(quotedCols, ", ")
 
-	boundaries := make([]interface{}, 0, n-1)
-
-	for i := 1; i < n; i++ {
-
-		offset := totalRows * int64(i) / int64(n)
-
-		if offset >= totalRows {
-
-			offset = totalRows - 1
-
-		}
-
-		var boundary interface{}
-
-		if len(pkCols) == 1 {
-			// 单列主键：返回单值
-			var pk interface{}
-			err := readSource.QueryRowContext(ctx,
-				fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
-					colList, schema, table, colList),
-				offset,
-			).Scan(&pk)
-			if err != nil {
-				return nil, fmt.Errorf("sample point %d failed: %v", i, err)
-			}
-			boundary = normalizePKBoundaryValue(pk)
-		} else {
-			// 复合主键：返回 []interface{} 包含所有列值
-			vals := make([]interface{}, len(pkCols))
-			ptrs := make([]interface{}, len(pkCols))
-			for j := range vals {
-				ptrs[j] = &vals[j]
-			}
-			err := readSource.QueryRowContext(ctx,
-				fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
-					colList, schema, table, colList),
-				offset,
-			).Scan(ptrs...)
-			if err != nil {
-				return nil, fmt.Errorf("sample point %d failed: %v", i, err)
-			}
-			result := make([]interface{}, len(vals))
-			for j, val := range vals {
-				result[j] = normalizePKBoundaryValue(val)
-			}
-			boundary = result
-		}
-
-		if len(boundaries) > 0 && compareBoundaryValues(boundaries[len(boundaries)-1], boundary) >= 0 {
-
-			logger.Warn("[SampleBoundary] Skip non-increasing boundary for %s.%s at offset=%d: prev=%v current=%v",
-				schema, table, offset, boundaries[len(boundaries)-1], boundary)
-
-			continue
-
-		}
-
-		boundaries = append(boundaries, boundary)
-
+	// step：相邻边界之间的行数。估算行数足够即可，不要求精确
+	step := estimatedRows / int64(n)
+	if step < 1 {
+		step = 1
 	}
 
-	logger.Info("Dynamic boundary sampling: totalRows=%d, requestedWorkers=%d, effectiveWorkers=%d, pkCols=%v, boundaries=%v",
+	boundaries := make([]interface{}, 0, n-1)
+	var lastID interface{}
 
-		totalRows, n, len(boundaries)+1, pkCols, boundaries)
+	for i := 0; i < n-1; i++ {
+		// 短查询：每步独立检查 ctx 取消，配合外层 ctx 超时/取消可立即退出
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		query, args := buildKeysetStepQuery(schema, table, pkCols, colList, quotedCols[0], lastID, step)
+
+		// 流式读取，仅保留最后一行作为下一边界；返回 (lastBoundary, rowsRead, err)
+		lastBoundary, rowsRead, err := readKeysetStepLastPK(ctx, readSource, query, args, len(pkCols))
+		if err != nil {
+			return nil, fmt.Errorf("keyset step %d failed: %v", i+1, err)
+		}
+		if rowsRead < step {
+			// 表已读完（实际行数少于估算），无更多可用边界
+			break
+		}
+		if lastBoundary == nil {
+			break
+		}
+
+		// 边界单调性保护（与原实现语义一致）
+		// 兜底：理论上 keyset + ORDER BY + 唯一主键保证单调递增，但若数据出现重复或回退，
+		// 必须仍推进 lastID 避免下一批重读相同行导致循环。
+		if len(boundaries) > 0 && compareBoundaryValues(boundaries[len(boundaries)-1], lastBoundary) >= 0 {
+			logger.Warn("[SampleBoundary] Skip non-increasing boundary for %s.%s at step=%d: prev=%v current=%v",
+				schema, table, i+1, boundaries[len(boundaries)-1], lastBoundary)
+			lastID = lastBoundary
+			continue
+		}
+
+		boundaries = append(boundaries, lastBoundary)
+		lastID = lastBoundary
+	}
+
+	logger.Info("Dynamic boundary sampling: estimatedRows=%d, requestedWorkers=%d, effectiveWorkers=%d, step=%d, pkCols=%v, boundaries=%v",
+		estimatedRows, n, len(boundaries)+1, step, pkCols, boundaries)
 
 	return boundaries, nil
+}
 
+// buildKeysetStepQuery 构造 keyset 步进 SQL：仅选择 PK 列，沿 PK 升序推进。
+// lastID 为 nil 时从表头开始；单列主键传标量；复合主键传 []interface{}。
+// 复合主键 (pk1,...,pkN) > (v1,...,vN) 展开为 OR 走联合索引，与 reader 包 keyset 风格一致。
+func buildKeysetStepQuery(schema, table string, pkCols []string, colList, firstQuoted string, lastID interface{}, step int64) (string, []interface{}) {
+	if len(pkCols) == 1 {
+		if lastID == nil {
+			return fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s ASC LIMIT ?",
+					colList, schema, table, colList),
+				[]interface{}{step}
+		}
+		return fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s > ? ORDER BY %s ASC LIMIT ?",
+				colList, schema, table, colList, colList),
+			[]interface{}{lastID, step}
+	}
+
+	// 复合主键
+	if lastID == nil {
+		return fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s ASC LIMIT ?",
+				colList, schema, table, colList),
+			[]interface{}{step}
+	}
+	lastIDs, ok := lastID.([]interface{})
+	if !ok || len(lastIDs) != len(pkCols) {
+		// 兜底：lastID 不是完整复合主键值，退化为按首列定位
+		return fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s > ? ORDER BY %s ASC LIMIT ?",
+				colList, schema, table, firstQuoted, colList),
+			[]interface{}{lastID, step}
+	}
+	whereClause, whereArgs := buildKeysetCompositeWhere(pkCols, lastIDs)
+	return fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s ORDER BY %s ASC LIMIT ?",
+			colList, schema, table, whereClause, colList),
+		append(whereArgs, step)
+}
+
+// buildKeysetCompositeWhere 将复合主键元组比较 (pk1,...,pkN) > (v1,...,vN) 展开为 OR 表达式，
+// 2 列示例：(pk1=? AND pk2>?) OR (pk1>?)；N 列通用：尾部相等、前一列更大的累加 OR。
+// 与 reader.buildCompositeKeysetWhere 等价；此处独立实现以避免 service 包依赖 reader 内部函数。
+func buildKeysetCompositeWhere(pkCols []string, lastIDs []interface{}) (string, []interface{}) {
+	n := len(pkCols)
+	var branches []string
+	var args []interface{}
+	for k := n; k >= 1; k-- {
+		var conds []string
+		for j := 0; j < k-1; j++ {
+			conds = append(conds, fmt.Sprintf("`%s` = ?", pkCols[j]))
+			args = append(args, lastIDs[j])
+		}
+		conds = append(conds, fmt.Sprintf("`%s` > ?", pkCols[k-1]))
+		args = append(args, lastIDs[k-1])
+		branches = append(branches, "("+strings.Join(conds, " AND ")+")")
+	}
+	return strings.Join(branches, " OR "), args
+}
+
+// readKeysetStepLastPK 流式读取一批 keyset 结果，仅返回最后一行的 PK 值。
+// 使用 rows.Next() 逐行消费 + 仅保留末位，内存 O(1)，不构建 row map。
+// 返回 (lastBoundary, rowsRead, err)：lastBoundary 为 nil 表示空结果；rowsRead 用于判断是否到达表尾。
+func readKeysetStepLastPK(ctx context.Context, readSource sourceQueryer, query string, args []interface{}, pkCount int) (interface{}, int64, error) {
+	rows, err := readSource.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var lastVals []interface{}
+	var read int64
+	for rows.Next() {
+		if pkCount == 1 {
+			var v interface{}
+			if err := rows.Scan(&v); err != nil {
+				return nil, read, err
+			}
+			lastVals = []interface{}{v}
+		} else {
+			vals := make([]interface{}, pkCount)
+			ptrs := make([]interface{}, pkCount)
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				return nil, read, err
+			}
+			lastVals = vals
+		}
+		read++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, read, err
+	}
+	if len(lastVals) == 0 {
+		return nil, read, nil
+	}
+
+	if pkCount == 1 {
+		return normalizePKBoundaryValue(lastVals[0]), read, nil
+	}
+	result := make([]interface{}, len(lastVals))
+	for i, v := range lastVals {
+		result[i] = normalizePKBoundaryValue(v)
+	}
+	return result, read, nil
 }
 
 // shortLockStepTimeout 单步（连接获取 / FTWRL / SHOW MASTER STATUS / UNLOCK）的超时上限。
@@ -6490,26 +6578,79 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 }
 
-// restorePendingIndexes 按表顺序恢复全量同步期间移除的索引。
-// 调用方必须确保所有表数据已经同步成功；这里刻意保持串行，避免多个
-// CREATE INDEX 同时争抢目标实例的 CPU、磁盘 IO 和临时空间。
-func (s *TaskService) restorePendingIndexes(runtime *taskRuntime, taskID string, pending []pendingIndexRestore) error {
+// restorePendingIndexes 在所有表数据同步完成后，按表级并发恢复全量同步期间移除的索引。
+// 单表内多个索引仍串行重建（避免同表 MDL 锁竞争）；不同表之间按 workers 并发。
+// 任一表失败或任务被停止时，通过 context 取消其余在途任务并尽快返回。
+func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRuntime, taskID string, pending []pendingIndexRestore, workers int) error {
+	if len(pending) == 0 {
+		return nil
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(pending) {
+		workers = len(pending)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+	sem := make(chan struct{}, workers)
+
 	for _, item := range pending {
 		if len(item.indexes) == 0 {
 			continue
 		}
-		logger.Info("[Task %s] Restoring indexes for target table %s.%s...", taskID, item.targetSchema, item.targetTable)
-		if err := s.restoreIndexes(runtime, item.targetSchema, item.targetTable, item.indexes); err != nil {
-			return fmt.Errorf("restore indexes for %s.%s: %w", item.targetSchema, item.targetTable, err)
+		// 停止信号快速退出
+		if s.isTaskStopped(taskID) {
+			cancel()
+			break
 		}
-		logger.Info("[Task %s] Restored indexes for target table %s.%s", taskID, item.targetSchema, item.targetTable)
+		if ctx.Err() != nil {
+			break
+		}
+
+		item := item
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Info("[Task %s] Restoring indexes for target table %s.%s...", taskID, item.targetSchema, item.targetTable)
+			if err := s.restoreIndexes(ctx, runtime, item.targetSchema, item.targetTable, item.indexes); err != nil {
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("restore indexes for %s.%s: %w", item.targetSchema, item.targetTable, err)
+					cancel() // 取消其余在途任务
+				})
+				return
+			}
+			logger.Info("[Task %s] Restored indexes for target table %s.%s", taskID, item.targetSchema, item.targetTable)
+		}()
 	}
-	return nil
+	wg.Wait()
+
+	// 停止信号优先于普通错误返回，与全量同步停止语义一致
+	if s.isTaskStopped(taskID) {
+		return errFullSyncStoppedByUser
+	}
+	if firstErr == nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return firstErr
 }
 
 // restoreIndexes 恢复索引
 
-func (s *TaskService) restoreIndexes(runtime *taskRuntime, schema, tableName string, indexes []map[string]interface{}) error {
+func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string, indexes []map[string]interface{}) error {
 
 	if runtime == nil || runtime.targetDB == nil {
 
@@ -6528,6 +6669,13 @@ func (s *TaskService) restoreIndexes(runtime *taskRuntime, schema, tableName str
 	logger.Info("[Task] Restoring %d indexes for table %s.%s...", len(indexes), schema, tableName)
 
 	for _, indexInfo := range indexes {
+
+		// 单表内串行：先做一次取消检查，再构造 DDL，避免无谓的 SQL 生成
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
 		indexName, ok := indexInfo["name"].(string)
 		if !ok || indexName == "" {
@@ -6566,13 +6714,13 @@ func (s *TaskService) restoreIndexes(runtime *taskRuntime, schema, tableName str
 				indexName, schema, tableName, columns)
 		}
 
-		_, err := targetDB.Exec(createSQL)
+		_, err := targetDB.ExecContext(ctx, createSQL)
 
 		if err != nil {
 
 			logger.Warn("Warning: failed to create index %s: %v (SQL: %s)", indexName, err, createSQL)
 
-			continue
+			return fmt.Errorf("create index `%s` on `%s`.`%s`: %w", indexName, schema, tableName, err)
 
 		}
 

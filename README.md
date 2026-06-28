@@ -449,30 +449,19 @@ Content-Type: application/json
 
 
 | 参数 | 类型 | 必填 | 说明 |
-
 |------|------|------|------|
-
 | name | string | 是 | 任务名称 |
-
 | mode | string | 是 | 同步模式：FULL/INCREMENTAL/ALL |
-
 | sync_level | string | 是 | 同步级别：DATABASE(库级别)/TABLE(表级别) |
-
 | source_schema | string | 是 | 源数据库名 |
-
 | target_schema | string | 是 | 目标数据库名 |
-
 | tables | array | 表级别必填 | 要同步的表列表 |
-
 | batch_size | int | 否 | 批量大小，默认1000 |
-
 | worker_count | int | 否 | 工作线程数，默认4 |
-
 | tx_commit_every_n_parallel | int | 否 | 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐 |
-
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
-
 | enable_drop_table_before_ddl | bool | 否 | 同步 DDL 前先执行 `DROP TABLE IF EXISTS`，适用于库级别/表级别同步，默认false |
+| index_restore_worker_count | int | 否 | 索引回放表级并发度，0=自动推导 min(worker_count,4)，默认0 |
 
 
 

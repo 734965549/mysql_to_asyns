@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"os"
@@ -115,19 +116,25 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepsAutoIncrementKey(t *testing.T)
 	assert.False(t, strings.Contains(stripped, ",\n) ENGINE"))
 }
 
-func TestRestorePendingIndexes_ProcessesTablesSequentially(t *testing.T) {
+func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	targetDB, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	// sqlmock checks expectations in order by default. This guards the task-level
-	// contract that index builds are serialized in the order they were queued.
+	// sqlmock checks expectations in order by default. Disable ordered matching
+	// because the concurrent implementation may dispatch the two tables in any
+	// order, and each table's CREATE INDEX may overlap with the other table's.
+	mock.MatchExpectationsInOrder(false)
 	mock.ExpectExec("CREATE INDEX `idx_users_name` ON `target_db`.`users` \\(`name`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE UNIQUE INDEX `uk_orders_no` ON `target_db`.`orders` \\(`order_no`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	ts := &TaskService{}
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"task-index-order": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusRunning}},
+		},
+	}
 	runtime := &taskRuntime{targetDB: targetDB}
 	pending := []pendingIndexRestore{
 		{
@@ -146,8 +153,240 @@ func TestRestorePendingIndexes_ProcessesTablesSequentially(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, ts.restorePendingIndexes(runtime, "task-index-order", pending))
+	require.NoError(t, ts.restorePendingIndexes(context.Background(), runtime, "task-index-order", pending, 2))
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRestorePendingIndexes_RespectsStopSignal(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	// 不期望任何 CREATE INDEX 被执行
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"task-stop": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusPaused}},
+		},
+	}
+	runtime := &taskRuntime{targetDB: targetDB}
+	pending := []pendingIndexRestore{
+		{
+			targetSchema: "db",
+			targetTable:  "t",
+			indexes: []map[string]interface{}{
+				{"name": "idx", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+			},
+		},
+	}
+
+	err = ts.restorePendingIndexes(context.Background(), runtime, "task-stop", pending, 2)
+	require.ErrorIs(t, err, errFullSyncStoppedByUser)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRestorePendingIndexes_FailsFastOnFirstError_Sequential(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	// workers=1 让派发顺序确定：表 a 报错后主循环 break 出去，保证表 b 的 Exec 永远不会被发出。
+	mock.ExpectExec("CREATE INDEX `idx_a` ON `db`.`a` \\(`c`\\)").
+		WillReturnError(fmt.Errorf("DDL failed"))
+
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"task-fail": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusRunning}},
+		},
+	}
+	runtime := &taskRuntime{targetDB: targetDB}
+	pending := []pendingIndexRestore{
+		{
+			targetSchema: "db",
+			targetTable:  "a",
+			indexes: []map[string]interface{}{
+				{"name": "idx_a", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+			},
+		},
+		{
+			targetSchema: "db",
+			targetTable:  "b",
+			indexes: []map[string]interface{}{
+				{"name": "idx_b", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+			},
+		},
+	}
+
+	err = ts.restorePendingIndexes(context.Background(), runtime, "task-fail", pending, 1)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "restore indexes for db.a")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// fakeIndexRestoreDriver 用于验证并发索引回放的 fail-fast / context 取消行为。
+// 它通过 started / proceed channel 与测试协同，确保两张表的 DDL 都被派发后再继续。
+type fakeIndexRestoreDriver struct {
+	mu      sync.Mutex
+	started chan struct{}
+	proceed chan struct{}
+	calls   []string
+}
+
+func (d *fakeIndexRestoreDriver) Open(string) (driver.Conn, error) {
+	return &fakeIndexRestoreConn{driver: d}, nil
+}
+
+type fakeIndexRestoreConn struct{ driver *fakeIndexRestoreDriver }
+
+func (c *fakeIndexRestoreConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *fakeIndexRestoreConn) Close() error              { return nil }
+func (c *fakeIndexRestoreConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+
+func (c *fakeIndexRestoreConn) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.driver.mu.Lock()
+	c.driver.calls = append(c.driver.calls, query)
+	c.driver.mu.Unlock()
+
+	select {
+	case c.driver.started <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	select {
+	case <-c.driver.proceed:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	if strings.Contains(query, "idx_a") {
+		return nil, errors.New("DDL failed for a")
+	}
+	return driver.ResultNoRows, nil
+}
+
+func TestRestorePendingIndexes_FailsFastOnFirstError_Concurrent(t *testing.T) {
+	drv := &fakeIndexRestoreDriver{
+		started: make(chan struct{}, 2),
+		proceed: make(chan struct{}),
+	}
+	sql.Register("fake_index_restore_failfast", drv)
+
+	targetDB, err := sql.Open("fake_index_restore_failfast", "")
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"task-fail-concurrent": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusRunning}},
+		},
+	}
+	runtime := &taskRuntime{targetDB: targetDB}
+	pending := []pendingIndexRestore{
+		{
+			targetSchema: "db",
+			targetTable:  "a",
+			indexes: []map[string]interface{}{
+				{"name": "idx_a", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+			},
+		},
+		{
+			targetSchema: "db",
+			targetTable:  "b",
+			indexes: []map[string]interface{}{
+				{"name": "idx_b", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+			},
+		},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ts.restorePendingIndexes(context.Background(), runtime, "task-fail-concurrent", pending, 2)
+	}()
+
+	// 等待两张表的 DDL 都被派发，证明是并发执行。
+	<-drv.started
+	<-drv.started
+	close(drv.proceed)
+
+	err = <-errCh
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "restore indexes for db.a")
+
+	drv.mu.Lock()
+	require.Len(t, drv.calls, 2)
+	drv.mu.Unlock()
+}
+
+func TestRestorePendingIndexes_ContextCanceled_SkipsAllWork(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"task-ctx-cancel": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusRunning}},
+		},
+	}
+	runtime := &taskRuntime{targetDB: targetDB}
+	pending := []pendingIndexRestore{
+		{
+			targetSchema: "db",
+			targetTable:  "a",
+			indexes: []map[string]interface{}{
+				{"name": "idx_a", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+			},
+		},
+		{
+			targetSchema: "db",
+			targetTable:  "b",
+			indexes: []map[string]interface{}{
+				{"name": "idx_b", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+			},
+		},
+	}
+
+	err = ts.restorePendingIndexes(ctx, runtime, "task-ctx-cancel", pending, 2)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRestoreIndexes_ContextCanceled_ReturnsEarly(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ts := &TaskService{}
+	runtime := &taskRuntime{targetDB: targetDB}
+	indexes := []map[string]interface{}{
+		{"name": "idx_a", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+	}
+
+	err = ts.restoreIndexes(ctx, runtime, "db", "a", indexes)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestEffectiveIndexRestoreWorkers(t *testing.T) {
+	cases := []struct{ configured, workerCount, hardMax, want int }{
+		{0, 0, 0, 4},    // 全默认 -> 4
+		{0, 8, 0, 4},    // 回退 min(8,4)=4
+		{0, 2, 0, 2},    // workerCount<4 -> 2
+		{6, 8, 0, 6},    // 显式 6
+		{32, 8, 16, 16}, // 受 hardMax 封顶
+		{0, 0, 2, 2},    // hardMax<defaultCap -> 2
+		{-1, 0, 0, 4},   // 负数当 0
+	}
+	for _, c := range cases {
+		require.Equal(t, c.want, taskEntity.EffectiveIndexRestoreWorkers(c.configured, c.workerCount, c.hardMax))
+	}
 }
 
 // newTestTaskService 创建一个使用自定义数据目录的测试任务服务
@@ -1739,51 +1978,163 @@ func TestBoundaryToString(t *testing.T) {
 	assert.Equal(t, "a\x00b\x00c", result)
 }
 
-func TestSamplePKBoundariesImproved_DirectBoundariesForAllWorkers(t *testing.T) {
+// TestSamplePKBoundariesImproved_KeysetStepsForAllWorkers 验证 keyset 步进算法：
+// 取代串行深 OFFSET，预期发出 (n-1) 条 WHERE pk > ? ... LIMIT ? 查询，产出的边界单调递增。
+func TestSamplePKBoundariesImproved_KeysetStepsForAllWorkers(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
 	defer db.Close()
 
-	const workers = 16
-	const totalRows int64 = 160
-	query := "SELECT `id` FROM `src`.`events` ORDER BY `id` LIMIT 1 OFFSET ?"
-	for i := 1; i < workers; i++ {
-		offset := totalRows * int64(i) / int64(workers)
-		mock.ExpectQuery(query).
-			WithArgs(offset).
-			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(fmt.Sprintf("%03d", offset)))
+	const workers = 4
+	const estimatedRows int64 = 40 // step = 40/4 = 10
+	const step int64 = 10
+
+	// Batch 1：从表头开始
+	firstQuery := "SELECT `id` FROM `src`.`events` ORDER BY `id` ASC LIMIT ?"
+	rows1 := sqlmock.NewRows([]string{"id"})
+	for i := int64(1); i <= step; i++ {
+		rows1.AddRow(fmt.Sprintf("%03d", i))
+	}
+	mock.ExpectQuery(firstQuery).WithArgs(step).WillReturnRows(rows1)
+
+	// Batch 2..n-1：每批用上批的末位作为下界，算法共 n-1 轮，故除首轮外再 mock n-2 批
+	for b := 1; b < workers-1; b++ {
+		lastID := fmt.Sprintf("%03d", int64(b)*step)
+		query := "SELECT `id` FROM `src`.`events` WHERE `id` > ? ORDER BY `id` ASC LIMIT ?"
+		rows := sqlmock.NewRows([]string{"id"})
+		for i := int64(1); i <= step; i++ {
+			rows.AddRow(fmt.Sprintf("%03d", int64(b)*step+i))
+		}
+		mock.ExpectQuery(query).WithArgs(lastID, step).WillReturnRows(rows)
 	}
 
 	var ts TaskService
-	boundaries, err := ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, totalRows, workers)
+	boundaries, err := ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, estimatedRows, workers)
 	require.NoError(t, err)
 	require.Len(t, boundaries, workers-1)
 	for i := 1; i < len(boundaries); i++ {
 		assert.Less(t, compareBoundaryValues(boundaries[i-1], boundaries[i]), 0)
 	}
+	// 校验末位为 "030"（第三批的 step*3 处）
+	assert.Equal(t, "030", boundaries[workers-2])
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestSamplePKBoundariesImproved_SkipsNonIncreasingBoundaries(t *testing.T) {
+// TestSamplePKBoundariesImproved_EstimatedRowsTooSmall 估算行数小于 n*2 时直接返回错误，
+// 表明不值得并行，调用方应回退到单线程 keyset 读取。
+func TestSamplePKBoundariesImproved_EstimatedRowsTooSmall(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
 	defer db.Close()
 
-	query := "SELECT `id` FROM `src`.`events` ORDER BY `id` LIMIT 1 OFFSET ?"
-	mock.ExpectQuery(query).
-		WithArgs(int64(2)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("a"))
-	mock.ExpectQuery(query).
-		WithArgs(int64(4)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("a"))
-	mock.ExpectQuery(query).
-		WithArgs(int64(6)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("c"))
+	var ts TaskService
+	// estimatedRows=5, n=4，要求 >= n*2=8，期望失败且不发任何查询
+	_, err = ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, 5, 4)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "insufficient rows")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestSamplePKBoundariesImproved_EstimatedTooLargeConvergesAtTableEnd 估算行数偏大：
+// 最后一批 rowsRead < step 即收敛，有效 worker 自动减少，调用方据此下调 intraWorkers。
+func TestSamplePKBoundariesImproved_EstimatedTooLargeConvergesAtTableEnd(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	defer db.Close()
+
+	const workers = 4
+	const estimatedRows int64 = 400 // step = 100，估算远大于实际
+	const step int64 = 100
+
+	// Batch 1: 满 batch
+	rows1 := sqlmock.NewRows([]string{"id"})
+	for i := int64(1); i <= step; i++ {
+		rows1.AddRow(fmt.Sprintf("%03d", i))
+	}
+	mock.ExpectQuery("SELECT `id` FROM `src`.`events` ORDER BY `id` ASC LIMIT ?").
+		WithArgs(step).
+		WillReturnRows(rows1)
+
+	// Batch 2: 满 batch
+	rows2 := sqlmock.NewRows([]string{"id"})
+	for i := int64(1); i <= step; i++ {
+		rows2.AddRow(fmt.Sprintf("%03d", step+i))
+	}
+	mock.ExpectQuery("SELECT `id` FROM `src`.`events` WHERE `id` > ? ORDER BY `id` ASC LIMIT ?").
+		WithArgs("100", step).
+		WillReturnRows(rows2)
+
+	// Batch 3: 只剩 30 行，rowsRead < step，触发收敛
+	rows3 := sqlmock.NewRows([]string{"id"})
+	for i := int64(1); i <= 30; i++ {
+		rows3.AddRow(fmt.Sprintf("%03d", 2*step+i))
+	}
+	mock.ExpectQuery("SELECT `id` FROM `src`.`events` WHERE `id` > ? ORDER BY `id` ASC LIMIT ?").
+		WithArgs("200", step).
+		WillReturnRows(rows3)
+
+	// Batch 4 不应发出（循环已收敛）
 
 	var ts TaskService
-	boundaries, err := ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, 8, 4)
+	boundaries, err := ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, estimatedRows, workers)
 	require.NoError(t, err)
-	require.Equal(t, []interface{}{"a", "c"}, boundaries)
+	// 实际行数 = 230, step=100，应产出 2 个边界（100, 200），有效 worker=3
+	require.Len(t, boundaries, 2)
+	assert.Equal(t, "100", boundaries[0])
+	assert.Equal(t, "200", boundaries[1])
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestSamplePKBoundariesImproved_CompositeKeysetSteps 复合主键 keyset 步进：
+// 验证 buildKeysetCompositeWhere 正确展开 (pk1,pk2) > (v1,v2) 为 OR 表达式，
+// 边界产出 []interface{} 类型，与 comparePKWithBoundary 续传逻辑兼容。
+func TestSamplePKBoundariesImproved_CompositeKeysetSteps(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	defer db.Close()
+
+	const workers = 3
+	const estimatedRows int64 = 30
+	const step int64 = 10
+
+	// Batch 1：从表头开始，末位 = ["002", "b"]
+	batch1 := [][]driver.Value{
+		{"001", "a"}, {"001", "b"}, {"001", "c"}, {"001", "d"}, {"001", "e"},
+		{"001", "f"}, {"001", "g"}, {"001", "h"}, {"001", "i"}, {"002", "b"},
+	}
+	rows1 := sqlmock.NewRows([]string{"id1", "id2"})
+	for _, r := range batch1 {
+		rows1.AddRow(r...)
+	}
+	mock.ExpectQuery("SELECT `id1`, `id2` FROM `src`.`events` ORDER BY `id1`, `id2` ASC LIMIT ?").
+		WithArgs(step).
+		WillReturnRows(rows1)
+
+	// Batch 2: WHERE (id1=id1_v AND id2>id2_v) OR (id1>id1_v)
+	// args: "002", "b", "002"
+	batch2 := [][]driver.Value{
+		{"002", "c"}, {"002", "d"}, {"002", "e"}, {"002", "f"}, {"002", "g"},
+		{"002", "h"}, {"002", "i"}, {"002", "j"}, {"003", "a"}, {"003", "b"},
+	}
+	rows2 := sqlmock.NewRows([]string{"id1", "id2"})
+	for _, r := range batch2 {
+		rows2.AddRow(r...)
+	}
+	mock.ExpectQuery("SELECT `id1`, `id2` FROM `src`.`events` WHERE (`id1` = ? AND `id2` > ?) OR (`id1` > ?) ORDER BY `id1`, `id2` ASC LIMIT ?").
+		WithArgs("002", "b", "002", step).
+		WillReturnRows(rows2)
+
+	var ts TaskService
+	boundaries, err := ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id1", "id2"}, estimatedRows, workers)
+	require.NoError(t, err)
+	require.Len(t, boundaries, workers-1)
+
+	// 末位为 ["002","b"] 和 ["003","b"]，均为 []interface{} 类型
+	expected := []interface{}{
+		[]interface{}{"002", "b"},
+		[]interface{}{"003", "b"},
+	}
+	assert.Equal(t, expected, boundaries)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

@@ -348,19 +348,23 @@ func TestSyncDatabasePair_ParallelRangePath_InsertMode(t *testing.T) {
 // TestSyncDatabasePair_ParallelSamplePath_InsertMode 非数值主键 sample 并行路径（task_service.go ~3400）。
 func TestSyncDatabasePair_ParallelSamplePath_InsertMode(t *testing.T) {
 	setupSource := func(mock sqlmock.Sqlmock) {
-		mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `" + fullSyncSrcSchema + "`.`events`").
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(100)))
-		mock.ExpectQuery("SELECT `code` FROM `" + fullSyncSrcSchema + "`.`events` ORDER BY `code` LIMIT 1 OFFSET \\?").
-			WithArgs(int64(50)).
-			WillReturnRows(sqlmock.NewRows([]string{"code"}).AddRow("mmm"))
+		// 新版：information_schema.TABLE_ROWS 替代 COUNT(*)
+		mock.ExpectQuery("SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = \\? AND TABLE_NAME = \\?").
+			WithArgs(fullSyncSrcSchema, "events").
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_ROWS"}).AddRow(int64(4))) // step = 4/2 = 2
+		// 新版：keyset 步进取边界（仅取 PK 列）。
+		// n=2 时循环仅跑 1 轮（i=0），无需 mock i=1；末位 = "mmm"，产出 1 个边界，2 个 worker。
+		mock.ExpectQuery("^SELECT `code` FROM `" + fullSyncSrcSchema + "`.`events` ORDER BY `code` ASC LIMIT \\?$").
+			WithArgs(int64(2)).
+			WillReturnRows(sqlmock.NewRows([]string{"code"}).AddRow("aaa").AddRow("mmm"))
 
 		rowsW0 := sqlmock.NewRows([]string{"code", "payload"}).AddRow("aaa", "p0")
-		mock.ExpectQuery("SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` ORDER BY `code` ASC LIMIT \\?").
+		mock.ExpectQuery("^SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` ORDER BY `code` ASC LIMIT \\?$").
 			WillReturnRows(rowsW0)
-		mock.ExpectQuery("SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` WHERE `code` > \\? ORDER BY `code` ASC LIMIT \\?").
+		mock.ExpectQuery("^SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` WHERE `code` > \\? ORDER BY `code` ASC LIMIT \\?$").
 			WillReturnRows(sqlmock.NewRows([]string{"code", "payload"}))
 
-		mock.ExpectQuery("SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` WHERE `code` > \\? ORDER BY `code` ASC LIMIT \\?").
+		mock.ExpectQuery("^SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` WHERE `code` > \\? ORDER BY `code` ASC LIMIT \\?$").
 			WillReturnRows(sqlmock.NewRows([]string{"code", "payload"}))
 	}
 	setupTarget := func(mock sqlmock.Sqlmock, insertSQL string) {
