@@ -1,0 +1,36 @@
+{
+  "config": {
+    "id": "concurrent_task_unique_0",
+    "name": "Concurrent Task",
+    "sync_level": "",
+    "source_schema": "",
+    "target_schema": "",
+    "source_databases": null,
+    "target_database": "",
+    "target_databases": null,
+    "tables": null,
+    "target_tables": null,
+    "mode": "",
+    "batch_size": 0,
+    "worker_count": 0,
+    "intra_table_worker_count": 0,
+    "enable_limit_one": false,
+    "optimize_index": false,
+    "index_restore_worker_count": 0,
+    "enable_read_only": false,
+    "enable_drop_table_before_ddl": false,
+    "tx_commit_every_n_parallel": 0
+  },
+  "context": {
+    "status": "PENDING",
+    "current_position": "",
+    "progress_percent": 0,
+    "total_rows": 0,
+    "processed_rows": 0,
+    "created_at": "2026-07-04T17:08:31.9836826+08:00",
+    "start_time": "0001-01-01T00:00:00Z",
+    "end_time": "0001-01-01T00:00:00Z",
+    "last_update_time": "2026-07-04T17:08:31.9836826+08:00",
+    "error_stack": ""
+  }
+}

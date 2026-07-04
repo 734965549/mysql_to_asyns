@@ -110,13 +110,14 @@ StartTask
 1. 全量开始前短锁拿到 binlog 位点 P0。
 2. 立即解锁，并把 P0 保存为增量 checkpoint。
 3. 全量阶段执行普通短查询，目标端默认使用 INSERT IGNORE 写入（`enable_drop_table_before_ddl=true` 时改用普通 INSERT）。
+   - 「DDL 前删除目标」按 `sync_level` 分支：DATABASE 级别在 `MarkFullSyncStarted` 后、任何目标表 DDL/数据写入前，对去重后的唯一目标库执行 `DROP DATABASE IF EXISTS` + `CREATE DATABASE IF NOT EXISTS`（utf8mb4/utf8mb4_unicode_ci），任一步失败终止全量；之后建表不再逐表 `DROP TABLE`。TABLE 级别保持每张表建表前 `DROP TABLE IF EXISTS`。两种级别均使用用户配置的目标库名/目标表名，仅在全量阶段执行一次，增量阶段不执行。
 4. ALL 模式全量完成后，增量从 P0 开始回放。
 5. P0 之后发生的变更会再次应用到目标库，用于追平全量读取期间的时间差。
 ```
 
 重复处理不是单一的“全部跳过”：
 
-- 全量批量写默认使用 `INSERT IGNORE`，重复键跳过，保证全量重跑或续跑幂等；`enable_drop_table_before_ddl=true` 时目标表已重建为空表，改用普通 `INSERT` 提升性能并禁用续传。
+- 全量批量写默认使用 `INSERT IGNORE`，重复键跳过，保证全量重跑或续跑幂等；`enable_drop_table_before_ddl=true` 时目标端已重建为空（DATABASE 级别重建目标库 / TABLE 级别重建目标表），改用普通 `INSERT` 提升性能并禁用续传。
 - 增量 PK/UK 表的 INSERT 使用 `INSERT ... ON DUPLICATE KEY UPDATE`，重复到达时要覆盖旧值，保证最终收敛。
 - 增量 UPDATE/DELETE 使用 PK/UK 定位；无主键表使用 before image 或行镜像做全列 WHERE。
 - 无主键表 INSERT 没有真正冲突键，无法可靠去重，仍建议给表补主键或唯一键。
@@ -134,7 +135,7 @@ StartTask
 
 全量写默认使用 `INSERT IGNORE`。这是为了让重复执行具备幂等性，并降低目标表已有重复键时的失败概率。全量不是增量回放，不使用 upsert 作为默认语义。
 
-例外：`enable_drop_table_before_ddl=true` 时目标表已被 DROP+CREATE 重建为空表，确认为空、不存在主键/唯一键冲突风险，此时全量写改用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE），省去唯一键检查的纯开销以提升性能；同时自动禁用全量续传，因为目标表已重建、续传游标不再有意义。
+例外：`enable_drop_table_before_ddl=true` 时目标端已被重建为空（DATABASE 级别 `DROP DATABASE`+`CREATE DATABASE` 重建目标库；TABLE 级别 `DROP TABLE`+建表重建目标表），确认为空、不存在主键/唯一键冲突风险，此时全量写改用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE），省去唯一键检查的纯开销以提升性能；同时自动禁用全量续传，因为目标端已重建、续传游标不再有意义。
 
 ## 4. 全量续传设计
 

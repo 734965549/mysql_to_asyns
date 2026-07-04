@@ -255,17 +255,18 @@ FULL_FAILED
 1. 任务进入 RUNNING。
 2. 如果需要全量，短暂执行 FLUSH TABLES WITH READ LOCK 捕获 binlog 起点，然后 UNLOCK。
 3. MarkFullSyncStarted(startPosition)。
-4. 按库/表遍历。
-5. ensureTargetTable：必要时建表、可选 DROP TABLE、可选优化索引。
-6. IdentityAnalyzer.AnalyzeTable 识别 PK/UK/no-PK。
-7. 根据身份策略选择 reader：
+4. 若 `enable_drop_table_before_ddl=true` 且 `sync_level=DATABASE`：在任何目标表 DDL/数据写入前，对去重后的唯一目标库执行 `DROP DATABASE IF EXISTS` + `CREATE DATABASE IF NOT EXISTS`，任一步失败终止全量；之后建表不再逐表 DROP TABLE。`sync_level=TABLE` 时保持原有逐表 DROP TABLE 行为。该删除仅在全量阶段执行一次，增量阶段不执行。
+5. 按库/表遍历。
+6. ensureTargetTable：必要时建表、可选 DROP TABLE（仅 TABLE 级别 + 开启删除时）、可选优化索引。
+7. IdentityAnalyzer.AnalyzeTable 识别 PK/UK/no-PK。
+8. 根据身份策略选择 reader：
    - PK/UK：RangeShardingReader，支持 keyset/range。
    - no-PK：CursorReader，流式读，表级续传。
-8. BatchWriter 写目标库；全量批量写默认使用 INSERT IGNORE（`enable_drop_table_before_ddl=true` 时目标表已重建，改用普通 INSERT 并禁用续传）。
-9. 写事务提交后才能推进 full_sync_resume 游标。
-10. 表完成后 MarkTableDone。
-11. 全部完成后 MarkFullSyncCompleted。
-12. ALL 模式继续进入增量；FULL 模式完成任务。
+9. BatchWriter 写目标库；全量批量写默认使用 INSERT IGNORE（`enable_drop_table_before_ddl=true` 时目标端已重建为空，改用普通 INSERT 并禁用续传）。
+10. 写事务提交后才能推进 full_sync_resume 游标。
+11. 表完成后 MarkTableDone。
+12. 全部完成后 MarkFullSyncCompleted。
+13. ALL 模式继续进入增量；FULL 模式完成任务。
 ```
 
 读路径续传能力：

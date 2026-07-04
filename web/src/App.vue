@@ -4139,9 +4139,22 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                   <a-form-item v-if="targetType === 'MYSQL'">
                     <a-checkbox v-model="taskForm.enable_drop_table_before_ddl">
                       <a-space direction="vertical" :size="4">
-                        <span style="font-weight: 500">同步 DDL 前删除目标表</span>
+                        <span style="font-weight: 500">{{
+                          selectedSyncLevel === "database"
+                            ? "同步前删除目标库"
+                            : "同步 DDL 前删除目标表"
+                        }}</span>
 
                         <a-typography-text
+                          v-if="selectedSyncLevel === 'database'"
+                          type="danger"
+                          style="font-size: 12px"
+                        >
+                          破坏性操作：库级别同步开始前会先 DROP DATABASE IF EXISTS 再 CREATE DATABASE 重建整个目标库，目标库内所有表与数据将丢失。每个唯一目标库只重建一次，之后不再逐表删除。
+                        </a-typography-text>
+
+                        <a-typography-text
+                          v-else
                           type="secondary"
                           style="font-size: 12px"
                         >

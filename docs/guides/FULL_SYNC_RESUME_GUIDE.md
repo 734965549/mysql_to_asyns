@@ -20,10 +20,10 @@
 满足以下全部条件时，暂停/失败后再次点击「启动」会**续传**而不是整库重跑：
 
 1. `sync_phase` 为 `FULL_STARTED` 或 `FULL_FAILED`（`FullSyncIncomplete()` 为真）
-2. 未开启 **DDL 前 DROP TABLE**（`enable_drop_table_before_ddl=false`）
+2. 未开启 **DDL 前删除目标**（`enable_drop_table_before_ddl=false`）
 3. 任务存档中仍保留 `full_sync_resume` 断点
 
-若全新启动（`sync_phase` 为空或已完成全量）、或开启了 DROP TABLE，系统会在全量开始前**清空** `full_sync_resume`，按全新一轮执行。
+若全新启动（`sync_phase` 为空或已完成全量）、或开启了「DDL 前删除目标」，系统会在全量开始前**清空** `full_sync_resume`，按全新一轮执行。
 
 ---
 
@@ -81,9 +81,9 @@
 - `sync_phase` 变为 `FULL_COMPLETED`（ALL 模式随后接增量）
 - `full_sync_resume` 被清空，不再占用存档空间
 
-### 开启「DDL 前 DROP TABLE」时
+### 开启「DDL 前删除目标」时
 
-续传**自动禁用**。每次启动会重建目标表，必须从全量头开始，否则会因跳过已 DROP 的表而丢数据。
+续传**自动禁用**。每次启动会重建目标端：DATABASE 级别同步先 `DROP DATABASE IF EXISTS` + `CREATE DATABASE` 重建目标库（每个唯一目标库一次，之后不再逐表删除）；TABLE 级别同步在每张表建表前 `DROP TABLE IF EXISTS`。两种级别都必须从全量头开始，否则会因跳过已重建的目标端而丢数据。该删除仅在全量阶段执行一次，增量阶段不执行。
 
 ---
 

@@ -460,7 +460,7 @@ Content-Type: application/json
 | worker_count | int | 否 | 工作线程数，默认4 |
 | tx_commit_every_n_parallel | int | 否 | 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐 |
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
-| enable_drop_table_before_ddl | bool | 否 | 同步 DDL 前先执行 `DROP TABLE IF EXISTS`，适用于库级别/表级别同步，默认false |
+| enable_drop_table_before_ddl | bool | 否 | 开启后按同步级别删除目标：DATABASE 级别先 `DROP DATABASE IF EXISTS` + `CREATE DATABASE` 重建目标库；TABLE 级别在每张表建表前执行 `DROP TABLE IF EXISTS`。默认false |
 | index_restore_worker_count | int | 否 | 索引回放表级并发度，0=自动推导 min(worker_count,4)，默认0 |
 
 
@@ -475,15 +475,16 @@ Content-Type: application/json
 
 **`enable_drop_table_before_ddl` 说明：**
 
-- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`）。
+- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`）。JSON 字段名、默认值、存储结构不变，无迁移要求。
 
-- 当目标库中已存在同名表时，如果开启该开关，任务会在执行 `CREATE TABLE ... LIKE ...` 或回放 `SHOW CREATE TABLE` 之前，先执行：`DROP TABLE IF EXISTS \`目标库\`.\`目标表\``。
+- 删除/重建行为按 `sync_level` 分支执行，且仅在全量阶段（`MarkFullSyncStarted` 之后、任何目标表 DDL/数据写入前）执行一次；增量阶段或已跳过全量阶段时不执行删除：
 
-- 该行为会在库级别同步和表级别同步中生效，适合“每次都以源表结构重建目标表”的场景。
+  - **DATABASE 级别**：对去重后的每个唯一目标库依次执行 `DROP DATABASE IF EXISTS \`目标库\`` 与 `CREATE DATABASE IF NOT EXISTS \`目标库\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`（使用用户配置的目标库名，`TargetDatabases`/`TargetSchema` 为空才回退源名）。任一步失败立即终止全量同步并标记 `FULL_FAILED`。库级重建完成后，建表阶段不再逐表执行 `DROP TABLE`（目标库已为空）。多个源库映射到同一目标库时，该目标库只重建一次。
+  - **TABLE 级别**：保持原有行为，在每张表执行 `CREATE TABLE ... LIKE ...` 或回放 `SHOW CREATE TABLE` 之前，先执行 `DROP TABLE IF EXISTS \`目标库\`.\`目标表\``（使用用户配置的目标库/目标表名，`TargetTables` 为空才回退源表名）。
 
-- 注意：开启后会删除目标表及其数据，请确认目标库允许覆盖。
+- 注意：开启后会删除目标库/目标表及其数据，请确认目标端允许覆盖。按用户选择，不新增"源目标同实例同名库"保护；配置如此映射时仍会执行删除。
 
-- 写入与续传副作用：目标表被 DROP+CREATE 重建为空表后，全量写改用普通 `INSERT`（省去 `INSERT IGNORE` 的唯一键检查开销，提升性能），同时自动禁用全量续传——因为目标表已重建，续传游标不再有意义。默认（关闭该开关时）全量写仍使用 `INSERT IGNORE` 以保证幂等。
+- 写入与续传副作用（两种级别一致）：目标端被重建为空后，全量写改用普通 `INSERT`（省去 `INSERT IGNORE` 的唯一键检查开销，提升性能），同时自动禁用全量续传——因为目标端已重建，续传游标不再有意义。默认（关闭该开关时）全量写仍使用 `INSERT IGNORE` 以保证幂等。
 
 
 
@@ -534,7 +535,7 @@ Content-Type: application/json
 **说明：**
 
 - 更新任务时，请把需要保留的字段一并传入，后端按请求体覆盖对应配置。
-- `enable_drop_table_before_ddl=true` 时，任务在同步表结构前会先执行 `DROP TABLE IF EXISTS`。
+- `enable_drop_table_before_ddl=true` 时，任务在同步前按 `sync_level` 删除目标：DATABASE 级别重建目标库（`DROP DATABASE` + `CREATE DATABASE`），TABLE 级别在每张表建表前执行 `DROP TABLE IF EXISTS`。
 - 如果只想切换该开关，可以只传该字段和任务标识相关的必要字段，但建议前端保存完整配置，避免遗漏。
 
 
@@ -1061,7 +1062,7 @@ mysql-to-sync/
 
 - 无主键表：单协程流式读取（仅表级续传，中断后整表重跑）
 
-- 批量插入：默认使用批量 `INSERT IGNORE` 语句；`enable_drop_table_before_ddl=true` 时目标表已 DROP 重建为空表，改用普通 INSERT 省去唯一键检查开销，同时自动禁用全量续传
+- 批量插入：默认使用批量 `INSERT IGNORE` 语句；`enable_drop_table_before_ddl=true` 时目标端已重建为空（DATABASE 级别重建目标库 / TABLE 级别重建目标表），改用普通 INSERT 省去唯一键检查开销，同时自动禁用全量续传
 
 
 
@@ -1467,7 +1468,7 @@ binlog_row_image=FULL
 
 **仍会从头的情况**：
 
-- 开启了「DDL 前 DROP TABLE」—— 每次启动会重建目标表，续传自动禁用
+- 开启了「DDL 前删除目标」—— 每次启动会重建目标端（DATABASE 级别重建目标库 / TABLE 级别重建目标表），续传自动禁用
 
 - 全量已整体完成（`sync_phase=FULL_COMPLETED`）后再次全量—— 属于新一轮同步
 

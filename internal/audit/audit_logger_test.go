@@ -9,23 +9,31 @@ import (
 	"time"
 )
 
-func TestNewAuditLogger(t *testing.T) {
-	logDir := "./test_audit_logs_new"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
-
+// newAuditLoggerForTest 创建审计日志器并在测试结束时自动关闭，避免 Windows 下
+// t.TempDir() 因文件句柄未释放而无法清理。
+func newAuditLoggerForTest(t *testing.T, logDir string) *AuditLogger {
 	logger := NewAuditLogger(logDir)
+	t.Cleanup(func() {
+		if err := logger.Close(); err != nil {
+			t.Logf("failed to close audit logger: %v", err)
+		}
+	})
+	return logger
+}
+
+func TestNewAuditLogger(t *testing.T) {
+	logDir := t.TempDir()
+
+	logger := newAuditLoggerForTest(t, logDir)
 	if logger == nil {
 		t.Fatal("expected logger, got nil")
 	}
 }
 
 func TestLog(t *testing.T) {
-	logDir := "./test_audit_logs_log"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	event := &Event{
 		TaskID:    "test_task_1",
 		EventType: EventTypeSyncStart,
@@ -71,11 +79,9 @@ func TestLog(t *testing.T) {
 }
 
 func TestLogSyncStart(t *testing.T) {
-	logDir := "./test_audit_logs_sync_start"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogSyncStart("task_sync_start", "test_db", "users")
 
 	events, err := logger.Query(QueryOptions{TaskID: "task_sync_start"})
@@ -91,11 +97,9 @@ func TestLogSyncStart(t *testing.T) {
 }
 
 func TestLogSyncComplete(t *testing.T) {
-	logDir := "./test_audit_logs_sync_complete"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogSyncComplete("task_sync_complete", "test_db", "users", 1000)
 	events, err := logger.Query(QueryOptions{TaskID: "task_sync_complete"})
 	if err != nil {
@@ -110,11 +114,9 @@ func TestLogSyncComplete(t *testing.T) {
 }
 
 func TestLogSyncFailed(t *testing.T) {
-	logDir := "./test_audit_logs_sync_failed"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	details := map[string]interface{}{"retry": float64(3)}
 	logger.LogSyncFailed("task_sync_failed", "test_db", "users", "binlog.001:123", "connection failed", details)
 	events, err := logger.Query(QueryOptions{TaskID: "task_sync_failed"})
@@ -133,11 +135,9 @@ func TestLogSyncFailed(t *testing.T) {
 }
 
 func TestLogDataWrite(t *testing.T) {
-	logDir := "./test_audit_logs_data_write"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogDataWrite("task_data_write", "test_db", "users", 100, true, "")
 	events, err := logger.Query(QueryOptions{TaskID: "task_data_write"})
 	if err != nil {
@@ -155,11 +155,9 @@ func TestLogDataWrite(t *testing.T) {
 }
 
 func TestLogDataUpdate(t *testing.T) {
-	logDir := "./test_audit_logs_data_update"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	details := map[string]interface{}{"columns": float64(5)}
 	logger.LogDataUpdate("task_data_update", "test_db", "users", true, "", details)
 	events, err := logger.Query(QueryOptions{TaskID: "task_data_update"})
@@ -175,11 +173,9 @@ func TestLogDataUpdate(t *testing.T) {
 }
 
 func TestLogDataDelete(t *testing.T) {
-	logDir := "./test_audit_logs_data_delete"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogDataDelete("task_data_delete", "test_db", "users", true, "")
 	events, err := logger.Query(QueryOptions{TaskID: "task_data_delete"})
 	if err != nil {
@@ -194,11 +190,9 @@ func TestLogDataDelete(t *testing.T) {
 }
 
 func TestLogError(t *testing.T) {
-	logDir := "./test_audit_logs_error"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	details := map[string]interface{}{"code": float64(500)}
 	logger.LogError("task_error", "internal error", details)
 	events, err := logger.Query(QueryOptions{TaskID: "task_error"})
@@ -217,11 +211,9 @@ func TestLogError(t *testing.T) {
 }
 
 func TestLogTaskCreated(t *testing.T) {
-	logDir := "./test_audit_logs_task_created"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogTaskCreated("task_created", "test_task")
 	events, err := logger.Query(QueryOptions{TaskID: "task_created"})
 	if err != nil {
@@ -236,11 +228,9 @@ func TestLogTaskCreated(t *testing.T) {
 }
 
 func TestLogTaskDeleted(t *testing.T) {
-	logDir := "./test_audit_logs_task_deleted"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogTaskDeleted("task_deleted")
 	events, err := logger.Query(QueryOptions{TaskID: "task_deleted"})
 	if err != nil {
@@ -255,11 +245,9 @@ func TestLogTaskDeleted(t *testing.T) {
 }
 
 func TestLogTaskPaused(t *testing.T) {
-	logDir := "./test_audit_logs_task_paused"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogTaskPaused("task_paused")
 	events, err := logger.Query(QueryOptions{TaskID: "task_paused"})
 	if err != nil {
@@ -274,11 +262,9 @@ func TestLogTaskPaused(t *testing.T) {
 }
 
 func TestLogTaskResumed(t *testing.T) {
-	logDir := "./test_audit_logs_task_resumed"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogTaskResumed("task_resumed")
 	events, err := logger.Query(QueryOptions{TaskID: "task_resumed"})
 	if err != nil {
@@ -293,11 +279,9 @@ func TestLogTaskResumed(t *testing.T) {
 }
 
 func TestQueryWithFilters(t *testing.T) {
-	logDir := "./test_audit_logs_query"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogSyncStart("task_query_1", "test_db", "users")
 	logger.LogSyncStart("task_query_2", "test_db", "orders")
 	logger.LogSyncComplete("task_query_1", "test_db", "users", 1000)
@@ -342,11 +326,9 @@ func TestQueryWithFilters(t *testing.T) {
 }
 
 func TestQueryWithEventType(t *testing.T) {
-	logDir := "./test_audit_logs_query_type"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogSyncStart("task_query_type_unique", "test_db", "users")
 	logger.LogSyncComplete("task_query_type_unique", "test_db", "users", 1000)
 	logger.LogDataWrite("task_query_type_unique", "test_db", "users", 100, true, "")
@@ -365,11 +347,9 @@ func TestQueryWithEventType(t *testing.T) {
 }
 
 func TestQueryWithLimit(t *testing.T) {
-	logDir := "./test_audit_logs_query_limit"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogSyncStart("task_query_limit_unique", "test_db", "users")
 	logger.LogSyncComplete("task_query_limit_unique", "test_db", "users", 1000)
 	logger.LogDataWrite("task_query_limit_unique", "test_db", "users", 100, true, "")
@@ -388,9 +368,7 @@ func TestQueryWithLimit(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
-	logDir := "./test_audit_logs_close"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
 	logger := NewAuditLogger(logDir)
 	if err := logger.Close(); err != nil {
@@ -399,11 +377,9 @@ func TestClose(t *testing.T) {
 }
 
 func TestRotateFile(t *testing.T) {
-	logDir := "./test_audit_logs_rotate"
-	os.RemoveAll(logDir)
-	defer os.RemoveAll(logDir)
+	logDir := t.TempDir()
 
-	logger := NewAuditLogger(logDir)
+	logger := newAuditLoggerForTest(t, logDir)
 	logger.LogSyncStart("task_rotate_unique", "test_db", "users")
 
 	if err := logger.rotateFile(); err != nil {

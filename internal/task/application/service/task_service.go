@@ -2210,6 +2210,41 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		t.MarkFullSyncStarted(startPosStr)
 	})
 
+	// 库级别同步且开启"DDL 前删除"时，在任何目标表 DDL/数据写入前统一重建目标库。
+	// 表级别同步保持原有逐表 DROP TABLE 行为（在 ensureTargetTable 内执行）。
+	// 增量阶段不会进入 executeFullSync，故此处天然不会在增量阶段执行删除。
+	dbLevelRebuilt := false
+	if task.Config.EnableDropTableBeforeDDL && task.Config.SyncLevel == taskEntity.SyncLevelDatabase {
+		var targetSchemas []string
+		for _, p := range pairs {
+			targetSchemas = append(targetSchemas, p.dst)
+		}
+		if err := s.rebuildTargetDatabases(runtime, taskID, targetSchemas); err != nil {
+
+			if errors.Is(err, errFullSyncStoppedByUser) {
+
+				return err
+
+			}
+
+			errMsg := fmt.Sprintf("Failed to rebuild target databases: %v", err)
+
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+
+				t.MarkFullSyncFailed(errMsg)
+
+			})
+
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+
+			return fmt.Errorf("%s", errMsg)
+
+		}
+		dbLevelRebuilt = true
+		logger.Info("[Task %s] Database-level rebuild completed for %d target database(s); per-table DROP TABLE disabled",
+			taskID, len(targetSchemas))
+	}
+
 	// 依次同步每个库（库间串行，库内表间并行）。索引恢复任务跨库累计，
 	// 必须等所有库、所有表的数据同步完成后再统一串行执行。
 	var pendingIndexRestores []pendingIndexRestore
@@ -2230,7 +2265,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		}
 
-		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores); err != nil {
+		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt); err != nil {
 
 			// 一并区分"被停止"和"真实失败"：库级 err 时再核查一次任务状态。
 			if s.isTaskStopped(taskID) {
@@ -2387,7 +2422,9 @@ func adjustReadLimitForWideColumns(base int64, identity *entity.TableIdentity) i
 
 // syncDatabasePair 同步单个源库到目标库（含全部或指定表），只负责表结构准备和数据复制；索引恢复任务写入 pending，
 // 由全量同步最外层在所有数据库对完成后统一串行执行。
-func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, pending *[]pendingIndexRestore) error {
+// dbLevelRebuilt 表示上层已在库级别统一重建过目标库（DATABASE 级别 + 开启删除），
+// 此时目标库已清空，ensureTargetTable 内的逐表 DROP TABLE 不再需要。
+func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, pending *[]pendingIndexRestore, dbLevelRebuilt bool) error {
 
 	taskID := task.Config.ID
 
@@ -2466,7 +2503,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		savedIndexes, err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, task.Config.EnableDropTableBeforeDDL)
+		// 库级别重建已清空整个目标库，逐表 DROP TABLE 不再需要；表级别保持原有删除行为。
+		effectiveDropBeforeDDL := task.Config.EnableDropTableBeforeDDL && !dbLevelRebuilt
+		savedIndexes, err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL)
 
 		if err != nil {
 
@@ -4163,6 +4202,85 @@ func (s *TaskService) applyDropBeforeDDL(conn *sql.Conn, schema, tableName strin
 	return s.dropTargetTableIfNeeded(conn, schema, tableName, enabled)
 }
 
+// rebuildTargetDatabases 在库级别同步且开启"DDL 前删除"时统一重建目标库：
+// 对每个唯一目标库依次执行 DROP DATABASE IF EXISTS 与 CREATE DATABASE IF NOT EXISTS
+// （utf8mb4 / utf8mb4_unicode_ci）。任一步失败立即返回错误，调用方应据此终止全量同步。
+// 仅在全量阶段、任何目标表 DDL/数据写入前调用一次；增量阶段不调用。
+func (s *TaskService) rebuildTargetDatabases(runtime *taskRuntime, taskID string, targetSchemas []string) error {
+
+	if runtime == nil || runtime.targetDB == nil {
+
+		return fmt.Errorf("task runtime is not initialized")
+
+	}
+
+	conn, err := runtime.targetDB.Conn(context.Background())
+
+	if err != nil {
+
+		return fmt.Errorf("failed to get target connection for database rebuild: %v", err)
+
+	}
+
+	defer conn.Close()
+
+	// 整体重建包在单次 withDDL 内，最小化 read_only 切换次数
+	seen := make(map[string]struct{})
+
+	return s.withDDL(runtime, func() error {
+
+		for _, schema := range targetSchemas {
+
+			if s.isTaskStopped(taskID) {
+
+				logger.Info("[Task %s] Full sync stopped during database rebuild", taskID)
+
+				return errFullSyncStoppedByUser
+
+			}
+
+			if strings.TrimSpace(schema) == "" {
+
+				continue
+
+			}
+
+			if _, ok := seen[schema]; ok {
+
+				continue
+
+			}
+
+			seen[schema] = struct{}{}
+
+			if _, e := conn.ExecContext(context.Background(),
+
+				fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", schema)); e != nil {
+
+				return fmt.Errorf("failed to drop target database %s: %v", schema, e)
+
+			}
+
+			logger.Info("[Task %s] Dropped target database %s before full sync (database-level rebuild)", taskID, schema)
+
+			if _, e := conn.ExecContext(context.Background(),
+
+				fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", schema)); e != nil {
+
+				return fmt.Errorf("failed to recreate target database %s: %v", schema, e)
+
+			}
+
+			logger.Info("[Task %s] Recreated target database %s (utf8mb4/utf8mb4_unicode_ci)", taskID, schema)
+
+		}
+
+		return nil
+
+	})
+
+}
+
 // ensureTargetTable 确保目标表存在
 
 func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targetSchema, sourceTableName, targetTableName string, optimizeIndex bool, dropBeforeDDL bool) ([]map[string]interface{}, error) {
@@ -4321,6 +4439,16 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		}
 
+		// 在剥离 CREATE TABLE 中的二级索引前，先提取自增列集合。
+
+		// 任何包含自增列的索引都会随 CREATE TABLE 保留在目标表上，因此不应再加入恢复列表，
+
+		// 避免阶段 3 再次创建同名索引触发 MySQL 1061。
+
+		autoIncrementColumns := extractAutoIncrementColumnsFromCreateSQL(strings.Split(createSQL, "\n"))
+
+		savedIndexes = filterIndexesUsingAutoIncrementColumns(savedIndexes, autoIncrementColumns)
+
 		createSQL = stripNonPrimaryIndexesFromCreateSQL(createSQL)
 
 	}
@@ -4444,16 +4572,76 @@ func extractAutoIncrementColumnsFromCreateSQL(lines []string) map[string]struct{
 func indexDefinitionUsesAnyColumn(indexDefinition string, columns map[string]struct{}) bool {
 
 	if len(columns) == 0 {
+
 		return false
+
 	}
 
 	for column := range columns {
+
 		if strings.Contains(indexDefinition, fmt.Sprintf("`%s`", column)) {
+
 			return true
+
 		}
+
 	}
 
 	return false
+
+}
+
+// indexColumnsUseAnyColumn 判断索引列字符串（如 "`col1`, `col2`"）是否包含给定列中的任意一个。
+
+func indexColumnsUseAnyColumn(columns string, cols map[string]struct{}) bool {
+
+	if len(cols) == 0 {
+
+		return false
+
+	}
+
+	for c := range cols {
+
+		if strings.Contains(columns, fmt.Sprintf("`%s`", c)) {
+
+			return true
+
+		}
+
+	}
+
+	return false
+
+}
+
+// filterIndexesUsingAutoIncrementColumns 从索引恢复列表中移除使用 AUTO_INCREMENT 列的索引。
+
+// 这些索引会随 CREATE TABLE 保留在目标表上，不应重复恢复。
+
+func filterIndexesUsingAutoIncrementColumns(indexes []map[string]interface{}, autoIncrementColumns map[string]struct{}) []map[string]interface{} {
+
+	if len(autoIncrementColumns) == 0 {
+
+		return indexes
+
+	}
+
+	filtered := make([]map[string]interface{}, 0, len(indexes))
+
+	for _, idx := range indexes {
+
+		cols, _ := idx["columns"].(string)
+
+		if !indexColumnsUseAnyColumn(cols, autoIncrementColumns) {
+
+			filtered = append(filtered, idx)
+
+		}
+
+	}
+
+	return filtered
 
 }
 
@@ -6548,14 +6736,18 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 	}
 
-	// 删除非主键索引
+	// 删除非主键索引；只有成功删除的索引才需要恢复，避免恢复阶段再次创建失败。
+
+	dropped := make([]map[string]interface{}, 0, len(savedIndexes))
 
 	for _, indexInfo := range savedIndexes {
 
 		name, ok := indexInfo["name"].(string)
 
 		if !ok || name == "" {
+
 			continue
+
 		}
 
 		dropQuery := fmt.Sprintf("ALTER TABLE `%s`.`%s` DROP INDEX `%s`", schema, tableName, name)
@@ -6570,11 +6762,13 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 		}
 
+		dropped = append(dropped, indexInfo)
+
 		logger.Info("Dropped index %s from table %s.%s", name, schema, tableName)
 
 	}
 
-	return savedIndexes, nil
+	return dropped, nil
 
 }
 
@@ -6648,6 +6842,95 @@ func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRu
 	return firstErr
 }
 
+// targetIndexExists 检查目标表上是否已存在同名索引，并校验定义是否一致。
+
+// 返回的 exists 表示是否存在；match 为 true 表示名称、唯一性、索引类型、列顺序及前缀长度均一致。
+
+func targetIndexExists(ctx context.Context, targetDB *sql.DB, schema, tableName, indexName string, nonUnique int, indexType, columns string) (bool, bool, error) {
+
+	rows, err := targetDB.QueryContext(ctx,
+
+		`SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX
+
+		 FROM information_schema.STATISTICS
+
+		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?
+
+		 ORDER BY SEQ_IN_INDEX`,
+
+		schema, tableName, indexName,
+	)
+
+	if err != nil {
+
+		return false, false, err
+
+	}
+
+	defer rows.Close()
+
+	var (
+		parts []string
+
+		actualNonUnique int
+
+		actualIndexType string
+
+		firstRowScanned bool
+	)
+
+	for rows.Next() {
+
+		var colName string
+
+		var subPart sql.NullString
+
+		var seqInIndex int
+
+		if err := rows.Scan(&actualNonUnique, &actualIndexType, &colName, &subPart, &seqInIndex); err != nil {
+
+			return false, false, err
+
+		}
+
+		firstRowScanned = true
+
+		if subPart.Valid && subPart.String != "" && subPart.String != "0" {
+
+			parts = append(parts, fmt.Sprintf("`%s`(%s)", colName, subPart.String))
+
+		} else {
+
+			parts = append(parts, fmt.Sprintf("`%s`", colName))
+
+		}
+
+	}
+
+	if err := rows.Err(); err != nil {
+
+		return false, false, err
+
+	}
+
+	if !firstRowScanned {
+
+		return false, false, nil
+
+	}
+
+	actualColumns := strings.Join(parts, ", ")
+
+	match := actualNonUnique == nonUnique &&
+
+		strings.EqualFold(actualIndexType, indexType) &&
+
+		strings.EqualFold(actualColumns, columns)
+
+	return true, match, nil
+
+}
+
 // restoreIndexes 恢复索引
 
 func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string, indexes []map[string]interface{}) error {
@@ -6698,23 +6981,61 @@ func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, 
 			indexType = v
 		}
 
-		// 构建 CREATE INDEX 语句（区分 UNIQUE / FULLTEXT / SPATIAL / 普通索引）
-		var createSQL string
-		if nonUnique == 0 {
-			createSQL = fmt.Sprintf("CREATE UNIQUE INDEX `%s` ON `%s`.`%s` (%s)",
-				indexName, schema, tableName, columns)
-		} else if strings.EqualFold(indexType, "FULLTEXT") {
-			createSQL = fmt.Sprintf("CREATE FULLTEXT INDEX `%s` ON `%s`.`%s` (%s)",
-				indexName, schema, tableName, columns)
-		} else if strings.EqualFold(indexType, "SPATIAL") {
-			createSQL = fmt.Sprintf("CREATE SPATIAL INDEX `%s` ON `%s`.`%s` (%s)",
-				indexName, schema, tableName, columns)
-		} else {
-			createSQL = fmt.Sprintf("CREATE INDEX `%s` ON `%s`.`%s` (%s)",
-				indexName, schema, tableName, columns)
+		// 恢复前检查目标表上是否已存在同名索引；定义一致则跳过，不一致则报错。
+
+		exists, match, err := targetIndexExists(ctx, targetDB, schema, tableName, indexName, nonUnique, indexType, columns)
+
+		if err != nil {
+
+			return fmt.Errorf("check existing index `%s` on `%s`.`%s`: %w", indexName, schema, tableName, err)
+
 		}
 
-		_, err := targetDB.ExecContext(ctx, createSQL)
+		if exists {
+
+			if match {
+
+				logger.Info("Index `%s` already exists on `%s`.`%s` with matching definition, skipping", indexName, schema, tableName)
+
+				continue
+
+			}
+
+			return fmt.Errorf("index `%s` already exists on `%s`.`%s` but with a different definition", indexName, schema, tableName)
+
+		}
+
+		// 构建 CREATE INDEX 语句（区分 UNIQUE / FULLTEXT / SPATIAL / 普通索引）
+
+		var createSQL string
+
+		if nonUnique == 0 {
+
+			createSQL = fmt.Sprintf("CREATE UNIQUE INDEX `%s` ON `%s`.`%s` (%s)",
+
+				indexName, schema, tableName, columns)
+
+		} else if strings.EqualFold(indexType, "FULLTEXT") {
+
+			createSQL = fmt.Sprintf("CREATE FULLTEXT INDEX `%s` ON `%s`.`%s` (%s)",
+
+				indexName, schema, tableName, columns)
+
+		} else if strings.EqualFold(indexType, "SPATIAL") {
+
+			createSQL = fmt.Sprintf("CREATE SPATIAL INDEX `%s` ON `%s`.`%s` (%s)",
+
+				indexName, schema, tableName, columns)
+
+		} else {
+
+			createSQL = fmt.Sprintf("CREATE INDEX `%s` ON `%s`.`%s` (%s)",
+
+				indexName, schema, tableName, columns)
+
+		}
+
+		_, err = targetDB.ExecContext(ctx, createSQL)
 
 		if err != nil {
 

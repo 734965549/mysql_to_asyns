@@ -6,7 +6,9 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -121,10 +123,18 @@ func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
+	emptyStatsRows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+
 	// sqlmock checks expectations in order by default. Disable ordered matching
 	// because the concurrent implementation may dispatch the two tables in any
 	// order, and each table's CREATE INDEX may overlap with the other table's.
 	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("target_db", "users", "idx_users_name").
+		WillReturnRows(emptyStatsRows)
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("target_db", "orders", "uk_orders_no").
+		WillReturnRows(emptyStatsRows)
 	mock.ExpectExec("CREATE INDEX `idx_users_name` ON `target_db`.`users` \\(`name`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE UNIQUE INDEX `uk_orders_no` ON `target_db`.`orders` \\(`order_no`\\)").
@@ -189,7 +199,12 @@ func TestRestorePendingIndexes_FailsFastOnFirstError_Sequential(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
+	emptyStatsRows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+
 	// workers=1 让派发顺序确定：表 a 报错后主循环 break 出去，保证表 b 的 Exec 永远不会被发出。
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "a", "idx_a").
+		WillReturnRows(emptyStatsRows)
 	mock.ExpectExec("CREATE INDEX `idx_a` ON `db`.`a` \\(`c`\\)").
 		WillReturnError(fmt.Errorf("DDL failed"))
 
@@ -264,6 +279,19 @@ func (c *fakeIndexRestoreConn) ExecContext(ctx context.Context, query string, _ 
 		return nil, errors.New("DDL failed for a")
 	}
 	return driver.ResultNoRows, nil
+}
+
+func (c *fakeIndexRestoreConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	return &fakeIndexRestoreRows{}, nil
+}
+
+// fakeIndexRestoreRows 返回空结果集，用于 fakeIndexRestoreConn 的 QueryContext。
+type fakeIndexRestoreRows struct{}
+
+func (r *fakeIndexRestoreRows) Columns() []string { return nil }
+func (r *fakeIndexRestoreRows) Close() error      { return nil }
+func (r *fakeIndexRestoreRows) Next(dest []driver.Value) error {
+	return io.EOF
 }
 
 func TestRestorePendingIndexes_FailsFastOnFirstError_Concurrent(t *testing.T) {
@@ -371,6 +399,141 @@ func TestRestoreIndexes_ContextCanceled_ReturnsEarly(t *testing.T) {
 
 	err = ts.restoreIndexes(ctx, runtime, "db", "a", indexes)
 	require.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestFilterIndexesUsingAutoIncrementColumns(t *testing.T) {
+	indexes := []map[string]interface{}{
+		{"name": "idx_id", "columns": "`id`"},
+		{"name": "idx_name", "columns": "`name`"},
+		{"name": "idx_id_name", "columns": "`id`, `name`"},
+	}
+
+	autoIncs := map[string]struct{}{"id": {}}
+	filtered := filterIndexesUsingAutoIncrementColumns(indexes, autoIncs)
+
+	require.Len(t, filtered, 1)
+	assert.Equal(t, "idx_name", filtered[0]["name"])
+}
+
+func TestFilterIndexesUsingAutoIncrementColumns_EmptyAutoIncrements(t *testing.T) {
+	indexes := []map[string]interface{}{
+		{"name": "idx_id", "columns": "`id`"},
+	}
+
+	filtered := filterIndexesUsingAutoIncrementColumns(indexes, nil)
+	assert.Equal(t, indexes, filtered)
+}
+
+func TestDropNonPrimaryKeyIndexes_SkipsFailedDrops(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	rows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name",
+		"Collation", "Cardinality", "Sub_part", "Packed", "Null",
+		"Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).AddRow("t", 1, "idx_a", 1, "a", "A", 0, nil, nil, "YES", "BTREE", "", "", "YES", nil).
+		AddRow("t", 1, "idx_b", 1, "b", "A", 0, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+
+	mock.ExpectQuery("SHOW INDEX FROM `db`.`t`").WillReturnRows(rows)
+	mock.ExpectExec("ALTER TABLE `db`.`t` DROP INDEX `idx_a`").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE `db`.`t` DROP INDEX `idx_b`").WillReturnError(fmt.Errorf("lock wait timeout"))
+
+	ts := &TaskService{}
+	runtime := &taskRuntime{targetDB: targetDB}
+	dropped, err := ts.dropNonPrimaryKeyIndexes(runtime, "db", "t")
+
+	require.NoError(t, err)
+	require.Len(t, dropped, 1)
+	assert.Equal(t, "idx_a", dropped[0]["name"])
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestTargetIndexExists_MatchingIndex(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
+		AddRow(1, "BTREE", "c", nil, 1)
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_c").
+		WillReturnRows(rows)
+
+	exists, match, err := targetIndexExists(context.Background(), targetDB, "db", "t", "idx_c", 1, "BTREE", "`c`")
+
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.True(t, match)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestTargetIndexExists_ConflictingIndex(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
+		AddRow(1, "BTREE", "d", nil, 1)
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_c").
+		WillReturnRows(rows)
+
+	exists, match, err := targetIndexExists(context.Background(), targetDB, "db", "t", "idx_c", 1, "BTREE", "`c`")
+
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.False(t, match)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRestoreIndexes_SkipsExistingMatchingIndex(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
+		AddRow(1, "BTREE", "c", nil, 1)
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_c").
+		WillReturnRows(rows)
+	// 不应再执行 CREATE INDEX
+
+	ts := &TaskService{}
+	runtime := &taskRuntime{targetDB: targetDB}
+	indexes := []map[string]interface{}{
+		{"name": "idx_c", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+	}
+
+	err = ts.restoreIndexes(context.Background(), runtime, "db", "t", indexes)
+
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRestoreIndexes_FailsOnConflictingExistingIndex(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
+		AddRow(1, "BTREE", "d", nil, 1)
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_c").
+		WillReturnRows(rows)
+
+	ts := &TaskService{}
+	runtime := &taskRuntime{targetDB: targetDB}
+	indexes := []map[string]interface{}{
+		{"name": "idx_c", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+	}
+
+	err = ts.restoreIndexes(context.Background(), runtime, "db", "t", indexes)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -2922,6 +3085,78 @@ func TestExecuteSync_FullPauseDoesNotCompleteTask(t *testing.T) {
 		"paused full sync must NOT advance phase to FULL_COMPLETED")
 	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase,
 		"paused full sync must NOT be flipped to FULL_FAILED either")
+}
+
+// TestExecuteSync_DatabaseRebuildPauseKeepsPhase 覆盖库级别重建被暂停时，
+// executeFullSync 必须把 errFullSyncStoppedByUser 原样返回，不能调用 MarkFullSyncFailed，
+// 因此 SyncPhase 保持 FULL_STARTED 而不被翻转为 FULL_FAILED。
+func TestExecuteSync_DatabaseRebuildPauseKeepsPhase(t *testing.T) {
+	sourceDB, sourceMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer sourceDB.Close()
+	targetDB, targetMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	sourceMock.MatchExpectationsInOrder(false)
+	targetMock.MatchExpectationsInOrder(false)
+
+	// 源库：短锁取位点
+	sourceMock.ExpectExec(regexp.QuoteMeta("FLUSH TABLES WITH READ LOCK")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	sourceMock.ExpectQuery(regexp.QuoteMeta("SHOW MASTER STATUS")).
+		WillReturnRows(sqlmock.NewRows([]string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set"}).
+			AddRow("mysql-bin.000001", uint32(4), "", "", ""))
+	sourceMock.ExpectExec(regexp.QuoteMeta("UNLOCK TABLES")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// 目标库：库级别重建。第一个 DROP 故意延迟，让测试有机会在重建过程中暂停任务；
+	// 暂停后第二个库的迭代应被 isTaskStopped 拦截，不会执行 DROP/CREATE。
+	targetMock.ExpectExec(regexp.QuoteMeta("DROP DATABASE IF EXISTS `tgt_a`")).
+		WillDelayFor(500 * time.Millisecond).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	targetMock.ExpectExec(regexp.QuoteMeta("CREATE DATABASE IF NOT EXISTS `tgt_a` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ts := newTestTaskService(t.TempDir())
+	ts.sourceDB = sourceDB
+	ts.targetDB = targetDB
+	ts.analyzer = &fixedIdentityAnalyzer{identity: pkUsersIdentity()}
+	ts.checkpointManager = checkpoint.NewMemoryCheckpointManager()
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:                       "db_rebuild_pause",
+		Name:                     "DB Rebuild Pause",
+		Mode:                     taskEntity.SyncModeFull,
+		SyncLevel:                taskEntity.SyncLevelDatabase,
+		SourceDatabases:          []string{"src_a", "src_b"},
+		TargetDatabases:          []string{"tgt_a", "tgt_b"},
+		EnableDropTableBeforeDDL: true,
+	})
+	task.Start()
+	ts.tasks[task.Config.ID] = task
+
+	runtime := &taskRuntime{
+		sourceDB: sourceDB,
+		targetDB: targetDB,
+		analyzer: ts.analyzer,
+	}
+
+	// 在重建过程中暂停任务：延迟 100ms 确保 executeFullSync 已通过早停检查并进入 rebuild。
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		task.Pause()
+	}()
+
+	ts.executeSync(context.Background(), task.Config.ID, runtime)
+
+	assert.Equal(t, taskEntity.TaskStatusPaused, task.Context.Status,
+		"paused database rebuild must NOT be marked COMPLETED")
+	assert.Equal(t, taskEntity.SyncPhaseFullStarted, task.Context.SyncPhase,
+		"paused database rebuild must keep FULL_STARTED phase, not flip to FULL_FAILED")
+
+	require.NoError(t, sourceMock.ExpectationsWereMet())
+	require.NoError(t, targetMock.ExpectationsWereMet())
 }
 
 // TestErrFullSyncStoppedByUser_IsSentinel 守住 sentinel 的可识别性：
