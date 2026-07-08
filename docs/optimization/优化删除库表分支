@@ -8,8 +8,8 @@ Implementation Changes
 全量同步捕获 binlog 起点并标记 FULL_STARTED 后、任何目标表 DDL/数据写入前，统一处理库级删除。
 对目标库映射去重，使用固定连接依次执行安全引用的 DROP DATABASE IF EXISTS 和 CREATE DATABASE IF NOT EXISTS；任一步失败立即终止全量同步。
 库级分支重建数据库后，调用 ensureTargetTable 时关闭逐表删除；表级分支保持现有 DROP TABLE 行为。
-保持开启删除时禁用全量续传和使用普通 INSERT 的现有语义。
-UI 根据同步级别动态显示“删除目标库/目标表”及破坏性提示；同步更新 README、续传指南和设计文档。
+保持开启删除时重建目标端并使用普通 INSERT 的现有语义；当前全量中断后统一不续传。
+UI 根据同步级别动态显示“删除目标库/目标表”及破坏性提示；同步更新 README、全量中断处理指南和设计文档。
 JSON 字段、任务存储结构及默认值不变，无迁移要求。
 Test Plan
 DATABASE + 开启删除：目标库只重建一次，不执行 DROP TABLE。

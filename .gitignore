@@ -1,4 +1,4 @@
-﻿# Binaries for programs and plugins
+# Binaries for programs and plugins
 *.exe
 *.exe~
 *.dll
@@ -49,3 +49,7 @@ etc/application.toml
 # Temp files
 *.tmp
 *.bak
+
+# Test data directories (test runtime artifacts, not tracked fixtures)
+internal/task/application/service/test_task_service_*/
+internal/task/application/service/test_task_storage_*/

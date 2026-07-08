@@ -36,16 +36,15 @@ This is a Go 1.24 MySQL-to-MySQL sync service with a Vue management UI.
 
 ## Domain Rules
 
-- Keep `TaskStatus` and `SyncPhase` separate. `TaskStatus` is the external lifecycle state; `SyncPhase` decides whether full sync must run, resume, or hand off to incremental sync.
-- Store full-sync resume state in task archives at `context.full_sync_resume`. Do not move it to Redis. Redis/memory checkpoints are for incremental binlog positions.
-- Resume full sync only when `sync_phase` is `FULL_STARTED` or `FULL_FAILED`, `enable_drop_table_before_ddl=false`, and `full_sync_resume` still exists.
-- Disable or clear full-sync resume when `enable_drop_table_before_ddl=true`, because the target table may be rebuilt.
-- Advance full-sync row cursors only after the write transaction commits.
-- Keep full-sync read paths distinct: `keyset` and `range` support row-level resume; `sample` and `nopk` support table-level resume only.
+- Keep `TaskStatus` and `SyncPhase` separate. `TaskStatus` is the external lifecycle state; `SyncPhase` decides whether full sync must run or hand off to incremental sync.
+- Keep historical full-sync progress fields in task archives at `context.full_sync_resume` for compatibility only. Do not move them to Redis. Redis/memory checkpoints are for incremental binlog positions.
+- Do not resume full sync after interruption. If `sync_phase` is `FULL_STARTED` or `FULL_FAILED` and `enable_drop_table_before_ddl=false`, starting `FULL` or `ALL` must be rejected.
+- Clear historical full-sync progress before any new full sync. With `enable_drop_table_before_ddl=true`, the target table is rebuilt and a fresh full sync can run.
+- Keep full-sync read paths distinct: `keyset`, `range`, `sample`, and `nopk` still choose different read strategies, but none of them performs current full-sync resume.
 - Preserve the short `FLUSH TABLES WITH READ LOCK` binlog-position capture before full sync. Do not reintroduce long global snapshot behavior or `enable_consistent_snapshot`.
 - Incremental sync requires MySQL binlog ROW format. Treat `binlog_row_image=FULL` as essential for safe no-primary-key incremental handling.
 - For no-primary-key tables, use `FullColumnsStrategy` and before-image data for UPDATE/DELETE matching. Honor `enable_limit_one` behavior in SQL generation and tests.
-- Keep full-sync writes idempotent. Full-sync bulk writes use `INSERT IGNORE`; incremental PK/UK inserts need upsert semantics; no-PK inserts cannot rely on duplicate-key upsert.
+- Full-sync bulk writes use plain `INSERT`; users must guarantee the target table is empty or enable `enable_drop_table_before_ddl`. Incremental PK/UK inserts need upsert semantics; no-PK inserts cannot rely on duplicate-key upsert.
 - Preserve task-level runtime isolation. Each running task owns its source DB, target DB, analyzer, read-only manager, and cancel function.
 - Do not leak task database passwords. Storage encryption uses AES-GCM via `pkg/crypto`; serialize encrypted values without permanently mutating the in-memory plaintext task object.
 

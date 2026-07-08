@@ -655,8 +655,7 @@ func TestResolveTableTargetName(t *testing.T) {
 }
 
 func TestNewTaskService(t *testing.T) {
-	dataDir := "./test_task_service"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 	assert.NotNil(t, ts)
@@ -665,9 +664,6 @@ func TestNewTaskService(t *testing.T) {
 }
 
 func TestNewTaskServiceWithDB(t *testing.T) {
-	dataDir := "./test_task_service_db"
-	defer os.RemoveAll(dataDir)
-
 	sourceDB, _, err := sqlmock.New()
 	require.NoError(t, err)
 	defer sourceDB.Close()
@@ -689,9 +685,6 @@ func TestNewTaskServiceWithDB(t *testing.T) {
 }
 
 func TestNewTaskServiceWithDBAndConfig(t *testing.T) {
-	dataDir := "./test_task_service_config"
-	defer os.RemoveAll(dataDir)
-
 	sourceDB, _, err := sqlmock.New()
 	require.NoError(t, err)
 	defer sourceDB.Close()
@@ -723,9 +716,6 @@ func TestNewTaskServiceWithDBAndConfig(t *testing.T) {
 }
 
 func TestSetEnableReadOnly(t *testing.T) {
-	dataDir := "./test_task_service_readonly"
-	defer os.RemoveAll(dataDir)
-
 	ts := NewTaskService(newDefaultConfig())
 
 	// 测试设置为 false
@@ -738,10 +728,8 @@ func TestSetEnableReadOnly(t *testing.T) {
 }
 
 func TestReinitStorage_FileMode(t *testing.T) {
-	dataDir := "./test_task_service_reinit_storage_old"
-	newDataDir := "./test_task_service_reinit_storage_new"
-	defer os.RemoveAll(dataDir)
-	defer os.RemoveAll(newDataDir)
+	dataDir := t.TempDir()
+	newDataDir := t.TempDir()
 
 	cfg := &config.Config{
 		Storage: config.StorageConfig{Mode: "file", DataDir: dataDir},
@@ -770,8 +758,7 @@ func TestReinitStorage_FileMode(t *testing.T) {
 }
 
 func TestReinitCheckpointManager_MemoryMode(t *testing.T) {
-	dataDir := "./test_task_service_reinit_checkpoint"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := NewTaskService(&config.Config{
 		Storage: config.StorageConfig{Mode: "file", DataDir: dataDir},
@@ -797,9 +784,6 @@ func TestReinitCheckpointManager_MemoryMode(t *testing.T) {
 }
 
 func TestCreateTask(t *testing.T) {
-	dataDir := "./test_task_service_create"
-	defer os.RemoveAll(dataDir)
-
 	ts := NewTaskService(newDefaultConfig())
 
 	taskConfig := taskEntity.TaskConfig{
@@ -826,8 +810,7 @@ func TestCreateTask(t *testing.T) {
 }
 
 func TestGetTask(t *testing.T) {
-	dataDir := "./test_task_service_get_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -851,8 +834,7 @@ func TestGetTask(t *testing.T) {
 }
 
 func TestGetAllTasks(t *testing.T) {
-	dataDir := "./test_task_service_getall_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -880,8 +862,7 @@ func TestGetAllTasks(t *testing.T) {
 }
 
 func TestUpdateTask(t *testing.T) {
-	dataDir := "./test_task_service_update_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -907,8 +888,7 @@ func TestUpdateTask(t *testing.T) {
 }
 
 func TestUpdateTask_NotFound(t *testing.T) {
-	dataDir := "./test_task_service_update_notfound_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -923,8 +903,7 @@ func TestUpdateTask_NotFound(t *testing.T) {
 }
 
 func TestDeleteTask(t *testing.T) {
-	dataDir := "./test_task_service_delete_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -949,8 +928,7 @@ func TestDeleteTask(t *testing.T) {
 }
 
 func TestDeleteTask_NotFound(t *testing.T) {
-	dataDir := "./test_task_service_delete_notfound_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -960,9 +938,6 @@ func TestDeleteTask_NotFound(t *testing.T) {
 }
 
 func TestStartTask(t *testing.T) {
-	dataDir := "./test_task_service_start"
-	defer os.RemoveAll(dataDir)
-
 	sourceDB, _, err := sqlmock.New()
 	require.NoError(t, err)
 	defer sourceDB.Close()
@@ -1012,9 +987,6 @@ func TestStartTask(t *testing.T) {
 }
 
 func TestStartTask_NotFound(t *testing.T) {
-	dataDir := "./test_task_service_start_notfound"
-	defer os.RemoveAll(dataDir)
-
 	ts := NewTaskService(newDefaultConfig())
 
 	ctx := context.Background()
@@ -1024,9 +996,6 @@ func TestStartTask_NotFound(t *testing.T) {
 }
 
 func TestStartTask_AlreadyRunning(t *testing.T) {
-	dataDir := "./test_task_service_start_running"
-	defer os.RemoveAll(dataDir)
-
 	ts := NewTaskService(newDefaultConfig())
 
 	// 创建并启动任务
@@ -1044,8 +1013,7 @@ func TestStartTask_AlreadyRunning(t *testing.T) {
 }
 
 func TestStartTask_ConcurrentRuntimeIsolation(t *testing.T) {
-	dataDir := "./test_task_service_start_concurrent_runtime"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 	ts.runtimes = make(map[string]*taskRuntime)
@@ -1312,9 +1280,6 @@ func TestStartTask_SuccessPath_StorageSaveCalled(t *testing.T) {
 }
 
 func TestPauseTask(t *testing.T) {
-	dataDir := "./test_task_service_pause"
-	defer os.RemoveAll(dataDir)
-
 	ts := NewTaskService(newDefaultConfig())
 
 	// 创建并启动任务
@@ -1335,9 +1300,6 @@ func TestPauseTask(t *testing.T) {
 }
 
 func TestPauseTask_NotFound(t *testing.T) {
-	dataDir := "./test_task_service_pause_notfound"
-	defer os.RemoveAll(dataDir)
-
 	ts := NewTaskService(newDefaultConfig())
 
 	err := ts.PauseTask("non_existent")
@@ -1346,9 +1308,6 @@ func TestPauseTask_NotFound(t *testing.T) {
 }
 
 func TestSkipError(t *testing.T) {
-	dataDir := "./test_task_service_skip"
-	defer os.RemoveAll(dataDir)
-
 	ts := NewTaskService(newDefaultConfig())
 
 	// 创建任务并设置错误状态
@@ -1371,9 +1330,6 @@ func TestSkipError(t *testing.T) {
 }
 
 func TestSkipError_NotFound(t *testing.T) {
-	dataDir := "./test_task_service_skip_notfound"
-	defer os.RemoveAll(dataDir)
-
 	ts := NewTaskService(newDefaultConfig())
 
 	err := ts.SkipError("non_existent")
@@ -1382,8 +1338,7 @@ func TestSkipError_NotFound(t *testing.T) {
 }
 
 func TestGetTaskMetrics(t *testing.T) {
-	dataDir := "./test_task_service_metrics_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1413,8 +1368,7 @@ func TestGetTaskMetrics(t *testing.T) {
 }
 
 func TestGetTaskMetrics_NotFound(t *testing.T) {
-	dataDir := "./test_task_service_metrics_notfound_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1424,8 +1378,7 @@ func TestGetTaskMetrics_NotFound(t *testing.T) {
 }
 
 func TestGetRunningTaskCount(t *testing.T) {
-	dataDir := "./test_task_service_running_count_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1448,9 +1401,6 @@ func TestGetRunningTaskCount(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
-	dataDir := "./test_task_service_close"
-	defer os.RemoveAll(dataDir)
-
 	sourceDB, _, err := sqlmock.New()
 	require.NoError(t, err)
 	defer sourceDB.Close()
@@ -1505,8 +1455,7 @@ func TestGenerateServerID(t *testing.T) {
 }
 
 func TestIsTaskStopped(t *testing.T) {
-	dataDir := "./test_task_service_stopped_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1527,8 +1476,7 @@ func TestIsTaskStopped(t *testing.T) {
 }
 
 func TestUpdateTaskProgress(t *testing.T) {
-	dataDir := "./test_task_service_progress_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1545,8 +1493,7 @@ func TestUpdateTaskProgress(t *testing.T) {
 }
 
 func TestIncrementTaskProgress(t *testing.T) {
-	dataDir := "./test_task_service_increment_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1608,8 +1555,7 @@ func newTestTaskServiceWithSpy(dataDir string) (*TaskService, *spyTaskStorage) {
 // 1. 同一秒内多次 incrementTaskProgress 只触发一次 Save
 // 2. 超过 1 秒后再次调用会触发新的 Save
 func TestIncrementTaskProgress_Throttle(t *testing.T) {
-	dataDir := "./test_task_service_throttle_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts, spy := newTestTaskServiceWithSpy(dataDir)
 
@@ -1651,8 +1597,7 @@ func TestIncrementTaskProgress_Throttle(t *testing.T) {
 // TestIncrementTaskProgress_ThrottleReset 验证任务完成时会清理节流记录，
 // 确保同一 taskID 快速重复运行时首秒能正常落盘。
 func TestIncrementTaskProgress_ThrottleReset(t *testing.T) {
-	dataDir := "./test_task_service_throttle_reset_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts, spy := newTestTaskServiceWithSpy(dataDir)
 
@@ -1687,8 +1632,7 @@ func TestIncrementTaskProgress_ThrottleReset(t *testing.T) {
 
 // TestDeleteTask_CleansThrottleRecord 验证 DeleteTask 会清理 lastProgressPersist。
 func TestDeleteTask_CleansThrottleRecord(t *testing.T) {
-	dataDir := "./test_task_service_delete_throttle_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts, spy := newTestTaskServiceWithSpy(dataDir)
 
@@ -1714,8 +1658,7 @@ func TestDeleteTask_CleansThrottleRecord(t *testing.T) {
 }
 
 func TestUpdateTaskTotalRows(t *testing.T) {
-	dataDir := "./test_task_service_totalrows_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1731,8 +1674,7 @@ func TestUpdateTaskTotalRows(t *testing.T) {
 }
 
 func TestUpdateTaskStatus(t *testing.T) {
-	dataDir := "./test_task_service_status_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1750,8 +1692,7 @@ func TestUpdateTaskStatus(t *testing.T) {
 }
 
 func TestCompleteTask(t *testing.T) {
-	dataDir := "./test_task_service_complete_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -1769,9 +1710,6 @@ func TestCompleteTask(t *testing.T) {
 }
 
 func TestTaskStorage_Save_Error(t *testing.T) {
-	dataDir := "./test_task_storage_error"
-	defer os.RemoveAll(dataDir)
-
 	// 创建一个无效的目录路径（使用保留字符）
 	storage := NewFileTaskStorage("invalid:dir")
 
@@ -1785,8 +1723,7 @@ func TestTaskStorage_Save_Error(t *testing.T) {
 }
 
 func TestTaskStorage_LoadAll_InvalidJSON(t *testing.T) {
-	dataDir := "./test_task_storage_invalid_json"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	storage := NewFileTaskStorage(dataDir)
 
@@ -1802,8 +1739,7 @@ func TestTaskStorage_LoadAll_InvalidJSON(t *testing.T) {
 }
 
 func TestTaskStorage_LoadAll_ReadError(t *testing.T) {
-	dataDir := "./test_task_storage_read_error"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	storage := NewFileTaskStorage(dataDir)
 
@@ -1825,8 +1761,7 @@ func TestTaskStorage_NewTaskStorage_Error(t *testing.T) {
 }
 
 func TestTaskService_ConcurrentOperations(t *testing.T) {
-	dataDir := "./test_task_service_concurrent_unique"
-	defer os.RemoveAll(dataDir)
+	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
@@ -2938,7 +2873,7 @@ func TestSyncPhase_MarkFullSyncFailedKeepsIncompleteFlag(t *testing.T) {
 
 	assert.Equal(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
 	assert.Equal(t, "simulated DB error", task.Context.FullSyncFailedReason)
-	assert.True(t, task.FullSyncIncomplete(), "FULL_FAILED still counts as incomplete (must rerun)")
+	assert.True(t, task.FullSyncIncomplete(), "FULL_FAILED still counts as incomplete (requires target rebuild before a new full sync)")
 	assert.False(t, task.HasFullSyncEverCompleted(), "FULL_FAILED must not pretend to be completed")
 }
 

@@ -50,7 +50,7 @@ mysql-to-sync/
 │       ├── application/
 │       │   └── service/
 │       │       ├── task_service_test.go
-│       │       └── resume_test.go   # 全量断点续传
+│       │       └── resume_test.go   # 历史全量断点字段与清理
 │       └── domain/
 │           └── entity/
 │               └── task_test.go
@@ -125,7 +125,7 @@ go test -v ./...
 | TestStartTask_ConcurrentRuntimeIsolation | 测试并发启动两个任务时 runtime 隔离 |
 | TestPauseTask | 测试暂停任务 |
 | TestTaskStatus | 测试任务状态转换 |
-| resume_test.go | 全量断点续传：游标序列化、range 分片确定性、断点生命周期 |
+| resume_test.go | 历史全量断点字段：游标序列化、断点清理、全量续传禁用 |
 
 ### Sync 模块
 

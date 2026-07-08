@@ -12,8 +12,8 @@ import ( // 导入外部包和标准库
 
 // Checkpoint 增量同步位点信息（Binlog 文件/位置、按表 Offset 等）。
 //
-// 注意：全量同步的行级/表级断点续传保存在任务存档 ProcessContext.FullSyncResume 中，
-// 不由本包的 Manager 管理。SavePosition/GetPosition 主要用于增量阶段的 binlog 订阅恢复。
+// 注意：历史全量断点字段保存在任务存档 ProcessContext.FullSyncResume 中，
+// 当前不再用于续传，也不由本包的 Manager 管理。SavePosition/GetPosition 主要用于增量阶段的 binlog 订阅恢复。
 type Checkpoint struct { // 定义检查点结构体
 	TaskID        string    `json:"task_id"`        // 任务ID
 	TableName     string    `json:"table_name"`     // 表名
@@ -28,8 +28,8 @@ type Checkpoint struct { // 定义检查点结构体
 // Manager 位点管理器接口
 // Manager persists incremental binlog checkpoints.
 //
-// SavePosition/GetPosition are for incremental recovery only. Full-sync table
-// and row resume state is stored on the task archive as FullSyncResume.
+// SavePosition/GetPosition are for incremental recovery only. Historical
+// full-sync progress fields remain on the task archive as FullSyncResume.
 type Manager interface { // 定义检查点管理器接口
 	// Save 保存位点方法
 	Save(ctx context.Context, cp *Checkpoint) error // 保存检查点

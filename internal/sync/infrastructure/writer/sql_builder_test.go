@@ -590,7 +590,7 @@ func TestSQLBuilder_BuildBatchUpsert_AllPKColumnsFallsBackToIgnore(t *testing.T)
 	}
 }
 
-// TestSQLBuilder_BuildBatchInsert_UnchangedSemantics 守住全量路径继续走 INSERT IGNORE 不变。
+// TestSQLBuilder_BuildBatchInsert_UnchangedSemantics 守住默认兼容路径继续走 INSERT IGNORE 不变。
 func TestSQLBuilder_BuildBatchInsert_UnchangedSemantics(t *testing.T) {
 	columns := []entity.ColumnMeta{
 		{Name: "id", IsPrimaryKey: true},
@@ -603,7 +603,7 @@ func TestSQLBuilder_BuildBatchInsert_UnchangedSemantics(t *testing.T) {
 	query, _ := builder.BuildBatchInsert(rows)
 
 	if !strings.Contains(query, "INSERT IGNORE") {
-		t.Errorf("BuildBatchInsert must keep INSERT IGNORE semantics for full sync, got: %s", query)
+		t.Errorf("BuildBatchInsert must keep INSERT IGNORE semantics for the default compatibility path, got: %s", query)
 	}
 	if strings.Contains(query, "ON DUPLICATE KEY UPDATE") {
 		t.Errorf("BuildBatchInsert must NOT emit upsert clause, got: %s", query)

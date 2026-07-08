@@ -8,7 +8,7 @@
 2. [领域模块边界与调用关系说明](design/DOMAIN_MODULE_BOUNDARIES.md)：各模块职责、入参/出参、调用链和状态流转。
 3. [设计文档](design/shejiwendang.md)：DDD 分层、全量/增量同步设计、无主键表策略。
 4. [配置说明](CONFIGURATION.md)：TOML、环境变量、存储、Redis、安全和连接池。
-5. [全量续传指南](guides/FULL_SYNC_RESUME_GUIDE.md)：全量暂停/失败后的表级和行级续传。
+5. [全量中断处理与增量恢复指南](guides/FULL_SYNC_RESUME_GUIDE.md)：全量暂停/失败后的处理方式，以及增量 checkpoint 恢复。
 6. [增量同步指南](guides/INCREMENTAL_SYNC_GUIDE.md)：binlog checkpoint 和 ROW 模式要求。
 7. [单元测试说明](testing/UNIT_TEST.md)：测试范围、运行方式和覆盖重点。
 
@@ -28,7 +28,7 @@
 
 ### 同步机制
 
-- [全量续传指南](guides/FULL_SYNC_RESUME_GUIDE.md)
+- [全量中断处理与增量恢复指南](guides/FULL_SYNC_RESUME_GUIDE.md)
 - [增量同步指南](guides/INCREMENTAL_SYNC_GUIDE.md)
 - [任务存储升级 SQL](sql/sys_sync_tasks_upgrade.sql)
 
@@ -70,7 +70,7 @@ mysql-to-sync/
 ## 文档维护规则
 
 - 行为变化必须同步更新对应指南、配置示例和 API 说明。
-- 任务生命周期、`SyncPhase`、全量续传、checkpoint、无主键表策略变化时，优先更新 [领域模块边界与调用关系说明](design/DOMAIN_MODULE_BOUNDARIES.md)。
+- 任务生命周期、`SyncPhase`、全量中断处理、checkpoint、无主键表策略变化时，优先更新 [领域模块边界与调用关系说明](design/DOMAIN_MODULE_BOUNDARIES.md)。
 - 配置字段变化时，同时更新 `etc/application.toml.example`、`docs/CONFIGURATION.md` 和部署模板。
 - Web API 字段变化时，同时检查 `web/` 调用和展示文案。
 

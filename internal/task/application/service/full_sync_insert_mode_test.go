@@ -167,15 +167,16 @@ func runSyncDatabasePairInsertModeTest(
 ) {
 	t.Helper()
 
+	task := newFullSyncInsertModeTask(enableDrop, extra)
+
 	insertSQL := "INSERT IGNORE INTO `" + fullSyncTgtSchema + "`.`" + tableName + "` (`id`, `name`) VALUES (?, ?)"
 	if identity.Strategy == entity.FullColumnsStrategy {
 		insertSQL = "INSERT IGNORE INTO `" + fullSyncTgtSchema + "`.`" + tableName + "` (`a`, `b`) VALUES (?, ?)"
 	} else if identity.IdentifyCols[0] == "code" {
 		insertSQL = "INSERT IGNORE INTO `" + fullSyncTgtSchema + "`.`" + tableName + "` (`code`, `payload`) VALUES (?, ?)"
 	}
-	if enableDrop {
-		insertSQL = insertPlainSQL(insertSQL)
-	}
+	// 全量同步统一使用普通 INSERT，目标端由用户保证为空或通过 DDL 前删除重建为空。
+	insertSQL = insertPlainSQL(insertSQL)
 
 	sourceDB, sourceMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
@@ -198,7 +199,6 @@ func runSyncDatabasePairInsertModeTest(
 	ts := NewTaskServiceWithDB(sourceDB, targetDB, &fixedIdentityAnalyzer{identity: identity})
 	ts.SetEnableReadOnly(false)
 
-	task := newFullSyncInsertModeTask(enableDrop, extra)
 	ts.tasks[task.Config.ID] = task
 
 	runtime := &taskRuntime{
@@ -291,11 +291,17 @@ func TestSyncDatabasePair_KeysetPath_InsertMode(t *testing.T) {
 		expectTargetWriteSession(mock, insertSQL)
 	}
 
-	t.Run("insert_ignore_when_drop_disabled", func(t *testing.T) {
+	t.Run("plain_insert_when_drop_disabled", func(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, pkUsersIdentity(), "users", false, nil, setupSource, setupTarget)
 	})
 	t.Run("plain_insert_when_drop_enabled", func(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, pkUsersIdentity(), "users", true, nil, setupSource, setupTarget)
+	})
+	t.Run("plain_insert_when_table_level_drop_disabled", func(t *testing.T) {
+		tableExtra := func(cfg *taskEntity.TaskConfig) {
+			cfg.SyncLevel = taskEntity.SyncLevelTable
+		}
+		runSyncDatabasePairInsertModeTest(t, pkUsersIdentity(), "users", false, tableExtra, setupSource, setupTarget)
 	})
 }
 
@@ -310,11 +316,17 @@ func TestSyncDatabasePair_NoPKPath_InsertMode(t *testing.T) {
 		expectTargetWriteSession(mock, insertSQL)
 	}
 
-	t.Run("insert_ignore_when_drop_disabled", func(t *testing.T) {
+	t.Run("plain_insert_when_drop_disabled", func(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, nopkLogsIdentity(), "logs", false, nil, setupSource, setupTarget)
 	})
 	t.Run("plain_insert_when_drop_enabled", func(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, nopkLogsIdentity(), "logs", true, nil, setupSource, setupTarget)
+	})
+	t.Run("plain_insert_when_table_level_drop_disabled", func(t *testing.T) {
+		tableExtra := func(cfg *taskEntity.TaskConfig) {
+			cfg.SyncLevel = taskEntity.SyncLevelTable
+		}
+		runSyncDatabasePairInsertModeTest(t, nopkLogsIdentity(), "logs", false, tableExtra, setupSource, setupTarget)
 	})
 }
 
@@ -337,11 +349,19 @@ func TestSyncDatabasePair_ParallelRangePath_InsertMode(t *testing.T) {
 		cfg.WorkerCount = 2
 	}
 
-	t.Run("insert_ignore_when_drop_disabled", func(t *testing.T) {
+	t.Run("plain_insert_when_drop_disabled", func(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, pkUsersIdentity(), "users", false, extra, setupSource, setupTarget)
 	})
 	t.Run("plain_insert_when_drop_enabled", func(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, pkUsersIdentity(), "users", true, extra, setupSource, setupTarget)
+	})
+	t.Run("plain_insert_when_table_level_drop_disabled", func(t *testing.T) {
+		tableExtra := func(cfg *taskEntity.TaskConfig) {
+			cfg.IntraTableWorkerCount = 2
+			cfg.WorkerCount = 2
+			cfg.SyncLevel = taskEntity.SyncLevelTable
+		}
+		runSyncDatabasePairInsertModeTest(t, pkUsersIdentity(), "users", false, tableExtra, setupSource, setupTarget)
 	})
 }
 
@@ -375,10 +395,18 @@ func TestSyncDatabasePair_ParallelSamplePath_InsertMode(t *testing.T) {
 		cfg.WorkerCount = 2
 	}
 
-	t.Run("insert_ignore_when_drop_disabled", func(t *testing.T) {
+	t.Run("plain_insert_when_drop_disabled", func(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, varcharPKIdentity(), "events", false, extra, setupSource, setupTarget)
 	})
 	t.Run("plain_insert_when_drop_enabled", func(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, varcharPKIdentity(), "events", true, extra, setupSource, setupTarget)
+	})
+	t.Run("plain_insert_when_table_level_drop_disabled", func(t *testing.T) {
+		tableExtra := func(cfg *taskEntity.TaskConfig) {
+			cfg.IntraTableWorkerCount = 2
+			cfg.WorkerCount = 2
+			cfg.SyncLevel = taskEntity.SyncLevelTable
+		}
+		runSyncDatabasePairInsertModeTest(t, varcharPKIdentity(), "events", false, tableExtra, setupSource, setupTarget)
 	})
 }

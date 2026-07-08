@@ -67,7 +67,7 @@ func TestFullSyncTableKey(t *testing.T) {
 
 func TestResumeEnabled(t *testing.T) {
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "t1"})
-	assert.True(t, resumeEnabled(task))
+	assert.False(t, resumeEnabled(task))
 
 	task.Config.EnableDropTableBeforeDDL = true
 	assert.False(t, resumeEnabled(task))
@@ -239,16 +239,15 @@ func TestResetResumeIfFresh(t *testing.T) {
 	ts.resetResumeIfFresh("fresh_task")
 	assert.Nil(t, ts.getTableProgress("fresh_task", key))
 
-	// 处于"全量未完成中间态" -> 保留断点（真正续传）
+	// 处于"全量未完成中间态"也不再保留断点：全量普通 INSERT 不支持续传
 	task.Context.SyncPhase = taskEntity.SyncPhaseFullStarted
 	ts.recordResumeCursor("fresh_task", key, -1, &taskEntity.ResumeKey{Vals: []string{"20"}})
 	ts.resetResumeIfFresh("fresh_task")
-	p := ts.getTableProgress("fresh_task", key)
-	require.NotNil(t, p)
-	assert.Equal(t, []string{"20"}, p.Cursor.Vals)
+	assert.Nil(t, ts.getTableProgress("fresh_task", key))
 
-	// 开启 DROP TABLE -> 即便中间态也强制清空（避免跳过已被重建的表）
+	// 开启 DROP TABLE -> 同样清空
 	task.Config.EnableDropTableBeforeDDL = true
+	ts.recordResumeCursor("fresh_task", key, -1, &taskEntity.ResumeKey{Vals: []string{"30"}})
 	ts.resetResumeIfFresh("fresh_task")
 	assert.Nil(t, ts.getTableProgress("fresh_task", key))
 }
@@ -266,4 +265,87 @@ func TestClearFullSyncResume(t *testing.T) {
 
 	ts.clearFullSyncResume("clear_task")
 	assert.Nil(t, ts.getTableProgress("clear_task", key))
+}
+
+// TestFullSyncRestartBlockedError 覆盖全量中断后重启的拦截判定：
+//   - 开启 enable_drop_table_before_ddl -> 放行（目标端会被重建）
+//   - 未开启且全量未完成（FULL_STARTED / FULL_FAILED）+ FULL/ALL 模式 -> 拒绝
+//   - 已完成全量 / INCREMENTAL 模式 / nil 任务 -> 放行
+func TestFullSyncRestartBlockedError(t *testing.T) {
+	makeTask := func(mode taskEntity.SyncMode, dropDDL bool, phase taskEntity.SyncPhase) *taskEntity.SyncTask {
+		task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+			ID:                       "block_chk",
+			Mode:                     mode,
+			EnableDropTableBeforeDDL: dropDDL,
+		})
+		task.Context.SyncPhase = phase
+		return task
+	}
+
+	tests := []struct {
+		name    string
+		task    *taskEntity.SyncTask
+		wantErr bool
+	}{
+		{
+			name:    "drop_ddl enabled with FULL_STARTED -> allowed",
+			task:    makeTask(taskEntity.SyncModeFull, true, taskEntity.SyncPhaseFullStarted),
+			wantErr: false,
+		},
+		{
+			name:    "drop_ddl enabled with FULL_FAILED -> allowed",
+			task:    makeTask(taskEntity.SyncModeAll, true, taskEntity.SyncPhaseFullFailed),
+			wantErr: false,
+		},
+		{
+			name:    "drop_ddl false + FULL_STARTED + FULL mode -> blocked",
+			task:    makeTask(taskEntity.SyncModeFull, false, taskEntity.SyncPhaseFullStarted),
+			wantErr: true,
+		},
+		{
+			name:    "drop_ddl false + FULL_FAILED + ALL mode -> blocked",
+			task:    makeTask(taskEntity.SyncModeAll, false, taskEntity.SyncPhaseFullFailed),
+			wantErr: true,
+		},
+		{
+			name:    "drop_ddl false + FULL_COMPLETED -> allowed (already completed)",
+			task:    makeTask(taskEntity.SyncModeFull, false, taskEntity.SyncPhaseFullCompleted),
+			wantErr: false,
+		},
+		{
+			name:    "drop_ddl false + INCREMENTAL_STARTED -> allowed",
+			task:    makeTask(taskEntity.SyncModeAll, false, taskEntity.SyncPhaseIncrementalStarted),
+			wantErr: false,
+		},
+		{
+			name:    "drop_ddl false + FULL_STARTED + INCREMENTAL mode -> allowed (mode not FULL/ALL)",
+			task:    makeTask(taskEntity.SyncModeIncremental, false, taskEntity.SyncPhaseFullStarted),
+			wantErr: false,
+		},
+		{
+			name:    "drop_ddl false + Init phase + FULL mode -> allowed (never started)",
+			task:    makeTask(taskEntity.SyncModeFull, false, taskEntity.SyncPhaseInit),
+			wantErr: false,
+		},
+		{
+			name:    "nil task -> allowed",
+			task:    nil,
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := fullSyncRestartBlockedError(tt.task)
+			if tt.wantErr {
+				require.Error(t, err, "expected restart to be blocked")
+				assert.Contains(t, err.Error(), "enable_drop_table_before_ddl=false",
+					"error message should explain the drop_ddl condition")
+				assert.Contains(t, err.Error(), "full sync was interrupted",
+					"error message should explain the interruption")
+			} else {
+				assert.NoError(t, err, "expected restart to be allowed")
+			}
+		})
+	}
 }

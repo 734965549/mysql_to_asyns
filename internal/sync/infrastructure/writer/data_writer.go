@@ -18,9 +18,9 @@ const mysqlMaxPreparedPlaceholders = 62000 // MySQL预处理语句占位符上�
 // DataWriter 数据写入器接口
 // DataWriter is the target write contract used by full and incremental sync.
 //
-// Full sync normally calls WriteBatch with INSERT IGNORE semantics. Incremental
-// sync enables upsert on buffered writers for PK/UK tables and uses before-image
-// matching for no-primary-key UPDATE events.
+// Full sync enables plain INSERT at the service layer and requires an empty
+// target table. Incremental sync enables upsert on buffered writers for PK/UK
+// tables and uses before-image matching for no-primary-key UPDATE events.
 type DataWriter interface { // 定义数据写入器接口
 	// WriteBatch 批量写入数据方法
 	WriteBatch(ctx context.Context, rows []map[string]interface{}) error // 批量写入数据
@@ -40,9 +40,9 @@ type SQLExecutor interface { // 定义SQL执行器接口
 // BatchWriter 批量写入器
 // BatchWriter executes deterministic SQL generated from TableIdentity.
 //
-// useUpsert is deliberately opt-in: full sync keeps INSERT IGNORE semantics,
-// while incremental sync must enable upsert so repeated PK/UK INSERT events
-// converge to the source row.
+// useUpsert is deliberately opt-in: full sync enables plain INSERT at the
+// service layer, while incremental sync must enable upsert so repeated PK/UK
+// INSERT events converge to the source row.
 type BatchWriter struct { // 定义批量写入器结构体
 	db          SQLExecutor        // SQL执行器
 	sqlBuilder  *SQLBuilder        // SQL构建器
@@ -53,12 +53,12 @@ type BatchWriter struct { // 定义批量写入器结构体
 	schema      string             // 数据库schema
 	tableName   string             // 表名
 	// useUpsert 控制 WriteBatch 是否使用 "INSERT ... ON DUPLICATE KEY UPDATE" 形式。
-	// 全量同步路径默认 false（INSERT IGNORE）；增量同步路径必须设为 true，否则同一行的重复 INSERT 事件
-	// 不会更新已有行（破坏修复 10/11 的幂等承诺）。
+	// 增量同步路径必须设为 true，否则同一行的重复 INSERT 事件不会更新已有行
+	//（破坏修复 10/11 的幂等承诺）。全量同步路径在服务层启用 usePlainInsert。
 	useUpsert bool
 
 	// usePlainInsert 控制 WriteBatch 是否使用普通 INSERT（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
-	// 仅在全量同步且 enable_drop_table_before_ddl=true 时启用：目标表已被 DROP+CREATE 重建为空表。
+	// 全量同步路径统一启用；目标端必须由用户保证为空，或通过 enable_drop_table_before_ddl 重建为空。
 	// 优先级高于 useUpsert。
 	usePlainInsert bool
 }
@@ -71,8 +71,7 @@ func (w *BatchWriter) EnableUpsert() {
 
 // EnablePlainInsert 切换 WriteBatch 进入普通 INSERT 语义（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
 //
-// 仅在全量同步且 enable_drop_table_before_ddl=true 时调用：目标表已被 DROP+CREATE 重建，
-// 确认为空表，INSERT IGNORE 的唯一键检查是纯开销。
+// 全量同步路径统一调用；目标端必须由用户保证为空，或通过 enable_drop_table_before_ddl 重建为空。
 // 与 useUpsert 互斥：usePlainInsert 优先级最高，其次是 useUpsert，默认 INSERT IGNORE。
 func (w *BatchWriter) EnablePlainInsert() {
 	w.usePlainInsert = true
@@ -152,9 +151,8 @@ func (w *BatchWriter) WriteBatch(ctx context.Context, rows []map[string]interfac
 			end = len(rows) // 调整为总行数
 		}
 		chunk := rows[start:end] // 获取当前批次
-		// 修复 10/11：增量路径 useUpsert=true → ON DUPLICATE KEY UPDATE，保证 INSERT 事件可重复执行
-		// usePlainInsert 优先级最高：全量同步 + enable_drop_table_before_ddl=true 时目标表为空，
-		// 使用普通 INSERT 省去 IGNORE 的唯一键检查开销。
+		// 修复 10/11：增量路径 useUpsert=true → ON DUPLICATE KEY UPDATE，保证 INSERT 事件可重复执行。
+		// usePlainInsert 优先级最高：全量同步统一使用普通 INSERT，目标端必须为空。
 		var (
 			query string
 			args  []interface{}
@@ -400,7 +398,7 @@ func (w *BufferedWriter) Close() error { // 关闭写入器
 }
 
 // EnableUpsert 转发到底层 BatchWriter，让缓冲 INSERT 走 upsert 语义。
-// 增量同步路径必须调用，全量同步路径不需要（INSERT IGNORE 已足够且更便宜）。
+// 增量同步路径必须调用；全量同步路径使用 EnablePlainInsert。
 func (w *BufferedWriter) EnableUpsert() {
 	if w.writer != nil {
 		w.writer.EnableUpsert()
@@ -408,7 +406,7 @@ func (w *BufferedWriter) EnableUpsert() {
 }
 
 // EnablePlainInsert 转发到底层 BatchWriter，让缓冲 INSERT 走普通 INSERT 语义。
-// 仅在全量同步 + enable_drop_table_before_ddl=true 时调用。
+// 全量同步路径统一调用。
 func (w *BufferedWriter) EnablePlainInsert() {
 	if w.writer != nil {
 		w.writer.EnablePlainInsert()

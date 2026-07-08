@@ -18,6 +18,9 @@ const (
 	fullSyncLockWaitTimeoutSQL         = "SET SESSION innodb_lock_wait_timeout=300"
 )
 
+// disableFullSyncWriteSession applies bulk-load optimizations for full sync.
+// Full sync uses plain INSERT and requires an empty target; UNIQUE_CHECKS=0 is
+// not a conflict-detection mechanism for non-empty targets.
 func disableFullSyncWriteSession(ctx context.Context, conn *sql.Conn, label string) error {
 	if conn == nil {
 		return fmt.Errorf("target write connection is nil for %s", label)

@@ -1425,7 +1425,7 @@ function syncPhaseText(phase) {
   return map[phase] ?? (phase || "未开始");
 }
 
-// 全量断点续传表进度列表
+// 历史全量断点表进度列表
 
 function resumeTableList(task) {
   const resume = task?.context?.full_sync_resume;
@@ -2927,8 +2927,8 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
               </a-descriptions>
             </a-tab-pane>
 
-            <!-- 表同步进度 -->
-            <a-tab-pane key="tables" title="表同步进度">
+            <!-- 历史全量断点 -->
+            <a-tab-pane key="tables" title="历史断点">
               <a-table
                 :columns="[
                   { title: '表名', dataIndex: 'key' },
@@ -2949,7 +2949,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
               </a-table>
               <a-empty
                 v-if="resumeTableList(detailPageTask).length === 0"
-                description="暂无表级断点续传数据（任务尚未进入全量同步或为库级同步）"
+                description="暂无历史全量断点数据"
                 style="margin-top: 24px"
               />
             </a-tab-pane>
@@ -2986,6 +2986,25 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                 </a-descriptions-item>
                 <a-descriptions-item label="无主键 LIMIT 1">
                   {{ detailPageTask.config.enable_limit_one ? '开启' : '关闭' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="并行事务提交间隔">
+                  {{ detailPageTask.config.tx_commit_every_n_parallel > 0 ? detailPageTask.config.tx_commit_every_n_parallel : '默认（5批）' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="启用索引优化">
+                  {{ detailPageTask.config.optimize_index ? '开启' : '关闭' }}
+                </a-descriptions-item>
+                <a-descriptions-item v-if="detailPageTask.config.optimize_index" label="索引回放并发度">
+                  {{
+                    detailPageTask.config.index_restore_worker_count > 0
+                      ? detailPageTask.config.index_restore_worker_count
+                      : '自动（min(worker_count, 4)）'
+                  }}
+                </a-descriptions-item>
+                <a-descriptions-item label="目标库只读保护">
+                  {{ detailPageTask.config.enable_read_only ? '开启' : '关闭' }}
+                </a-descriptions-item>
+                <a-descriptions-item label="DDL前删除目标">
+                  {{ detailPageTask.config.enable_drop_table_before_ddl ? '开启' : '关闭' }}
                 </a-descriptions-item>
               </a-descriptions>
 
@@ -5655,7 +5674,28 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                 : "默认（≤16）"
             }}
           </a-descriptions-item>
-
+          <a-descriptions-item label="无主键 LIMIT 1">
+            {{ selectedTaskForDetail.config.enable_limit_one ? '开启' : '关闭' }}
+          </a-descriptions-item>
+          <a-descriptions-item label="并行事务提交间隔">
+            {{ selectedTaskForDetail.config.tx_commit_every_n_parallel > 0 ? selectedTaskForDetail.config.tx_commit_every_n_parallel : '默认（5批）' }}
+          </a-descriptions-item>
+          <a-descriptions-item label="启用索引优化">
+            {{ selectedTaskForDetail.config.optimize_index ? '开启' : '关闭' }}
+          </a-descriptions-item>
+          <a-descriptions-item v-if="selectedTaskForDetail.config.optimize_index" label="索引回放并发度">
+            {{
+              selectedTaskForDetail.config.index_restore_worker_count > 0
+                ? selectedTaskForDetail.config.index_restore_worker_count
+                : '自动（min(worker_count, 4)）'
+            }}
+          </a-descriptions-item>
+          <a-descriptions-item label="目标库只读保护">
+            {{ selectedTaskForDetail.config.enable_read_only ? '开启' : '关闭' }}
+          </a-descriptions-item>
+          <a-descriptions-item label="DDL前删除目标">
+            {{ selectedTaskForDetail.config.enable_drop_table_before_ddl ? '开启' : '关闭' }}
+          </a-descriptions-item>
         </a-descriptions>
 
         <!-- 源端和目标端配置 -->

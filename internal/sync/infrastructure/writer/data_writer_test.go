@@ -494,7 +494,7 @@ func TestBufferedWriter_FlushWithData(t *testing.T) {
 
 // === 修复 10/11：BatchWriter.WriteBatch 在 useUpsert 模式下必须发出 ON DUPLICATE KEY UPDATE ===
 
-// TestBatchWriter_WriteBatch_DefaultIsInsertIgnore 默认模式应保持 INSERT IGNORE（全量同步语义不变）。
+// TestBatchWriter_WriteBatch_DefaultIsInsertIgnore 默认模式保留 INSERT IGNORE，作为未显式选择 plain/upsert 的兼容路径。
 func TestBatchWriter_WriteBatch_DefaultIsInsertIgnore(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	if err != nil {
@@ -581,7 +581,7 @@ func TestBufferedWriter_EnableUpsert_ForwardsToBatchWriter(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestBatchWriter_WriteBatch_PlainInsertMode 全量同步 + enable_drop_table_before_ddl=true 时，
+// TestBatchWriter_WriteBatch_PlainInsertMode 显式启用 plain insert 后，
 // 应发出普通 INSERT INTO（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
 func TestBatchWriter_WriteBatch_PlainInsertMode(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))

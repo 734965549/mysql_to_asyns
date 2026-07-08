@@ -41,8 +41,8 @@ const ( // 定义常量
 //
 // TaskStatus 描述任务整体运行/暂停/失败，SyncPhase 描述同步进度处在哪个阶段。
 // 恢复决策分两层：
-//   - 阶段级：要不要重跑全量、能不能直接接增量 → 看 SyncPhase（HasFullSyncEverCompleted / FullSyncIncomplete）
-//   - 全量表级/行级：暂停后续传从哪张表、哪个主键继续 → 看 FullSyncResume（见 docs/guides/FULL_SYNC_RESUME_GUIDE.md）
+//   - 阶段级：能不能直接接增量 → 看 SyncPhase（HasFullSyncEverCompleted / FullSyncIncomplete）
+//   - 全量未完成：不再支持 full_sync_resume 续传，需要重新准备目标端后启动新一轮全量
 //
 // 增量 binlog 位点由 checkpoint.Manager 管理，与 FullSyncResume 无关。
 type SyncPhase string
@@ -93,7 +93,7 @@ type TaskConfig struct { // 定义任务配置结构体
 	// 单表内多个索引仍串行重建，避免同表 MDL 锁竞争。建议 ≤ target_max_open_conns。
 	IndexRestoreWorkerCount  int             `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
 	EnableReadOnly           bool            `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
-	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后禁用全量断点续传
+	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后可重建目标端重新全量
 	TxCommitEveryNParallel   int             `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐
 	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`          // 源数据库配置（可选，覆盖配置文件）
 	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`          // 目标数据库配置（可选，覆盖配置文件）
@@ -104,8 +104,8 @@ type TaskConfig struct { // 定义任务配置结构体
 //
 // TaskStatus is the external lifecycle state. SyncPhase is the internal sync
 // stage used to decide whether full sync can resume or incremental sync can
-// take over. FullSyncResume belongs here because full-sync resume must survive
-// service restarts with the task archive.
+// take over. FullSyncResume remains here as a historical archive-compatible
+// field; incremental binlog positions are stored separately.
 type ProcessContext struct { // 定义处理上下文结构体
 	Status              TaskStatus  `json:"status"`                 // 任务状态
 	CurrentPosition     string      `json:"current_position"`       // 当前位点
@@ -136,13 +136,13 @@ type ProcessContext struct { // 定义处理上下文结构体
 	LastIncrementalPosition string     `json:"last_incremental_position,omitempty"` // 最近一次成功落库的增量位点 "file:pos"
 	FullSyncFailedReason    string     `json:"full_sync_failed_reason,omitempty"`   // 全量失败原因（便于排查；SyncPhase=FULL_FAILED 时填充）
 
-	// === 全量同步断点续传 ===
-	// 记录每张表的全量同步进度，key = "sourceSchema.tableName"。暂停/重启后据此跳过已完成的表，
-	// 并让未完成的表从上次"已提交"的主键位置继续。随任务存档落盘，进程重启也不丢。
+	// === 历史全量断点字段 ===
+	// 历史兼容字段：曾用于记录每张表的全量同步进度，key = "sourceSchema.tableName"。
+	// 当前全量使用普通 INSERT，暂停/失败后不再续传；进入新一轮全量前会清空。
 	FullSyncResume map[string]*TableSyncProgress `json:"full_sync_resume,omitempty"`
 }
 
-// ResumeKey 续传游标：主键各列的字符串化值（单列主键长度为 1，复合主键按列顺序）。
+// ResumeKey 历史全量断点键：主键各列的字符串化值（单列主键长度为 1，复合主键按列顺序）。
 // interface{} 主键值（含 []byte / int / string 等）统一转为字符串持久化，
 // 回填给 ReadBatchByKeys 作为 SQL bind 参数（字符串可被 MySQL 隐式转换为目标列类型）。
 type ResumeKey struct {
@@ -152,14 +152,14 @@ type ResumeKey struct {
 // TableSyncProgress 单表全量同步断点。
 //
 // 读取路径 read_path 取值：keyset（单线程主键顺序）、range（数值主键并行分片）、
-// sample（采样边界并行）、nopk（无主键流式）。range/keyset 支持行级续传；sample/nopk 仅表级。
+// sample（采样边界并行）、nopk（无主键流式）。当前仅作历史断点字段兼容。
 type TableSyncProgress struct {
 	Done             bool               `json:"done"`                        // 该表是否已完整同步
 	ReadPath         string             `json:"read_path,omitempty"`         // 读取路径：keyset / range / sample / nopk
 	IntraWorkers     int                `json:"intra_workers,omitempty"`     // 首跑时的表内并行度（变化则分片游标失效）
 	Cursor           *ResumeKey         `json:"cursor,omitempty"`            // 单线程 keyset 路径整表游标
 	ShardCursors     map[int]*ResumeKey `json:"shard_cursors,omitempty"`     // 并行路径每分片游标，key = worker 序号
-	SampleBoundaries []*ResumeKey       `json:"sample_boundaries,omitempty"` // sample 路径首跑边界，续传复用以保证分片确定性
+	SampleBoundaries []*ResumeKey       `json:"sample_boundaries,omitempty"` // sample 路径首跑边界（历史断点字段）
 	ProcessedRows    int64              `json:"processed_rows,omitempty"`    // 该表已处理行数（仅用于展示/排查）
 }
 
@@ -312,7 +312,7 @@ func (t *SyncTask) MarkFullSyncCompleted() {
 	t.Context.LastUpdateTime = now
 }
 
-// MarkFullSyncFailed 标记全量明确失败（不是用户主动暂停）。失败后下次启动必须重跑全量，不能直接接增量。
+// MarkFullSyncFailed 标记全量明确失败。失败后不能直接接增量，也不再做 full_sync_resume 续传。
 func (t *SyncTask) MarkFullSyncFailed(reason string) {
 	t.Context.SyncPhase = SyncPhaseFullFailed
 	t.Context.FullSyncFailedReason = reason
@@ -352,19 +352,18 @@ func (t *SyncTask) HasFullSyncEverCompleted() bool {
 }
 
 // FullSyncIncomplete 返回全量是否处于"开始过但未完成"的中间态（崩溃/暂停/失败留下的不一致快照）。
-// 该状态下不允许直接接增量；再次启动时会结合 FullSyncResume 做表级/行级续传（未开启 DROP TABLE 时），
-// 而非盲目整库从头重读。
+// 该状态下不允许直接接增量；未开启 destructive rebuild 时也不允许继续全量续传。
 func (t *SyncTask) FullSyncIncomplete() bool {
 	return t.Context.SyncPhase == SyncPhaseFullStarted ||
 		t.Context.SyncPhase == SyncPhaseFullFailed
 }
 
-// ResetFullSyncResume 清空所有表的全量续传断点（全新一轮全量开始时调用）。
+// ResetFullSyncResume 清空所有表的历史全量断点（全新一轮全量开始时调用）。
 func (t *SyncTask) ResetFullSyncResume() {
 	t.Context.FullSyncResume = nil
 }
 
-// GetTableProgress 返回指定表的续传断点；不存在时返回 nil。
+// GetTableProgress 返回指定表的历史全量断点；不存在时返回 nil。
 func (t *SyncTask) GetTableProgress(tableKey string) *TableSyncProgress {
 	if t.Context.FullSyncResume == nil {
 		return nil
@@ -372,7 +371,7 @@ func (t *SyncTask) GetTableProgress(tableKey string) *TableSyncProgress {
 	return t.Context.FullSyncResume[tableKey]
 }
 
-// ensureTableProgress 获取（或创建）指定表的续传断点。
+// ensureTableProgress 获取（或创建）指定表的历史全量断点。
 func (t *SyncTask) ensureTableProgress(tableKey string) *TableSyncProgress {
 	if t.Context.FullSyncResume == nil {
 		t.Context.FullSyncResume = make(map[string]*TableSyncProgress)
@@ -385,7 +384,7 @@ func (t *SyncTask) ensureTableProgress(tableKey string) *TableSyncProgress {
 	return p
 }
 
-// InitTableProgress 记录该表本次同步采用的读取路径与并行度（用于续传时校验断点是否仍然有效）。
+// InitTableProgress 记录该表本次同步采用的读取路径与并行度（历史断点字段）。
 func (t *SyncTask) InitTableProgress(tableKey, readPath string, intraWorkers int) {
 	p := t.ensureTableProgress(tableKey)
 	p.ReadPath = readPath
@@ -407,7 +406,7 @@ func (t *SyncTask) SetShardCursor(tableKey string, shard int, key *ResumeKey) {
 	p.ShardCursors[shard] = key
 }
 
-// SetSampleBoundaries 持久化 sample 路径首跑的采样边界，续传时复用以保证分片确定性。
+// SetSampleBoundaries 持久化 sample 路径首跑的采样边界（历史断点字段）。
 func (t *SyncTask) SetSampleBoundaries(tableKey string, boundaries []*ResumeKey) {
 	p := t.ensureTableProgress(tableKey)
 	p.SampleBoundaries = boundaries

@@ -140,9 +140,9 @@ func (b *SQLBuilder) BuildDelete(row map[string]interface{}) (string, []interfac
 
 // BuildBatchInsert 构建批量 INSERT IGNORE 语句方法。
 //
-// 用途：全量同步阶段，目标表通常为空或仅有少量重叠行，IGNORE 跳过重复键的开销最低；
-// 对于增量重放可能反复到达同一 INSERT 的场景，IGNORE 不会更新已有行，**不具有 upsert 语义**，
-// 请增量路径使用 BuildBatchUpsert（按 strategy 分流，详见函数注释）。
+// 用途：未显式选择 plain INSERT 或 upsert 的兼容路径。对于增量重放可能反复到达
+// 同一 INSERT 的场景，IGNORE 不会更新已有行，**不具有 upsert 语义**，请增量路径使用
+// BuildBatchUpsert（按 strategy 分流，详见函数注释）。
 func (b *SQLBuilder) BuildBatchInsert(rows []map[string]interface{}) (string, []interface{}) { // 构建批量INSERT语句
 	if len(rows) == 0 { // 如果没有行数据
 		return "", nil // 返回空
@@ -150,8 +150,7 @@ func (b *SQLBuilder) BuildBatchInsert(rows []map[string]interface{}) (string, []
 
 	columns, _, values, rowPlaceholders := b.collectBatchValues(rows)
 
-	// 全量同步场景：目标表通常为空，ON DUPLICATE KEY UPDATE 的 UPDATE 步骤纯属开销。
-	// 使用 INSERT IGNORE 可跳过重复键检查的写入代价，对空表与 ON DUPLICATE 行为一致。
+	// 默认兼容路径保留 INSERT IGNORE；全量同步路径由服务层改用 BuildBatchInsertPlain。
 	query := fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES %s",
 		b.tableRef(),
 		strings.Join(columns, ", "),
@@ -162,8 +161,7 @@ func (b *SQLBuilder) BuildBatchInsert(rows []map[string]interface{}) (string, []
 
 // BuildBatchInsertPlain 构建普通批量 INSERT 语句（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
 //
-// 仅在全量同步且 enable_drop_table_before_ddl=true 时使用：目标表在同步前已被 DROP+CREATE 重建，
-// 确认为空表，不存在主键/唯一键冲突风险，INSERT IGNORE 的唯一键检查是纯开销。
+// 全量同步路径统一使用：目标表必须由用户保证为空，或在同步前已被 DROP+CREATE 重建为空。
 // 增量同步路径绝对不能使用此方法（幂等性依赖 upsert/IGNORE）。
 func (b *SQLBuilder) BuildBatchInsertPlain(rows []map[string]interface{}) (string, []interface{}) {
 	if len(rows) == 0 {

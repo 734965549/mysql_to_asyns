@@ -31,7 +31,7 @@ HTTP request
   -> sync/infrastructure/reader 读取源库数据
   -> sync/infrastructure/writer 写入目标库
   -> checkpoint.Manager 仅保存增量 binlog 位点
-  -> task storage 保存任务归档、状态、全量续传游标
+  -> task storage 保存任务归档、状态、历史全量断点字段
 ```
 
 ## 2. 分层边界
@@ -39,7 +39,7 @@ HTTP request
 | 层/目录 | 职责 | 允许依赖 | 不应承担 |
 |---|---|---|---|
 | `internal/api` | HTTP 路由、请求校验、请求/响应结构转换 | `task`、`metadata` 应用服务 | 不做同步算法、不直接拼业务 SQL |
-| `internal/task/domain/entity` | 任务聚合、生命周期状态、同步阶段、全量续传结构 | 标准库、少量共享工具 | 不连数据库、不启动 goroutine |
+| `internal/task/domain/entity` | 任务聚合、生命周期状态、同步阶段、历史全量断点结构 | 标准库、少量共享工具 | 不连数据库、不启动 goroutine |
 | `internal/task/application/service` | 任务创建、启动、暂停、调度、运行时隔离、全量/增量编排、任务存储 | `metadata`、`sync`、`checkpoint`、`config` | 不承载底层 SQL 生成细节 |
 | `internal/metadata/domain` | 表结构模型和身份策略选择 | 元数据仓库接口 | 不执行同步、不写目标库 |
 | `internal/metadata/infrastructure` | 从 `information_schema` / MySQL 元数据读取表、列、PK、UK | `database/sql` | 不决定任务生命周期 |
@@ -48,7 +48,7 @@ HTTP request
 | `internal/sync/infrastructure/reader` | 全量读取源库，支持 keyset、range、cursor | `database/sql`、metadata entity | 不写目标库 |
 | `internal/sync/infrastructure/writer` | SQL 构造、批量写、更新、删除、缓冲写入 | metadata entity、strategy | 不决定读路径和任务状态 |
 | `internal/sync/infrastructure/readonly` | 目标库只读保护和临时 DDL 写权限 | `database/sql` | 不参与同步数据转换 |
-| `internal/checkpoint` | 增量 binlog 位点保存和恢复 | Redis 或内存 | 不保存全量续传游标 |
+| `internal/checkpoint` | 增量 binlog 位点保存和恢复 | Redis 或内存 | 不保存历史全量断点 |
 | `internal/config` | TOML、环境变量覆盖、连接池参数、校验 | 标准库 | 不做业务编排 |
 | `pkg/binlog` | 对 `go-mysql` canal 的薄封装，把行事件转为内部事件 | go-mysql | 不写目标库、不保存任务状态 |
 | `pkg/crypto` | 任务数据库密码 AES-GCM 加解密 | 标准库 | 不决定何时持久化 |
@@ -64,7 +64,7 @@ HTTP request
 
 - API 创建/更新任务请求。
 - 配置文件默认值和环境变量覆盖。
-- 服务端运行时写回的状态、进度、错误、续传游标。
+- 服务端运行时写回的状态、进度、错误、历史断点字段。
 
 输出去向：
 
@@ -79,7 +79,7 @@ HTTP request
 | `Config` | 任务配置，如源/目标库、模式、表列表、批大小、worker 数、DDL 行为 | API + TaskService |
 | `Context.Status` | 外部生命周期状态：`PENDING/RUNNING/PAUSED/COMPLETED/FAILED/SCHEDULED` | TaskService |
 | `Context.SyncPhase` | 同步阶段：决定全量是否需要继续跑或能否接增量 | TaskService |
-| `Context.FullSyncResume` | 全量同步表级/行级续传游标 | TaskService 全量流程 |
+| `Context.FullSyncResume` | 历史兼容字段；当前全量不再续传，进入新一轮全量前清空 | TaskService 全量流程 |
 | `Context.LastIncrementalPosition` | 最近增量位点快照，便于排查 | IncrementalSyncService 回调到 TaskService |
 
 ### 3.2 TableIdentity
@@ -100,9 +100,9 @@ HTTP request
 
 | 策略 | 使用条件 | 读路径 | 写入匹配 |
 |---|---|---|---|
-| `PK_STRATEGY` | 表有主键 | keyset/range，可行级续传 | 主键列 WHERE |
-| `UK_STRATEGY` | 无主键但有唯一键 | keyset/sample，可行级或表级续传 | 唯一键列 WHERE |
-| `FULL_COLUMNS_STRATEGY` | 无主键且无唯一键 | cursor/nopk，表级续传 | 全列 WHERE，UPDATE 使用 before image |
+| `PK_STRATEGY` | 表有主键 | keyset/range | 主键列 WHERE |
+| `UK_STRATEGY` | 无主键但有唯一键 | keyset/sample | 唯一键列 WHERE |
+| `FULL_COLUMNS_STRATEGY` | 无主键且无唯一键 | cursor/nopk | 全列 WHERE，UPDATE 使用 before image |
 
 ## 4. API 调用边界
 
@@ -217,17 +217,18 @@ FULL_STARTED
   -> FULL_FAILED               全量明确失败
 
 FULL_FAILED
-  -> FULL_STARTED              下次启动重新跑或基于 FullSyncResume 续跑
+  -> FULL_STARTED              仅在目标端被重建后启动新一轮全量
 ```
 
-全量续传条件：
+全量中断处理：
 
-- `sync_phase` 是 `FULL_STARTED` 或 `FULL_FAILED`。
-- `enable_drop_table_before_ddl=false`。
-- `context.full_sync_resume` 仍存在。
+- `sync_phase` 是 `FULL_STARTED` 或 `FULL_FAILED` 时，表示全量未完成。
+- `enable_drop_table_before_ddl=false` 时，同一旧任务再次启动会被拒绝；若人工清理/重建目标端，需要创建/重置任务后从头跑，或开启 destructive rebuild 后重新全量。
+- `enable_drop_table_before_ddl=true` 时，允许启动新一轮全量，因为目标库/目标表会先被重建。
 
-必须清理全量续传的情况：
+必须清理历史全量断点的情况：
 
+- 每次进入新一轮全量前。
 - 开启 `enable_drop_table_before_ddl=true`，因为目标表可能被重建。
 - 运维显式要求全新全量。
 
@@ -261,23 +262,23 @@ FULL_FAILED
 7. IdentityAnalyzer.AnalyzeTable 识别 PK/UK/no-PK。
 8. 根据身份策略选择 reader：
    - PK/UK：RangeShardingReader，支持 keyset/range。
-   - no-PK：CursorReader，流式读，表级续传。
-9. BatchWriter 写目标库；全量批量写默认使用 INSERT IGNORE（`enable_drop_table_before_ddl=true` 时目标端已重建为空，改用普通 INSERT 并禁用续传）。
-10. 写事务提交后才能推进 full_sync_resume 游标。
+   - no-PK：CursorReader，流式读。
+9. BatchWriter 写目标库；全量批量写统一使用普通 INSERT，目标端必须由用户保证为空，或通过 `enable_drop_table_before_ddl=true` 重建为空。
+10. 更新运行进度；全量不再推进 full_sync_resume 游标。
 11. 表完成后 MarkTableDone。
 12. 全部完成后 MarkFullSyncCompleted。
 13. ALL 模式继续进入增量；FULL 模式完成任务。
 ```
 
-读路径续传能力：
+读路径：
 
-| read_path | 典型场景 | 续传粒度 |
-|---|---|---|
-| `keyset` | 单 worker 主键/唯一键顺序读 | 行级 |
-| `range` | 数值单列主键分片并行（每 worker 独立读） | 行级，按 shard cursor |
-| `sample` | 采样边界并行（每 worker 独立读） | 表级 |
-| `nopk` | 无主键流式读 | 表级 |
-| `channel` | 单 reader + channel 多 worker 写（`ChannelSyncExecutor`，预留未接入） | 行级（设计上与 keyset 游标兼容） |
+| read_path | 典型场景 |
+|---|---|
+| `keyset` | 单 worker 主键/唯一键顺序读 |
+| `range` | 数值单列主键分片并行（每 worker 独立读） |
+| `sample` | 采样边界并行（每 worker 独立读） |
+| `nopk` | 无主键流式读 |
+| `channel` | 单 reader + channel 多 worker 写（`ChannelSyncExecutor`，预留未接入） |
 
 并行读写的两种模型：
 
@@ -299,7 +300,7 @@ channel（预留路径，见 channel_sync.go）：
 ```text
 T0: 短暂 FTWRL，读取 SHOW MASTER STATUS 得到 P0，然后立即 UNLOCK
 T1: 将 P0 保存到 checkpoint.Manager，作为后续增量订阅起点
-T2: 全量阶段用普通短 SELECT 读取源表，默认 INSERT IGNORE 写目标表（`enable_drop_table_before_ddl=true` 时改用普通 INSERT）
+T2: 全量阶段用普通短 SELECT 读取源表，普通 INSERT 写目标表（目标端需为空或由 DDL 前删除重建）
 T3: 全量完成后，ALL 模式启动增量订阅，从 P0 RunFrom
 T4: 回放 P0 之后发生过的 INSERT/UPDATE/DELETE，把全量期间的变化追平
 ```
@@ -310,13 +311,13 @@ T4: 回放 P0 之后发生过的 INSERT/UPDATE/DELETE，把全量期间的变化
 
 | 场景 | 处理方式 | 结果 |
 |---|---|---|
-| 全量重复写同一 PK/UK 行 | 默认全量 `INSERT IGNORE`；`enable_drop_table_before_ddl=true` 时为普通 INSERT | 默认跳过重复键保持幂等；DROP 重建场景目标表为空，无重复键风险 |
+| 全量重复写同一 PK/UK 行 | 普通 `INSERT` | 目标端应为空；非空目标属于不支持场景，可能失败或污染目标数据 |
 | 增量 INSERT 重复到达 PK/UK 行 | 增量 writer 启用 `ON DUPLICATE KEY UPDATE` | 后到事件覆盖旧值，收敛到源库状态 |
 | 增量 UPDATE/DELETE PK/UK 行 | 使用 PK/UK WHERE | 精确匹配目标行 |
 | 无主键表 UPDATE/DELETE | 使用 before image / 行镜像做全列 WHERE | 尽力匹配，依赖 `binlog_row_image=FULL` |
 | 无主键表 INSERT | 退化为 `INSERT IGNORE`，没有真正冲突键 | 不能保证去重，推荐补 PK/UK |
 
-这不是“所有重复都跳过”。全量阶段默认靠 `INSERT IGNORE` 跳过重复（`enable_drop_table_before_ddl=true` 时改用普通 INSERT）；增量阶段对 PK/UK 表必须是 upsert，否则全量期间同一行的后续 INSERT/UPDATE 不能可靠收敛。无主键表因为没有冲突键，只能使用全列匹配降低 UPDATE/DELETE 风险，无法获得真正的 INSERT 去重语义。
+这不是“所有重复都跳过”。全量阶段用普通 `INSERT`，目标端不应存在重复键；增量阶段对 PK/UK 表必须是 upsert，否则全量期间同一行的后续 INSERT/UPDATE 不能可靠收敛。无主键表因为没有冲突键，只能使用全列匹配降低 UPDATE/DELETE 风险，无法获得真正的 INSERT 去重语义。
 
 ## 8. 增量同步流程
 
@@ -411,7 +412,7 @@ Delete(ctx context.Context, row map[string]interface{}) error
 
 重要规则：
 
-- 全量写默认 `INSERT IGNORE`，保持幂等和低成本。
+- 全量写统一使用普通 INSERT；目标端必须为空或由 `enable_drop_table_before_ddl=true` 重建为空。
 - 增量写必须调用 `EnableUpsert()`，否则重复 INSERT 不会覆盖旧值。
 - no-PK 表不能获得真正 upsert，只能依赖全列匹配和 before image 降低风险。
 
@@ -424,9 +425,9 @@ SavePosition(ctx, taskID, mysql.Position) error
 GetPosition(ctx, taskID) (mysql.Position, error)
 ```
 
-不要把全量断点放到 checkpoint：
+不要把历史全量断点放到 checkpoint：
 
-- 全量断点：`task.Context.FullSyncResume`，随任务归档持久化。
+- 全量断点：`task.Context.FullSyncResume` 是历史兼容字段，随任务归档持久化但当前不再用于续传。
 - 增量断点：Redis/内存 checkpoint，保存 binlog file/pos。
 
 两者用途不同，不能互相替代。
@@ -460,9 +461,9 @@ etc/application.toml
 | 新增任务状态或阶段 | `internal/task/domain/entity`，并同步 TaskService、测试、文档 |
 | 新增 API 字段 | handler request/response、TaskConfig、README/docs、web |
 | 新增表身份策略 | metadata domain service + sync strategy + writer tests |
-| 修改全量读取策略 | reader + TaskService full sync + resume tests |
+| 修改全量读取策略 | reader + TaskService full sync + 全量中断门禁测试 |
 | 修改增量 SQL 语义 | writer SQLBuilder/BatchWriter + IncrementalSyncService + SQL tests |
-| 修改 checkpoint | checkpoint manager + 增量指南，避免影响 FullSyncResume |
+| 修改 checkpoint | checkpoint manager + 增量指南，避免混入历史 FullSyncResume 字段 |
 | 修改存储 | TaskStorage 两条路径都要测：file + MySQL |
 
 ## 15. 注释维护建议

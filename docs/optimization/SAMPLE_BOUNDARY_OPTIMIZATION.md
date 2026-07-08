@@ -110,7 +110,7 @@ SELECT pk FROM `schema`.`table` WHERE pk > ? ORDER BY pk LIMIT ?
 |---|---|
 | 扫描量 | 恰好 1× 主键索引（只取 pk 列，不取全行） |
 | 内存 | 每批仅 `step` 行的 pk 值，有界 |
-| 可取消/续传 | 每批是短查询，响应 ctx 取消；sample 路径本就是表级续传，边界首跑后持久化复用，语义不变 |
+| 可取消 | 每批是短查询，响应 ctx 取消；当前全量中断后不再续传，sample 边界仅作为历史断点字段保留 |
 | 复用现有代码 | 逻辑对齐 `RangeShardingReader.ReadBatchByKeys`（已支持单列与复合主键，见 [cursor_reader.go:253](../../internal/sync/infrastructure/reader/cursor_reader.go#L253)） |
 | 正确性 | 分片只需"连续、不重叠"，边界无需绝对均匀，因此用估算行数算 step 完全安全 |
 
@@ -258,8 +258,8 @@ TaskService.syncTableData
 
 1. **行数来源切换**：调用处 [task_service.go:2661](../../internal/task/application/service/task_service.go#L2661) 已改为 `GetEstimatedCount`；保留"行数过少不并行"的阈值判断（用估算值近似即可）。
 2. **复用现有读取器**：`buildKeysetStepQuery` 与 `RangeShardingReader.ReadBatchByKeys` 采用相同的 keyset SQL 与复合主键展开风格，避免重复实现。
-3. **续传语义保持不变**：sample 路径仍为表级续传（见 [task.go:152](../../internal/task/domain/entity/task.go#L152)），首跑边界通过 `SetSampleBoundaries` 持久化、续传复用。新算法产出的边界同样走 `saveSampleBoundaries`（[task_service.go:5220](../../internal/task/application/service/task_service.go#L5220)），契约不变。
-4. **边界归一化**：继续用 `normalizePKBoundaryValue` 处理 `[]byte`/`string` 类型差异，保证跨进程续传比较一致。
+3. **历史断点字段兼容**：旧版本 sample 边界通过 `SetSampleBoundaries` 持久化；当前全量中断后不再续传，新算法产出的边界仍可走 `saveSampleBoundaries` 以保持存档结构兼容。
+4. **边界归一化**：继续用 `normalizePKBoundaryValue` 处理 `[]byte`/`string` 类型差异，保证边界比较一致。
 5. **失败回退**：估算行数不可用或步进首批即失败时，回退到单线程 keyset 顺序读取（现有 `canParallelSample = false` 分支），不阻断同步。
 6. **日志**：保留 `Dynamic boundary sampling` 摘要日志，增加 `estimatedRows`、`requestedWorkers`、`effectiveWorkers`、`step`、`pkCols`、`boundaries` 字段便于排查。
 
@@ -288,7 +288,7 @@ TaskService.syncTableData
 |---|---|---|
 | 估算行数误差大 | 分片不均，尾 worker 偏重 | 正确性不受影响；可记录实际行数用于后续校准；必要时对超大表保守降低 worker 数 |
 | keyset 步进在超宽复合主键上 SQL 较重 | 单批耗时略增 | step 取较大值减少批数；`buildKeysetCompositeWhere` 已按联合索引展开 |
-| 改动影响续传兼容 | 已存档的旧 sample 边界 | 续传复用已持久化的 `SampleBoundaries`，不重算；仅首跑走新算法 |
+| 改动影响历史断点兼容 | 已存档的旧 sample 边界 | 保持 `SampleBoundaries` 存档结构；当前全量中断后不再续传 |
 | 回滚 | — | 改动集中在 `samplePKBoundariesImproved` 与行数获取处，回滚即恢复旧 `LIMIT 1 OFFSET ?` + `COUNT(*)` |
 
 ## 9. 预期收益
