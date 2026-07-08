@@ -32,7 +32,7 @@
 
 # 全量同步吞吐与连接池（实例资源充足时可加大；需小于 MySQL max_connections，并留余量给其它客户端）
 [sync]
-  # 源/目标 sql.DB 最大连接数；0 或未写则默认 256
+  # 源/目标 sql.DB 最大连接数；0 或未写则默认 32
   # source_max_open_conns = 512
   # target_max_open_conns = 512
   # source_max_idle_conns = 256
@@ -41,6 +41,7 @@
   # conn_max_lifetime_seconds = 120
   # intra_table_legacy_cap = 64
   # intra_table_hard_max = 512
+  # index_restore_hard_max = 16
   # api_default_worker_count = 32
   # api_default_batch_size = 2000
 
@@ -117,27 +118,14 @@
   # 是否启用只读模式（同步期间目标数据库设为只读）
   # enable_readonly = true
   
-  # 是否启用索引优化（删除非主键索引，同步完成后再重建）
+  # 是否启用索引优化（删除非主键索引，所有表数据完成后按顺序统一重建）
   # optimize_index = false
 
-# ========== 任务级参数说明（非 application.toml 全局配置）==========
-# enable_consistent_snapshot 不是 TOML 配置项，而是创建/更新任务时的 JSON 字段。
-# 用途：全量阶段开启“并发 + 强一致”读取（多 worker 在同一时间点快照上读取）。
-# 适用位置：POST /api/tasks 与 PUT /api/tasks/:id 的请求体。
+# ========== 全量起点位点说明（无需配置）==========
+# 全量同步开始前会自动短暂执行一次 FLUSH TABLES WITH READ LOCK 取到 binlog 位点，
+# 随后立即 UNLOCK TABLES（过程毫秒级），用于后续增量同步起点。该行为对所有任务
+# 默认生效，无任何 TOML / JSON 开关需要配置。
 #
-# 示例（创建任务时传入）：
-# {
-#   "name": "full-sync-orders",
-#   "mode": "FULL",
-#   "sync_level": "TABLE",
-#   "source_schema": "db_src",
-#   "target_schema": "db_dst",
-#   "tables": ["orders"],
-#   "worker_count": 16,
-#   "intra_table_worker_count": 16,
-#   "batch_size": 2000,
-#   "enable_consistent_snapshot": true
-# }
-#
-# 注意：开启后会在快照建立阶段短暂使用 FTWRL（FLUSH TABLES WITH READ LOCK），
-# 需确保源库账号具备相关权限，并建议在业务低峰时段执行大表全量同步。
+# 历史版本曾提供 enable_consistent_snapshot 任务级字段（"严格全局快照 + 长事务
+# 连接池"模式），现已下线。如果你的客户端代码仍在传该字段，请直接删除——服务端
+# 会忽略，不会报错。

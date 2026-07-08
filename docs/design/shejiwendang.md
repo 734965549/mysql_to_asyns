@@ -1,130 +1,233 @@
-这是一个针对 **MySQL-to-MySQL** 同步场景，且深度适配 **无主键表（No-PK Tables）** 的工业级设计文档。
+# MySQL-to-MySQL 同步平台设计文档
 
----
+本文描述项目的总体设计。更细的模块职责、入参/出参和调用关系见 [领域模块边界与调用关系说明](DOMAIN_MODULE_BOUNDARIES.md)。
 
-# MySQL-to-MySQL 数据同步平台设计文档 (DTS-Go Pro)
+## 1. 设计目标
 
-## 1. 系统架构综述
-本系统采用 DDD（领域驱动设计）架构，旨在解决 MySQL 之间高性能、高可靠的数据迁移与同步需求。特别针对“无主键”这一痛点，通过动态标识识别（Identity Detection）和全列匹配技术，确保数据一致性。
+系统目标是在 MySQL 到 MySQL 场景下提供可运维的全量同步、增量同步和全量+增量组合同步能力。
 
-*   **全量阶段**：
-    *   **有主键/唯一键**：基于 Range Sharding 的并发分片读取。
-    *   **无主键**：基于流式游标（Cursor）的单协程深分页优化读取。
-*   **增量阶段**：基于 Binlog Row 模式，通过 Before Image 补全 `WHERE` 条件。
-*   **架构理念**：领域模型驱动策略选择（Strategy Pattern），基础设施层屏蔽库表差异。
+核心约束：
 
-### 技术栈
-*   **后端**: Go 1.21+, Gin, GORM, `go-mysql-org/go-mysql`。
-*   **前端**: Vue 3 + Element Plus + Pinia。
-*   **存储**: Redis（保存 Checkpoint 位点）、MySQL（元数据与任务配置）。
+- 支持有主键、有唯一键、无主键三类表。
+- 全量同步暂停、失败或进程重启后不再续传；需要重新准备目标端后启动新一轮全量。
+- 增量同步基于 ROW binlog，使用 Redis 或内存保存 binlog 位点。
+- 历史全量断点字段 `context.full_sync_resume` 仅作兼容和排查，不放到 Redis。
+- 目标库 destructive 行为必须显式配置，例如 `enable_drop_table_before_ddl=true`。
+- 任务运行时必须隔离，每个运行任务拥有独立源/目标 DB、analyzer、readOnlyManager 和 cancel。
 
----
+## 2. 领域划分
 
-## 2. DDD 领域模型设计
+### Task 领域
 
-### 2.1 领域划分
-*   **Task 领域**：任务生命周期管理、心跳监控、容错重试。
-*   **Metadata 领域**：**核心逻辑**。负责表结构扫描，自动判定同步策略：`PK`（主键）、`UK`（唯一键）、或 `No-PK`（全列匹配）。
-*   **Sync 领域**：执行单元。包含 DataReader（源端）、DataWriter（目标端）、Transformer（清洗）。
+Task 是任务聚合根，负责保存同步配置、外部生命周期状态和内部同步阶段。
 
-### 2.2 核心实体 (Entity & VO)
-*   **TableIdentity (Value Object)**:
-    *   `Strategy`: `PK_STRATEGY` | `UK_STRATEGY` | `FULL_COLUMNS_STRATEGY`。
-    *   `IdentifyCols`: 标识一行数据所需的列集合。
-*   **SyncTask (Aggregate Root)**:
-    *   包含 `TaskConfig` 和 `ProcessContext`（当前位点、进度百分比、错误堆栈）。
+职责：
 
----
+- 创建、更新、删除、启动、暂停、定时启动任务。
+- 保存任务状态、进度、错误栈和调度信息。
+- 清理历史全量断点字段 `FullSyncResume`。
+- 编排全量和增量同步，但不直接实现 SQL 生成。
 
-## 3. 核心功能设计
+关键状态：
 
-### 3.1 差异化全量同步 (Full Sync)
-*   **分片机制**：
-    *   **有主键**：获取 `MAX(id)` 和 `MIN(id)`，按步长切分分片，Worker 协程并发拉取。
-    *   **无主键**：无法切片。系统自动降级为 **单协程流式读取**，利用 Go 的 `sql.Rows` 迭代器降低内存占用，但在写入端保持多协程并发写入。
-*   **断点续传**：
-    *   记录已完成的分片 ID 或已读取的 Offset。
+- `TaskStatus`：外部生命周期，例如 `PENDING`、`RUNNING`、`PAUSED`。
+- `SyncPhase`：内部同步阶段，例如 `FULL_STARTED`、`FULL_COMPLETED`、`INCREMENTAL_STARTED`。
 
-### 3.2 增量同步 (Incremental CDC)
-*   **逻辑主键定位**：
-    *   **有主键**：生成的 SQL 为 `UPDATE ... WHERE id = ?`。
-    *   **无主键**：利用 Binlog 提供的 Before Image，生成全列匹配的 SQL：
-        `UPDATE/DELETE ... WHERE col1=? AND col2=? AND col3=? ... LIMIT 1`。
-    *   *注意：必须附加 `LIMIT 1` 以防在存在完全重复行时误操作。*
-*   **幂等处理**：
-    *   所有 `INSERT` 自动转化为 `REPLACE INTO` 或 `INSERT ... ON DUPLICATE KEY UPDATE`。
+二者必须保持分离。`TaskStatus=PAUSED` 只表示任务暂停；是否能接增量要看 `SyncPhase` 是否已完成全量。
 
-### 3.3 无主键表专项安全策略
-*   **环境预检**：启动前检查 `binlog_row_image` 是否为 `FULL`。若为 `MINIMAL` 且存在无主键表，则强制中止任务。
-*   **冲突处理**：无主键表在同步过程中若 `WHERE` 条件匹配不到行，记录为“数据空漂移”异常并打入审计日志，不中断主流程。
+### Metadata 领域
 
----
+Metadata 负责识别表结构和数据行身份。
 
-## 4. 接口设计 (API)
+职责：
 
-| 模块 | 方法 | 路径 | 描述 |
-| :--- | :--- | :--- | :--- |
-| 任务 | POST | `/api/tasks` | 创建任务（包含自动表结构检测） |
-| 元数据 | GET | `/api/metadata/tables` | 预览待同步表及标识策略（标注无主键表风险） |
-| 监控 | GET | `/api/tasks/:id/metrics` | 实时 TPS、延迟、无主键匹配成功率 |
-| 容错 | POST | `/api/tasks/:id/skip` | 跳过当前报错的位点 |
+- 从源库读取列、主键、唯一键和表列表。
+- 决定 `TableIdentity.Strategy`。
+- 输出 reader/writer 可消费的 `IdentifyCols` 和 `CursorCols`。
 
----
-
-## 5. 工程目录结构
+策略优先级：
 
 ```text
-dts-platform/
-├── internal/
-│   ├── metadata/                 # 元数据领域
-│   │   ├── domain/service/       # IdentityAnalyzer (主键/无主键判定算法)
-│   │   └── infrastructure/       # Schema 探测器 (查询 info_schema)
-│   ├── sync/                     # 同步领域
-│   │   ├── domain/strategy/      # PK/FullColumn 匹配策略实现
-│   │   ├── application/          # 协调全量切换增量流程
-│   │   └── infrastructure/       
-│   │       ├── writer/sql_builder.go # 动态生成有主键/无主键 SQL
-│   │       └── reader/cursor_reader.go# 无主键流式读取器
-│   └── task/                     # 任务管理
-├── pkg/
-│   └── binlog/                   # 基于 go-mysql 的原生封装
-└── web/                          # Vue 3 应用
+主键 PK -> 唯一键 UK -> 全列匹配 FullColumns
 ```
 
----
+### Sync 领域
 
-## 6. 前端设计亮点
+Sync 负责实际数据同步执行。
 
-1.  **风险雷达**：在选择表页面，红色高亮显示“无主键表”，并提示“该表将采用全列匹配模式，同步性能可能受限”。
-2.  **实时看板**：
-    *   **TPS 曲线**：区分展示有主键表和无主键表的写入速率。
-    *   **位点偏移量**：直观展示 Master Position 与当前处理 Position 的 Gap。
-3.  **SQL 预览**：支持点击查看当前正在生成的增量 SQL 模板（可见 `WHERE col1=... LIMIT 1`）。
+职责：
 
----
+- 全量读取源表并批量写入目标表。
+- 增量订阅 binlog 并回放 INSERT/UPDATE/DELETE。
+- 根据 `TableIdentity` 选择匹配策略和 SQL 生成方式。
+- 目标库只读保护、DDL 临时写权限、外键检查控制。
 
-## 7. “最快”与“安全”的平衡优化
+Sync 不保存任务配置和生命周期状态；这些由 TaskService 维护。
 
-1.  **批量写入 (Batching)**：
-    无论是全量还是增量，数据进入 `Buffer`，满足 1000 条或 500ms 触发一次批量提交，最大化利用 MySQL 吞吐量。
-2.  **并发冲突规避**：
-    *   **有主键**：按 `Hash(id) % WorkerNum` 分发，保证同一行的操作顺序。
-    *   **无主键**：按 `Hash(All_Columns) % WorkerNum` 分发，保证物理完全一致的行进入同一处理器。
-3.  **连接池优化**：
-    针对全量读取单独设置连接池，防止大数据量拉取占满业务连接。
-4.  **无主键安全阈值**：
-    支持设置 `Limit 1` 保护开关，默认开启，防止在非严格模式下的目标库出现多行误删。
+### Checkpoint 领域
 
----
+Checkpoint 只负责增量 binlog 位点。
 
-## 8. 实施计划 (Roadmap)
+职责：
 
-1.  **Phase 1**: 核心元数据扫描逻辑（自动区分 PK/UK/No-PK）。
-2.  **Phase 2**: 实现全量分片与无主键流式读取的双重引擎。
-3.  **Phase 3**: 实现基于 Before Image 的增量 SQL 构建器（全列匹配逻辑）。
-4.  **Phase 4**: 引入 Redis Checkpoint，实现断点续传与监控 API。
-5.  **Phase 5**: 前端可视化看板与异常审计后台。
+- `SavePosition(taskID, pos)` 保存增量位点。
+- `GetPosition(taskID)` 恢复增量位点。
+- Redis 可持久化，内存实现用于测试或无 Redis 场景。
 
----
+非职责：
 
-**设计总结**：本方案在原有 DTS 基础上，通过在 **Metadata 领域** 引入 `IdentityStrategy`，在 **Infrastructure 层** 引入 `FullColumnMatch` 算法，完美兼容了无主键表的极端场景，是目前 Go 实现 CDC 系统中最严谨的工程实践路径。
+- 不保存全量 row cursor。
+- 不判断全量是否完成。
+
+## 3. 全量同步设计
+
+全量同步入口由 TaskService 调用。
+
+流程：
+
+```text
+StartTask
+  -> executeSync
+  -> captureFullSyncStartPosition
+  -> MarkFullSyncStarted
+  -> syncDatabasePair
+  -> ensureTargetTable
+  -> AnalyzeTable
+  -> reader 读取源表
+  -> writer 写目标表（普通 INSERT；目标端需为空）
+  -> 提交后更新运行进度
+  -> MarkTableDone
+  -> MarkFullSyncCompleted
+```
+
+全量起点位点通过短暂 `FLUSH TABLES WITH READ LOCK` 捕获，随后立即 `UNLOCK TABLES`。不要重新引入长事务全局快照或 `enable_consistent_snapshot`。
+
+### 短锁起点与增量追平
+
+本项目不依赖“全量期间一直持锁”来保证一致性，而是使用“起点位点 + 空目标全量写 + 增量追平”：
+
+```text
+1. 全量开始前短锁拿到 binlog 位点 P0。
+2. 立即解锁，并把 P0 保存为增量 checkpoint。
+3. 全量阶段执行普通短查询，目标端使用普通 INSERT 写入；目标表必须为空，或通过 `enable_drop_table_before_ddl=true` 在全量前重建为空。
+   - 「DDL 前删除目标」按 `sync_level` 分支：DATABASE 级别在 `MarkFullSyncStarted` 后、任何目标表 DDL/数据写入前，对去重后的唯一目标库执行 `DROP DATABASE IF EXISTS` + `CREATE DATABASE IF NOT EXISTS`（utf8mb4/utf8mb4_unicode_ci），任一步失败终止全量；之后建表不再逐表 `DROP TABLE`。TABLE 级别保持每张表建表前 `DROP TABLE IF EXISTS`。两种级别均使用用户配置的目标库名/目标表名，仅在全量阶段执行一次，增量阶段不执行。
+4. ALL 模式全量完成后，增量从 P0 开始回放。
+5. P0 之后发生的变更会再次应用到目标库，用于追平全量读取期间的时间差。
+```
+
+重复处理不是单一的“全部跳过”：
+
+- 全量批量写统一使用普通 `INSERT`，目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 在全量前重建为空；非空目标属于不支持场景，可能失败或污染目标数据。
+- 增量 PK/UK 表的 INSERT 使用 `INSERT ... ON DUPLICATE KEY UPDATE`，重复到达时要覆盖旧值，保证最终收敛。
+- 增量 UPDATE/DELETE 使用 PK/UK 定位；无主键表使用 before image 或行镜像做全列 WHERE。
+- 无主键表 INSERT 没有真正冲突键，无法可靠去重，仍建议给表补主键或唯一键。
+
+### 读路径
+
+| 表类型 | 读取方式 |
+|---|---|
+| 数值单列主键 | range 分片并行 |
+| 主键/唯一键 | keyset 顺序读 |
+| 采样边界并行 | sample |
+| 无主键 | cursor 流式读 |
+
+### 写入语义
+
+全量写统一使用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE）。目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 后由程序在全量前重建为空；如果目标表已有数据，属于不支持场景，可能失败或污染目标数据。全量不是增量回放，不使用 upsert 作为默认语义。
+
+## 4. 全量中断处理
+
+历史断点字段保存在：
+
+```text
+SyncTask.Context.FullSyncResume
+```
+
+历史记录曾包含：
+
+- `Done`：表是否完成。
+- `ReadPath`：`keyset/range/sample/nopk`。
+- `Cursor`：单 worker keyset 游标。
+- `ShardCursors`：range 分片游标。
+- `SampleBoundaries`：sample 首跑边界。
+- `ProcessedRows`：用于展示和排查。
+
+当前全量写入使用普通 `INSERT` 场景，暂停/失败/进程中断后不再使用该字段续传。`sync_phase=FULL_STARTED/FULL_FAILED` 且 `enable_drop_table_before_ddl=false` 时，同一旧任务再次启动会被拒绝；若人工清理/重建目标端，需要创建/重置任务后从头跑，或开启 `enable_drop_table_before_ddl=true` 后启动新一轮全量。进入新一轮全量前会清空历史断点。
+
+## 5. 增量同步设计
+
+增量同步入口：
+
+```text
+TaskService.executeIncrementalSync
+  -> IncrementalSyncService.Start
+  -> checkpoint.GetPosition
+  -> pkg/binlog.Subscriber.Start
+  -> syncEventHandler.OnEvent
+```
+
+增量要求：
+
+- MySQL binlog 必须是 ROW 格式。
+- 对无主键表，`binlog_row_image=FULL` 是安全处理 UPDATE/DELETE 的关键前提。
+- 增量 checkpoint 保存 binlog file/pos。
+
+事件处理：
+
+| 事件 | PK/UK 表 | 无主键表 |
+|---|---|---|
+| INSERT | upsert | `INSERT IGNORE`，不能保证去重 |
+| UPDATE | after image 更新，身份列 WHERE | before image 全列 WHERE |
+| DELETE | 身份列 WHERE | 全列 WHERE |
+
+写入成功后保存 checkpoint。checkpoint 保存失败应视为本次事件处理失败，避免后续恢复丢事件。
+
+## 6. 无主键表设计
+
+无主键表使用 `FullColumnsStrategy`。
+
+全量阶段：
+
+- 使用 cursor 流式扫描，避免 OFFSET 深分页。
+- 全量中断后不续传；需要按全量中断处理规则重新准备目标端。
+
+增量阶段：
+
+- UPDATE 使用 before image 作为 WHERE 条件。
+- DELETE 使用事件携带的行镜像作为 WHERE 条件。
+- `enable_limit_one` 控制 SQL 生成中的 `LIMIT 1` 保护语义，应通过 SQL builder 测试覆盖。
+
+风险：
+
+- 如果目标库已有漂移，UPDATE/DELETE 可能匹配 0 行。
+- 如果存在完全重复行，无主键场景无法精确定位逻辑上的“第几行”。
+- 推荐给业务表补主键或唯一键。
+
+## 7. 存储与安全
+
+任务存储支持文件和 MySQL：
+
+- 文件：默认 `data/<taskID>.json`。
+- MySQL：`sys_sync_tasks`，内容存 JSON。
+
+密码持久化：
+
+- 配置了 `[security].encrypt_key` 时，任务中的 `source_db.password` 和 `target_db.password` 持久化前会加密。
+- 加密不应永久污染内存中的明文任务对象；运行时连接数据库仍使用明文。
+
+## 8. 只读保护
+
+`ReadOnlyManager` 用于同步期间保护目标库：
+
+- 保存原始 `read_only/super_read_only`。
+- 同步期间设置 `read_only=ON`，并保证同步账号可写入。
+- 执行 DDL 时通过 `WithWriteAccess` 临时开放写权限。
+- 同步结束或失败清理时恢复原始状态。
+
+## 9. 扩展原则
+
+- 新增状态或阶段时，先更新 `task/domain/entity`，再更新 TaskService、测试和文档。
+- 新增 SQL 行为时，先补 `SQLBuilder` 单测，保证 SQL 和参数顺序确定。
+- 修改全量中断处理时，必须覆盖暂停、失败、重启、`enable_drop_table_before_ddl` 四类场景。
+- 修改增量 checkpoint 时，确认没有把历史全量断点和 binlog 位点混在一起。
+- 修改 API 字段时，同步更新 handler、README/docs、配置示例和 web。

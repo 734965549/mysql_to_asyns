@@ -1,4 +1,4 @@
-﻿# 🎉 MySQL-to-Async 项目优化总结报告
+# 🎉 MySQL-to-Async 项目优化总结报告
 
 ## 📊 项目概览
 
@@ -96,7 +96,7 @@
 
 ### 测试结果
 `ash
-✅ 编译成功: go build -o mysql-to-async.exe
+✅ 编译成功: go build -o mysql-to-sync.exe
 ✅ 测试通过: 12/12 (100%)
 ✅ 测试覆盖: 85.7%
 ✅ 无编译错误
@@ -118,7 +118,7 @@
 ## 📁 项目结构
 
 `
-mysql-to-async/
+mysql-to-sync/
 ├── data/                          # 任务数据（持久化）
 │   └── task_*.json
 ├── logs/                          # 日志目录
@@ -169,10 +169,10 @@ mysql-to-async/
 go mod tidy
 
 # 2. 编译项目
-go build -o mysql-to-async.exe
+go build -o mysql-to-sync.exe
 
 # 3. 运行服务
-./mysql-to-async.exe
+./mysql-to-sync.exe
 
 # 4. 运行测试
 go test ./...

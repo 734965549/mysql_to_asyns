@@ -1,0 +1,42 @@
+---
+description: Data synchronization correctness contracts for full sync, incremental sync, no-primary-key tables, and checkpoints
+globs: internal/sync/**/*.go,internal/task/**/*.go,internal/metadata/**/*.go,pkg/binlog/**/*.go,internal/checkpoint/**/*.go
+alwaysApply: false
+---
+
+# 同步正确性规则
+
+## 表身份策略
+
+- `TableIdentity` 是同步策略的入口。任何读取、写入、UPDATE、DELETE、断点续传逻辑都必须基于 `TableIdentity.Strategy` 和 `IdentifyCols`。
+- 主键表使用 `PK_STRATEGY`，唯一键表使用 `UK_STRATEGY`，无主键无唯一键表使用 `FULL_COLUMNS_STRATEGY`。
+- 对复合主键、自增列、唯一键、无主键表的行为要写测试，不能只测单列主键。
+
+## SQL 生成契约
+
+- INSERT 增量路径必须具备幂等语义：有 PK/UK 时使用 `INSERT ... ON DUPLICATE KEY UPDATE`；无 PK/UK 时不能假装有冲突键。
+- 全量批量写入可以使用 `INSERT IGNORE` 降低重复写风险，但不能把它误当作增量 upsert 语义。
+- UPDATE/DELETE 对无主键表必须使用 before image 构建 WHERE，并追加 `LIMIT 1`，避免重复行场景下误改多行。
+- WHERE 条件必须来自识别列或 before image，不要用 after image 定位被 UPDATE 前的记录。
+- SQL 值必须用占位符参数传递；表名、库名、列名必须反引号引用。
+
+## 全量同步与断点续传
+
+- 全量断点只在事务成功提交后推进，避免已记录但未落库导致丢行。
+- 表级完成后设置 `done=true`，重启时可跳过已完成表。
+- keyset/range 路径支持行级续传；sample/nopk 路径通常只承诺表级续传。
+- 开启 DDL 前 `DROP TABLE` 时必须禁用全量续传并清空旧断点，否则会跳过已被删除的目标表数据。
+- `FULL`、`ALL`、`INCREMENTAL` 三种模式的恢复逻辑不能混淆：`ALL` 全量完成后才进入增量；`INCREMENTAL` 应依赖已存在的 Binlog checkpoint 或明确起点。
+
+## 增量同步与 Binlog
+
+- 增量同步必须检查源库 Binlog 开启、`binlog_format=ROW`。涉及无主键表 UPDATE/DELETE 时必须要求 `binlog_row_image=FULL`。
+- 每个任务使用独立 server ID 或可证明不冲突的 server ID 生成策略。
+- checkpoint 保存失败是可靠性风险，不能静默吞掉。至少要记录错误并让任务状态可观察。
+- Redis checkpoint 是生产推荐；内存 checkpoint 仅适合本地或临时运行，重启会丢位点。
+
+## 只读保护与数据安全
+
+- 只读保护只应用于目标库，不能误操作源库。
+- 只读保护失败时要明确任务是否继续，不能在不确定状态下静默同步。
+- 删除、重建目标表、DDL、DROP TABLE 等高风险行为必须有配置开关和日志。

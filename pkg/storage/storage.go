@@ -6,7 +6,7 @@ import ( // 导入外部包
 	"path/filepath" // 导入path/filepath包，用于文件路径操作
 	"sync" // 导入sync包，用于并发控制
 
-	taskEntity "mysql-to-async/internal/task/domain/entity" // 导入任务实体
+	taskEntity "mysql-to-sync/internal/task/domain/entity" // 导入任务实体
 )
 
 // Storage 存储接口定义

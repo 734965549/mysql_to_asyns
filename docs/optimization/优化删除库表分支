@@ -1,0 +1,23 @@
+按同步级别修正目标删除逻辑
+Summary
+保留现有 enable_drop_table_before_ddl API 字段，但根据 sync_level 分支执行：
+DATABASE：全量同步开始时先重建目标库。
+TABLE：继续在建表前逐表删除。
+增量阶段或已跳过全量阶段时不执行删除。
+Implementation Changes
+全量同步捕获 binlog 起点并标记 FULL_STARTED 后、任何目标表 DDL/数据写入前，统一处理库级删除。
+对目标库映射去重，使用固定连接依次执行安全引用的 DROP DATABASE IF EXISTS 和 CREATE DATABASE IF NOT EXISTS；任一步失败立即终止全量同步。
+库级分支重建数据库后，调用 ensureTargetTable 时关闭逐表删除；表级分支保持现有 DROP TABLE 行为。
+保持开启删除时重建目标端并使用普通 INSERT 的现有语义；当前全量中断后统一不续传。
+UI 根据同步级别动态显示“删除目标库/目标表”及破坏性提示；同步更新 README、全量中断处理指南和设计文档。
+JSON 字段、任务存储结构及默认值不变，无迁移要求。
+Test Plan
+DATABASE + 开启删除：目标库只重建一次，不执行 DROP TABLE。
+多库映射：每个唯一目标库只重建一次，之后再同步所有库。
+TABLE + 开启删除：仍逐表执行 DROP TABLE，不删除数据库。
+关闭开关：两种级别均不执行删除。
+验证 DROP/CREATE 失败会终止同步，空库重建后仍保留目标数据库。
+运行 go test ./internal/task/application/service、go test ./...、go vet ./... 和 web 的 npm run build。
+Assumptions
+目标库使用现有默认字符集 utf8mb4、排序规则 utf8mb4_unicode_ci 重建。
+按用户选择，不新增“源目标同实例同名库”保护；配置如此映射时仍会执行删除。

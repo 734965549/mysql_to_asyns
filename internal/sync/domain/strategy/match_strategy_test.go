@@ -3,7 +3,7 @@ package strategy
 import (
 	"testing"
 
-	"mysql-to-async/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metadata/domain/entity"
 )
 
 func TestPKMatchStrategy_BuildWhereClause(t *testing.T) {

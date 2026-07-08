@@ -7,17 +7,19 @@ import (
 
 	"fmt"
 
-	"mysql-to-async/internal/checkpoint"
+	"mysql-to-sync/internal/checkpoint"
 
-	"mysql-to-async/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metadata/domain/entity"
 
-	"mysql-to-async/internal/metadata/domain/service"
+	"mysql-to-sync/internal/metadata/domain/service"
 
-	"mysql-to-async/internal/sync/infrastructure/writer"
+	"mysql-to-sync/internal/metrics"
 
-	"mysql-to-async/pkg/binlog"
+	"mysql-to-sync/internal/sync/infrastructure/writer"
 
-	"mysql-to-async/pkg/logger"
+	"mysql-to-sync/pkg/binlog"
+
+	"mysql-to-sync/pkg/logger"
 
 	"sync"
 
@@ -26,8 +28,18 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 )
 
+// PositionPersister 位点回写回调：每次成功落库 + 写完 checkpoint 后被调用，由调用方（task service）决定如何
+// 把位点冗余持久化到任务存档（用于离线审计 / 阶段状态判断）。回调内部应自带节流，避免每个 binlog 事件都触发存储写。
+// 回调失败不会反向影响增量同步本身。
+type PositionPersister func(taskID string, pos mysql.Position)
+
 // IncrementalSyncService 增量同步服务
 
+// IncrementalSyncService replays ROW binlog events into the target database.
+//
+// It owns binlog subscription, target writers, table identities, and incremental
+// checkpoint writes. It does not own task lifecycle; TaskService starts/stops it
+// and optionally receives throttled position snapshots for task archives.
 type IncrementalSyncService struct {
 	sourceDB *sql.DB
 
@@ -38,6 +50,10 @@ type IncrementalSyncService struct {
 	analyzer service.IdentityAnalyzer
 
 	checkpointMgr checkpoint.Manager
+
+	// positionPersister 可选位点回写回调，由 task service 注入用于把增量位点冗余到任务存档。
+	// nil 时不做任何回写，行为与历史版本一致。
+	positionPersister PositionPersister
 
 	subscriber *binlog.Subscriber
 
@@ -56,6 +72,14 @@ type IncrementalSyncService struct {
 	auditChan chan *AuditLog
 
 	wg sync.WaitGroup
+}
+
+// SetPositionPersister 注入位点回写回调。允许在 Start 前调用，重复调用会覆盖旧值。
+// 传 nil 可以清除已注入的回调。
+func (s *IncrementalSyncService) SetPositionPersister(p PositionPersister) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.positionPersister = p
 }
 
 // AuditLog 审计日志
@@ -217,6 +241,11 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 
 				tgtDB,
 			)
+
+			// 修复 10/11：增量路径开启 upsert 语义。
+			// 增量 INSERT 事件可能重复到达（全量期间的变更要由增量回放追平），
+			// 必须用 ON DUPLICATE KEY UPDATE 保证幂等；无主键表内部会自动退化为 INSERT IGNORE。
+			bw.EnableUpsert()
 
 			s.mu.Lock()
 
@@ -411,6 +440,14 @@ func (s *IncrementalSyncService) getTargetSchema(key string) string {
 
 }
 
+// snapshotPositionPersister 在写锁外取一份 persister 的"现值"，避免每事件路径都持锁。
+// 返回值可能为 nil（未注入或被清除），调用方判空。
+func (s *IncrementalSyncService) snapshotPositionPersister() PositionPersister {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.positionPersister
+}
+
 // SyncConfig 同步配置
 
 type SyncConfig struct {
@@ -471,6 +508,13 @@ func (h *syncEventHandler) OnEvent(event *binlog.BinlogEvent) error {
 
 	targetSchema := h.service.getTargetSchema(key)
 
+	// 修复 9/14：无主键 / 无唯一键表事件埋点 + 显式告警（按事件级，量级可控）
+	if identity.Strategy == entity.FullColumnsStrategy {
+		metrics.GetMetrics().IncrementIncrementalNoPKTableEvents()
+		logger.Warn("[NoPK][Task %s] Incremental event on table %s.%s (event=%s, strategy=FullColumns): falling back to full-column WHERE + LIMIT 1; idempotency is best-effort, recommend adding a primary or unique key",
+			h.taskID, event.Schema, event.Table, event.EventType)
+	}
+
 	var err error
 
 	switch event.EventType {
@@ -502,6 +546,11 @@ func (h *syncEventHandler) OnEvent(event *binlog.BinlogEvent) error {
 			logger.Error("[Task %s] Failed to save checkpoint for %s.%s at %s:%d: %v",
 
 				h.taskID, event.Schema, event.Table, event.Position.Name, event.Position.Pos, cpErr)
+
+		} else if persist := h.service.snapshotPositionPersister(); persist != nil {
+
+			// 节流回写到任务存档：由 task service 注入的 persister 自行决定写盘频率。
+			persist(h.taskID, event.Position)
 
 		}
 

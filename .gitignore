@@ -1,4 +1,4 @@
-﻿# Binaries for programs and plugins
+# Binaries for programs and plugins
 *.exe
 *.exe~
 *.dll
@@ -10,6 +10,8 @@
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+coverage*
+coverage_*
 
 # Dependency directories
 vendor/
@@ -29,8 +31,8 @@ go.work
 Thumbs.db
 
 # Project specific
-mysql-to-async
-mysql-to-async.exe
+mysql-to-sync
+mysql-to-sync.exe
 data/
 logs/
 *.log
@@ -47,3 +49,7 @@ etc/application.toml
 # Temp files
 *.tmp
 *.bak
+
+# Test data directories (test runtime artifacts, not tracked fixtures)
+internal/task/application/service/test_task_service_*/
+internal/task/application/service/test_task_storage_*/

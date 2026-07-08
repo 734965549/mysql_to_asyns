@@ -9,7 +9,7 @@ import ( // 导入外部包
 	_ "github.com/go-sql-driver/mysql" // 导入MySQL驱动，下划线表示仅导入init函数
 	"github.com/redis/go-redis/v9" // 导入Redis客户端包
 
-	"mysql-to-async/pkg/logger" // 导入自定义日志包，用于日志输出
+	"mysql-to-sync/pkg/logger" // 导入自定义日志包，用于日志输出
 )
 
 // Validator 配置验证器结构体

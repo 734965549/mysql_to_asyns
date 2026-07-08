@@ -1,4 +1,4 @@
-﻿package writer
+package writer
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"mysql-to-async/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metadata/domain/entity"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
@@ -489,5 +489,151 @@ func TestBufferedWriter_FlushWithData(t *testing.T) {
 	err = writer.Close()
 	assert.NoError(t, err)
 
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// === 修复 10/11：BatchWriter.WriteBatch 在 useUpsert 模式下必须发出 ON DUPLICATE KEY UPDATE ===
+
+// TestBatchWriter_WriteBatch_DefaultIsInsertIgnore 默认模式保留 INSERT IGNORE，作为未显式选择 plain/upsert 的兼容路径。
+func TestBatchWriter_WriteBatch_DefaultIsInsertIgnore(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	mock.ExpectExec("INSERT IGNORE INTO `users` (`id`, `name`) VALUES (?, ?)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := NewBatchWriter(db, identity, 100)
+	err = w.WriteBatch(context.Background(), []map[string]interface{}{{"id": 1, "name": "Alice"}})
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBatchWriter_WriteBatch_UpsertModeEmitsOnDuplicateKey 增量模式启用 upsert 后，
+// 同一 SQL 必须改为 `INSERT ... ON DUPLICATE KEY UPDATE 非键列 = VALUES(...)`。
+func TestBatchWriter_WriteBatch_UpsertModeEmitsOnDuplicateKey(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	mock.ExpectExec("INSERT INTO `users` (`id`, `name`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := NewBatchWriter(db, identity, 100)
+	w.EnableUpsert()
+	err = w.WriteBatch(context.Background(), []map[string]interface{}{{"id": 1, "name": "Alice"}})
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBufferedWriter_EnableUpsert_ForwardsToBatchWriter BufferedWriter 是增量路径的入口，
+// EnableUpsert 必须能正确转发到底层 BatchWriter，避免增量 INSERT 仍走 IGNORE。
+func TestBufferedWriter_EnableUpsert_ForwardsToBatchWriter(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	bw := NewBufferedWriter(db, identity, 100, time.Hour)
+	bw.EnableUpsert()
+
+	mock.ExpectExec("INSERT INTO `users` (`id`, `name`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	bw.mu.Lock()
+	bw.buffer = append(bw.buffer, map[string]interface{}{"id": 1, "name": "Alice"})
+	bw.mu.Unlock()
+
+	assert.NoError(t, bw.Flush())
+	assert.NoError(t, bw.Close())
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBatchWriter_WriteBatch_PlainInsertMode 显式启用 plain insert 后，
+// 应发出普通 INSERT INTO（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
+func TestBatchWriter_WriteBatch_PlainInsertMode(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	mock.ExpectExec("INSERT INTO `users` (`id`, `name`) VALUES (?, ?)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := NewBatchWriter(db, identity, 100)
+	w.EnablePlainInsert()
+	err = w.WriteBatch(context.Background(), []map[string]interface{}{{"id": 1, "name": "Alice"}})
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBatchWriter_WriteBatch_PlainInsertOverridesUpsert usePlainInsert 优先级高于 useUpsert。
+func TestBatchWriter_WriteBatch_PlainInsertOverridesUpsert(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		Columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	// 即使同时启用了 upsert，plain insert 应优先生效
+	mock.ExpectExec("INSERT INTO `users` (`id`, `name`) VALUES (?, ?)").
+		WithArgs(1, "Alice").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := NewBatchWriter(db, identity, 100)
+	w.EnableUpsert()
+	w.EnablePlainInsert()
+	err = w.WriteBatch(context.Background(), []map[string]interface{}{{"id": 1, "name": "Alice"}})
+	assert.NoError(t, err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }

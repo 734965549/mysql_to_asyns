@@ -1,7 +1,7 @@
-﻿.PHONY: build run test clean docker help
+.PHONY: build run test clean docker help
 
 # 变量
-APP_NAME=mysql-to-async
+APP_NAME=mysql-to-sync
 VERSION=1.0.0
 BUILD_TIME=
 GO_VERSION=

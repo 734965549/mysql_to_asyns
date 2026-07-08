@@ -1,4 +1,4 @@
-﻿package router
+package router
 
 import (
 	"net/http"
@@ -7,9 +7,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"mysql-to-async/internal/config"
-	metadataEntity "mysql-to-async/internal/metadata/domain/entity"
-	taskService "mysql-to-async/internal/task/application/service"
+	"mysql-to-sync/internal/config"
+	metadataEntity "mysql-to-sync/internal/metadata/domain/entity"
+	taskService "mysql-to-sync/internal/task/application/service"
 )
 
 // MockAnalyzer 妯℃嫙 IdentityAnalyzer
@@ -193,6 +193,25 @@ func TestTaskByIDEndpoints(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("GET /api/tasks/nonexistent: expected status 404, got %d", w.Code)
+	}
+}
+
+func TestTaskProgressEndpoint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	taskSvc := taskService.NewTaskService(testConfig())
+	analyzer := &MockAnalyzer{}
+	cfg := testConfig()
+
+	router := SetupRouter(taskSvc, analyzer, cfg)
+
+	// GET /api/tasks/nonexistent/progress — 应返回 404
+	req := httptest.NewRequest("GET", "/api/tasks/nonexistent/progress", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("GET /api/tasks/nonexistent/progress: expected status 404, got %d", w.Code)
 	}
 }
 

@@ -8,11 +8,11 @@ import ( // 导入外部包和内部模块
 	"github.com/gin-gonic/gin"                                // 导入Gin框架，用于构建HTTP API
 	"github.com/prometheus/client_golang/prometheus/promhttp" // 导入Prometheus HTTP处理器
 
-	"mysql-to-async/internal/api/handler"                          // 导入处理器模块
-	"mysql-to-async/internal/config"                               // 导入配置模块
-	"mysql-to-async/internal/metadata/domain/service"              // 导入元数据领域服务
-	"mysql-to-async/internal/metrics"                              // 导入指标模块
-	taskService "mysql-to-async/internal/task/application/service" // 导入任务应用服务
+	"mysql-to-sync/internal/api/handler"                          // 导入处理器模块
+	"mysql-to-sync/internal/config"                               // 导入配置模块
+	"mysql-to-sync/internal/metadata/domain/service"              // 导入元数据领域服务
+	"mysql-to-sync/internal/metrics"                              // 导入指标模块
+	taskService "mysql-to-sync/internal/task/application/service" // 导入任务应用服务
 )
 
 // SetupRouter 设置路由函数
@@ -57,6 +57,7 @@ func SetupRouter(taskSvc *taskService.TaskService, analyzer service.IdentityAnal
 		// 任务管理
 		tasks := api.Group("/tasks") // 创建任务路由分组
 		{                            // 分组开始
+			tasks.GET("/sort-options", taskHandler.GetTaskSortOptions)     // 获取任务排序选项：GET /api/tasks/sort-options
 			tasks.POST("", taskHandler.CreateTask)                         // 创建任务路由：POST /api/tasks
 			tasks.GET("", taskHandler.GetAllTasks)                         // 获取所有任务路由：GET /api/tasks
 			tasks.GET("/:id", taskHandler.GetTask)                         // 获取任务详情路由：GET /api/tasks/:id
@@ -65,6 +66,7 @@ func SetupRouter(taskSvc *taskService.TaskService, analyzer service.IdentityAnal
 			tasks.POST("/:id/start", taskHandler.StartTask)                // 启动任务路由：POST /api/tasks/:id/start
 			tasks.POST("/:id/pause", taskHandler.PauseTask)                // 暂停任务路由：POST /api/tasks/:id/pause
 			tasks.GET("/:id/metrics", taskHandler.GetTaskMetrics)          // 获取任务指标路由：GET /api/tasks/:id/metrics
+			tasks.GET("/:id/progress", taskHandler.GetTaskProgress)        // 获取任务运行时进度路由：GET /api/tasks/:id/progress
 			tasks.POST("/:id/skip", taskHandler.SkipError)                 // 跳过错误路由：POST /api/tasks/:id/skip
 			tasks.POST("/:id/cancel-schedule", taskHandler.CancelSchedule) // 取消定时启动路由：POST /api/tasks/:id/cancel-schedule
 		} // 分组结束

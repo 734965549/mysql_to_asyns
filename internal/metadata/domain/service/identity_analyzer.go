@@ -1,7 +1,7 @@
 package service // 声明当前文件属于service包，用于业务服务层
 
 import ( // 导入外部包和标准库
-	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
+	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
 )
 
 // IdentityAnalyzer 标识分析器接口
@@ -69,7 +69,28 @@ func (s *IdentityAnalyzerService) AnalyzeTable(schema, tableName string) (*entit
 		}
 	}
 
+	// 游标/分片列：复合主键含自增列时仅用自增列分页，否则与 IdentifyCols 一致
+	identity.CursorCols = resolveCursorCols(identity.IdentifyCols, columns)
+
 	return identity, nil // 返回表标识
+}
+
+// resolveCursorCols 根据主键/标识列与列元数据决定全量同步的分页游标键。
+// 复合主键中存在 auto_increment 列时，仅使用该列作为游标；否则保留完整标识列（含元组比较）。
+func resolveCursorCols(identifyCols []string, columns []entity.ColumnMeta) []string {
+	if len(identifyCols) <= 1 {
+		return append([]string(nil), identifyCols...)
+	}
+	colByName := make(map[string]entity.ColumnMeta, len(columns))
+	for _, col := range columns {
+		colByName[col.Name] = col
+	}
+	for _, name := range identifyCols {
+		if col, ok := colByName[name]; ok && col.IsAutoIncrement {
+			return []string{name}
+		}
+	}
+	return append([]string(nil), identifyCols...)
 }
 
 // GetAllTables 获取所有表方法

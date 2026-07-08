@@ -1,0 +1,40 @@
+---
+description: MySQL-to-Async project context, product contract, and default engineering expectations
+globs: 
+alwaysApply: true
+---
+
+# MySQL-to-Async 项目总则
+
+这是一个高性能 MySQL 数据同步工具，目标是把 MySQL 源库的数据可靠同步到目标端。当前核心产品面向 MySQL-to-MySQL，同步能力覆盖全量、增量、全量+增量组合模式，并提供 REST API 与 Web 管理界面。
+
+## 项目定位
+
+- 优先保证数据正确性、一致性、可恢复性，再谈性能优化。
+- 主要能力包括全量迁移、Binlog 增量同步、断点续传、无主键表支持、任务生命周期管理、只读保护、审计日志、Prometheus 指标、Web UI。
+- 已有架构倾向 DDD：`internal/task` 管任务生命周期，`internal/metadata` 管表结构和身份识别，`internal/sync` 管同步执行，`internal/api` 管 HTTP 接口，`pkg` 放可复用基础能力。
+- 不要把业务逻辑堆回 `main.go` 或 HTTP handler。handler 只做请求/响应转换，应用服务负责编排，领域和基础设施模块各守边界。
+
+## 必须保护的核心契约
+
+- 表身份识别策略只有三类：`PK_STRATEGY`、`UK_STRATEGY`、`FULL_COLUMNS_STRATEGY`。新增逻辑必须明确属于哪类策略，不能隐式假设所有表都有主键。
+- 无主键表是项目的一等场景，不是异常分支。全量阶段通常采用流式读取或表级续传；增量阶段依赖 before image 做全列匹配。
+- 增量同步依赖 MySQL Binlog ROW 模式；无主键表要求 `binlog_row_image=FULL` 才能安全处理 UPDATE/DELETE。
+- 全量断点和增量 checkpoint 是两套机制：全量断点在任务存档 `context.full_sync_resume` 中，增量 Binlog 位点由 checkpoint manager 维护，优先 Redis，内存只适合临时环境。
+- 任务运行时必须任务级隔离。每个任务维护自己的 source DB、target DB、analyzer、readOnlyManager、cancel，不要重新引入全局共享 runtime 导致并发任务串扰。
+- 任务配置中的数据库密码可能使用 AES-256-GCM 加密持久化，读取和保存时要兼容明文旧数据与 `ENC~` 密文。
+
+## 代码风格
+
+- Go 代码保持 `gofmt`/`go vet` 通过。优先小函数、明确错误返回、context 可取消、资源显式关闭。
+- 不新增低价值中文注释。现有代码里有大量注释和部分编码损坏文本，改动附近代码时可以顺手清理明显乱码，但不要做无关的大规模格式化。
+- SQL 必须参数化，标识符要用反引号包裹。不能拼接用户输入作为 SQL 值。
+- 配置变更需要同时考虑 `etc/application.toml.example`、`docs/CONFIGURATION.md`、环境变量覆盖、Docker/K8s 部署。
+- 前后端契约变更需要同步更新 handler、router、Web UI、README/docs、测试。
+
+## 建议方向
+
+- 优先补齐同步正确性测试：无主键表、before image、断点续传、任务并发隔离、Redis checkpoint、DDL/drop-table 续传禁用。
+- 建议逐步修复文档和前端中文乱码，统一为 UTF-8。
+- 建议清理根目录构建产物和异常文件，如 `main.exe`、`coverage*`、空文件 `1`，并确认 `.gitignore` 覆盖。
+- 当前 Makefile 变量看起来不完整，改动构建流程时优先修复 `APP_NAME`、`VERSION`、输出文件名等目标。

@@ -51,6 +51,80 @@
 
 ### 查看任务列表
 
+任务列表采用后端分页接口获取，支持按页浏览、状态筛选、关键字搜索和排序。
+
+#### 列表接口
+
+```http
+GET /api/tasks?page=1&page_size=10&status=RUNNING&keyword=order&sort=created_at_desc
+```
+
+#### 返回结构
+
+```json
+{
+  "total": 123,
+  "page": 1,
+  "page_size": 10,
+  "items": []
+}
+```
+
+#### 任务时间字段
+
+- `created_at`: 任务创建时间，由后端在任务存档中写入，并对应数据库表 `sys_sync_tasks.created_at`
+- `updated_at`: 任务更新时间，由数据库在更新任务记录时自动维护，对应 `sys_sync_tasks.updated_at`
+
+#### 任务存储表结构
+
+任务元数据存储在 `sys_sync_tasks` 中，推荐结构如下：
+
+```sql
+CREATE TABLE IF NOT EXISTS sys_sync_tasks (
+  pk_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  id VARCHAR(64) NOT NULL,
+  name VARCHAR(255),
+  content JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (pk_id),
+  UNIQUE KEY uk_task_id (id)
+);
+```
+
+如果你是从旧版本升级，建议由 DBA 统一执行补表脚本，示例：
+
+```sql
+ALTER TABLE sys_sync_tasks
+  ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+```
+
+#### 支持的查询参数
+
+- **page**: 页码，默认 `1`
+- **page_size**: 每页条数，默认 `10`
+- **status**: 按状态筛选，例如 `RUNNING`
+- **keyword**: 关键字搜索，可匹配任务名称、任务 ID、源/目标 schema、表名
+- **sort**: 排序字段
+
+#### 支持的排序字段
+
+- `created_at_desc` 创建时间倒序（默认）
+- `created_at_asc` 创建时间正序
+- `name_asc` 名称正序
+- `name_desc` 名称倒序
+- `status_asc` 状态正序
+- `status_desc` 状态倒序
+- `progress_asc` 进度正序
+- `progress_desc` 进度倒序
+
+#### 前端行为
+
+- 任务列表顶部提供状态筛选、排序和关键字搜索
+- 筛选条件会同步到 URL，刷新页面后会自动恢复
+- 翻页和修改筛选条件都会重新请求后端
+
 任务列表显示所有已创建的同步任务，包含以下信息：
 
 - **任务名称**: 任务的唯一标识
@@ -71,8 +145,9 @@
 
 - **详情**: 查看任务的详细信息
 - **编辑**: 编辑任务配置（仅待执行或已暂停状态）
-- **启动**: 启动任务（仅待执行或已暂停状态）
-- **暂停**: 暂停正在执行的任务
+- **启动**: 启动任务（仅待执行或已暂停状态）；全量未完成时会按后端规则拒绝或重新全量，增量阶段可从 checkpoint 继续
+- **暂停**: 暂停正在执行的任务；全量阶段会保留 `sync_phase=FULL_STARTED`
+- **取消定时**: 取消已设置的 Cron/定时启动（仅 `SCHEDULED` 状态）
 - **删除**: 删除任务（仅非执行中状态）
 
 ### 任务详情抽屉
@@ -96,6 +171,97 @@
 
 **同步表列表**:
 - 显示所有同步的表名
+
+---
+
+### 任务运行时进度接口
+
+任务运行时进度接口用于在任务同步期间获取实时的表级进度信息，包括当前同步到哪张表、每张表的行数、进度百分比、同步速度等。
+
+#### 接口定义
+
+```
+GET /api/tasks/:id/progress
+```
+
+#### 请求示例
+
+```bash
+curl http://localhost:8080/api/tasks/abc123/progress
+```
+
+#### 响应示例
+
+```json
+{
+  "current_table": "production.orders",
+  "tables": [
+    {
+      "schema": "production",
+      "table": "users",
+      "total_rows": 50000,
+      "processed_rows": 50000,
+      "progress_pct": 100,
+      "speed_rows_sec": 1250.5,
+      "status": "completed",
+      "started_at": "2026-06-19T10:00:00Z",
+      "completed_at": "2026-06-19T10:00:40Z"
+    },
+    {
+      "schema": "production",
+      "table": "orders",
+      "total_rows": 200000,
+      "processed_rows": 85000,
+      "progress_pct": 42.5,
+      "speed_rows_sec": 980.3,
+      "status": "running",
+      "started_at": "2026-06-19T10:00:41Z"
+    },
+    {
+      "schema": "production",
+      "table": "products",
+      "total_rows": 10000,
+      "processed_rows": 0,
+      "progress_pct": 0,
+      "speed_rows_sec": 0,
+      "status": "pending"
+    }
+  ],
+  "overall_speed": 1050.8,
+  "elapsed_seconds": 127.5,
+  "estimated_remain": 119.3,
+  "phase": "full",
+  "updated_at": "2026-06-19T10:02:08Z"
+}
+```
+
+#### 响应字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `current_table` | string | 当前正在同步的表，格式 `schema.table` |
+| `tables` | array | 所有表的进度列表 |
+| `tables[].schema` | string | 源库名 |
+| `tables[].table` | string | 表名 |
+| `tables[].total_rows` | int64 | 该表估算总行数 |
+| `tables[].processed_rows` | int64 | 该表已处理行数 |
+| `tables[].progress_pct` | float64 | 该表进度百分比 (0-100) |
+| `tables[].speed_rows_sec` | float64 | 该表同步速度（行/秒） |
+| `tables[].status` | string | 表状态：`pending` / `running` / `completed` / `failed` |
+| `tables[].started_at` | string | 该表开始同步时间（ISO 8601） |
+| `tables[].completed_at` | string | 该表完成时间（ISO 8601） |
+| `overall_speed` | float64 | 整体同步速度（行/秒） |
+| `elapsed_seconds` | float64 | 已耗时（秒） |
+| `estimated_remain` | float64 | 预估剩余时间（秒），-1 表示无法估算 |
+| `phase` | string | 当前阶段：`full`（全量）/ `incremental`（增量） |
+| `updated_at` | string | 最后更新时间（ISO 8601） |
+
+#### 前端轮询建议
+
+- 建议轮询间隔：**1-2 秒**
+- 进度数据仅存在于内存中，任务完成/暂停/停止后会被清除
+- 任务未运行时调用此接口会返回 404
+- 可配合 `GET /api/tasks/:id/metrics` 获取持久化的整体指标
 
 ---
 
@@ -372,7 +538,7 @@
 
 **启用索引优化**:
 - 同步前删除非主键索引
-- 同步完成后自动重建
+- 所有表数据同步完成后按表顺序统一重建，索引创建不会与仍在运行的数据写入并发
 - 可以显著提高写入速度
 
 **适用场景**:
@@ -385,20 +551,47 @@
 - 需要足够的临时空间
 - 建议在低峰期执行
 
-### 并发一致性快照（enable_consistent_snapshot）
+### Cron 定时启动
+
+任务支持使用 Cron 表达式进行计划启动，适合企业级的周期调度场景。
+
+**支持范围**:
+- 标准 cron：例如 `0 9 * * 1-5`，表示每周一到周五 09:00 执行
+- 扩展 cron：支持 Quartz 风格常见的 `L`、`W`、`#` 语义
+  - `0 0 L * *`：每月最后一天 00:00
+  - `0 30 9 * * 1#1`：每月第一个周一 09:30
+  - `0 0 10 W * *`：每月最接近 10 号的工作日 10:00
+
+**UI 用法**:
+- 在“启动任务”弹窗中输入 cron 表达式
+- 可点击快捷模板快速填充常见场景
+- 可填写时区，例如 `Asia/Shanghai`
+
+**详情页展示**:
+- 原始 cron 表达式
+- 时区
+- 下一次触发时间
+
+**注意**:
+- Cron 模式下实际执行时间由表达式计算，后端会写入下次触发的 `scheduled_at`
+- 如果表达式不合法，接口会返回校验错误
+- 已设置定时的任务可点击「取消定时」恢复为定时前的状态
+
+### 全量起点位点（无需配置，默认走"短锁取位点"）
 
 **作用**:
-- 在全量阶段启用并发一致性快照读取。
-- 前端在创建/编辑任务时通过“启用并发一致性快照（全量）”复选框控制。
+- 全量同步开始前，自动短暂执行一次 `FLUSH TABLES WITH READ LOCK` 取到 binlog 位点，
+  随后立即 `UNLOCK TABLES`，整个过程毫秒级。
+- 该位点被持久化为后续增量同步的起点，保证全量期间的所有 DML 都能被增量阶段完整回放。
 
 **接口传参**:
-- 勾选后，请求体会自动携带：`"enable_consistent_snapshot": true`
-- 未勾选时为：`"enable_consistent_snapshot": false`
-- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`），不是 `application.toml` 全局配置。
+- 无任何前端开关、无任何任务请求体字段需要配置；该行为对所有任务默认生效。
 
-**注意事项**:
-- 开启后快照建立阶段会短暂使用 FTWRL（`FLUSH TABLES WITH READ LOCK`）。
-- 建议在业务低峰执行大表全量同步，并确保源库账号具备相关权限。
+**历史变更**:
+- 老版本曾提供 `enable_consistent_snapshot` 字段以及"严格全局快照 + 长事务连接池"
+  模式，现已移除。当前实现统一使用"短锁取位点 + 全量短查询"，避免长事务长期
+  持有源库 `MDL_SHARED_READ`。如果你的客户端代码仍在传 `enable_consistent_snapshot`
+  字段，请直接删除，服务端会忽略。
 
 ---
 
@@ -694,6 +887,16 @@ MySQL 主机: 127.0.0.1
 3. 点击"编辑"按钮修改配置
 4. 点击"启动"按钮重新执行
 
+### Q8b: 全量同步暂停后，再点启动会继续吗？
+
+**不会继续全量。**
+
+- 未开启「DDL 前 DROP TABLE」时，同一旧任务会被后端拒绝启动；需开启该开关重建后重新全量，或人工清理目标端后创建/重置任务从头跑
+- 开启「DDL 前 DROP TABLE」时，再次启动会重建目标库/目标表并重新全量
+- 全量已完成并进入增量阶段时，再启动会从增量 checkpoint 继续
+
+详情见 [全量中断处理与增量恢复指南](FULL_SYNC_RESUME_GUIDE.md)。
+
 ### Q9: 能否同时运行多个任务？
 
 **答案**: 可以
@@ -842,10 +1045,10 @@ MySQL 主机: 127.0.0.1
 - **项目文档**: [README.md](../../README.md)
 - **配置指南**: [CONFIGURATION.md](../CONFIGURATION.md)
 - **增量同步指南**: [guides/INCREMENTAL_SYNC_GUIDE.md](INCREMENTAL_SYNC_GUIDE.md)
-- **问题反馈**: [GitHub Issues](https://github.com/yourusername/mysql-to-async/issues)
+- **问题反馈**: [GitHub Issues](https://github.com/yourusername/mysql-to-sync/issues)
 
 ---
 
-**文档版本**: v1.0  
-**最后更新**: 2026-03-25  
+**文档版本**: v1.1  
+**最后更新**: 2026-06-06  
 **维护者**: MySQL-to-Async Team

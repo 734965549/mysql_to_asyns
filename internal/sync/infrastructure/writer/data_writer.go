@@ -1,20 +1,26 @@
 package writer // 声明当前文件属于writer包，用于数据写入
 
 import ( // 导入外部包和标准库
-	"context"                                        // 导入context包，用于上下文管理
-	"database/sql"                                   // 导入database/sql包，用于数据库操作
-	"fmt"                                            // 导入fmt包，用于格式化输入输出
-	"mysql-to-async/internal/audit"                  // 导入审计包
-	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
-	"mysql-to-async/pkg/logger"                      // 导入log包，用于日志输出
-	"sync"                                           // 导入sync包，用于并发控制
-	"time"                                           // 导入time包，用于时间处理
+	"context"                                       // 导入context包，用于上下文管理
+	"database/sql"                                  // 导入database/sql包，用于数据库操作
+	"fmt"                                           // 导入fmt包，用于格式化输入输出
+	"mysql-to-sync/internal/audit"                  // 导入审计包
+	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
+	"mysql-to-sync/internal/metrics"                // 导入指标包，用于零行匹配等漂移指标
+	"mysql-to-sync/pkg/logger"                      // 导入log包，用于日志输出
+	"sync"                                          // 导入sync包，用于并发控制
+	"time"                                          // 导入time包，用于时间处理
 )
 
 // mysqlMaxPreparedPlaceholders MySQL 单条预处理语句占位符上限（留余量）
 const mysqlMaxPreparedPlaceholders = 62000 // MySQL预处理语句占位符上限
 
 // DataWriter 数据写入器接口
+// DataWriter is the target write contract used by full and incremental sync.
+//
+// Full sync enables plain INSERT at the service layer and requires an empty
+// target table. Incremental sync enables upsert on buffered writers for PK/UK
+// tables and uses before-image matching for no-primary-key UPDATE events.
 type DataWriter interface { // 定义数据写入器接口
 	// WriteBatch 批量写入数据方法
 	WriteBatch(ctx context.Context, rows []map[string]interface{}) error // 批量写入数据
@@ -32,6 +38,11 @@ type SQLExecutor interface { // 定义SQL执行器接口
 }
 
 // BatchWriter 批量写入器
+// BatchWriter executes deterministic SQL generated from TableIdentity.
+//
+// useUpsert is deliberately opt-in: full sync enables plain INSERT at the
+// service layer, while incremental sync must enable upsert so repeated PK/UK
+// INSERT events converge to the source row.
 type BatchWriter struct { // 定义批量写入器结构体
 	db          SQLExecutor        // SQL执行器
 	sqlBuilder  *SQLBuilder        // SQL构建器
@@ -41,6 +52,29 @@ type BatchWriter struct { // 定义批量写入器结构体
 	taskID      string             // 任务ID
 	schema      string             // 数据库schema
 	tableName   string             // 表名
+	// useUpsert 控制 WriteBatch 是否使用 "INSERT ... ON DUPLICATE KEY UPDATE" 形式。
+	// 增量同步路径必须设为 true，否则同一行的重复 INSERT 事件不会更新已有行
+	//（破坏修复 10/11 的幂等承诺）。全量同步路径在服务层启用 usePlainInsert。
+	useUpsert bool
+
+	// usePlainInsert 控制 WriteBatch 是否使用普通 INSERT（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
+	// 全量同步路径统一启用；目标端必须由用户保证为空，或通过 enable_drop_table_before_ddl 重建为空。
+	// 优先级高于 useUpsert。
+	usePlainInsert bool
+}
+
+// EnableUpsert 切换 WriteBatch 进入 upsert 语义。增量同步路径必须调用此方法，否则
+// 同一 PK/UK 的后续 INSERT 事件会被 IGNORE 而不更新行内容。
+func (w *BatchWriter) EnableUpsert() {
+	w.useUpsert = true
+}
+
+// EnablePlainInsert 切换 WriteBatch 进入普通 INSERT 语义（无 IGNORE，无 ON DUPLICATE KEY UPDATE）。
+//
+// 全量同步路径统一调用；目标端必须由用户保证为空，或通过 enable_drop_table_before_ddl 重建为空。
+// 与 useUpsert 互斥：usePlainInsert 优先级最高，其次是 useUpsert，默认 INSERT IGNORE。
+func (w *BatchWriter) EnablePlainInsert() {
+	w.usePlainInsert = true
 }
 
 // NewBatchWriter 创建批量写入器函数
@@ -116,9 +150,21 @@ func (w *BatchWriter) WriteBatch(ctx context.Context, rows []map[string]interfac
 		if end > len(rows) {          // 如果超过总行数
 			end = len(rows) // 调整为总行数
 		}
-		chunk := rows[start:end]                            // 获取当前批次
-		query, args := w.sqlBuilder.BuildBatchInsert(chunk) // 构建批量插入语句
-		if query == "" {                                    // 如果查询为空
+		chunk := rows[start:end] // 获取当前批次
+		// 修复 10/11：增量路径 useUpsert=true → ON DUPLICATE KEY UPDATE，保证 INSERT 事件可重复执行。
+		// usePlainInsert 优先级最高：全量同步统一使用普通 INSERT，目标端必须为空。
+		var (
+			query string
+			args  []interface{}
+		)
+		if w.usePlainInsert {
+			query, args = w.sqlBuilder.BuildBatchInsertPlain(chunk)
+		} else if w.useUpsert {
+			query, args = w.sqlBuilder.BuildBatchUpsert(chunk)
+		} else {
+			query, args = w.sqlBuilder.BuildBatchInsert(chunk)
+		}
+		if query == "" { // 如果查询为空
 			continue // 跳过
 		}
 		_, err := w.db.ExecContext(ctx, query, args...) // 执行插入
@@ -157,11 +203,13 @@ func (w *BatchWriter) Update(ctx context.Context, row map[string]interface{}) er
 	// 检查是否匹配到行（无主键表安全检查）
 	rowsAffected, _ := result.RowsAffected() // 获取影响的行数
 	if rowsAffected == 0 {                   // 如果没有匹配的行
-		// 记录数据空漂移异常（审计日志）
+		// 修复 10/14：审计 + 指标 + 结构化日志，便于运维定位漂移
 		if w.auditLogger != nil { // 如果有审计日志器
 			w.auditLogger.LogDataUpdate(w.taskID, w.schema, w.tableName, true, "no rows matched (data drift)", row) // 记录警告
 		}
-		logger.Warn("[Task %s] UPDATE matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
+		metrics.GetMetrics().IncrementIncrementalZeroRowUpdate()
+		logger.Warn("[ZeroRowMatch][Task %s] UPDATE matched 0 rows for table %s.%s; possible target drift (counter: mysql_sync_incremental_zero_row_update_total)",
+			w.taskID, w.schema, w.tableName)
 	} else { // 否则
 		// 记录成功审计日志
 		if w.auditLogger != nil { // 如果有审计日志器
@@ -189,10 +237,13 @@ func (w *BatchWriter) UpdateWithBeforeImage(ctx context.Context, row, beforeImag
 
 	rowsAffected, _ := result.RowsAffected() // 获取影响的行数
 	if rowsAffected == 0 {                   // 如果没有匹配的行
+		// 无主键表 update：风险面更高（全列 WHERE + LIMIT 1），同样累计漂移计数
 		if w.auditLogger != nil { // 如果有审计日志器
 			w.auditLogger.LogDataUpdate(w.taskID, w.schema, w.tableName, true, "no rows matched (data drift)", row) // 记录警告
 		}
-		logger.Warn("[Task %s] UPDATE (with before image) matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
+		metrics.GetMetrics().IncrementIncrementalZeroRowUpdate()
+		logger.Warn("[ZeroRowMatch][Task %s] UPDATE (before-image) matched 0 rows for table %s.%s; possible target drift on no-PK table",
+			w.taskID, w.schema, w.tableName)
 	} else { // 否则
 		if w.auditLogger != nil { // 如果有审计日志器
 			w.auditLogger.LogDataUpdate(w.taskID, w.schema, w.tableName, true, "", nil) // 记录成功日志
@@ -221,11 +272,13 @@ func (w *BatchWriter) Delete(ctx context.Context, row map[string]interface{}) er
 	// 检查是否匹配到行
 	rowsAffected, _ := result.RowsAffected() // 获取影响的行数
 	if rowsAffected == 0 {                   // 如果没有匹配的行
-		// 记录数据空漂移异常
+		// 修复 10/14：审计 + 指标 + 结构化日志
 		if w.auditLogger != nil { // 如果有审计日志器
 			w.auditLogger.LogDataDelete(w.taskID, w.schema, w.tableName, true, "no rows matched (data drift)") // 记录警告
 		}
-		logger.Warn("[Task %s] DELETE matched 0 rows for table %s, possible data drift", w.taskID, w.tableName) // 输出警告日志
+		metrics.GetMetrics().IncrementIncrementalZeroRowDelete()
+		logger.Warn("[ZeroRowMatch][Task %s] DELETE matched 0 rows for table %s.%s; possible target drift (counter: mysql_sync_incremental_zero_row_delete_total)",
+			w.taskID, w.schema, w.tableName)
 	} else { // 否则
 		// 记录成功审计日志
 		if w.auditLogger != nil { // 如果有审计日志器
@@ -342,6 +395,22 @@ func (w *BufferedWriter) flushLoop() { // 定时刷新循环
 func (w *BufferedWriter) Close() error { // 关闭写入器
 	close(w.stopCh)  // 关闭停止通道
 	return w.Flush() // 执行最后一次刷新
+}
+
+// EnableUpsert 转发到底层 BatchWriter，让缓冲 INSERT 走 upsert 语义。
+// 增量同步路径必须调用；全量同步路径使用 EnablePlainInsert。
+func (w *BufferedWriter) EnableUpsert() {
+	if w.writer != nil {
+		w.writer.EnableUpsert()
+	}
+}
+
+// EnablePlainInsert 转发到底层 BatchWriter，让缓冲 INSERT 走普通 INSERT 语义。
+// 全量同步路径统一调用。
+func (w *BufferedWriter) EnablePlainInsert() {
+	if w.writer != nil {
+		w.writer.EnablePlainInsert()
+	}
 }
 
 // GetSQLBuilder 获取SQL构建器方法（用于增量同步）

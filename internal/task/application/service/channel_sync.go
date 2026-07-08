@@ -8,11 +8,16 @@ import (
 
 	"database/sql"
 
-	"mysql-to-async/internal/metadata/domain/entity"
-	"mysql-to-async/internal/sync/infrastructure/reader"
-	"mysql-to-async/internal/sync/infrastructure/writer"
-	taskEntity "mysql-to-async/internal/task/domain/entity"
-	"mysql-to-async/pkg/logger"
+	"mysql-to-sync/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/sync/infrastructure/reader"
+	"mysql-to-sync/internal/sync/infrastructure/writer"
+	taskEntity "mysql-to-sync/internal/task/domain/entity"
+	"mysql-to-sync/pkg/logger"
+)
+
+const (
+	defaultChannelBufferMultiplier = 4
+	maxChannelBufferMultiplier     = 64
 )
 
 // BatchTask 批次任务结构
@@ -25,21 +30,49 @@ type BatchTask struct {
 	Mark     string                   // 标记信息
 }
 
+// ChannelSyncStats 通道同步观测指标（便于日志/Prometheus 接入）
+type ChannelSyncStats struct {
+	EnqueueWaitNs   int64 // 累计投递等待纳秒
+	EnqueueCount    int64 // 成功投递批次数
+	PendingBatches  int   // 当前 channel 中待处理批次数
+	ChannelCapacity int   // channel 容量
+}
+
 // ChannelSync 基于channel的并行同步器
 type ChannelSync struct {
 	batchChan   chan *BatchTask // 批次任务channel
-	resultChan  chan error      // 结果channel
+	workerDone  chan error      // worker 退出信号（nil=成功，非 nil=首个失败原因）
 	workerCount int             // worker数量
 	batchSize   int             // 批次大小
 	processed   int64           // 已处理行数
 	totalRows   int64           // 总行数
+	enqueueWait int64           // 累计投递等待纳秒
+	enqueueN    int64           // 成功投递批次数
+}
+
+// EffectiveChannelBufferBatches 计算 batchChan 容量（单位：批次数，非行数）。
+// configured<=0 时默认 intraWorkers×4；configured>0 时使用配置值，上限 intraWorkers×64。
+func EffectiveChannelBufferBatches(workerCount, configured int) int {
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	defaultBuf := workerCount * defaultChannelBufferMultiplier
+	maxBuf := workerCount * maxChannelBufferMultiplier
+	if configured <= 0 {
+		return defaultBuf
+	}
+	if configured > maxBuf {
+		return maxBuf
+	}
+	return configured
 }
 
 // NewChannelSync 创建channel同步器
-func NewChannelSync(workerCount, batchSize int) *ChannelSync {
+func NewChannelSync(workerCount, batchSize, channelBufferBatches int) *ChannelSync {
+	buf := EffectiveChannelBufferBatches(workerCount, channelBufferBatches)
 	return &ChannelSync{
-		batchChan:   make(chan *BatchTask, workerCount*2), // 缓冲区为worker数量的2倍
-		resultChan:  make(chan error, workerCount),
+		batchChan:   make(chan *BatchTask, buf),
+		workerDone:  make(chan error, workerCount),
 		workerCount: workerCount,
 		batchSize:   batchSize,
 	}
@@ -49,38 +82,37 @@ func NewChannelSync(workerCount, batchSize int) *ChannelSync {
 func (cs *ChannelSync) StartWorkers(ctx context.Context, processFunc func(*BatchTask) error) {
 	for i := 0; i < cs.workerCount; i++ {
 		go func(workerID int) {
+			var exitErr error
+			defer func() {
+				cs.workerDone <- exitErr
+			}()
+
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case task := <-cs.batchChan:
-					if task == nil {
-						return // channel关闭，退出
-					}
-
-					// 记录worker ID
-					task.WorkerID = workerID
-
-					// 处理批次
-					err := processFunc(task)
-					if err != nil {
-						cs.resultChan <- fmt.Errorf("worker %d failed on batch %d: %v", workerID, task.BatchID, err)
+				case task, ok := <-cs.batchChan:
+					if !ok {
 						return
 					}
 
-					// 更新处理进度
-					atomic.AddInt64(&cs.processed, int64(len(task.Data)))
+					task.WorkerID = workerID
 
-					// 发送完成信号
-					cs.resultChan <- nil
+					err := processFunc(task)
+					if err != nil {
+						exitErr = fmt.Errorf("worker %d failed on batch %d: %w", workerID, task.BatchID, err)
+						return
+					}
+
+					atomic.AddInt64(&cs.processed, int64(len(task.Data)))
 				}
 			}
 		}(i)
 	}
 }
 
-// AddBatch 添加批次任务
-func (cs *ChannelSync) AddBatch(batchID int, data []map[string]interface{}, startPK, endPK interface{}, mark string) error {
+// AddBatch 阻塞投递批次任务，直到 channel 有空间或 ctx 取消。
+func (cs *ChannelSync) AddBatch(ctx context.Context, batchID int, data []map[string]interface{}, startPK, endPK interface{}, mark string) error {
 	task := &BatchTask{
 		BatchID: batchID,
 		Data:    data,
@@ -89,34 +121,43 @@ func (cs *ChannelSync) AddBatch(batchID int, data []map[string]interface{}, star
 		Mark:    mark,
 	}
 
+	start := time.Now()
 	select {
 	case cs.batchChan <- task:
+		atomic.AddInt64(&cs.enqueueWait, int64(time.Since(start)))
+		atomic.AddInt64(&cs.enqueueN, 1)
 		return nil
-	default:
-		return fmt.Errorf("batch channel is full, batch %d rejected", batchID)
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-// WaitForCompletion 等待所有任务完成
+// WaitForCompletion 关闭 batch channel 并等待所有 worker 退出。
 func (cs *ChannelSync) WaitForCompletion(ctx context.Context) error {
-	// 关闭batch channel，通知worker结束
 	close(cs.batchChan)
 
-	// 等待所有worker完成
-	completedWorkers := 0
-	for completedWorkers < cs.workerCount {
+	for i := 0; i < cs.workerCount; i++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-cs.resultChan:
+		case err := <-cs.workerDone:
 			if err != nil {
-				return err // 返回第一个错误
+				return err
 			}
-			completedWorkers++
 		}
 	}
 
 	return nil
+}
+
+// Stats 返回当前观测指标快照。
+func (cs *ChannelSync) Stats() ChannelSyncStats {
+	return ChannelSyncStats{
+		EnqueueWaitNs:   atomic.LoadInt64(&cs.enqueueWait),
+		EnqueueCount:    atomic.LoadInt64(&cs.enqueueN),
+		PendingBatches:  len(cs.batchChan),
+		ChannelCapacity: cap(cs.batchChan),
+	}
 }
 
 // GetProgress 获取处理进度
@@ -152,32 +193,25 @@ func NewChannelSyncExecutor(sourceDB, targetDB *sql.DB, auditLogger interface{},
 }
 
 // ExecuteFullSyncChannel 执行channel并行同步
-func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task *taskEntity.SyncTask, sourceSchema, targetSchema, tableName string, identity *entity.TableIdentity, intraWorkers, readLimit, txCommitEveryN int) error {
+func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task *taskEntity.SyncTask, sourceSchema, targetSchema, tableName string, identity *entity.TableIdentity, intraWorkers, readLimit, txCommitEveryN, channelBufferBatches int) error {
 	taskID := task.Config.ID
 
-	// 创建channel同步器
-	channelSync := NewChannelSync(intraWorkers, readLimit)
+	channelSync := NewChannelSync(intraWorkers, readLimit, channelBufferBatches)
 
-	// 获取总行数用于进度跟踪
-	// var totalRows int64
-	// 这里需要实际的数据库查询，暂时跳过
-	// if err := cse.sourceDB.QueryRowContext(ctx,
-	// 	fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", sourceSchema, tableName)).Scan(&totalRows); err == nil {
-	// 	channelSync.SetTotalRows(totalRows)
-	// 	cse.updateTaskTotalRows(taskID, totalRows)
-	// }
-
-	// 创建reader
 	rdr := reader.NewRangeShardingReader(cse.sourceDB, sourceSchema, tableName, identity)
+	cursorCols := identity.EffectiveCursorCols()
 
-	// 启动workers
 	channelSync.StartWorkers(ctx, func(batchTask *BatchTask) error {
 		return cse.processBatchTask(ctx, task, batchTask, sourceSchema, targetSchema, tableName, identity, txCommitEveryN)
 	})
 
-	// 启动数据分发器
 	dispatchErr := make(chan error, 1)
 	go func() {
+		var dispatchResult error
+		defer func() {
+			dispatchErr <- dispatchResult
+		}()
+
 		batchID := 0
 		lastPK := interface{}(nil)
 
@@ -186,10 +220,11 @@ func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task
 				return
 			}
 
-			// 读取下一批数据
+			readStart := time.Now()
 			batch, err := rdr.ReadBatchByKeys(ctx, lastPK, int64(readLimit))
+			readDur := time.Since(readStart)
 			if err != nil {
-				dispatchErr <- fmt.Errorf("read batch failed: %v", err)
+				dispatchResult = fmt.Errorf("read batch failed: %w", err)
 				return
 			}
 
@@ -198,53 +233,57 @@ func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task
 				break
 			}
 
-			firstPK := batch[0][identity.IdentifyCols[0]]
-			lastPK = batch[len(batch)-1][identity.IdentifyCols[0]]
+			var firstPK interface{}
+			if len(cursorCols) == 1 {
+				firstPK = batch[0][cursorCols[0]]
+				lastPK = batch[len(batch)-1][cursorCols[0]]
+			} else {
+				firstVals := make([]interface{}, len(cursorCols))
+				lastVals := make([]interface{}, len(cursorCols))
+				for i, col := range cursorCols {
+					firstVals[i] = batch[0][col]
+					lastVals[i] = batch[len(batch)-1][col]
+				}
+				firstPK = firstVals
+				lastPK = lastVals
+			}
 			mark := fmt.Sprintf("%s.%s:batch%d", sourceSchema, tableName, batchID)
 
-			// 添加批次到channel
-			err = channelSync.AddBatch(batchID, batch, firstPK, lastPK, mark)
+			enqueueStart := time.Now()
+			err = channelSync.AddBatch(ctx, batchID, batch, firstPK, lastPK, mark)
+			enqueueDur := time.Since(enqueueStart)
 			if err != nil {
-				logger.Warn("[Task %s] %v", taskID, err)
-				// 如果channel满了，等待一下再重试
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(time.Millisecond * 100):
-					err = channelSync.AddBatch(batchID, batch, firstPK, lastPK, mark)
-					if err != nil {
-						dispatchErr <- fmt.Errorf("add batch failed: %v", err)
-						return
-					}
-				}
+				dispatchResult = fmt.Errorf("add batch failed: %w", err)
+				return
 			}
 
-			batchID++
+			st := channelSync.Stats()
+			logger.Info("[Task %s] Channel sync dispatch batch %d: read=%s enqueue=%s pending=%d/%d",
+				taskID, batchID, readDur, enqueueDur, st.PendingBatches, st.ChannelCapacity)
 
-			// 更新进度
+			batchID++
 			cse.incrementTaskProgress(taskID, int64(len(batch)), mark)
 		}
 	}()
 
-	// 等待分发完成
 	select {
 	case err := <-dispatchErr:
 		if err != nil {
-			return fmt.Errorf("dispatch failed: %v", err)
+			return fmt.Errorf("dispatch failed: %w", err)
 		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 
-	// 等待所有worker完成
 	err := channelSync.WaitForCompletion(ctx)
 	if err != nil {
-		return fmt.Errorf("channel sync failed: %v", err)
+		return fmt.Errorf("channel sync failed: %w", err)
 	}
 
-	// 更新最终进度
 	processed, total := channelSync.GetProgress()
-	logger.Info("[Task %s] Channel sync completed for %s.%s: %d/%d rows processed", taskID, sourceSchema, tableName, processed, total)
+	st := channelSync.Stats()
+	logger.Info("[Task %s] Channel sync completed for %s.%s: %d/%d rows, enqueue_batches=%d enqueue_wait=%s pending=%d",
+		taskID, sourceSchema, tableName, processed, total, st.EnqueueCount, time.Duration(st.EnqueueWaitNs), st.PendingBatches)
 
 	return nil
 }
@@ -253,22 +292,25 @@ func (cse *ChannelSyncExecutor) ExecuteFullSyncChannel(ctx context.Context, task
 func (cse *ChannelSyncExecutor) processBatchTask(ctx context.Context, task *taskEntity.SyncTask, batchTask *BatchTask, sourceSchema, targetSchema, tableName string, identity *entity.TableIdentity, txCommitEveryN int) error {
 	taskID := task.Config.ID
 
-	// 获取数据库连接
+	writeStart := time.Now()
+
 	conn, err := cse.targetDB.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("worker %d failed to get connection: %v", batchTask.WorkerID, err)
+		return fmt.Errorf("worker %d failed to get connection: %w", batchTask.WorkerID, err)
 	}
 	defer conn.Close()
 
-	// 设置会话参数
-	conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0")
-	defer conn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=1, UNIQUE_CHECKS=1")
+	writeSessionLabel := fmt.Sprintf("%s.%s worker %d", targetSchema, tableName, batchTask.WorkerID)
+	if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+		return err
+	}
+	defer restoreFullSyncWriteSession(conn, writeSessionLabel)
 
-	// 处理批次写入
 	var curTx *sql.Tx
 	var txW *writer.BatchWriter
 	var txBatchN int
 	var txStartMark string
+	var commitDur time.Duration
 
 	defer func() {
 		if curTx != nil {
@@ -276,18 +318,14 @@ func (cse *ChannelSyncExecutor) processBatchTask(ctx context.Context, task *task
 		}
 	}()
 
-	// 写入函数
 	doWrite := func(rows []map[string]interface{}, mark string) error {
 		if curTx == nil {
 			var e error
 			curTx, e = conn.BeginTx(ctx, nil)
 			if e != nil {
-				return fmt.Errorf("worker %d begin tx at %s: %v", batchTask.WorkerID, mark, e)
+				return fmt.Errorf("worker %d begin tx at %s: %w", batchTask.WorkerID, mark, e)
 			}
 			txW = writer.NewBatchWriterWithTx(curTx, identity, task.Config.BatchSize, targetSchema)
-			if cse.auditLogger != nil {
-				// txW.SetAuditLogger(cse.auditLogger, taskID, sourceSchema, tableName)
-			}
 			txBatchN = 0
 			txStartMark = mark
 		}
@@ -295,36 +333,41 @@ func (cse *ChannelSyncExecutor) processBatchTask(ctx context.Context, task *task
 		if e := txW.WriteBatch(ctx, rows); e != nil {
 			curTx.Rollback()
 			curTx = nil
-			return fmt.Errorf("worker %d write at %s (tx from %s) rolled back: %v", batchTask.WorkerID, mark, txStartMark, e)
+			return fmt.Errorf("worker %d write at %s (tx from %s) rolled back: %w", batchTask.WorkerID, mark, txStartMark, e)
 		}
 
 		txBatchN++
 		if txBatchN >= txCommitEveryN {
+			commitStart := time.Now()
 			if e := curTx.Commit(); e != nil {
 				curTx = nil
-				return fmt.Errorf("worker %d commit at %s (tx from %s): %v", batchTask.WorkerID, mark, txStartMark, e)
+				return fmt.Errorf("worker %d commit at %s (tx from %s): %w", batchTask.WorkerID, mark, txStartMark, e)
 			}
+			commitDur += time.Since(commitStart)
 			curTx = nil
 		}
 
 		return nil
 	}
 
-	// 写入批次数据
 	logger.Info("[Task %s] Worker %d processing batch %d: %d rows (PK %v -> %v)",
 		taskID, batchTask.WorkerID, batchTask.BatchID, len(batchTask.Data), batchTask.StartPK, batchTask.EndPK)
 
 	if err := doWrite(batchTask.Data, batchTask.Mark); err != nil {
-		return fmt.Errorf("worker %d failed to write batch %d: %v", batchTask.WorkerID, batchTask.BatchID, err)
+		return fmt.Errorf("worker %d failed to write batch %d: %w", batchTask.WorkerID, batchTask.BatchID, err)
 	}
 
-	// 提交当前事务
 	if curTx != nil {
+		commitStart := time.Now()
 		if err := curTx.Commit(); err != nil {
-			return fmt.Errorf("worker %d final commit failed: %v", batchTask.WorkerID, err)
+			return fmt.Errorf("worker %d final commit failed: %w", batchTask.WorkerID, err)
 		}
+		commitDur += time.Since(commitStart)
 		curTx = nil
 	}
+
+	logger.Info("[Task %s] Worker %d batch %d done: write+commit=%s commit=%s",
+		taskID, batchTask.WorkerID, batchTask.BatchID, time.Since(writeStart), commitDur)
 
 	return nil
 }

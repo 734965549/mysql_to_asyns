@@ -1,19 +1,19 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: mysql-to-async
+  name: mysql-to-sync
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "20m"
 spec:
   ingressClassName: nginx
   rules:
-    - host: mysql-to-async.local
+    - host: mysql-to-sync.local
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: mysql-to-async
+                name: mysql-to-sync
                 port:
                   number: 8080

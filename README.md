@@ -1,4 +1,4 @@
-﻿# MySQL-to-Async 数据同步工具
+# MySQL-to-Async 数据同步工具
 
 
 
@@ -18,7 +18,7 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 
 - **实时增量同步**：基于 Binlog 的实时数据捕获，延迟小于1秒
 
-- **断点续传**：Redis 持久化位点，服务重启后自动恢复
+- **断点恢复**：全量中断后拒绝续传并要求重新准备目标端；增量阶段通过 Binlog 位点（Redis/内存）恢复
 
 - **无主键表同步**：智能识别策略，全列匹配保障数据一致性
 
@@ -56,7 +56,9 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 
 - **多种同步模式**：支持全量同步(FULL)、增量同步(INCREMENTAL)、全量+增量(ALL)
 
-- **断点续传**：基于 Redis 的 checkpoint 机制，支持任务中断后继续执行
+- **断点恢复**：
+  - **全量**：全量阶段暂停/失败后不再续传；同一旧任务需开启 DDL 前删除后重新全量，或人工清理目标端后创建/重置任务从头跑
+  - **增量**：基于 Redis/内存 checkpoint 保存 Binlog 位点，服务重启后续订
 
 - **实时监控**：提供任务进度、状态、指标等实时监控
 
@@ -71,6 +73,7 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 - **只读保护**：同步期间自动设置目标库只读模式
 
 - **密码加密存储**：任务配置中的数据库密码使用 AES-256-GCM 加密后持久化，防止明文泄露
+- **任务元数据字段对齐**：任务存储表 `sys_sync_tasks` 建议包含 `pk_id`、`created_at`、`updated_at` 等字段，并由 DBA 按升级脚本统一执行结构升级，兼容旧数据库结构
 
 
 
@@ -172,11 +175,11 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 
 GRANT SELECT ON *.* TO 'username'@'%';
 
-# 若创建任务时启用 enable_consistent_snapshot=true（并发一致性快照）
+# 全量起点位点采用"短锁取位点"模式，会短暂执行 FLUSH TABLES WITH READ LOCK，
 
-# 建议额外授予 RELOAD 权限（用于快照建立阶段的 FTWRL）
+# 因此需要 RELOAD 权限
 
-# GRANT RELOAD ON *.* TO 'username'@'%';
+GRANT RELOAD ON *.* TO 'username'@'%';
 
 FLUSH PRIVILEGES;
 
@@ -194,9 +197,9 @@ FLUSH PRIVILEGES;
 
 ``bash
 
-git clone https://github.com/yourusername/mysql-to-async.git
+git clone https://github.com/yourusername/mysql-to-sync.git
 
-cd mysql-to-async
+cd mysql-to-sync
 
 ``
 
@@ -309,17 +312,17 @@ go run main.go
 
 # Linux/macOS
 
-go build -o mysql-to-async
+go build -o mysql-to-sync
 
-./mysql-to-async
+./mysql-to-sync
 
 
 
 # Windows
 
-go build -o mysql-to-async.exe
+go build -o mysql-to-sync.exe
 
-.\mysql-to-async.exe
+.\mysql-to-sync.exe
 
 ``
 
@@ -399,38 +402,44 @@ docker compose up -d --build
 
 
 
-``bash
-
+```bash
 POST /api/tasks
-
 Content-Type: application/json
+```
 
+**请求示例：**
 
-
+```json
 {
-
   "name": "用户表同步",
-
   "mode": "ALL",
-
   "sync_level": "TABLE",
-
   "source_schema": "production",
-
   "target_schema": "production_backup",
-
   "tables": ["users", "orders"],
-
+  "target_tables": ["users_archive", "orders_archive"],
   "batch_size": 1000,
-
   "worker_count": 4,
-
+  "intra_table_worker_count": 8,
   "enable_limit_one": false,
-
-  "enable_consistent_snapshot": true
-
+  "optimize_index": true,
+  "enable_read_only": true,
+  "enable_drop_table_before_ddl": true,
+  "source_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "production",
+    "username": "root",
+    "password": "root_password"
+  },
+  "target_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "production_backup",
+    "username": "root",
+    "password": "root_password"
+  }
 }
-
 ```
 
 
@@ -440,38 +449,94 @@ Content-Type: application/json
 
 
 | 参数 | 类型 | 必填 | 说明 |
-
 |------|------|------|------|
-
 | name | string | 是 | 任务名称 |
-
 | mode | string | 是 | 同步模式：FULL/INCREMENTAL/ALL |
-
 | sync_level | string | 是 | 同步级别：DATABASE(库级别)/TABLE(表级别) |
-
 | source_schema | string | 是 | 源数据库名 |
-
 | target_schema | string | 是 | 目标数据库名 |
-
 | tables | array | 表级别必填 | 要同步的表列表 |
-
 | batch_size | int | 否 | 批量大小，默认1000 |
-
 | worker_count | int | 否 | 工作线程数，默认4 |
-
+| tx_commit_every_n_parallel | int | 否 | 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐 |
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
+| enable_drop_table_before_ddl | bool | 否 | 开启后按同步级别删除目标：DATABASE 级别先 `DROP DATABASE IF EXISTS` + `CREATE DATABASE` 重建目标库；TABLE 级别在每张表建表前执行 `DROP TABLE IF EXISTS`。默认false |
+| index_restore_worker_count | int | 否 | 索引回放表级并发度，0=自动推导 min(worker_count,4)，默认0 |
 
-| enable_consistent_snapshot | bool | 否 | 全量阶段启用并发一致性快照（任务级参数，默认false） |
+
+
+**全量起点位点说明（无需配置）：**
+
+- 全量同步开始前会自动短暂执行一次 `FLUSH TABLES WITH READ LOCK` 取到 binlog 位点，
+  随后立即 `UNLOCK TABLES`，整个过程毫秒级，对所有任务默认生效，无 JSON / TOML 开关。
+
+- 历史版本曾提供 `enable_consistent_snapshot` 任务级字段（"严格全局快照 + 长事务连接池"
+  模式），现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
+
+**`enable_drop_table_before_ddl` 说明：**
+
+- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`）。JSON 字段名、默认值、存储结构不变，无迁移要求。
+
+- 删除/重建行为按 `sync_level` 分支执行，且仅在全量阶段（`MarkFullSyncStarted` 之后、任何目标表 DDL/数据写入前）执行一次；增量阶段或已跳过全量阶段时不执行删除：
+
+  - **DATABASE 级别**：对去重后的每个唯一目标库依次执行 `DROP DATABASE IF EXISTS \`目标库\`` 与 `CREATE DATABASE IF NOT EXISTS \`目标库\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`（使用用户配置的目标库名，`TargetDatabases`/`TargetSchema` 为空才回退源名）。任一步失败立即终止全量同步并标记 `FULL_FAILED`。库级重建完成后，建表阶段不再逐表执行 `DROP TABLE`（目标库已为空）。多个源库映射到同一目标库时，该目标库只重建一次。
+  - **TABLE 级别**：保持原有行为，在每张表执行 `CREATE TABLE ... LIKE ...` 或回放 `SHOW CREATE TABLE` 之前，先执行 `DROP TABLE IF EXISTS \`目标库\`.\`目标表\``（使用用户配置的目标库/目标表名，`TargetTables` 为空才回退源表名）。
+
+- 注意：开启后会删除目标库/目标表及其数据，请确认目标端允许覆盖。按用户选择，不新增"源目标同实例同名库"保护；配置如此映射时仍会执行删除。
+
+- 写入与重启副作用：全量阶段统一使用普通 `INSERT`（无 `IGNORE`、无 upsert），并会使用批量导入会话优化。目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 由程序重建为空；目标端非空属于不支持场景，可能失败或污染目标数据。全量阶段暂停/失败后不再续传；若未开启 DDL 前删除，同一旧任务再次启动会被拒绝，需要开启该开关重建后重新全量，或人工清理目标端后创建/重置任务从头跑。增量阶段仍通过 checkpoint 恢复。
 
 
 
-**`enable_consistent_snapshot` 说明：**
+#### 更新任务
 
-- 该参数属于任务请求体字段（`POST /api/tasks`、`PUT /api/tasks/:id`），不是 `application.toml` 全局配置。
 
-- 开启后，全量阶段会让多个 worker 在同一时点快照上并发读取。
 
-- 快照建立时会短暂执行 FTWRL（`FLUSH TABLES WITH READ LOCK`），建议在低峰时段执行。
+```bash
+PUT /api/tasks/:id
+Content-Type: application/json
+```
+
+**请求示例：**
+
+```json
+{
+  "name": "用户表同步-调整版",
+  "mode": "ALL",
+  "sync_level": "TABLE",
+  "source_schema": "production",
+  "target_schema": "production_backup",
+  "tables": ["users", "orders"],
+  "target_tables": ["users_archive", "orders_archive"],
+  "batch_size": 2000,
+  "worker_count": 8,
+  "intra_table_worker_count": 12,
+  "enable_limit_one": false,
+  "optimize_index": true,
+  "enable_read_only": true,
+  "enable_drop_table_before_ddl": true,
+  "source_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "production",
+    "username": "root",
+    "password": "root_password"
+  },
+  "target_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "production_backup",
+    "username": "root",
+    "password": "root_password"
+  }
+}
+```
+
+**说明：**
+
+- 更新任务时，请把需要保留的字段一并传入，后端按请求体覆盖对应配置。
+- `enable_drop_table_before_ddl=true` 时，任务在同步前按 `sync_level` 删除目标：DATABASE 级别重建目标库（`DROP DATABASE` + `CREATE DATABASE`），TABLE 级别在每张表建表前执行 `DROP TABLE IF EXISTS`。
+- 如果只想切换该开关，可以只传该字段和任务标识相关的必要字段，但建议前端保存完整配置，避免遗漏。
 
 
 
@@ -504,12 +569,70 @@ GET /api/tasks/:id
 
 
 ```bash
-
 POST /api/tasks/:id/start
-
 ```
 
+**请求体说明：**
 
+- 不传请求体：立即启动任务。
+- 传入 `scheduled_at`：设置单次定时启动。
+- 传入 `repeat_count` 和 `repeat_interval_sec`：设置重复定时启动。
+- 传入 `schedule_mode: "cron"` 与 `cron_expression`：按 Cron 表达式周期启动（实际触发时间由后端计算）。
+
+**请求示例 1：立即启动**
+
+```bash
+curl -X POST http://localhost:8080/api/tasks/任务ID/start
+```
+
+**请求示例 2：单次定时启动**
+
+```json
+{
+  "scheduled_at": "2026-06-04T18:30:00+08:00"
+}
+```
+
+**请求示例 3：重复定时启动**
+
+```json
+{
+  "scheduled_at": "2026-06-04T18:30:00+08:00",
+  "repeat_count": 3,
+  "repeat_interval_sec": 60
+}
+```
+
+**请求示例 4：Cron 定时启动**
+
+```json
+{
+  "scheduled_at": "2026-06-12T20:00:00+08:00",
+  "schedule_mode": "cron",
+  "cron_expression": "0 1 * * 6",
+  "cron_timezone": "Asia/Shanghai"
+}
+```
+
+Cron 模式下 `scheduled_at` 仅作基准时间，**下次执行时刻由 `cron_expression` 计算**；不会因请求处理耗时触发「时间早于当前时间」校验失败。
+
+**参数说明：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| scheduled_at | string | 定时启动时必填 | 首次/基准启动时间，RFC3339 格式 |
+| schedule_mode | string | 否 | `cron` 表示 Cron 周期调度 |
+| cron_expression | string | Cron 模式必填 | 标准五段 Cron，如 `0 1 * * 6` |
+| cron_timezone | string | 否 | 时区，默认本地 |
+| repeat_count | int | 否 | 重复启动总次数，包含首次执行；不传或传 0 表示仅执行一次 |
+| repeat_interval_sec | int | 否 | 每次执行完成后到下一次启动的间隔秒数，默认 0 |
+
+**说明：**
+
+- 单次/重复定时模式下，`scheduled_at` 不能早于当前时间；Cron 模式不受此限制。
+- `repeat_count` 必须大于等于 0。
+- `repeat_interval_sec` 必须大于等于 0。
+- 重复启动会在每次任务执行完成后，自动安排下一次启动，直到达到 `repeat_count`。
 
 #### 暂停任务
 
@@ -520,6 +643,18 @@ POST /api/tasks/:id/start
 POST /api/tasks/:id/pause
 
 ```
+
+全量进行中暂停后 `sync_phase` 保持为 `FULL_STARTED`。再次调用启动接口不会续传全量；未开启「DDL 前 DROP TABLE」时会被拒绝。同一旧任务需开启该开关重建后重新全量，或人工清理目标端后创建/重置任务从头跑。若任务已完成全量并进入增量阶段，再启动会从增量 checkpoint 继续。
+
+#### 取消定时启动
+
+```bash
+
+POST /api/tasks/:id/cancel-schedule
+
+```
+
+仅当任务状态为 `SCHEDULED` 时可取消，恢复为设置定时前的状态。
 
 
 
@@ -677,9 +812,7 @@ curl -X POST http://localhost:8080/api/tasks \
 
     "worker_count": 16,
 
-    "intra_table_worker_count": 16,
-
-    "enable_consistent_snapshot": true
+    "intra_table_worker_count": 16
 
   }'
 
@@ -763,7 +896,7 @@ curl -X POST http://localhost:8080/api/tasks \
 
 ``tree
 
-mysql-to-async/
+mysql-to-sync/
 
 ├── main.go                      # 程序入口
 
@@ -881,7 +1014,9 @@ mysql-to-async/
 
 - 内存存储（备用）
 
-- 支持断点续传
+- **增量同步**：保存/恢复 Binlog 订阅位点（`SavePosition` / `GetPosition`）
+
+- **全量同步**：不使用本模块；历史 `context.full_sync_resume` 字段仅作兼容和排查
 
 
 
@@ -911,19 +1046,31 @@ mysql-to-async/
 
 3. 分批读取源表数据
 
-4. 批量写入目标表
+4. 批量写入目标表（全量普通 `INSERT` 场景要求目标端为空或由用户承担冲突风险）
 
-5. 更新进度
+5. 更新进度；全量完成后清理历史 `full_sync_resume`
+
+6. 暂停/失败后重启：全量未完成时拒绝续传，除非开启 DDL 前删除重新准备目标端
 
 
 
 **性能优化**：
 
-- 有主键表：使用ID范围分片，并行读取
+- 有主键表（数值单列）：按 min/max 主键 range 分片，表内多 worker 并行 keyset 读取
 
-- 无主键表：使用OFFSET分页，顺序读取
+- 有主键表（其他）：单线程或 sample 边界并行 keyset 读取
 
-- 批量插入：使用批量INSERT语句
+- 无主键表：单协程流式读取
+
+- 批量插入：全量阶段统一使用普通 `INSERT`；目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 在全量前重建为空。关闭该开关时若目标表已有数据，属于不支持场景，可能失败或污染目标数据。
+
+
+
+**中断处理**（详见 [全量中断处理与增量恢复指南](docs/guides/FULL_SYNC_RESUME_GUIDE.md)）：
+
+- 全量阶段暂停/失败后不再续传
+
+- 未开启 `enable_drop_table_before_ddl` 时再次启动会被拒绝；开启后会重建目标端并重新全量
 
 
 
@@ -1303,11 +1450,33 @@ binlog_row_image=FULL
 
 
 
-**原因**： 未配置Redis，使用内存存储位点。
+**原因**： 未配置 Redis，增量 Binlog 位点使用内存存储，进程退出后丢失。
 
 
 
-**解决方案**： 配置Redis并重启服务。
+**解决方案**： 配置 Redis 并重启服务。
+
+
+
+### Q3b: 全量同步暂停后还能继续吗？
+
+
+
+**不能继续。** 全量阶段使用普通 `INSERT` 语义，暂停、失败或进程中断后不再使用 `full_sync_resume` 续传。
+
+
+
+处理方式：
+
+- 未开启「DDL 前删除目标」：同一旧任务再次启动会失败；需要开启该开关重建后重新全量，或人工清理目标端后创建/重置任务从头跑
+
+- 开启「DDL 前删除目标」：再次启动会重建目标端（DATABASE 级别重建目标库 / TABLE 级别重建目标表）并重新全量
+
+- 全量已整体完成并进入增量阶段：再次启动会跳过全量，从增量 checkpoint 继续
+
+
+
+详见 [全量中断处理与增量恢复指南](docs/guides/FULL_SYNC_RESUME_GUIDE.md)。
 
 
 
@@ -1447,9 +1616,9 @@ GET /api/tasks/:id
 
 # 克隆项目
 
-git clone https://github.com/yourusername/mysql-to-async.git
+git clone https://github.com/yourusername/mysql-to-sync.git
 
-cd mysql-to-async
+cd mysql-to-sync
 
 
 
@@ -1607,7 +1776,7 @@ go tool cover -html=coverage.out
 
 - **文档**: [INCREMENTAL_SYNC_GUIDE.md](INCREMENTAL_SYNC_GUIDE.md)
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/mysql-to-async/issues)
+- **Issues**: [GitHub Issues](https://github.com/yourusername/mysql-to-sync/issues)
 
 
 

@@ -1,14 +1,14 @@
 package reader // 声明当前文件属于reader包，用于数据读取
 
 import ( // 导入外部包和标准库
-	"context"                                        // 导入context包，用于上下文管理
-	"database/sql"                                   // 导入database/sql包，用于数据库操作
-	"database/sql/driver"                            // 导入driver包，用于驱动接口
-	"errors"                                         // 导入errors包，用于错误处理
-	"fmt"                                            // 导入fmt包，用于格式化输入输出
-	"mysql-to-async/internal/metadata/domain/entity" // 导入实体包
-	"strings"                                        // 导入strings包，用于字符串操作
-	"time"                                           // 导入time包，用于时间处理
+	"context"                                       // 导入context包，用于上下文管理
+	"database/sql"                                  // 导入database/sql包，用于数据库操作
+	"database/sql/driver"                           // 导入driver包，用于驱动接口
+	"errors"                                        // 导入errors包，用于错误处理
+	"fmt"                                           // 导入fmt包，用于格式化输入输出
+	"mysql-to-sync/internal/metadata/domain/entity" // 导入实体包
+	"strings"                                       // 导入strings包，用于字符串操作
+	"time"                                          // 导入time包，用于时间处理
 )
 
 type queryExecutor interface {
@@ -40,43 +40,41 @@ func isConnRetryable(err error) bool { // 判断连接错误是否可重试函�
 		strings.Contains(s, "connection was bad") // 检查是否包含连接错误
 }
 
-// drainQueryWithRetry 对池中已失效连接（如超过 wait_timeout）导致的读失败做有限次重试。
-func drainQueryWithRetry(ctx context.Context, open func() (*sql.Rows, error), scan func(*sql.Rows) ([]map[string]interface{}, error)) ([]map[string]interface{}, error) { // 带重试的查询执行函数
-	const maxAttempts = 4                                // 最大重试次数
-	var lastErr error                                    // 记录最后一次错误
-	for attempt := 0; attempt < maxAttempts; attempt++ { // 尝试循环
-		if attempt > 0 { // 如果不是第一次尝试
-			select { // 等待重试
-			case <-ctx.Done(): // 如果上下文取消
-				return nil, ctx.Err() // 返回上下文错误
-			case <-time.After(time.Duration(25+attempt*25) * time.Millisecond): // 等待递增的退避时间
+// retryableQuery 先直接查询；在 QueryContext 或 scan/Close 阶段遇到连接失效等可重试错误时进入重试循环。
+// 正常路径无闭包分配和循环开销。
+func retryableQuery(ctx context.Context, db queryExecutor, query string, scan func(*sql.Rows) ([]map[string]interface{}, error), args ...interface{}) ([]map[string]interface{}, error) {
+	const maxRetries = 3
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(25+attempt*25) * time.Millisecond):
 			}
 		}
-		rows, err := open() // 打开查询
-		if err != nil {     // 如果打开失败
-			lastErr = err                                        // 记录错误
-			if isConnRetryable(err) && attempt < maxAttempts-1 { // 如果可重试且未达到最大次数
-				continue // 继续重试
+
+		rows, err := db.QueryContext(ctx, query, args...)
+		if err != nil {
+			if isConnRetryable(err) && attempt < maxRetries {
+				continue
 			}
-			return nil, err // 返回错误
+			return nil, err
 		}
-		results, sErr := scan(rows)                           // 扫描结果
-		if cErr := rows.Close(); cErr != nil && sErr == nil { // 关闭结果集
-			sErr = cErr // 记录关闭错误
+
+		results, sErr := scan(rows)
+		if cErr := rows.Close(); cErr != nil && sErr == nil {
+			sErr = cErr
 		}
-		if sErr != nil { // 如果扫描失败
-			lastErr = sErr                                        // 记录错误
-			if isConnRetryable(sErr) && attempt < maxAttempts-1 { // 如果可重试且未达到最大次数
-				continue // 继续重试
-			}
-			return nil, sErr // 返回错误
+
+		if sErr != nil && isConnRetryable(sErr) && attempt < maxRetries {
+			continue
 		}
-		return results, nil // 返回结果
+
+		return results, sErr
 	}
-	if lastErr == nil { // 如果没有错误
-		lastErr = fmt.Errorf("unknown") // 设置未知错误
-	}
-	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr) // 返回重试失败错误
+
+	return nil, fmt.Errorf("retryableQuery: max retries exceeded")
 }
 
 // selectExprForColumn 构建 SELECT 列表项。JSON/BLOB/TEXT 等原样读取，避免 CAST 在服务端物化整段大字段拖慢 IO；Scan 后经 normalizeScannedValue 处理 []byte。
@@ -91,14 +89,19 @@ func normalizeScannedValue(val interface{}) interface{} { // 规范化扫描值�
 		return nil // 返回空
 	}
 	if b, ok := val.([]byte); ok { // 如果是字节数组
-		out := make([]byte, len(b)) // 创建新的字节数组
-		copy(out, b)                // 拷贝数据
-		return string(out)          // 转换为字符串
+		// string([]byte) 会分配新内存并拷贝，生成不可变 string，不受 driver 底层缓冲复用影响。
+		// 不需要先 make+copy 再 string，避免重复拷贝。
+		return string(b)
 	}
 	return val // 返回原值
 }
 
 // DataReader 数据读取器接口
+// DataReader is the full-sync source read contract.
+//
+// Implementations return source rows as column-name maps. They do not advance
+// task resume cursors; TaskService records cursors only after the corresponding
+// target write transaction commits.
 type DataReader interface { // 定义数据读取器接口
 	// ReadBatch 批量读取数据方法
 	ReadBatch(ctx context.Context, offset, limit int64) ([]map[string]interface{}, error) // 批量读取数据
@@ -221,9 +224,10 @@ type RangeShardingReader struct { // 定义范围分片读取器结构体
 
 // NewRangeShardingReader 创建分片读取器函数
 func NewRangeShardingReader(db queryExecutor, schema, table string, identity *entity.TableIdentity) *RangeShardingReader { // 创建分片读取器实例
-	pkColumn := ""                      // 初始化主键列
-	if len(identity.IdentifyCols) > 0 { // 如果有标识列
-		pkColumn = identity.IdentifyCols[0] // 使用第一个标识列
+	pkColumn := "" // 初始化主键列
+	cursorCols := identity.EffectiveCursorCols()
+	if len(cursorCols) > 0 { // 如果有游标列
+		pkColumn = cursorCols[0] // 使用第一个游标列
 	}
 	return &RangeShardingReader{ // 返回读取器实例
 		db:       db,       // 设置数据库连接
@@ -244,9 +248,7 @@ func (r *RangeShardingReader) ReadBatch(ctx context.Context, minID, maxID int64)
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` >= ? AND `%s` < ?", // 构建查询
 		columns, r.schema, r.table, r.pkColumn, r.pkColumn) // 查询指定范围
-	return drainQueryWithRetry(ctx, func() (*sql.Rows, error) { // 执行带重试的查询
-		return r.db.QueryContext(ctx, query, minID, maxID) // 返回查询结果
-	}, r.scanRows) // 扫描行数据
+	return retryableQuery(ctx, r.db, query, r.scanRows, minID, maxID)
 }
 
 // ReadBatchByKeys 批量读取数据方法（Keyset Pagination，支持单列和复合主键）
@@ -258,7 +260,7 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 	}
 	columns := strings.Join(colParts, ", ") // 连接列名
 
-	pkCols := r.identity.IdentifyCols // 获取主键列
+	pkCols := r.identity.EffectiveCursorCols() // 获取游标/分片列
 
 	var query string       // 定义查询语句
 	var args []interface{} // 定义参数列表
@@ -275,23 +277,23 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 			args = []interface{}{lastID, limit} // 设置参数
 		}
 	} else { // 否则是复合主键
-		// 复合主键：WHERE (col1, col2, ...) > (?, ?, ...) ORDER BY col1, col2 LIMIT ?
-		// MySQL 支持行构造器比较，利用索引高效定位
+		// 复合主键：将 (pk1,...,pkN) > (v1,...,vN) 展开为 OR 表达式，
+		// 便于 MySQL 优化器按联合主键各列走索引（CDC 常用写法）。
 		var bkCols []string          // 创建备份列列表
 		for _, col := range pkCols { // 遍历主键列
 			bkCols = append(bkCols, "`"+col+"`") // 添加列引用
 		}
-		colList := strings.Join(bkCols, ", ")                                        // 连接列名
-		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(pkCols)), ", ") // 生成占位符
+		colList := strings.Join(bkCols, ", ") // 连接列名
 
 		if lastID == nil { // 如果没有上次ID
 			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` ORDER BY %s ASC LIMIT ?", // 构建查询
 				columns, r.schema, r.table, colList) // 排序并限制
 			args = []interface{}{limit} // 设置参数
-		} else if lastIDs, ok := lastID.([]interface{}); ok { // 完整复合主键值
-			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE (%s) > (%s) ORDER BY %s ASC LIMIT ?", // 构建查询
-				columns, r.schema, r.table, colList, placeholders, colList) // 使用行构造器比较
-			args = append(append([]interface{}{}, lastIDs...), limit) // 设置参数
+		} else if lastIDs, ok := lastID.([]interface{}); ok && len(lastIDs) == len(pkCols) { // 完整复合主键值
+			whereClause, whereArgs := buildCompositeKeysetWhere(pkCols, lastIDs)
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s ORDER BY %s ASC LIMIT ?", // 构建查询
+				columns, r.schema, r.table, whereClause, colList)
+			args = append(whereArgs, limit)
 		} else { // 单值：仅按第一主键列过滤（并行采样边界起始定位）
 			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` > ? ORDER BY %s ASC LIMIT ?", // 构建查询
 				columns, r.schema, r.table, pkCols[0], colList) // 按首列定位
@@ -299,9 +301,7 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 		}
 	}
 
-	return drainQueryWithRetry(ctx, func() (*sql.Rows, error) { // 执行带重试的查询
-		return r.db.QueryContext(ctx, query, args...) // 返回查询结果
-	}, r.scanRows) // 扫描行数据
+	return retryableQuery(ctx, r.db, query, r.scanRows, args...)
 }
 
 // ReadBatchInRange 批量读取数据方法（指定范围内，且带 LIMIT）
@@ -316,9 +316,7 @@ func (r *RangeShardingReader) ReadBatchInRange(ctx context.Context, startID, end
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` >= ? AND `%s` < ? ORDER BY `%s` ASC LIMIT ?", // 构建查询
 		columns, r.schema, r.table, r.pkColumn, r.pkColumn, r.pkColumn) // 查询指定范围
-	return drainQueryWithRetry(ctx, func() (*sql.Rows, error) { // 执行带重试的查询
-		return r.db.QueryContext(ctx, query, startID, endID, limit) // 返回查询结果
-	}, r.scanRows) // 扫描行数据
+	return retryableQuery(ctx, r.db, query, r.scanRows, startID, endID, limit)
 }
 
 // ReadByRange 按范围读取方法
@@ -397,6 +395,26 @@ func scanRowsToMaps(rows *sql.Rows) ([]map[string]interface{}, error) { // 扫�
 		return nil, err // 返回错误
 	}
 	return results, nil // 返回结果
+}
+
+// buildCompositeKeysetWhere 将复合主键元组比较 (pk1,...,pkN) > (v1,...,vN) 展开为 OR 表达式。
+// 2 列示例：(pk1 = ? AND pk2 > ?) OR (pk1 > ?)
+// N 列通用：(pk1=v1 AND ... AND pk_{k-1}=v_{k-1} AND pk_k > vk) OR ... OR (pk1 > v1)
+func buildCompositeKeysetWhere(pkCols []string, lastIDs []interface{}) (string, []interface{}) {
+	n := len(pkCols)
+	var branches []string
+	var args []interface{}
+	for k := n; k >= 1; k-- {
+		var conds []string
+		for j := 0; j < k-1; j++ {
+			conds = append(conds, fmt.Sprintf("`%s` = ?", pkCols[j]))
+			args = append(args, lastIDs[j])
+		}
+		conds = append(conds, fmt.Sprintf("`%s` > ?", pkCols[k-1]))
+		args = append(args, lastIDs[k-1])
+		branches = append(branches, "("+strings.Join(conds, " AND ")+")")
+	}
+	return strings.Join(branches, " OR "), args
 }
 
 // NewReader 根据表标识创建合适的读取器函数

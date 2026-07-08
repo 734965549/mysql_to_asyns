@@ -1,6 +1,6 @@
 # Binaries
-mysql-to-async
-mysql-to-async.exe
+mysql-to-sync
+mysql-to-sync.exe
 *.exe
 *.dll
 *.so

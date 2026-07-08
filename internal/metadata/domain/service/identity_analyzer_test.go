@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"mysql-to-async/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metadata/domain/entity"
 )
 
 // MockTableMetadataRepository 模拟表元数据仓库
@@ -186,6 +186,35 @@ func TestIdentityAnalyzerService_AnalyzeTable_CompositePK(t *testing.T) {
 
 	if identity.IdentifyCols[1] != "role_id" {
 		t.Errorf("expected second identify column 'role_id', got %s", identity.IdentifyCols[1])
+	}
+
+	if len(identity.CursorCols) != 2 {
+		t.Errorf("expected 2 cursor columns for composite PK without auto_increment, got %d", len(identity.CursorCols))
+	}
+}
+
+func TestIdentityAnalyzerService_AnalyzeTable_CompositePKWithAutoIncrement(t *testing.T) {
+	mockRepo := &MockTableMetadataRepository{
+		columns: []entity.ColumnMeta{
+			{Name: "id", DataType: "bigint", IsPrimaryKey: true, IsAutoIncrement: true},
+			{Name: "tenant_id", DataType: "int", IsPrimaryKey: true},
+			{Name: "name", DataType: "varchar", IsPrimaryKey: false},
+		},
+		pkColumns: []string{"id", "tenant_id"},
+		ukColumns: []string{},
+	}
+
+	service := NewIdentityAnalyzerService(mockRepo)
+	identity, err := service.AnalyzeTable("test_db", "tenant_items")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(identity.IdentifyCols) != 2 {
+		t.Errorf("expected 2 identify columns, got %d", len(identity.IdentifyCols))
+	}
+	if len(identity.CursorCols) != 1 || identity.CursorCols[0] != "id" {
+		t.Errorf("expected cursor column [id], got %v", identity.CursorCols)
 	}
 }
 

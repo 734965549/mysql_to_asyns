@@ -4,7 +4,7 @@ import ( // 导入外部包
 	"context" // 导入context包，用于处理请求超时和取消
 	"errors"
 	"fmt"                       // 导入fmt包，用于格式化输入输出
-	"mysql-to-async/pkg/logger" // 导入log包，用于日志输出
+	"mysql-to-sync/pkg/logger" // 导入log包，用于日志输出
 	"sync"                      // 导入sync包，用于并发控制
 	"time"                      // 导入time包，用于时间处理
 

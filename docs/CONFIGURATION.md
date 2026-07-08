@@ -55,17 +55,17 @@ env:
   - name: MYSQL_TO_ASYNC_DATASOURCE_HOST
     valueFrom:
       configMapKeyRef:
-        name: mysql-to-async-config
+        name: mysql-to-sync-config
         key: datasource_host
   - name: MYSQL_TO_ASYNC_DATASOURCE_PASSWORD
     valueFrom:
       secretKeyRef:
-        name: mysql-to-async-secret
+        name: mysql-to-sync-secret
         key: datasource_password
   - name: MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY
     valueFrom:
       secretKeyRef:
-        name: mysql-to-async-secret
+        name: mysql-to-sync-secret
         key: security_encrypt_key
 ```
 
@@ -240,6 +240,12 @@ env:
   - 中等表（百万行）：使用中等分片（100000-150000）
   - 小表（十万行以下）：使用较大的分片（150000-200000）
 
+**index_restore_hard_max（索引回放并发硬上限，全局配置）**
+- 含义：`index_restore_worker_count=0` 自动推导或用户显式设置超过该值时，以此值作为绝对上限
+- 默认：`<=0` 时使用内置值 16
+- 建议值：16（保守）；目标库性能强劲、临时表空间充足时可适当提高，但通常不建议超过 `target_max_open_conns / 2`
+- 注意：该字段位于 `[sync]` 全局配置段，对所有开启 `optimize_index` 的任务生效
+
 ### 功能开关
 
 #### [features] - 功能开关
@@ -262,12 +268,22 @@ env:
 - 注意：需要MySQL 5.7+，且有足够权限
 
 **optimize_index（索引优化）**
-- 含义：同步前删除非主键索引，同步完成后再重建
+- 含义：同步前删除非主键索引，所有数据库、所有表的数据同步完成后，再按表顺序统一重建
 - 作用：大幅提升写入性能（特别是有大量索引的表）
 - 建议值：
   - 大表同步：`true`
   - 小表同步：`false`
 - 注意：同步期间表性能可能下降
+
+**index_restore_worker_count（索引回放并发度，任务级字段）**
+- 含义：`optimize_index=true` 时，阶段3索引回放的表级并发度，不同表的索引重建并行执行
+- 默认：0（自动推导为 `min(worker_count, 4)`，并受 `index_restore_hard_max` 封顶）
+- 建议值：4（保守）；目标库 CPU/IO/临时空间充足时可适当调高
+- 注意：
+  - 单表内多个索引仍串行重建，避免同表 MDL 锁竞争
+  - 并发度建议 ≤ `target_max_open_conns - 2`，每条 `CREATE INDEX` 会占用一条目标库连接
+  - 并发回放期间目标实例 CPU、磁盘 IO、临时表空间负载会上升，需确保资源充足
+  - MySQL 单条 `CREATE INDEX` 不可被 context 中断，任务暂停后最多等当前那张表的索引重建结束才生效
 
 ## 性能调优建议
 
@@ -323,47 +339,89 @@ env:
   "batch_size": 5000,           // 覆盖全局 batch_size
   "worker_count": 8,            // 覆盖全局 worker_count
   "optimize_index": true,        // 覆盖全局 optimize_index
-  "enable_consistent_snapshot": true // 任务级一致性快照开关
+  "tx_commit_every_n_parallel": 50  // 并行 worker 每 N 批提交一次事务（0=默认5）
 }
 ```
 
-### enable_consistent_snapshot（任务级参数）
+### 全量起点位点（短锁取位点）
 
-`enable_consistent_snapshot` 不是 `etc/application.toml` 的全局配置项，
-而是创建/更新任务时的 JSON 字段：
+全量同步开始前，会自动通过短暂的 `FLUSH TABLES WITH READ LOCK` 拿到一个严格领先于
+全量读取的 binlog 位点，取到位点后立即 `UNLOCK TABLES`，全过程毫秒级，无需任何
+额外配置开关。该位点会被持久化为后续增量同步的起点，保证全量期间的所有变更都能
+被增量阶段完整回放。
 
-- 创建任务：`POST /api/tasks`
-- 更新任务：`PUT /api/tasks/:id`
+> 注：历史上提供过 `enable_consistent_snapshot` 任务级开关（用于"严格全局快照
+> + 长事务连接池"模式），现已下线。当前实现统一使用"短锁取位点 + 全量短查询"
+> 模式，避免长事务长期持有源库 `MDL_SHARED_READ`。
 
-示例：
+### 并行事务提交间隔（tx_commit_every_n_parallel）
+
+控制并行 worker（range 分片 / sample 采样）每 N 批提交一次事务。
+
+- **串行路径**（keyset / nopk）：固定每 200 批提交一次，减少 fsync 频率提高吞吐。
+- **并行路径**（range / sample）：默认每 5 批提交一次，减少锁持有时间避免 lock wait timeout。
+
+对于大表 range/sample 并行同步场景，默认值 5 可能偏保守，fsync 频率偏高。
+如果目标库锁等待不严重，可以适当调大此值以提高吞吐：
 
 ```json
 {
-  "name": "full-sync-orders",
-  "mode": "FULL",
-  "sync_level": "TABLE",
-  "source_schema": "db_src",
-  "target_schema": "db_dst",
-  "tables": ["orders"],
-  "worker_count": 16,
-  "intra_table_worker_count": 16,
-  "batch_size": 2000,
-  "enable_consistent_snapshot": true
+  "tx_commit_every_n_parallel": 50
 }
 ```
 
-说明：
+| 值 | 行为 |
+|---|---|
+| 0（默认） | 使用内置默认值 5 |
+| 1-5 | 更频繁提交，降低锁等待，适合高并发写入场景 |
+| 10-50 | 减少 fsync 频率，提高大表吞吐 |
+| 100+ | 长事务，仅适合目标库无并发写入且磁盘性能极好的场景 |
 
-- 打开后，全量阶段会使用并行一致性快照读取，保证多个 worker 读取同一时点数据视图。
-- 快照建立阶段会短暂执行 `FLUSH TABLES WITH READ LOCK`，请在业务低峰执行大表全量同步。
-- 源库账号需具备相应权限（至少可执行快照建立所需语句）。
+> 注意：此参数仅影响并行路径。串行路径（keyset/nopk）的提交间隔固定为 200，
+> 不受此参数影响。
+
+### 全量并行读取路径（与 channel buffer 的关系）
+
+当前 `task_service` 实际使用的全量并行模式如下：
+
+| 模式 | 读模型 | 是否用 `ChannelSync` |
+|------|--------|----------------------|
+| `range` | 按数值主键分片，每个 worker **独立 reader** 读自己的区间 | 否 |
+| `sample` | 按采样边界分片，每个 worker **独立 reader** | 否 |
+| `keyset` | 单 goroutine 顺序 keyset 读 | 否 |
+| `nopk` | 无主键流式读 | 否 |
+| `channel`（预留） | **单 reader** 顺序读 batch，经 channel 分发给多 worker 写 | 是（`ChannelSyncExecutor`，尚未接入主流程） |
+
+因此日常调 `intra_table_worker_count`、`tx_commit_every_n_parallel` 时，影响的是 **range/sample 分片并行**，与 channel buffer **无直接关系**。channel buffer 仅在未来或自定义接入 `ChannelSync` 路径时才有意义。
+
+### Channel 批次缓冲（channel_buffer_batches，内部参数）
+
+`ChannelSync` 用带缓冲 channel 连接「单线程读 batch」与「多 worker 写 batch」。缓冲容量单位是 **批次数**（每个元素是一批行，不是行数）。
+
+**当前状态**：该参数仅在代码层 `NewChannelSync(workerCount, batchSize, channelBufferBatches)` / `ExecuteFullSyncChannel(..., channelBufferBatches)` 中可传，**尚未**加入任务 JSON / Web UI / `application.toml`。
+
+**计算规则**（`EffectiveChannelBufferBatches`）：
+
+| `channelBufferBatches` | 实际 channel 容量 |
+|------------------------|-------------------|
+| `0` 或未配置（默认） | **`workerCount × 4`**（不是固定 4） |
+| `1` … `workerCount × 64` | 使用配置值 |
+| `> workerCount × 64` | 截断为 **`workerCount × 64`** |
+
+其中 `workerCount` 即表内并行 worker 数（与 `intraWorkers` / `intra_table_worker_count` 生效值一致）。
+
+示例：`intra_table_worker_count = 8` 且未配置 buffer → channel 容量 = **32** 个 batch；若显式配置 `channel_buffer_batches = 16` → 容量为 **16**。
+
+**内存提示**：每个缓冲槽持有约 `batch_size` 行数据。大表、大行、高 `batch_size` 时不宜把 buffer 设得过大；默认 `worker×4` 用于吸收读/写短暂抖动，不能替代目标库写入能力调优。
+
+**投递语义**：`AddBatch` 为带 `context` 的**阻塞投递**——channel 满时 reader 等待空位，直到 `ctx` 取消；不再使用「满则报错 + sleep 重试」。
 
 ## 监控和日志
 
 ### 查看同步进度
 ```bash
 # 实时查看日志
-tail -f logs/mysql-to-async.log
+tail -f logs/mysql-to-sync.log
 ```
 
 ### 关键日志信息
