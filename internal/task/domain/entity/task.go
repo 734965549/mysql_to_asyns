@@ -221,11 +221,24 @@ func (t *SyncTask) ConsumeScheduledRun() bool {
 	return t.Context.RepeatRemaining > 0
 }
 
-// ResetRepeat 清空重复定时配置
+// ResetRepeat 清空重复定时配置。
+// 仅清理 repeat 相关字段，不触碰 cron/once 的调度字段与 ScheduledFromStatus，
+// 以便 ConfigureCronSchedule 在调用本方法后仍能保留刚写入的 cron 配置。
 func (t *SyncTask) ResetRepeat() {
 	t.Context.RepeatCount = 0
 	t.Context.RepeatRemaining = 0
 	t.Context.RepeatIntervalSec = 0
+}
+
+// ClearScheduleConfig 清空所有定时调度配置（once / repeat / cron 模式字段 + 调度位点）。
+// 用于任务最终完成、取消定时或立即启动时清除残留调度状态，避免前端在非 SCHEDULED 状态下误展示。
+func (t *SyncTask) ClearScheduleConfig() {
+	t.ResetRepeat()
+	t.Context.ScheduleMode = ""
+	t.Context.CronExpression = ""
+	t.Context.CronTimezone = ""
+	t.Context.ScheduledAt = nil
+	t.Context.ScheduledFromStatus = nil
 }
 
 // Schedule 设置定时启动
@@ -249,9 +262,7 @@ func (t *SyncTask) CancelSchedule() { // 取消定时启动
 		restoreStatus = *t.Context.ScheduledFromStatus
 	}
 	t.Context.Status = restoreStatus
-	t.Context.ScheduledAt = nil
-	t.Context.ScheduledFromStatus = nil
-	t.ResetRepeat()
+	t.ClearScheduleConfig()
 	t.Context.LastUpdateTime = time.Now()
 }
 

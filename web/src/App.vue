@@ -2905,7 +2905,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
               </a-descriptions>
 
               <a-descriptions
-                v-if="detailPageTask.context.schedule_mode || detailPageTask.context.cron_expression"
+                v-if="detailPageTask.context.status === 'SCHEDULED' && (detailPageTask.context.schedule_mode || detailPageTask.context.cron_expression)"
                 title="定时调度"
                 :column="2"
                 bordered

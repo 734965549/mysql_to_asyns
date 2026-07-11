@@ -2768,6 +2768,9 @@ func TestCancelScheduleClearsRepeatFields(t *testing.T) {
 	assert.Zero(t, task.Context.RepeatCount)
 	assert.Zero(t, task.Context.RepeatRemaining)
 	assert.Zero(t, task.Context.RepeatIntervalSec)
+	assert.Empty(t, task.Context.ScheduleMode)
+	assert.Empty(t, task.Context.CronExpression)
+	assert.Empty(t, task.Context.CronTimezone)
 	assert.NoError(t, ts.Close())
 }
 
@@ -2809,6 +2812,105 @@ func TestCompleteTaskWithRepeatReschedulesUntilExhausted(t *testing.T) {
 	assert.Zero(t, task.Context.RepeatCount)
 	assert.Zero(t, task.Context.RepeatRemaining)
 	assert.Zero(t, task.Context.RepeatIntervalSec)
+	assert.NoError(t, ts.Close())
+}
+
+// TestScheduleCronTaskPreservesCronConfig 验证 ScheduleCronTask 设置后 cron 字段保留，
+// 这是回归测试：此前 ResetRepeat 误清了 ConfigureCronSchedule 刚写入的 cron 字段，
+// 导致 nextCronRun 因 CronExpression 为空而失败。
+func TestScheduleCronTaskPreservesCronConfig(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "cron_set", Name: "Cron Set"})
+	require.NoError(t, err)
+
+	require.NoError(t, ts.ScheduleCronTask(task.Config.ID, time.Now().Add(time.Hour), "0 9 * * 1-5", "Asia/Shanghai"))
+
+	assert.Equal(t, taskEntity.TaskStatusScheduled, task.Context.Status)
+	assert.Equal(t, "cron", task.Context.ScheduleMode)
+	assert.Equal(t, "0 9 * * 1-5", task.Context.CronExpression)
+	assert.Equal(t, "Asia/Shanghai", task.Context.CronTimezone)
+	require.NotNil(t, task.Context.ScheduledAt)
+	assert.NoError(t, ts.Close())
+}
+
+// TestCompleteTaskCronReschedules 验证 cron 任务完成后会重新调度到下一次触发时间，
+// 且 cron 配置不会被 ClearScheduleConfig 误清。
+func TestCompleteTaskCronReschedules(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "cron_reschedule", Name: "Cron Reschedule"})
+	require.NoError(t, err)
+
+	require.NoError(t, ts.ScheduleCronTask(task.Config.ID, time.Now().Add(time.Hour), "0 9 * * 1-5", "Asia/Shanghai"))
+	task.Start()
+	ts.completeTask(task.Config.ID)
+
+	assert.Equal(t, taskEntity.TaskStatusScheduled, task.Context.Status)
+	assert.Equal(t, "cron", task.Context.ScheduleMode)
+	assert.Equal(t, "0 9 * * 1-5", task.Context.CronExpression)
+	require.NotNil(t, task.Context.ScheduledAt)
+	assert.NoError(t, ts.Close())
+}
+
+// TestCompleteTaskClearsStaleScheduleConfig 验证非 cron / repeat 已耗尽的任务完成时，
+// 残留的调度字段被 ClearScheduleConfig 清空，避免前端在 COMPLETED 状态下误展示定时调度。
+func TestCompleteTaskClearsStaleScheduleConfig(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "complete_clear", Name: "Complete Clear"})
+	require.NoError(t, err)
+
+	// 模拟残留的调度配置：repeat 模式但剩余次数为 0
+	task.Context.ScheduleMode = "repeat"
+	task.Context.RepeatRemaining = 0
+	task.Context.CronExpression = "0 9 * * 1-5"
+	task.Start()
+	ts.completeTask(task.Config.ID)
+
+	assert.Equal(t, taskEntity.TaskStatusCompleted, task.Context.Status)
+	assert.Empty(t, task.Context.ScheduleMode)
+	assert.Empty(t, task.Context.CronExpression)
+	assert.Empty(t, task.Context.CronTimezone)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
+	assert.NoError(t, ts.Close())
+}
+
+// TestStartTaskImmediatelyClearsStaleCronFields 验证立即启动任务时清除残留的 cron 调度配置，
+// 避免 RUNNING 期间残留调度字段造成状态不一致。
+func TestStartTaskImmediatelyClearsStaleCronFields(t *testing.T) {
+	ts := newScheduledTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "start_clear_cron", Name: "Start Clear Cron"})
+	require.NoError(t, err)
+	task.ConfigureCronSchedule("0 9 * * 1-5", "Asia/Shanghai")
+	require.Equal(t, "cron", task.Context.ScheduleMode)
+
+	require.NoError(t, ts.StartTask(context.Background(), task.Config.ID))
+
+	assert.Equal(t, taskEntity.TaskStatusRunning, task.Context.Status)
+	assert.Empty(t, task.Context.ScheduleMode)
+	assert.Empty(t, task.Context.CronExpression)
+	assert.Empty(t, task.Context.CronTimezone)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
+	assert.NoError(t, ts.Close())
+}
+
+// TestCancelScheduleAfterCronRestoresStatus 验证对 cron 定时任务取消后能恢复到原始状态，
+// 而非因 ScheduledFromStatus 被误清而退化为 PENDING。
+func TestCancelScheduleAfterCronRestoresStatus(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "cron_cancel_restore", Name: "Cron Cancel Restore"})
+	require.NoError(t, err)
+	task.Fail(assert.AnError)
+	require.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+
+	require.NoError(t, ts.ScheduleCronTask(task.Config.ID, time.Now().Add(time.Hour), "0 9 * * 1-5", "Asia/Shanghai"))
+	require.NoError(t, ts.CancelSchedule(task.Config.ID))
+
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Empty(t, task.Context.ScheduleMode)
+	assert.Empty(t, task.Context.CronExpression)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
 	assert.NoError(t, ts.Close())
 }
 

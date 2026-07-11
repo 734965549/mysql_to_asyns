@@ -1320,7 +1320,7 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 
 	task.Start()
 	if !wasScheduled {
-		task.ResetRepeat()
+		task.ClearScheduleConfig()
 	}
 
 	// 记录审计日志
@@ -5796,7 +5796,7 @@ func (s *TaskService) completeTask(taskID string) {
 			next, err := nextCronRun(task, time.Now())
 			if err != nil {
 				logger.Warn("[Task %s] Failed to compute next cron run: %v", taskID, err)
-				task.ResetRepeat()
+				task.ClearScheduleConfig()
 			} else {
 				task.Context.Status = taskEntity.TaskStatusScheduled
 				task.Context.ScheduledAt = &next
@@ -5812,7 +5812,7 @@ func (s *TaskService) completeTask(taskID string) {
 			task.Context.ScheduledAt = &next
 			task.Context.LastUpdateTime = time.Now()
 		} else {
-			task.ResetRepeat()
+			task.ClearScheduleConfig()
 		}
 
 		s.storage.Save(task)

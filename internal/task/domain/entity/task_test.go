@@ -3,6 +3,9 @@ package entity
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTaskStatus(t *testing.T) {
@@ -433,4 +436,98 @@ func TestRunningProgress_PhaseValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResetRepeat_OnlyClearsRepeatFields 验证 ResetRepeat 仅清理 repeat 字段，
+// 不触碰 cron 调度字段，以便 ConfigureCronSchedule 调用它后仍能保留刚写入的 cron 配置。
+func TestResetRepeat_OnlyClearsRepeatFields(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "reset_repeat_scope", Name: "Reset Repeat Scope"})
+	task.ConfigureCronSchedule("0 9 * * 1-5", "Asia/Shanghai")
+	task.Context.RepeatCount = 5
+	task.Context.RepeatRemaining = 5
+	task.Context.RepeatIntervalSec = 60
+
+	task.ResetRepeat()
+
+	assert.Zero(t, task.Context.RepeatCount)
+	assert.Zero(t, task.Context.RepeatRemaining)
+	assert.Zero(t, task.Context.RepeatIntervalSec)
+	assert.Equal(t, "cron", task.Context.ScheduleMode)
+	assert.Equal(t, "0 9 * * 1-5", task.Context.CronExpression)
+	assert.Equal(t, "Asia/Shanghai", task.Context.CronTimezone)
+}
+
+// TestClearScheduleConfig_ClearsAllScheduleFields 验证 ClearScheduleConfig 清空全部调度字段。
+func TestClearScheduleConfig_ClearsAllScheduleFields(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "clear_cfg", Name: "Clear Cfg"})
+	task.ConfigureCronSchedule("0 9 * * 1-5", "Asia/Shanghai")
+	task.Context.RepeatCount = 3
+	task.Context.RepeatRemaining = 3
+	task.Context.RepeatIntervalSec = 30
+	when := time.Now().Add(time.Hour)
+	task.Context.ScheduledAt = &when
+	prev := TaskStatusPaused
+	task.Context.ScheduledFromStatus = &prev
+
+	task.ClearScheduleConfig()
+
+	assert.Empty(t, task.Context.ScheduleMode)
+	assert.Empty(t, task.Context.CronExpression)
+	assert.Empty(t, task.Context.CronTimezone)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
+	assert.Zero(t, task.Context.RepeatCount)
+	assert.Zero(t, task.Context.RepeatRemaining)
+	assert.Zero(t, task.Context.RepeatIntervalSec)
+}
+
+// TestConfigureCronSchedule_PreservesCronFieldsAndFromStatus 验证设置 cron 调度后，
+// cron 字段与 ScheduledFromStatus 都保留，CancelSchedule 才能正确恢复原始状态。
+func TestConfigureCronSchedule_PreservesCronFieldsAndFromStatus(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "cron_preserve", Name: "Cron Preserve"})
+	task.Pause()
+	prev := task.Context.Status
+	require.NotEqual(t, TaskStatusScheduled, prev)
+	task.Schedule(time.Now().Add(time.Hour))
+	require.NotNil(t, task.Context.ScheduledFromStatus)
+
+	task.ConfigureCronSchedule("0 9 * * 1-5", "Asia/Shanghai")
+
+	assert.Equal(t, "cron", task.Context.ScheduleMode)
+	assert.Equal(t, "0 9 * * 1-5", task.Context.CronExpression)
+	assert.Equal(t, "Asia/Shanghai", task.Context.CronTimezone)
+	require.NotNil(t, task.Context.ScheduledFromStatus)
+	assert.Equal(t, prev, *task.Context.ScheduledFromStatus)
+}
+
+// TestCancelSchedule_ClearsCronConfigAndRestoresStatus 验证取消定时后恢复原状态并清空全部调度配置。
+func TestCancelSchedule_ClearsCronConfigAndRestoresStatus(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "cancel_cron", Name: "Cancel Cron"})
+	task.Pause()
+	task.Schedule(time.Now().Add(time.Hour))
+	task.ConfigureCronSchedule("0 9 * * 1-5", "Asia/Shanghai")
+
+	task.CancelSchedule()
+
+	assert.Equal(t, TaskStatusPaused, task.Context.Status)
+	assert.Empty(t, task.Context.ScheduleMode)
+	assert.Empty(t, task.Context.CronExpression)
+	assert.Empty(t, task.Context.CronTimezone)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
+}
+
+// TestStart_DoesNotMutateScheduleMode 验证 Start 不会清空 ScheduleMode，
+// completeTask 需要依据 ScheduleMode 判断是否重新调度 cron/repeat 任务。
+func TestStart_DoesNotMutateScheduleMode(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "start_no_mutate", Name: "Start No Mutate"})
+	task.ConfigureCronSchedule("0 9 * * 1-5", "Asia/Shanghai")
+
+	task.Start()
+
+	assert.Equal(t, "cron", task.Context.ScheduleMode)
+	assert.Equal(t, "0 9 * * 1-5", task.Context.CronExpression)
+	assert.Equal(t, TaskStatusRunning, task.Context.Status)
+	assert.Nil(t, task.Context.ScheduledAt)
+	assert.Nil(t, task.Context.ScheduledFromStatus)
 }
