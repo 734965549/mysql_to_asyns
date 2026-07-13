@@ -1449,7 +1449,12 @@ func (s *TaskService) resolveTargetSchema(task *taskEntity.SyncTask, sourceSchem
 
 }
 
-func (s *TaskService) resolveTableTargetName(task *taskEntity.SyncTask, tableName string, index int) string {
+// resolveTableTargetName resolves a target table from the durable, globally aligned
+// Tables/TargetTables arrays. In multi-database table sync, index is only the
+// table's position inside the current database and must not be used against the
+// global TargetTables array; doing so sends the first table of every later source
+// database to the first target table of the task.
+func (s *TaskService) resolveTableTargetName(task *taskEntity.SyncTask, sourceSchema, tableName string, index int) string {
 
 	if task == nil || len(task.Config.TargetTables) == 0 {
 
@@ -1457,15 +1462,51 @@ func (s *TaskService) resolveTableTargetName(task *taskEntity.SyncTask, tableNam
 
 	}
 
-	if index < 0 || index >= len(task.Config.TargetTables) {
-
-		return tableName
-
+	sourceSchema = strings.TrimSpace(sourceSchema)
+	tableName = strings.TrimSpace(tableName)
+	defaultSource := strings.TrimSpace(task.Config.SourceSchema)
+	if defaultSource == "" && len(task.Config.SourceDatabases) == 1 {
+		defaultSource = strings.TrimSpace(task.Config.SourceDatabases[0])
 	}
 
-	if target := strings.TrimSpace(task.Config.TargetTables[index]); target != "" {
+	for configuredIndex, configuredTable := range task.Config.Tables {
+		configuredTable = strings.TrimSpace(configuredTable)
+		configuredSchema := ""
+		configuredName := configuredTable
+		if parts := strings.SplitN(configuredTable, ".", 2); len(parts) == 2 {
+			configuredSchema = strings.TrimSpace(parts[0])
+			configuredName = strings.TrimSpace(parts[1])
+		}
 
-		return target
+		if configuredName != tableName {
+			continue
+		}
+		if configuredSchema != "" && configuredSchema != sourceSchema {
+			continue
+		}
+		if configuredSchema == "" {
+			// An unqualified table is only safe when the task has one source, or
+			// an explicit default source identifies which database owns it.
+			if defaultSource == "" || defaultSource != sourceSchema {
+				continue
+			}
+		}
+		if configuredIndex >= len(task.Config.TargetTables) {
+			return tableName
+		}
+		if target := strings.TrimSpace(task.Config.TargetTables[configuredIndex]); target != "" {
+			return target
+		}
+		return tableName
+	}
+
+	// Backward compatibility for historical single-database tasks whose Tables
+	// entries cannot be matched (for example, older archives with an empty list).
+	// This positional fallback is deliberately disabled for multi-database tasks.
+	if len(task.Config.SourceDatabases) <= 1 && index >= 0 && index < len(task.Config.TargetTables) {
+		if target := strings.TrimSpace(task.Config.TargetTables[index]); target != "" {
+			return target
+		}
 
 	}
 
@@ -2515,7 +2556,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		}
 
-		targetTableName := s.resolveTableTargetName(task, tableName, i)
+		targetTableName := s.resolveTableTargetName(task, sourceSchema, tableName, i)
 
 		logger.Info("[Task %s] 确保目标表: %s.%s -> %s.%s", taskID, sourceSchema, tableName, targetSchema, targetTableName)
 

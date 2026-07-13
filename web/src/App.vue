@@ -3,6 +3,11 @@ import { ref, onMounted, onUnmounted, watch, computed } from "vue";
 
 import { Message, Modal } from "@arco-design/web-vue";
 
+import {
+  buildTargetDatabasesPayload as buildDatabaseMappingsPayload,
+  getTaskDatabaseMappings,
+} from "./utils/databaseMappings.js";
+
 const API_BASE = "/api";
 const TASK_SORT_OPTIONS_URL = "/api/tasks/sort-options";
 const TASK_SORT_FALLBACK_OPTIONS = [
@@ -828,52 +833,8 @@ function getQualifiedTableName(database, tableName) {
   return `${database}.${tableName}`;
 }
 
-function resolveTargetDatabaseName(mapping) {
-  const mapped = String(mapping?.target || "").trim();
-  const defaultTarget = String(taskForm.value.target_database || "").trim();
-
-  if (mapped && mapped !== mapping.source) {
-    return mapped;
-  }
-
-  if (defaultTarget) {
-    return defaultTarget;
-  }
-
-  return mapped || mapping.source;
-}
-
 function buildTargetDatabasesPayload() {
-  return targetDatabaseMappings.value.map((mapping) =>
-    resolveTargetDatabaseName(mapping),
-  );
-}
-
-function getTaskDatabaseMappings(task) {
-  if (!task?.config) {
-    return [];
-  }
-
-  const cfg = task.config;
-  const srcDbs =
-    cfg.source_databases?.length > 0
-      ? cfg.source_databases
-      : cfg.source_schema
-        ? [cfg.source_schema]
-        : [];
-  const dstDbs = cfg.target_databases || [];
-  const defaultTarget = cfg.target_database || cfg.target_schema || "";
-
-  return srcDbs.map((src, i) => {
-    const stored = dstDbs[i];
-    if (stored && stored !== src) {
-      return { source: src, target: stored };
-    }
-    if (defaultTarget && defaultTarget !== src) {
-      return { source: src, target: defaultTarget };
-    }
-    return { source: src, target: stored || defaultTarget || src };
-  });
+  return buildDatabaseMappingsPayload(targetDatabaseMappings.value);
 }
 
 function parseQualifiedTableName(qualifiedName) {
@@ -1091,9 +1052,11 @@ async function createTask() {
     targetDatabasesPayload = buildTargetDatabasesPayload();
 
     sourceSchemaPayload = selectedDatabases.value[0] || "";
-    targetSchemaPayload = targetDatabasesPayload[0] || "";
-    targetDatabasePayload =
-      targetDatabasesPayload[0] || taskForm.value.target_database || "";
+    targetSchemaPayload =
+      selectedDatabases.value.length === 1
+        ? targetDatabasesPayload[0] || ""
+        : "";
+    targetDatabasePayload = "";
 
     tablesPayload = selectedDatabases.value.flatMap((db) => {
       const tableNames = tableSelectionsByDatabase.value[db] || [];
@@ -1604,7 +1567,7 @@ function fillTaskFormFromTask(task) {
 
       target:
         (task.config.target_databases && task.config.target_databases[i]) ||
-        task.config.target_schema ||
+        (sourceDatabases.length === 1 ? task.config.target_schema : "") ||
         db,
     }));
 
@@ -2407,8 +2370,7 @@ const tableTargetMappingsByDatabase = computed(() => {
 
       return {
         database: db,
-        targetDatabase:
-          mapping?.target || taskForm.value.target_database || db,
+        targetDatabase: mapping?.target || db,
         tables: sourceTables.map((tableName) => {
           const sourceQualifiedName = getQualifiedTableName(db, tableName);
 

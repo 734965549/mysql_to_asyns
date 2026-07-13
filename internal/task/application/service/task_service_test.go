@@ -645,13 +645,54 @@ func TestResolveTableTargetName(t *testing.T) {
 	ts := NewTaskService(&config.Config{Storage: config.StorageConfig{Mode: "file", DataDir: t.TempDir()}})
 	defer ts.Close()
 
-	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "rename-table", Tables: []string{"users", "orders"}, TargetTables: []string{"users_bak", "orders_bak"}})
-	assert.Equal(t, "users_bak", ts.resolveTableTargetName(task, "users", 0))
-	assert.Equal(t, "orders_bak", ts.resolveTableTargetName(task, "orders", 1))
-	assert.Equal(t, "fallback", ts.resolveTableTargetName(task, "fallback", 5))
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "rename-table", SourceSchema: "source_db", Tables: []string{"users", "orders"}, TargetTables: []string{"users_bak", "orders_bak"}})
+	assert.Equal(t, "users_bak", ts.resolveTableTargetName(task, "source_db", "users", 0))
+	assert.Equal(t, "orders_bak", ts.resolveTableTargetName(task, "source_db", "orders", 1))
+	assert.Equal(t, "fallback", ts.resolveTableTargetName(task, "source_db", "fallback", 5))
 
 	task.Config.TargetTables = nil
-	assert.Equal(t, "users", ts.resolveTableTargetName(task, "users", 0))
+	assert.Equal(t, "users", ts.resolveTableTargetName(task, "source_db", "users", 0))
+}
+
+func TestResolveTableTargetName_MultiDatabaseUsesQualifiedSourceKey(t *testing.T) {
+	ts := &TaskService{}
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:              "rename-table-multi-db",
+		SourceDatabases: []string{"db_a", "db_b"},
+		TargetDatabases: []string{"backup", "backup"},
+		Tables:          []string{"db_a.a", "db_a.a2", "db_b.b", "db_b.b2"},
+		TargetTables:    []string{"a_target", "a2_target", "b_target", "b2_target"},
+	})
+
+	// The local index resets for each source database. db_b.b is local index 0,
+	// but its target must come from global index 2, not TargetTables[0].
+	assert.Equal(t, "a_target", ts.resolveTableTargetName(task, "db_a", "a", 0))
+	assert.Equal(t, "b_target", ts.resolveTableTargetName(task, "db_b", "b", 0))
+	assert.Equal(t, "b2_target", ts.resolveTableTargetName(task, "db_b", "b2", 1))
+}
+
+func TestResolveTableTargetName_MultiDatabaseDoesNotUseUnsafeLocalIndexFallback(t *testing.T) {
+	ts := &TaskService{}
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:              "rename-table-multi-db-fallback",
+		SourceDatabases: []string{"db_a", "db_b"},
+		Tables:          []string{"db_a.a"},
+		TargetTables:    []string{"a_target"},
+	})
+
+	assert.Equal(t, "b", ts.resolveTableTargetName(task, "db_b", "b", 0))
+}
+
+func TestResolveTableTargetName_MultiDatabaseRejectsAmbiguousUnqualifiedTable(t *testing.T) {
+	ts := &TaskService{}
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:              "rename-table-multi-db-unqualified",
+		SourceDatabases: []string{"db_a", "db_b"},
+		Tables:          []string{"shared"},
+		TargetTables:    []string{"wrong_for_db_b"},
+	})
+
+	assert.Equal(t, "shared", ts.resolveTableTargetName(task, "db_b", "shared", 0))
 }
 
 func TestNewTaskService(t *testing.T) {
