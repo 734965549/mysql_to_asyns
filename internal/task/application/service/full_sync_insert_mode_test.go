@@ -335,8 +335,10 @@ func TestSyncDatabasePair_ParallelRangePath_InsertMode(t *testing.T) {
 	setupSource := func(mock sqlmock.Sqlmock) {
 		mock.ExpectQuery("SELECT COALESCE\\(MIN\\(`id`\\), 0\\), COALESCE\\(MAX\\(`id`\\), -1\\) FROM `" + fullSyncSrcSchema + "`.`users`").
 			WillReturnRows(sqlmock.NewRows([]string{"min", "max"}).AddRow(int64(1), int64(1)))
+		// minPK=maxPK=1, workers=2 → span=1 < 2 → 实际 worker=1 → 单 worker: start=nil, end=nil
+		// ReadBatchByKeyRange(nil, nil, limit) 退化为 ReadBatchByKeys(nil, limit) → 无 WHERE
 		rows := sqlmock.NewRows([]string{"id", "name"}).AddRow(int64(1), "alice")
-		mock.ExpectQuery("SELECT `id`, `name` FROM `" + fullSyncSrcSchema + "`.`users` WHERE `id` > \\? ORDER BY `id` ASC LIMIT \\?").
+		mock.ExpectQuery("SELECT `id`, `name` FROM `" + fullSyncSrcSchema + "`.`users` ORDER BY `id` ASC LIMIT \\?").
 			WillReturnRows(rows)
 		mock.ExpectQuery("SELECT `id`, `name` FROM `" + fullSyncSrcSchema + "`.`users` WHERE `id` > \\? ORDER BY `id` ASC LIMIT \\?").
 			WillReturnRows(sqlmock.NewRows([]string{"id", "name"}))
@@ -378,12 +380,15 @@ func TestSyncDatabasePair_ParallelSamplePath_InsertMode(t *testing.T) {
 			WithArgs(int64(2)).
 			WillReturnRows(sqlmock.NewRows([]string{"code"}).AddRow("aaa").AddRow("mmm"))
 
-		rowsW0 := sqlmock.NewRows([]string{"code", "payload"}).AddRow("aaa", "p0")
-		mock.ExpectQuery("^SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` ORDER BY `code` ASC LIMIT \\?$").
+		rowsW0 := sqlmock.NewRows([]string{"code", "payload"}).AddRow("aaa", "p0").AddRow("mmm", "p0b")
+		// w0 第一个 batch：startID=nil, endID="mmm" -> WHERE code <= ?（含边界行）
+		mock.ExpectQuery("^SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` WHERE `code` <= \\? ORDER BY `code` ASC LIMIT \\?$").
 			WillReturnRows(rowsW0)
-		mock.ExpectQuery("^SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` WHERE `code` > \\? ORDER BY `code` ASC LIMIT \\?$").
+		// w0 第二个 batch：startID="mmm", endID="mmm" -> WHERE code > ? AND code <= ? -> 空
+		mock.ExpectQuery("^SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` WHERE `code` > \\? AND `code` <= \\? ORDER BY `code` ASC LIMIT \\?$").
 			WillReturnRows(sqlmock.NewRows([]string{"code", "payload"}))
 
+		// w1 第一个 batch：startID="mmm", endID=nil -> 退化为 WHERE code > ?
 		mock.ExpectQuery("^SELECT `code`, `payload` FROM `" + fullSyncSrcSchema + "`.`events` WHERE `code` > \\? ORDER BY `code` ASC LIMIT \\?$").
 			WillReturnRows(sqlmock.NewRows([]string{"code", "payload"}))
 	}

@@ -2064,7 +2064,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	}
 
 	// 全量同步使用普通 INSERT 语义，暂停/失败后不再支持 full_sync_resume 续传。
-	// 每次进入全量前都清空旧断点，避免沿用陈旧游标。
+	// 每次进入全量前都清空旧断点和运行计数，避免沿用陈旧游标或累加旧值。
+	// 计数重置放在此处（而非通用 Start()），确保 ALL/INCREMENTAL 重启时不清空历史全量统计。
 	s.resetResumeIfFresh(taskID)
 
 	// 构建 (sourceSchema, targetSchema) 对列表
@@ -2223,58 +2224,70 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 	}
 
-	// 先用估算值快速启动，让前端立即看到进度
-	s.updateTaskTotalRows(taskID, estimatedRows)
+	// 先用估算值快速启动，让前端立即看到进度（仅用于 ETA，不用于正确性校验）
+	s.updateTaskEstimatedRows(taskID, estimatedRows)
 
 	logger.Info("[Task %s] Fast estimated total rows: %d (via information_schema)", taskID, estimatedRows)
 
 	// 初始化运行时进度追踪（供前端实时展示）
 	s.initRunningProgress(taskID, allTableEntries, "full")
 
-	// 后台异步获取精确行数，完成后更新（不阻塞同步启动）
-	go func() {
-		var preciseTotal int64
-		for _, entry := range allTableEntries {
-			if s.isTaskStopped(taskID) {
-				return
-			}
-			r := reader.NewReader(runtime.sourceDB, entry.schema, entry.table, entry.identity)
-			count, err := r.GetTotalCount(context.Background())
-			if err != nil {
-				continue
-			}
-			preciseTotal += count
-		}
-		if !s.isTaskStopped(taskID) {
-			s.updateTaskTotalRows(taskID, preciseTotal)
-			logger.Info("[Task %s] Precise total rows updated: %d (via COUNT(*))", taskID, preciseTotal)
-		}
-	}()
+	// === Binlog 增量起点：仅 ALL 模式需要 ===
+	// FULL 模式不捕获 binlog 位点、不保存增量 checkpoint：只做一次无缝全表遍历，
+	// 同步期间发生的变化不进行追平。如需覆盖同步期间的变化，请使用 ALL 模式。
+	var startPosStr string
+	if task.Config.Mode == taskEntity.SyncModeAll {
+		// 参照云厂商 DTS/DRS 的常见做法：增量起点必须早于所有全量读取，确保全量期间的变更
+		// 都能通过 binlog 追平；全量读取本身使用普通短查询，避免长事务长期持有源库 MDL_SHARED_READ。
+		// 仅在取位点时短暂 FTWRL，取到位点后立即 UNLOCK，整个过程毫秒级。
+		//
+		// P0 fail-closed：位点捕获或保存失败时必须终止任务。若继续全量，增量同步会因
+		// checkpoint 为空而回退到主库当前位置，直接漏掉全量期间的所有变更。
+		logger.Info("[Task %s] ALL mode: capturing binlog start position before full scan (short-lock-position, non-snapshot)", taskID)
 
-	// === 低锁一致增量起点：在任何数据读取之前记录 binlog 位点 ===
-	// 参照云厂商 DTS/DRS 的常见做法：增量起点必须早于所有全量读取，确保全量期间的变更
-	// 都能通过 binlog 追平；全量读取本身使用普通短查询，避免长事务长期持有源库 MDL_SHARED_READ。
-	// 仅在取位点时短暂 FTWRL，取到位点后立即 UNLOCK，整个过程毫秒级。
-	//
-	// 当前实现固定走"短锁取位点（非一致性快照）"模式：跨 worker 之间的并行读取
-	// 会存在毫秒~秒级的时间差，依赖随后的 binlog 增量回放追平。
-	logger.Info("[Task %s] Full sync starting (mode=short-lock-position, non-snapshot; cross-worker time skew accepted, will be caught up by binlog)", taskID)
-
-	binlogPos, posErr := s.captureFullSyncStartPosition(ctx, runtime)
-	startPosStr := formatBinlogPosition(binlogPos)
-	if posErr != nil {
-		logger.Warn("[Task %s] Warning: failed to capture full-sync start binlog position: %v", taskID, posErr)
-	} else if binlogPos.Name != "" {
+		binlogPos, posErr := s.captureFullSyncStartPosition(ctx, runtime)
+		startPosStr = formatBinlogPosition(binlogPos)
+		if posErr != nil {
+			errMsg := fmt.Sprintf("Failed to capture full-sync start binlog position: %v. "+
+				"Without a start position, incremental sync would fall back to current master position and miss all changes during full sync. "+
+				"Task failed to prevent silent data loss.", posErr)
+			logger.Error("[Task %s] %s", taskID, errMsg)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		if binlogPos.Name == "" {
+			errMsg := "Captured empty binlog start position (file name is empty). " +
+				"Incremental sync cannot be seeded correctly; task failed to prevent silent data loss."
+			logger.Error("[Task %s] %s", taskID, errMsg)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
 		if err := s.checkpointManager.SavePosition(ctx, taskID, binlogPos); err != nil {
-			logger.Warn("[Task %s] Warning: failed to save binlog position for incremental sync: %v", taskID, err)
-		} else {
-			logger.Info("[Task %s] Full-sync start binlog position saved (will be incremental catch-up start point): %s",
-				taskID, startPosStr)
+			errMsg := fmt.Sprintf("Failed to save binlog start position for incremental sync: %v. "+
+				"Without a persisted checkpoint, incremental sync would fall back to current master position and miss all changes during full sync. "+
+				"Task failed to prevent silent data loss.", err)
+			logger.Error("[Task %s] %s", taskID, errMsg)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
+		logger.Info("[Task %s] Full-sync start binlog position saved (will be incremental catch-up start point): %s",
+			taskID, startPosStr)
+	} else {
+		logger.Info("[Task %s] FULL mode: skipping binlog position capture and incremental checkpoint (no change catch-up)", taskID)
 	}
 
-	// === 修复 4/7：进入"全量已开始"阶段，持久化到任务存档 ===
+	// 进入"全量已开始"阶段，持久化到任务存档。
 	// 失败/暂停后恢复时，根据这个标志决定是不是要重跑全量。
+	// FULL 模式 startPosStr 为空，ALL 模式包含实际 binlog 位点。
 	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
 		t.MarkFullSyncStarted(startPosStr)
 	})
@@ -2811,20 +2824,24 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			}
 
 			// === 修复 14：决策摘要日志，让运维直接看出"模式 / 是否无主键 / 是否并行" ===
-			// 严格全局快照模式已下线，当前固定走"短锁取位点"，并行读取存在跨 worker 时间差，
-			// 由后续 binlog 增量回放兜底追平。
+			// 严格全局快照模式已下线，并行读取存在跨 worker 时间差；仅 ALL 模式会在全量前捕获
+			// binlog 起点并由后续增量追平，FULL 模式不捕获位点、不启动增量。
 			noPK := identity.Strategy == entity.FullColumnsStrategy
 			if noPK {
 				logger.Warn("[NoPK][Task %s] Table %s.%s will use FullColumns strategy (no primary key, no unique key); falling back to single-worker streaming read + INSERT IGNORE; idempotency on re-run is best-effort, recommend adding a primary or unique key",
 					taskID, sourceSchema, tableName)
 			}
+			skewNote := ", changes during sync will not be caught up (FULL mode)"
+			if task.Config.Mode == taskEntity.SyncModeAll {
+				skewNote = ", will be caught up by binlog (ALL mode)"
+			}
 			switch {
 			case canParallelRange:
-				logger.Info("[Task %s] Table %s.%s decision: parallel read enabled (range, workers=%d, strategy=%s, non-snapshot mode -> cross-worker time skew accepted, will be caught up by binlog)",
-					taskID, sourceSchema, tableName, intraWorkers, identity.Strategy)
+				logger.Info("[Task %s] Table %s.%s decision: parallel read enabled (range, workers=%d, strategy=%s, non-snapshot mode -> cross-worker time skew accepted%s)",
+					taskID, sourceSchema, tableName, intraWorkers, identity.Strategy, skewNote)
 			case canParallelSample:
-				logger.Info("[Task %s] Table %s.%s decision: parallel read enabled (sample, workers=%d, strategy=%s, non-snapshot mode -> cross-worker time skew accepted, will be caught up by binlog)",
-					taskID, sourceSchema, tableName, intraWorkers, identity.Strategy)
+				logger.Info("[Task %s] Table %s.%s decision: parallel read enabled (sample, workers=%d, strategy=%s, non-snapshot mode -> cross-worker time skew accepted%s)",
+					taskID, sourceSchema, tableName, intraWorkers, identity.Strategy, skewNote)
 			default:
 				logger.Info("[Task %s] Table %s.%s decision: sequential read (workers=1, strategy=%s, no_pk=%t)",
 					taskID, sourceSchema, tableName, identity.Strategy, noPK)
@@ -3093,11 +3110,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}()
 
-						// 创建reader
-
 						wReader := reader.NewRangeShardingReader(runtime.sourceDB, sourceSchema, tableName, identity)
-
-						// 每个worker负责 [workerStart, workerEnd)
 
 						workerStart := minPK + int64(wIdx)*chunkSize
 
@@ -3107,23 +3120,22 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 						}
 
-						workerEnd := maxPK + 1
+						// 使用与 sample 路径统一的 (start, end] 语义，由 ReadBatchByKeyRange
+						// 将边界写入 SQL WHERE 子句，让 MySQL 用原生类型判断：
+						//   worker 0: start=nil, end=workerStart[1]  → pk <= workerStart[1]
+						//   worker i: start=workerStart[i], end=workerStart[i+1]  → pk > workerStart[i] AND pk <= workerStart[i+1]
+						//   worker last: start=workerStart[last], end=nil  → pk > workerStart[last]
+						// 不使用 ±1、不做 Go 侧裁剪，完全由 MySQL 执行边界判断。
+						var startBoundary, endBoundary interface{}
 
-						if wIdx < intraWorkers-1 {
-
-							nextStart := minPK + int64(wIdx+1)*chunkSize
-
-							if nextStart < workerEnd {
-
-								workerEnd = nextStart
-
-							}
-
+						if wIdx > 0 {
+							startBoundary = interface{}(workerStart)
 						}
 
-						startBoundary := interface{}(workerStart - 1)
-
-						endBoundary := interface{}(workerEnd)
+						if wIdx < intraWorkers-1 {
+							nextStart := minPK + int64(wIdx+1)*chunkSize
+							endBoundary = interface{}(nextStart)
+						}
 
 						conn, err := runtime.targetDB.Conn(ctx)
 
@@ -3277,9 +3289,8 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							}
 
-							// 使用 ReadBatchByKeys 进行keyset分页
-
-							batch, err := wReader.ReadBatchByKeys(ctx, lastID, readLimit)
+							// 上界写入 SQL，让 MySQL 用原生类型判断边界，与 sample 路径统一
+							batch, err := wReader.ReadBatchByKeyRange(ctx, lastID, endBoundary, readLimit)
 
 							if err != nil {
 
@@ -3296,58 +3307,6 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 								break
 
 							}
-
-							// 数据一致性检查：验证第一批数据的连续性
-
-							if lastID != nil {
-
-								firstPK := batch[0][cursorCols[0]]
-
-								if comparePKValues(firstPK, lastID) <= 0 {
-
-									syncErrChan <- fmt.Errorf("w%d data continuity error: first PK %v should be > lastID %v", wIdx, firstPK, lastID)
-
-									return
-
-								}
-
-							}
-
-							// 非最后一个worker：检查是否超出边界
-
-							if endBoundary != nil {
-
-								cutIdx := len(batch)
-
-								for j, row := range batch {
-
-									if comparePKValues(row[cursorCols[0]], endBoundary) >= 0 {
-
-										cutIdx = j
-
-										break
-
-									}
-
-								}
-
-								if cutIdx < len(batch) {
-
-									logger.Info("[Task %s] w%d cutting %d rows that exceed boundary %v", taskID, wIdx, len(batch)-cutIdx, endBoundary)
-
-									batch = batch[:cutIdx]
-
-								}
-
-							}
-
-							if len(batch) == 0 {
-
-								break
-
-							}
-
-							// 记录批次范围信息
 
 							firstPK := batch[0][cursorCols[0]]
 
@@ -3372,21 +3331,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							taskTotalRows := s.incrementTaskProgress(taskID, n, rangeMark)
 							s.updateTableProgress(taskID, sourceSchema, tableName, n, time.Since(tableStartTime).Seconds(), task.Context.StartTime, taskTotalRows)
 
-							// 更新 lastID 为最后一条记录的主键值，确保连续性
-
-							lastRow := batch[len(batch)-1]
-
-							lastID = lastRow[cursorCols[0]]
-
-							// 检查是否达到边界
-
-							if endBoundary != nil && comparePKValues(lastID, endBoundary) >= 0 {
-
-								logger.Info("[Task %s] w%d reached boundary %v at %v", taskID, wIdx, endBoundary, lastID)
-
-								break
-
-							}
+							lastID = lastPK
 
 						}
 
@@ -3619,41 +3564,14 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 							}
 
-							batchRows, err := wReader.ReadBatchByKeys(ctx, lastID, readLimit)
+							// 上界写入 SQL，让 MySQL 用原生类型/collation 判断，杜绝 Go 字符串比较的语义差异
+							batchRows, err := wReader.ReadBatchByKeyRange(ctx, lastID, endBoundary, readLimit)
 
 							if err != nil {
 
 								syncErrChan <- fmt.Errorf("w%d read after %v: %v", wIdx, lastID, err)
 
 								return
-
-							}
-
-							if len(batchRows) == 0 {
-
-								break
-
-							}
-
-							// 非最后一个 worker：裁剪超出 endBoundary 的行（支持复合主键完整比较）
-
-							if endBoundary != nil {
-
-								cutIdx := len(batchRows)
-
-								for j, row := range batchRows {
-
-									if comparePKWithBoundary(cursorCols, row, endBoundary) > 0 {
-
-										cutIdx = j
-
-										break
-
-									}
-
-								}
-
-								batchRows = batchRows[:cutIdx]
 
 							}
 
@@ -3683,7 +3601,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 							taskTotalRows := s.incrementTaskProgress(taskID, n, mark)
 							s.updateTableProgress(taskID, sourceSchema, tableName, n, time.Since(tableStartTime).Seconds(), task.Context.StartTime, taskTotalRows)
 
-							// 更新 lastID：复合主键需要传完整的 []interface{} 给 ReadBatchByKeys
+							// 更新 lastID：复合主键需要传完整的 []interface{} 给 ReadBatchByKeyRange
 							if len(cursorCols) == 1 {
 								lastID = firstPKVal
 							} else {
@@ -3694,12 +3612,8 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 								lastID = compositePK
 							}
 
-							// 边界检查：使用游标列比较（采样边界已包含对应列值）
-							if endBoundary != nil && comparePKWithBoundary(cursorCols, lastRow, endBoundary) >= 0 {
-
-								break
-
-							}
+							// 上界已在 SQL 中处理：MySQL 只返回 < endBoundary 的行，
+							// 当 batch 不足 readLimit 时下一轮会返回空自动 break，无需 Go 侧裁剪
 
 						}
 
@@ -3977,6 +3891,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 				}
 
+			}
+
+			if s.isTaskStopped(taskID) {
+				return
 			}
 
 			// 该表全量同步完成：记录断点为 Done，重启时直接跳过。
@@ -5410,8 +5328,9 @@ func resumeEnabled(task *taskEntity.SyncTask) bool {
 	return false
 }
 
-// resetResumeIfFresh 在全量开始时按需清空历史断点：
-// 全量续传已禁用，每次进入全量前都清空历史断点。
+// resetResumeIfFresh 在全量开始时清空历史断点和运行计数：
+// 全量续传已禁用，每次进入全量前都清空历史断点；
+// 同时重置运行计数（ProcessedRows/TotalRows/ProgressPercent 等），避免新一轮全量累加旧值。
 func (s *TaskService) resetResumeIfFresh(taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5420,6 +5339,7 @@ func (s *TaskService) resetResumeIfFresh(taskID string) {
 		return
 	}
 	task.ResetFullSyncResume()
+	task.ResetFullSyncCounters()
 	s.storage.Save(task)
 }
 
@@ -5729,10 +5649,13 @@ func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position
 
 		task.Context.LastUpdateTime = time.Now()
 
-		if task.Context.TotalRows > 0 {
-
-			task.Context.ProgressPercent = float64(task.Context.ProcessedRows) / float64(task.Context.TotalRows) * 100
-
+		// 进度计算优先使用精确总数，未到位时用估算总数兜底（仅 ETA）
+		effectiveTotal := task.Context.TotalRows
+		if effectiveTotal <= 0 {
+			effectiveTotal = task.Context.EstimatedTotalRows
+		}
+		if effectiveTotal > 0 {
+			task.Context.ProgressPercent = float64(task.Context.ProcessedRows) / float64(effectiveTotal) * 100
 		}
 
 		// 节流：至少间隔 1 秒才落盘一次，减少存储 I/O
@@ -5743,30 +5666,21 @@ func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position
 			s.storage.Save(task)
 		}
 
-		return task.Context.TotalRows
+		return effectiveTotal
 	}
 
 	return 0
 }
 
-// updateTaskTotalRows 更新任务总行数
-
-func (s *TaskService) updateTaskTotalRows(taskID string, totalRows int64) {
-
+// updateTaskEstimatedRows 更新任务估算总行数（information_schema），仅用于 ETA
+func (s *TaskService) updateTaskEstimatedRows(taskID string, estimatedRows int64) {
 	s.mu.Lock()
-
 	defer s.mu.Unlock()
-
 	if task, exists := s.tasks[taskID]; exists {
-
-		task.Context.TotalRows = totalRows
-
+		task.Context.EstimatedTotalRows = estimatedRows
 		task.Context.LastUpdateTime = time.Now()
-
 		s.storage.Save(task)
-
 	}
-
 }
 
 func (s *TaskService) getTaskTotalRows(taskID string) int64 {
@@ -5774,7 +5688,11 @@ func (s *TaskService) getTaskTotalRows(taskID string) int64 {
 	defer s.mu.RUnlock()
 
 	if task, exists := s.tasks[taskID]; exists {
-		return task.Context.TotalRows
+		// 优先返回精确总数，未到位时用估算总数兜底（仅 ETA）
+		if task.Context.TotalRows > 0 {
+			return task.Context.TotalRows
+		}
+		return task.Context.EstimatedTotalRows
 	}
 	return 0
 }
@@ -6237,6 +6155,8 @@ func (s *TaskService) GetTaskMetrics(taskID string) (map[string]interface{}, err
 		"processed_rows": task.Context.ProcessedRows,
 
 		"total_rows": task.Context.TotalRows,
+
+		"estimated_total_rows": task.Context.EstimatedTotalRows,
 
 		"progress_percent": task.Context.ProgressPercent,
 

@@ -254,6 +254,25 @@ func (b *SQLBuilder) collectBatchValues(rows []map[string]interface{}) ([]string
 	return columns, columnNames, values, rowPlaceholders
 }
 
+// IdentityChanged 比较 before/after image 中标识列（PK/UK）的值是否发生变化。
+// 返回 true 表示至少有一个标识列值不同，调用方应在同一事务内先 DELETE 旧行再 UPSERT 新行。
+func (b *SQLBuilder) IdentityChanged(before, after map[string]interface{}) bool {
+	for _, col := range b.identity.IdentifyCols {
+		beforeVal, beforeOk := before[col]
+		afterVal, afterOk := after[col]
+		if !beforeOk || !afterOk {
+			if beforeOk != afterOk {
+				return true
+			}
+			continue
+		}
+		if fmt.Sprintf("%v", beforeVal) != fmt.Sprintf("%v", afterVal) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetStrategyName 获取当前策略名称方法
 func (b *SQLBuilder) GetStrategyName() string { // 获取当前使用的匹配策略名称
 	return b.matchStrategy.GetStrategyName() // 返回策略名称

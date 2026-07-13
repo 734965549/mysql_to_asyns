@@ -11,7 +11,7 @@ import (
 type MockTableMetadataRepository struct {
 	columns      []entity.ColumnMeta
 	pkColumns    []string
-	ukColumns    []string
+	ukColumns    [][]string
 	tables       []entity.TableInfo
 	databases    []string
 	columnsErr   error
@@ -29,7 +29,7 @@ func (m *MockTableMetadataRepository) GetPrimaryKeyColumns(schema, tableName str
 	return m.pkColumns, m.pkColumnsErr
 }
 
-func (m *MockTableMetadataRepository) GetUniqueKeyColumns(schema, tableName string) ([]string, error) {
+func (m *MockTableMetadataRepository) GetUniqueKeyColumns(schema, tableName string) ([][]string, error) {
 	return m.ukColumns, m.ukColumnsErr
 }
 
@@ -48,7 +48,7 @@ func TestIdentityAnalyzerService_AnalyzeTable_PK(t *testing.T) {
 			{Name: "name", DataType: "varchar", IsPrimaryKey: false},
 		},
 		pkColumns: []string{"id"},
-		ukColumns: []string{},
+		ukColumns: [][]string{},
 	}
 
 	service := NewIdentityAnalyzerService(mockRepo)
@@ -82,7 +82,7 @@ func TestIdentityAnalyzerService_AnalyzeTable_UK(t *testing.T) {
 			{Name: "email", DataType: "varchar", IsPrimaryKey: false, IsUnique: true},
 		},
 		pkColumns: []string{},
-		ukColumns: []string{"email"},
+		ukColumns: [][]string{{"email"}},
 	}
 
 	service := NewIdentityAnalyzerService(mockRepo)
@@ -120,7 +120,7 @@ func TestIdentityAnalyzerService_AnalyzeTable_FullColumns(t *testing.T) {
 			{Name: "created_at", DataType: "datetime", IsPrimaryKey: false},
 		},
 		pkColumns: []string{},
-		ukColumns: []string{},
+		ukColumns: [][]string{},
 	}
 
 	service := NewIdentityAnalyzerService(mockRepo)
@@ -163,7 +163,7 @@ func TestIdentityAnalyzerService_AnalyzeTable_CompositePK(t *testing.T) {
 			{Name: "assigned_at", DataType: "datetime", IsPrimaryKey: false},
 		},
 		pkColumns: []string{"user_id", "role_id"},
-		ukColumns: []string{},
+		ukColumns: [][]string{},
 	}
 
 	service := NewIdentityAnalyzerService(mockRepo)
@@ -201,7 +201,7 @@ func TestIdentityAnalyzerService_AnalyzeTable_CompositePKWithAutoIncrement(t *te
 			{Name: "name", DataType: "varchar", IsPrimaryKey: false},
 		},
 		pkColumns: []string{"id", "tenant_id"},
-		ukColumns: []string{},
+		ukColumns: [][]string{},
 	}
 
 	service := NewIdentityAnalyzerService(mockRepo)
@@ -356,7 +356,7 @@ func TestIdentityAnalyzerService_EmptyColumns(t *testing.T) {
 	mockRepo := &MockTableMetadataRepository{
 		columns:   []entity.ColumnMeta{},
 		pkColumns: []string{},
-		ukColumns: []string{},
+		ukColumns: [][]string{},
 	}
 
 	service := NewIdentityAnalyzerService(mockRepo)

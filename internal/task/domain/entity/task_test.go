@@ -77,6 +77,26 @@ func TestNewSyncTask(t *testing.T) {
 	}
 }
 
+// TestNewSyncTask_NormalizesMode 验证 NewSyncTask 将 Mode 归一化为大写，
+// 确保所有下游比较（校验、执行路径）大小写不敏感。
+func TestNewSyncTask_NormalizesMode(t *testing.T) {
+	tests := []struct {
+		input    SyncMode
+		expected SyncMode
+	}{
+		{"all", SyncModeAll},
+		{"All", SyncModeAll},
+		{"ALL", SyncModeAll},
+		{"full", SyncModeFull},
+		{"incremental", SyncModeIncremental},
+		{"INCREMENTAL", SyncModeIncremental},
+	}
+	for _, tt := range tests {
+		task := NewSyncTask(TaskConfig{ID: "test_mode", Mode: tt.input})
+		assert.Equal(t, tt.expected, task.Config.Mode, "input mode %q should normalize to %q", tt.input, tt.expected)
+	}
+}
+
 func TestTaskStart(t *testing.T) {
 	config := TaskConfig{
 		ID:   "test_task_2",
@@ -93,6 +113,46 @@ func TestTaskStart(t *testing.T) {
 	if task.Context.StartTime.IsZero() {
 		t.Error("start time should not be zero")
 	}
+}
+
+// TestStart_DoesNotResetCounters 验证 Start 不再重置运行计数字段，
+// 计数重置已移至 ResetFullSyncCounters，仅在全量开始时调用。
+func TestStart_DoesNotResetCounters(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "test_start_reset", Name: "Test"})
+	// 模拟上一轮全量残留的计数
+	task.Context.ProcessedRows = 9999
+	task.Context.TotalRows = 10000
+	task.Context.EstimatedTotalRows = 8000
+	task.Context.ProgressPercent = 99.9
+	task.Context.CurrentPosition = "old_pos"
+
+	task.Start()
+
+	// Start 应保留历史全量统计，不再清零
+	assert.Equal(t, int64(9999), task.Context.ProcessedRows)
+	assert.Equal(t, int64(10000), task.Context.TotalRows)
+	assert.Equal(t, int64(8000), task.Context.EstimatedTotalRows)
+	assert.Equal(t, float64(99.9), task.Context.ProgressPercent)
+	assert.Equal(t, "old_pos", task.Context.CurrentPosition)
+}
+
+// TestResetFullSyncCounters 验证 ResetFullSyncCounters 重置运行计数字段，
+// 仅在确定进入 executeFullSync 时调用。
+func TestResetFullSyncCounters(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "test_reset_counters", Name: "Test"})
+	task.Context.ProcessedRows = 9999
+	task.Context.TotalRows = 10000
+	task.Context.EstimatedTotalRows = 8000
+	task.Context.ProgressPercent = 99.9
+	task.Context.CurrentPosition = "old_pos"
+
+	task.ResetFullSyncCounters()
+
+	assert.Equal(t, int64(0), task.Context.ProcessedRows)
+	assert.Equal(t, int64(0), task.Context.TotalRows)
+	assert.Equal(t, int64(0), task.Context.EstimatedTotalRows)
+	assert.Equal(t, float64(0), task.Context.ProgressPercent)
+	assert.Equal(t, "", task.Context.CurrentPosition)
 }
 
 func TestTaskPause(t *testing.T) {
@@ -133,16 +193,21 @@ func TestTaskComplete(t *testing.T) {
 	}
 }
 
-func TestTaskComplete_ReconcilesTotalRows(t *testing.T) {
+func TestTaskComplete_PreservesTotalRows(t *testing.T) {
 	task := NewSyncTask(TaskConfig{ID: "test_complete_rows", Name: "Test"})
+	task.Start()
+	// 在 Start 之后设置，因为 Start 会重置运行计数
 	task.Context.ProcessedRows = 507165220
 	task.Context.TotalRows = 507578780
-	task.Start()
 	task.Complete()
 
-	if task.Context.TotalRows != task.Context.ProcessedRows {
-		t.Errorf("expected total_rows reconciled to processed_rows %d, got %d",
-			task.Context.ProcessedRows, task.Context.TotalRows)
+	// TotalRows 不应被 ProcessedRows 覆盖；两者是独立事实
+	if task.Context.TotalRows != 507578780 {
+		t.Errorf("expected total_rows preserved as %d, got %d",
+			507578780, task.Context.TotalRows)
+	}
+	if task.Context.TotalRows == task.Context.ProcessedRows {
+		t.Error("total_rows should NOT be overwritten to match processed_rows")
 	}
 }
 

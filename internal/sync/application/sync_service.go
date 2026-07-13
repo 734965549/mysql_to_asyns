@@ -602,39 +602,78 @@ func (h *syncEventHandler) handleInsert(event *binlog.BinlogEvent, w *writer.Buf
 }
 
 // handleUpdate 处理UPDATE事件
-
 func (h *syncEventHandler) handleUpdate(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity, targetSchema string) error {
-
 	batchWriter := writer.NewBatchWriterWithConn(h.service.writeConn, identity, 1000, targetSchema)
+	sqlBuilder := batchWriter.GetSQLBuilder()
 
 	for i, row := range event.Rows {
-
 		var err error
 
 		if identity.Strategy == entity.FullColumnsStrategy && i < len(event.BeforeImage) {
-
 			// 无主键表：使用 before image 作为 WHERE 条件
-
 			err = batchWriter.UpdateWithBeforeImage(context.Background(), row, event.BeforeImage[i])
-
+		} else if i < len(event.BeforeImage) {
+			// PK/UK 表：比较 before/after identity
+			beforeImage := event.BeforeImage[i]
+			if sqlBuilder.IdentityChanged(beforeImage, row) {
+				// identity 变化：同事务内 DELETE 旧行 + UPSERT 新行
+				err = h.deleteAndUpsert(identity, targetSchema, row, beforeImage)
+			} else {
+				// identity 未变：用 before key 定位后更新
+				err = batchWriter.UpdateWithBeforeImage(context.Background(), row, beforeImage)
+			}
 		} else {
-
-			// 有主键/唯一键表：直接使用 row (after image) 即可
-
+			// 没有 before image：回退到原逻辑（用 after image 做 WHERE）
 			err = batchWriter.Update(context.Background(), row)
-
 		}
 
 		if err != nil {
-
 			return err
-
 		}
-
 	}
 
 	return nil
+}
 
+// deleteAndUpsert 在同一事务内删除旧行并 upsert 新行，用于 PK/UK 值发生变更的场景。
+// 事务基于已禁用外键检查的 writeConn，保证 DELETE + INSERT 的原子性。
+func (h *syncEventHandler) deleteAndUpsert(identity *entity.TableIdentity, targetSchema string, row, beforeImage map[string]interface{}) error {
+	ctx := context.Background()
+
+	tx, err := h.service.writeConn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx for identity-change update: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	txWriter := writer.NewBatchWriterWithTx(tx, identity, 1000, targetSchema)
+	txSQLBuilder := txWriter.GetSQLBuilder()
+
+	// DELETE 旧行（直接执行，不检查零行匹配——目标可能尚未有旧行）
+	deleteQuery, deleteArgs := txSQLBuilder.BuildDelete(beforeImage)
+	if _, err := tx.ExecContext(ctx, deleteQuery, deleteArgs...); err != nil {
+		return fmt.Errorf("delete old row in identity-change update: %w", err)
+	}
+
+	// UPSERT 新行（ON DUPLICATE KEY UPDATE 保证幂等）
+	txWriter.EnableUpsert()
+	if err := txWriter.WriteBatch(ctx, []map[string]interface{}{row}); err != nil {
+		return fmt.Errorf("upsert new row in identity-change update: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit identity-change update: %w", err)
+	}
+	tx = nil
+
+	logger.Info("[IdentityChange][Task %s] PK/UK identity changed on table %s.%s; deleted old row and upserted new row in transaction",
+		h.taskID, targetSchema, identity.TableName)
+
+	return nil
 }
 
 // handleDelete 处理DELETE事件

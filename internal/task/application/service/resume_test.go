@@ -106,8 +106,12 @@ func TestTableSyncProgressJSONRoundTrip(t *testing.T) {
 
 // === range 分片划分确定性：相同 min/max/workers 推导一致 ===
 
-// rangeShards 复现 range 路径的分片边界划分逻辑（与 task_service.go 保持一致）。
-func rangeShards(minPK, maxPK int64, workers int) [][2]int64 {
+// rangeBoundaries 复现 range 路径的分片边界划分逻辑（与 task_service.go 保持一致）。
+// 返回 (start, end] 边界对，*int64 == nil 表示无界。
+// worker 0: start=nil; 最后一个 worker: end=nil。
+// 不使用 ±1：直接用 workerStart 值作为边界，
+// ReadBatchByKeyRange 的 (start, end] 语义保证不重不漏。
+func rangeBoundaries(minPK, maxPK int64, workers int) [][2]*int64 {
 	span := maxPK - minPK + 1
 	if span < int64(workers) {
 		workers = int(span)
@@ -116,35 +120,42 @@ func rangeShards(minPK, maxPK int64, workers int) [][2]int64 {
 		}
 	}
 	chunk := (span + int64(workers) - 1) / int64(workers)
-	out := make([][2]int64, 0, workers)
+	out := make([][2]*int64, 0, workers)
 	for w := 0; w < workers; w++ {
-		start := minPK + int64(w)*chunk
-		if start > maxPK {
+		workerStart := minPK + int64(w)*chunk
+		if workerStart > maxPK {
 			break
 		}
-		end := maxPK + 1
-		if w < workers-1 {
-			next := minPK + int64(w+1)*chunk
-			if next < end {
-				end = next
-			}
+		var start, end *int64
+		if w > 0 {
+			v := workerStart
+			start = &v
 		}
-		out = append(out, [2]int64{start, end})
+		if w < workers-1 {
+			v := minPK + int64(w+1)*chunk
+			end = &v
+		}
+		out = append(out, [2]*int64{start, end})
 	}
 	return out
 }
 
-func TestRangeShardDeterminism(t *testing.T) {
-	a := rangeShards(1, 1000, 4)
-	b := rangeShards(1, 1000, 4)
+func TestRangeBoundaryDeterminism(t *testing.T) {
+	a := rangeBoundaries(1, 1000, 4)
+	b := rangeBoundaries(1, 1000, 4)
 	assert.Equal(t, a, b, "相同 min/max/workers 应得到一致的分片划分")
 
-	// 分片应覆盖整个 [min, max] 且互不重叠
 	require.Len(t, a, 4)
-	assert.Equal(t, int64(1), a[0][0])
-	assert.Equal(t, int64(1001), a[len(a)-1][1])
+	// 第一个 worker: start=nil (从表头开始)
+	assert.Nil(t, a[0][0], "第一个 worker 应无下界")
+	// 最后一个 worker: end=nil (读到表尾)
+	assert.Nil(t, a[len(a)-1][1], "最后一个 worker 应无上界")
+
+	// 相邻分片边界应连续：后一个 worker 的 start 应等于前一个 worker 的 end
 	for i := 1; i < len(a); i++ {
-		assert.Equal(t, a[i-1][1], a[i][0], "相邻分片应首尾相接")
+		require.NotNil(t, a[i][0], "非首 worker 应有下界")
+		require.NotNil(t, a[i-1][1], "非末 worker 应有上界")
+		assert.Equal(t, *a[i-1][1], *a[i][0], "相邻分片边界应连续 (start, end] 语义")
 	}
 }
 

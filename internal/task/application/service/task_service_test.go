@@ -1553,6 +1553,28 @@ func TestIncrementTaskProgress(t *testing.T) {
 	assert.Equal(t, 30.0, retrievedTask.Context.ProgressPercent)
 }
 
+// TestIncrementTaskProgress_ReturnsEstimatedTotal 验证精确 TotalRows 未到位时，
+// incrementTaskProgress 返回 EstimatedTotalRows 供运行时 ETA 使用。
+func TestIncrementTaskProgress_ReturnsEstimatedTotal(t *testing.T) {
+	dataDir := t.TempDir()
+
+	ts := newTestTaskService(dataDir)
+
+	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_eta", Name: "Task ETA"})
+	// 精确 COUNT(*) 尚未完成，只有估算值
+	task.Context.TotalRows = 0
+	task.Context.EstimatedTotalRows = 5000
+
+	total := ts.incrementTaskProgress("task_eta", 100, "pos_1")
+
+	assert.Equal(t, int64(5000), total, "should return EstimatedTotalRows when TotalRows is 0")
+
+	// 精确 COUNT(*) 完成后应返回精确值
+	task.Context.TotalRows = 6000
+	total = ts.incrementTaskProgress("task_eta", 200, "pos_2")
+	assert.Equal(t, int64(6000), total, "should return TotalRows when it is set")
+}
+
 // spyTaskStorage 包装真实 FileTaskStorage，统计 Save 调用次数，用于测试持久化节流行为。
 type spyTaskStorage struct {
 	*FileTaskStorage
@@ -1706,12 +1728,12 @@ func TestUpdateTaskTotalRows(t *testing.T) {
 	// 创建任务
 	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 
-	// 更新总行数
-	ts.updateTaskTotalRows("task_1", 5000)
+	// 更新估算行数
+	ts.updateTaskEstimatedRows("task_1", 5000)
 
-	// 验证更新
+	// 验证估算行数更新
 	retrievedTask, _ := ts.GetTask("task_1")
-	assert.Equal(t, int64(5000), retrievedTask.Context.TotalRows)
+	assert.Equal(t, int64(5000), retrievedTask.Context.EstimatedTotalRows)
 }
 
 func TestUpdateTaskStatus(t *testing.T) {
@@ -3148,8 +3170,8 @@ func TestExecuteSync_FullPauseDoesNotCompleteTask(t *testing.T) {
 	task.Start()
 	ts.tasks[task.Config.ID] = task
 
-	// 模拟"用户在全量过程中按了暂停"
-	task.Pause()
+	// 模拟"用户在全量过程中按了暂停"（走 TaskService 入口，与生产路径一致）
+	require.NoError(t, ts.PauseTask(task.Config.ID))
 
 	ts.executeSync(context.Background(), task.Config.ID, &taskRuntime{
 		sourceDB: db,
@@ -3179,14 +3201,7 @@ func TestExecuteSync_DatabaseRebuildPauseKeepsPhase(t *testing.T) {
 	sourceMock.MatchExpectationsInOrder(false)
 	targetMock.MatchExpectationsInOrder(false)
 
-	// 源库：短锁取位点
-	sourceMock.ExpectExec(regexp.QuoteMeta("FLUSH TABLES WITH READ LOCK")).
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	sourceMock.ExpectQuery(regexp.QuoteMeta("SHOW MASTER STATUS")).
-		WillReturnRows(sqlmock.NewRows([]string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set"}).
-			AddRow("mysql-bin.000001", uint32(4), "", "", ""))
-	sourceMock.ExpectExec(regexp.QuoteMeta("UNLOCK TABLES")).
-		WillReturnResult(sqlmock.NewResult(0, 0))
+	// FULL 模式不再捕获 binlog 位点，无需 mock FTWRL/SHOW MASTER STATUS/UNLOCK。
 
 	// 目标库：库级别重建。第一个 DROP 故意延迟，让测试有机会在重建过程中暂停任务；
 	// 暂停后第二个库的迭代应被 isTaskStopped 拦截，不会执行 DROP/CREATE。
@@ -3219,11 +3234,12 @@ func TestExecuteSync_DatabaseRebuildPauseKeepsPhase(t *testing.T) {
 		targetDB: targetDB,
 		analyzer: ts.analyzer,
 	}
+	ts.runtimes[task.Config.ID] = runtime
 
 	// 在重建过程中暂停任务：延迟 100ms 确保 executeFullSync 已通过早停检查并进入 rebuild。
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		task.Pause()
+		_ = ts.PauseTask(task.Config.ID)
 	}()
 
 	ts.executeSync(context.Background(), task.Config.ID, runtime)

@@ -263,6 +263,10 @@ func (v *Validator) checkUserPrivileges(db *sql.DB) error { // 检查MySQL用户
 		}
 	}
 
+	if err := rows.Err(); err != nil { // 检查遍历过程中的连接错误，防止权限漏读
+		return fmt.Errorf("scan user privileges: %w", err)
+	}
+
 	if hasReplicationSlave == "" { // 如果没有复制权限
 		logger.Warn("  REPLICATION SLAVE privilege not found, incremental sync may not work") // 输出警告
 	}

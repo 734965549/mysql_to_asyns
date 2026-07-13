@@ -765,7 +765,7 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	// 表列表：允许清空（库级别同步时 tables 为空）
 	task.Config.Tables = req.Tables // 更新表列表
 	if req.Mode != "" {             // 如果提供了同步模式
-		task.Config.Mode = taskEntity.SyncMode(req.Mode) // 更新同步模式
+		task.Config.Mode = taskEntity.SyncMode(strings.ToUpper(req.Mode)) // 更新同步模式（归一化为大写）
 	}
 	if req.BatchSize > 0 { // 如果提供了批处理大小
 		task.Config.BatchSize = req.BatchSize // 更新批处理大小

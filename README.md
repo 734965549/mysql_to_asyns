@@ -175,9 +175,9 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 
 GRANT SELECT ON *.* TO 'username'@'%';
 
-# 全量起点位点采用"短锁取位点"模式，会短暂执行 FLUSH TABLES WITH READ LOCK，
+# ALL 模式全量开始前采用"短锁取位点"模式，会短暂执行 FLUSH TABLES WITH READ LOCK，
 
-# 因此需要 RELOAD 权限
+# 因此 ALL 模式需要 RELOAD 权限（FULL 模式不需要）
 
 GRANT RELOAD ON *.* TO 'username'@'%';
 
@@ -465,13 +465,13 @@ Content-Type: application/json
 
 
 
-**全量起点位点说明（无需配置）：**
+**Binlog 位点说明：**
 
-- 全量同步开始前会自动短暂执行一次 `FLUSH TABLES WITH READ LOCK` 取到 binlog 位点，
-  随后立即 `UNLOCK TABLES`，整个过程毫秒级，对所有任务默认生效，无 JSON / TOML 开关。
+- **FULL 模式**不捕获 binlog 位点、不保存增量 checkpoint。FULL 只做一次无缝全表遍历，保证分片边界与读取流程不漏数据；同步期间发生的新增、更新和删除不进行追平。
 
-- 历史版本曾提供 `enable_consistent_snapshot` 任务级字段（"严格全局快照 + 长事务连接池"
-  模式），现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
+- **ALL 模式**在全量扫描开始前，短暂执行 `FLUSH TABLES WITH READ LOCK` 取 binlog 位点（P0），随后立即 `UNLOCK TABLES`（毫秒级）。P0 捕获或持久化失败时任务立即终止。全量完成后从 P0 回放 binlog 追平变化并进入持续同步。
+
+- 历史版本曾提供 `enable_consistent_snapshot` 任务级字段，现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
 
 **`enable_drop_table_before_ddl` 说明：**
 
@@ -693,6 +693,8 @@ GET /api/tasks/:id/metrics
   "processed_rows": 12345,
 
   "total_rows": 50000,
+
+  "estimated_total_rows": 50000,
 
   "progress_percent": 24.69,
 
@@ -1038,6 +1040,16 @@ mysql-to-sync/
 
 
 
+**语义定义**：
+
+FULL 模式执行一次无缝全表遍历，保证分片边界与读取流程本身不漏数据；同步执行期间发生的新增、更新和删除不进行追平。如需覆盖同步期间的变化，请使用 ALL 模式。
+
+- 不执行 `COUNT(*)`
+- 不捕获 binlog 位点
+- 不保存增量 checkpoint
+- 依靠分片计划保证读取全集（sample / numeric range 均生成有界区间覆盖 `(-∞, +∞)`）
+- 所有 worker 扫到 EOF、所有事务提交成功，即标记 `FULL_COMPLETED`
+
 **工作流程**：
 
 1. 分析源表结构
@@ -1136,13 +1148,25 @@ mysql-to-sync/
 
 
 
+**语义定义**：
+
+ALL 模式先捕获 binlog 位点（P0），再执行与 FULL 相同的无缝全量扫描，全量结束后从 P0 回放 binlog 追平变化，最终进入持续同步。
+
+- 第一次读取前获取并持久化 P0（`FLUSH TABLES WITH READ LOCK` → `SHOW MASTER STATUS` → `UNLOCK TABLES`，毫秒级），失败必须终止
+- 使用与 FULL 相同的分片全量扫描
+- 全量结束后从 P0 回放 binlog：PK/UK INSERT 使用 upsert，UPDATE 正确处理 before/after key
+- 追平后进入实时同步
+- 无 PK/UK 表不能承诺严格收敛
+
 **工作流程**：
 
-1. 执行全量同步
+1. 捕获并持久化 binlog 起始位点 P0
 
-2. 全量完成后自动启动增量同步
+2. 执行全量同步（与 FULL 相同的无缝遍历）
 
-3. 持续实时同步
+3. 全量完成后从 P0 自动启动增量同步
+
+4. 持续实时同步
 
 
 

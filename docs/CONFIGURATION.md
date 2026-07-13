@@ -343,12 +343,15 @@ env:
 }
 ```
 
-### 全量起点位点（短锁取位点）
+### Binlog 位点捕获（仅 ALL 模式）
 
-全量同步开始前，会自动通过短暂的 `FLUSH TABLES WITH READ LOCK` 拿到一个严格领先于
-全量读取的 binlog 位点，取到位点后立即 `UNLOCK TABLES`，全过程毫秒级，无需任何
-额外配置开关。该位点会被持久化为后续增量同步的起点，保证全量期间的所有变更都能
-被增量阶段完整回放。
+**ALL 模式**在全量扫描开始前，自动通过短暂的 `FLUSH TABLES WITH READ LOCK` 拿到一个严格领先于
+全量读取的 binlog 位点（P0），取到位点后立即 `UNLOCK TABLES`，全过程毫秒级，无需任何
+额外配置开关。P0 会被持久化为后续增量同步的起点，保证全量期间的所有变更都能
+被增量阶段完整回放。P0 捕获或持久化失败时任务立即终止，防止增量阶段漏数据。
+
+**FULL 模式**不捕获 binlog 位点，不保存增量 checkpoint。FULL 只做一次无缝全表遍历，
+同步期间发生的变化不进行追平。如需覆盖同步期间的变化，请使用 ALL 模式。
 
 > 注：历史上提供过 `enable_consistent_snapshot` 任务级开关（用于"严格全局快照
 > + 长事务连接池"模式），现已下线。当前实现统一使用"短锁取位点 + 全量短查询"
@@ -438,7 +441,8 @@ curl http://localhost:8080/api/tasks/:id/metrics
 
 返回包含：
 - `processed_rows`: 已处理行数
-- `total_rows`: 总行数
+- `total_rows`: 总行数（当前版本未由同步流程填充；ETA 使用 estimated_total_rows）
+- `estimated_total_rows`: 估算总行数（information_schema），仅用于 ETA，不用于正确性校验
 - `progress_percent`: 进度百分比
 - `status`: 任务状态
 - `current_position`: 当前位置

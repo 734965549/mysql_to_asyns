@@ -1900,20 +1900,23 @@ function getProgress(task) {
 
   const ctx = task.context;
 
-  // 已完成任务以服务端进度为准，避免估算总行数与实处理行数不一致
+  // 已完成任务以服务端进度为准
   if (ctx.status === "COMPLETED") {
     return 100;
   }
 
+  // 优先使用精确 total_rows，其次使用估算值 estimated_total_rows
+  const effectiveTotal = Math.max(0, ctx.total_rows || ctx.estimated_total_rows || 0);
+
   if (ctx.progress_percent != null && ctx.progress_percent >= 0) {
     const fromServer = Math.min(100, Math.max(0, ctx.progress_percent));
-    if (!ctx.total_rows || ctx.total_rows <= 0) {
+    if (effectiveTotal <= 0) {
       return Number(fromServer.toFixed(2));
     }
   }
 
   // 防止除零错误
-  if (!ctx.total_rows || ctx.total_rows <= 0) {
+  if (effectiveTotal <= 0) {
     return 0;
   }
 
@@ -1921,7 +1924,7 @@ function getProgress(task) {
   const processed = Math.max(0, ctx.processed_rows || 0);
 
   // 计算百分比，并限制在 0-100 之间，保留两位小数
-  let percent = (processed / ctx.total_rows) * 100;
+  let percent = (processed / effectiveTotal) * 100;
   percent = Math.min(100, Math.max(0, percent));
 
   return Number(percent.toFixed(2));
@@ -1933,15 +1936,103 @@ function getProgressRatio(value) {
   return Math.min(1, Math.max(0, pct / 100));
 }
 
-// 已完成任务的总行数可能与估算值不一致，展示时以实处理行数为准
-function getRowCounts(task) {
+// 行数展示元数据：区分精确 total_rows 与估算 estimated_total_rows
+function getRowCountMeta(task) {
   const ctx = task?.context;
-  if (!ctx) return { processed: 0, total: 0 };
-  const processed = Math.max(0, ctx.processed_rows || 0);
-  if (ctx.status === "COMPLETED" && processed > 0) {
-    return { processed, total: processed };
+  if (!ctx) {
+    return {
+      processed: 0,
+      exactTotal: 0,
+      estimatedTotal: 0,
+      isCompleted: false,
+      hasExactTotal: false,
+      hasEstimatedTotal: false,
+    };
   }
-  return { processed, total: Math.max(0, ctx.total_rows || 0) };
+
+  const processed = Math.max(0, ctx.processed_rows || 0);
+  const exactTotal = Math.max(0, ctx.total_rows || 0);
+  const estimatedTotal = Math.max(0, ctx.estimated_total_rows || 0);
+  const isCompleted = ctx.status === "COMPLETED";
+
+  return {
+    processed,
+    exactTotal,
+    estimatedTotal,
+    isCompleted,
+    hasExactTotal: exactTotal > 0,
+    hasEstimatedTotal: estimatedTotal > 0 && exactTotal <= 0,
+  };
+}
+
+function formatRowCount(n) {
+  return Math.max(0, Number(n) || 0).toLocaleString("zh-CN");
+}
+
+// 进度分母展示：运行中优先精确总数，否则带「约」的估算值；已完成只展示实际同步行数
+function formatTotalRowDisplay(task) {
+  const meta = getRowCountMeta(task);
+  if (meta.isCompleted) {
+    return formatRowCount(meta.processed);
+  }
+  if (meta.hasExactTotal) {
+    return formatRowCount(meta.exactTotal);
+  }
+  if (meta.hasEstimatedTotal) {
+    return `约 ${formatRowCount(meta.estimatedTotal)}`;
+  }
+  return "0";
+}
+
+function getTotalRowDescriptionLabel(task) {
+  const meta = getRowCountMeta(task);
+  if (meta.hasExactTotal) {
+    return "总行数";
+  }
+  if (meta.hasEstimatedTotal) {
+    return "估算总行数";
+  }
+  return "总行数";
+}
+
+function getRowOverviewLabel(task) {
+  const meta = getRowCountMeta(task);
+  if (meta.isCompleted) {
+    return "已同步行数";
+  }
+  if (meta.hasExactTotal) {
+    return "已同步 / 总行数";
+  }
+  if (meta.hasEstimatedTotal) {
+    return "已同步 / 估算总行数";
+  }
+  return "已同步行数";
+}
+
+function getRowOverviewSubText(task) {
+  const meta = getRowCountMeta(task);
+  if (meta.isCompleted) {
+    return `共同步 ${formatRowCount(meta.processed)} 行`;
+  }
+  if (meta.hasExactTotal) {
+    return `总行数：${formatRowCount(meta.exactTotal)}`;
+  }
+  if (meta.hasEstimatedTotal) {
+    return `估算总行数：约 ${formatRowCount(meta.estimatedTotal)}`;
+  }
+  return "";
+}
+
+function formatRuntimeTableRows(record) {
+  const processed = formatRowCount(record?.processed_rows || 0);
+  if (record?.status === "completed") {
+    return processed;
+  }
+  const total = Math.max(0, record?.total_rows || 0);
+  if (total > 0) {
+    return `${processed} / 约 ${formatRowCount(total)}`;
+  }
+  return processed;
 }
 
 // 监听同步级别变化
@@ -2617,10 +2708,10 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
             </a-col>
             <a-col :xs="12" :md="6">
               <a-card class="overview-card">
-                <div class="overview-label">已处理 / 总行数</div>
-                <div class="overview-value">{{ getRowCounts(detailPageTask).processed }}</div>
-                <div class="overview-sub">
-                  总行数：{{ getRowCounts(detailPageTask).total }}
+                <div class="overview-label">{{ getRowOverviewLabel(detailPageTask) }}</div>
+                <div class="overview-value">{{ formatRowCount(getRowCountMeta(detailPageTask).processed) }}</div>
+                <div v-if="getRowOverviewSubText(detailPageTask)" class="overview-sub">
+                  {{ getRowOverviewSubText(detailPageTask) }}
                 </div>
               </a-card>
             </a-col>
@@ -2734,7 +2825,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                     { title: '表名', slotName: 'tableName', width: 240 },
                     { title: '状态', slotName: 'status', width: 110 },
                     { title: '进度', slotName: 'progress', width: 200 },
-                    { title: '已处理 / 总行数', slotName: 'rows', width: 200 },
+                    { title: '已同步 / 估算总行数', slotName: 'rows', width: 220 },
                     { title: '速度', slotName: 'speed', width: 130 },
                     { title: '时间', slotName: 'timeRange' },
                   ]"
@@ -2770,10 +2861,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                     />
                   </template>
                   <template #rows="{ record }">
-                    <span class="runtime-rows">
-                      {{ (record.processed_rows || 0).toLocaleString() }}
-                      <span class="runtime-rows-total">/ {{ (record.total_rows || 0).toLocaleString() }}</span>
-                    </span>
+                    <span class="runtime-rows">{{ formatRuntimeTableRows(record) }}</span>
                   </template>
                   <template #speed="{ record }">
                     <span v-if="record.speed_rows_sec > 0" class="runtime-speed">
@@ -2818,11 +2906,14 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                 <a-descriptions-item label="进度">
                   {{ getProgress(detailPageTask) }}%
                 </a-descriptions-item>
-                <a-descriptions-item label="已处理行数">
-                  {{ getRowCounts(detailPageTask).processed }}
+                <a-descriptions-item label="已同步行数">
+                  {{ formatRowCount(getRowCountMeta(detailPageTask).processed) }}
                 </a-descriptions-item>
-                <a-descriptions-item label="总行数">
-                  {{ getRowCounts(detailPageTask).total }}
+                <a-descriptions-item
+                  v-if="!getRowCountMeta(detailPageTask).isCompleted && (getRowCountMeta(detailPageTask).hasExactTotal || getRowCountMeta(detailPageTask).hasEstimatedTotal)"
+                  :label="getTotalRowDescriptionLabel(detailPageTask)"
+                >
+                  {{ formatTotalRowDisplay(detailPageTask) }}
                 </a-descriptions-item>
                 <a-descriptions-item label="已完成表数">
                   {{ resumeTableList(detailPageTask).filter((t) => t.done).length }} /
@@ -5173,8 +5264,8 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
                         <div class="progress-details">
                           <span class="progress-text">
-                            已处理: {{ task.context.processed_rows || 0 }} /
-                            {{ task.context.total_rows || 0 }}
+                            已同步: {{ formatRowCount(getRowCountMeta(task).processed) }} /
+                            {{ formatTotalRowDisplay(task) }}
                           </span>
                           <span class="progress-percent-text">{{ getProgress(task) }}%</span>
                         </div>
@@ -5781,12 +5872,15 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
             {{ getProgress(selectedTaskForDetail) }}%
           </a-descriptions-item>
 
-          <a-descriptions-item label="已处理行数">
-            {{ getRowCounts(selectedTaskForDetail).processed }}
+          <a-descriptions-item label="已同步行数">
+            {{ formatRowCount(getRowCountMeta(selectedTaskForDetail).processed) }}
           </a-descriptions-item>
 
-          <a-descriptions-item label="总行数">
-            {{ getRowCounts(selectedTaskForDetail).total }}
+          <a-descriptions-item
+            v-if="!getRowCountMeta(selectedTaskForDetail).isCompleted && (getRowCountMeta(selectedTaskForDetail).hasExactTotal || getRowCountMeta(selectedTaskForDetail).hasEstimatedTotal)"
+            :label="getTotalRowDescriptionLabel(selectedTaskForDetail)"
+          >
+            {{ formatTotalRowDisplay(selectedTaskForDetail) }}
           </a-descriptions-item>
 
           <a-descriptions-item label="当前位置">

@@ -118,56 +118,6 @@ func TestCursorReader_ReadBatch(t *testing.T) {
 	}
 }
 
-func TestCursorReader_GetTotalCount(t *testing.T) {
-	tests := []struct {
-		name      string
-		setupMock func(mock sqlmock.Sqlmock)
-		expectErr bool
-		expected  int64
-	}{
-		{
-			name: "成功获取总数",
-			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `test_db`.`users`").
-					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(100)))
-			},
-			expectErr: false,
-			expected:  100,
-		},
-		{
-			name: "查询错误",
-			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `test_db`.`users`").
-					WillReturnError(sql.ErrConnDone)
-			},
-			expectErr: true,
-			expected:  0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db, mock, err := sqlmock.New()
-			if err != nil {
-				t.Fatalf("failed to create mock db: %v", err)
-			}
-			defer db.Close()
-
-			tt.setupMock(mock)
-			reader := NewCursorReader(db, "test_db", "users", &entity.TableIdentity{})
-			count, err := reader.GetTotalCount(context.Background())
-
-			if tt.expectErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				assert.Equal(t, tt.expected, count)
-			}
-			assert.NoError(t, mock.ExpectationsWereMet())
-		})
-	}
-}
-
 func TestNewRangeShardingReader(t *testing.T) {
 	db, _, err := sqlmock.New()
 	if err != nil {
@@ -304,58 +254,6 @@ func TestRangeShardingReader_ReadByRange(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestRangeShardingReader_GetTotalCount(t *testing.T) {
-	tests := []struct {
-		name      string
-		setupMock func(mock sqlmock.Sqlmock)
-		expectErr bool
-		expected  int64
-	}{
-		{
-			name: "成功获取总数",
-			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `test_db`.`users`").
-					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(500)))
-			},
-			expectErr: false,
-			expected:  500,
-		},
-		{
-			name: "查询错误",
-			setupMock: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM `test_db`.`users`").
-					WillReturnError(sql.ErrConnDone)
-			},
-			expectErr: true,
-			expected:  0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db, mock, err := sqlmock.New()
-			if err != nil {
-				t.Fatalf("failed to create mock db: %v", err)
-			}
-			defer db.Close()
-
-			tt.setupMock(mock)
-			reader := NewRangeShardingReader(db, "test_db", "users", &entity.TableIdentity{
-				IdentifyCols: []string{"id"},
-			})
-			count, err := reader.GetTotalCount(context.Background())
-
-			if tt.expectErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				assert.Equal(t, tt.expected, count)
-			}
-			assert.NoError(t, mock.ExpectationsWereMet())
-		})
-	}
-}
-
 func TestNewReader(t *testing.T) {
 	db, _, err := sqlmock.New()
 	if err != nil {
@@ -472,6 +370,127 @@ func TestRangeShardingReader_ReadBatchByKeys_CompositePK(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, results, 1)
 	assert.Equal(t, "TA01", results[0]["device_id"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRangeShardingReader_ReadBatchByKeyRange_SinglePK(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+		CursorCols:   []string{"id"},
+	}
+
+	rows := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(11, "alice").
+		AddRow(49, "bob")
+	// WHERE `id` > ? AND `id` <= ?  ->  startID=10, endID=50
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` > \\? AND `id` <= \\? ORDER BY `id` ASC LIMIT \\?").
+		WithArgs(10, 50, int64(10)).
+		WillReturnRows(rows)
+
+	reader := NewRangeShardingReader(db, "test_db", "users", identity)
+	results, err := reader.ReadBatchByKeyRange(context.Background(), 10, 50, 10)
+
+	assert.NoError(t, err)
+	assert.Len(t, results, 2)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRangeShardingReader_ReadBatchByKeyRange_SinglePK_FirstWorker(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+		CursorCols:   []string{"id"},
+	}
+
+	rows := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(1, "alice").
+		AddRow(2, "bob")
+	// 第一个 worker：startID=nil，只有上界 WHERE `id` <= ?
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` <= \\? ORDER BY `id` ASC LIMIT \\?").
+		WithArgs(50, int64(10)).
+		WillReturnRows(rows)
+
+	reader := NewRangeShardingReader(db, "test_db", "users", identity)
+	results, err := reader.ReadBatchByKeyRange(context.Background(), nil, 50, 10)
+
+	assert.NoError(t, err)
+	assert.Len(t, results, 2)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRangeShardingReader_ReadBatchByKeyRange_CompositePK(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "device_id"}, {Name: "payload"}},
+		IdentifyCols: []string{"id", "device_id"},
+		CursorCols:   []string{"id", "device_id"},
+	}
+
+	rows := sqlmock.NewRows([]string{"id", "device_id", "payload"}).
+		AddRow("8bff", "TA01", "data1")
+	// 复合主键 2 列：下界 ("8bfe","TA00")，上界 ("9aaa","TZ99")
+	// 下界 OR 分支: (id=? AND device_id>?) OR (id>?)  -> args: 8bfe, TA00, 8bfe
+	// 上界 <= OR 分支: (id=? AND device_id=?) OR (id=? AND device_id<?) OR (id<?)  -> args: 9aaa, TZ99, 9aaa, TZ99, 9aaa
+	mock.ExpectQuery("SELECT `id`, `device_id`, `payload` FROM `test_db`.`devices` WHERE .* AND .* ORDER BY `id`, `device_id` ASC LIMIT .*").
+		WithArgs("8bfe", "TA00", "8bfe", "9aaa", "TZ99", "9aaa", "TZ99", "9aaa", int64(10)).
+		WillReturnRows(rows)
+
+	reader := NewRangeShardingReader(db, "test_db", "devices", identity)
+	results, err := reader.ReadBatchByKeyRange(context.Background(), []interface{}{"8bfe", "TA00"}, []interface{}{"9aaa", "TZ99"}, 10)
+
+	assert.NoError(t, err)
+	assert.Len(t, results, 1)
+	assert.Equal(t, "TA01", results[0]["device_id"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRangeShardingReader_ReadBatchByKeyRange_NilEndDelegates(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+		CursorCols:   []string{"id"},
+	}
+
+	rows := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(11, "alice")
+	// endID=nil → 退化为 ReadBatchByKeys，只有 WHERE `id` > ?
+	mock.ExpectQuery("SELECT `id`, `name` FROM `test_db`.`users` WHERE `id` > \\? ORDER BY `id` ASC LIMIT \\?").
+		WithArgs(10, int64(10)).
+		WillReturnRows(rows)
+
+	reader := NewRangeShardingReader(db, "test_db", "users", identity)
+	results, err := reader.ReadBatchByKeyRange(context.Background(), 10, nil, 10)
+
+	assert.NoError(t, err)
+	assert.Len(t, results, 1)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 

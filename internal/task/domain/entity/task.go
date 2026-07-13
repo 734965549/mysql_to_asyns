@@ -24,9 +24,9 @@ const ( // 定义常量
 type SyncMode string // 定义同步模式为字符串类型
 
 const ( // 定义常量
-	SyncModeFull        SyncMode = "FULL"        // 全量同步：同步所有数据
+	SyncModeFull        SyncMode = "FULL"        // 全量同步：执行一次无缝全表遍历，不捕获 binlog 位点，不追平同步期间的变化
 	SyncModeIncremental SyncMode = "INCREMENTAL" // 增量同步：只同步变更数据
-	SyncModeAll         SyncMode = "ALL"         // 全量+增量：先全量同步后增量同步
+	SyncModeAll         SyncMode = "ALL"         // 全量+增量：先捕获 binlog 位点，再全量遍历，然后从位点回放 binlog 追平变化并持续同步
 )
 
 // SyncLevel 同步级别
@@ -107,17 +107,18 @@ type TaskConfig struct { // 定义任务配置结构体
 // take over. FullSyncResume remains here as a historical archive-compatible
 // field; incremental binlog positions are stored separately.
 type ProcessContext struct { // 定义处理上下文结构体
-	Status              TaskStatus  `json:"status"`                 // 任务状态
-	CurrentPosition     string      `json:"current_position"`       // 当前位点
-	ProgressPercent     float64     `json:"progress_percent"`       // 进度百分比
-	TotalRows           int64       `json:"total_rows"`             // 总行数
-	ProcessedRows       int64       `json:"processed_rows"`         // 已处理行数
-	CreatedAt           time.Time   `json:"created_at"`             // 创建时间
-	StartTime           time.Time   `json:"start_time"`             // 开始时间
-	EndTime             time.Time   `json:"end_time"`               // 结束时间
-	LastUpdateTime      time.Time   `json:"last_update_time"`       // 最后更新时间
-	ErrorStack          string      `json:"error_stack"`            // 错误堆栈
-	ScheduledAt         *time.Time  `json:"scheduled_at,omitempty"` // 下次定时启动时间（为空表示立即启动）
+	Status              TaskStatus  `json:"status"`                         // 任务状态
+	CurrentPosition     string      `json:"current_position"`               // 当前位点
+	ProgressPercent     float64     `json:"progress_percent"`               // 进度百分比
+	TotalRows           int64       `json:"total_rows"`                     // 已同步总行数（由 worker 汇总），仅用于进度展示
+	EstimatedTotalRows  int64       `json:"estimated_total_rows,omitempty"` // 估算总行数（information_schema），仅用于 ETA，不用于正确性校验
+	ProcessedRows       int64       `json:"processed_rows"`                 // 已处理行数
+	CreatedAt           time.Time   `json:"created_at"`                     // 创建时间
+	StartTime           time.Time   `json:"start_time"`                     // 开始时间
+	EndTime             time.Time   `json:"end_time"`                       // 结束时间
+	LastUpdateTime      time.Time   `json:"last_update_time"`               // 最后更新时间
+	ErrorStack          string      `json:"error_stack"`                    // 错误堆栈
+	ScheduledAt         *time.Time  `json:"scheduled_at,omitempty"`         // 下次定时启动时间（为空表示立即启动）
 	ScheduledFromStatus *TaskStatus `json:"scheduled_from_status,omitempty"`
 	RepeatCount         int         `json:"repeat_count,omitempty"`        // 定时启动总次数（包含首次执行）
 	RepeatRemaining     int         `json:"repeat_remaining,omitempty"`    // 剩余重复次数（包含下一次执行）
@@ -171,6 +172,8 @@ type SyncTask struct { // 定义同步任务结构体
 
 // NewSyncTask 创建同步任务函数
 func NewSyncTask(config TaskConfig) *SyncTask { // 创建同步任务实例
+	// 归一化 Mode 为大写，确保所有下游比较（校验、执行路径）大小写不敏感
+	config.Mode = SyncMode(strings.ToUpper(string(config.Mode)))
 	now := time.Now()
 	return &SyncTask{ // 返回任务实例
 		Config: config, // 设置配置
@@ -182,13 +185,23 @@ func NewSyncTask(config TaskConfig) *SyncTask { // 创建同步任务实例
 	}
 }
 
-// Start 启动任务方法
+// Start 启动任务方法（仅管理生命周期状态，不清除全量统计）
 func (t *SyncTask) Start() { // 启动任务
 	t.Context.Status = TaskStatusRunning  // 设置状态为执行中
 	t.Context.StartTime = time.Now()      // 记录开始时间
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
 	t.Context.ScheduledAt = nil           // 清除定时启动时间
 	t.Context.ScheduledFromStatus = nil
+}
+
+// ResetFullSyncCounters 重置全量同步运行计数。
+// 仅在确定进入 executeFullSync 时调用，避免 ALL/INCREMENTAL 重启时清空历史全量统计。
+func (t *SyncTask) ResetFullSyncCounters() {
+	t.Context.ProcessedRows = 0
+	t.Context.TotalRows = 0
+	t.Context.EstimatedTotalRows = 0
+	t.Context.ProgressPercent = 0
+	t.Context.CurrentPosition = ""
 }
 
 // ConfigureRepeat 设置重复定时启动参数
@@ -278,10 +291,6 @@ func (t *SyncTask) Complete() { // 完成任务
 	t.Context.EndTime = time.Now()         // 记录结束时间
 	t.Context.LastUpdateTime = time.Now()  // 更新最后更新时间
 	t.Context.ProgressPercent = 100        // 设置进度为100%
-	// 全量总行数可能来自 information_schema 估算，与实处理行数不一致；完成时以实处理为准
-	if t.Context.ProcessedRows > 0 {
-		t.Context.TotalRows = t.Context.ProcessedRows
-	}
 }
 
 // Fail 任务失败方法
@@ -296,14 +305,19 @@ func (t *SyncTask) Fail(err error) { // 任务失败处理
 func (t *SyncTask) UpdateProgress(processedRows int64, position string) { // 更新任务进度
 	t.Context.ProcessedRows = processedRows // 设置已处理行数
 	t.Context.CurrentPosition = position    // 设置当前位点
-	if t.Context.TotalRows > 0 {            // 如果总行数大于0
-		t.Context.ProgressPercent = float64(processedRows) / float64(t.Context.TotalRows) * 100 // 计算进度百分比
+	// 进度计算优先使用精确总数，未到位时用估算总数兜底（仅 ETA 展示）
+	effectiveTotal := t.Context.TotalRows
+	if effectiveTotal <= 0 {
+		effectiveTotal = t.Context.EstimatedTotalRows
+	}
+	if effectiveTotal > 0 {
+		t.Context.ProgressPercent = float64(processedRows) / float64(effectiveTotal) * 100
 	}
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
 }
 
 // MarkFullSyncStarted 标记全量同步进入"已开始但未完成"阶段，并记录 binlog 起点位点字符串。
-// startPosition 形如 "mysql-bin.000123:456"；空串表示位点尚未捕获（捕获失败时也要打点，方便排查）。
+// startPosition 形如 "mysql-bin.000123:456"；FULL 模式传空串（不捕获位点），ALL 模式传实际位点。
 func (t *SyncTask) MarkFullSyncStarted(startPosition string) {
 	now := time.Now()
 	t.Context.SyncPhase = SyncPhaseFullStarted

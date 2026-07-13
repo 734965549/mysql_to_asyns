@@ -28,41 +28,42 @@ func NewIdentityAnalyzerService(repo TableMetadataRepository) *IdentityAnalyzerS
 func (s *IdentityAnalyzerService) AnalyzeTable(schema, tableName string) (*entity.TableIdentity, error) { // 分析表结构，确定如何标识记录
 	// 获取表的列信息
 	columns, err := s.repo.GetTableColumns(schema, tableName) // 从仓库获取表的所有列信息
-	if err != nil { // 如果获取失败
+	if err != nil {                                           // 如果获取失败
 		return nil, err // 返回错误
 	}
 
 	// 获取主键列
 	pkColumns, err := s.repo.GetPrimaryKeyColumns(schema, tableName) // 从仓库获取主键列
-	if err != nil { // 如果获取失败
+	if err != nil {                                                  // 如果获取失败
 		return nil, err // 返回错误
 	}
 
-	// 获取唯一键列
-	ukColumns, err := s.repo.GetUniqueKeyColumns(schema, tableName) // 从仓库获取唯一键列
-	if err != nil { // 如果获取失败
-		return nil, err // 返回错误
+	// 获取唯一键列（按 INDEX_NAME 分组，已排除 nullable）
+	ukGroups, err := s.repo.GetUniqueKeyColumns(schema, tableName)
+	if err != nil {
+		return nil, err
 	}
 
-	identity := &entity.TableIdentity{ // 创建表标识对象
-		TableName: tableName, // 设置表名
-		Columns:   columns, // 设置列信息
+	identity := &entity.TableIdentity{
+		TableName: tableName,
+		Columns:   columns,
 	}
 
 	// 确定标识策略
-	if len(pkColumns) > 0 { // 如果存在主键
-		identity.Strategy = entity.PKStrategy // 使用主键策略
-		identity.IdentifyCols = pkColumns // 设置标识列为主键列
-		identity.HasPK = true // 设置有主键标志
-	} else if len(ukColumns) > 0 { // 如果存在唯一键
-		identity.Strategy = entity.UKStrategy // 使用唯一键策略
-		identity.IdentifyCols = ukColumns // 设置标识列为唯一键列
-		identity.HasUK = true // 设置有唯一键标志
-	} else { // 如果既没有主键也没有唯一键
+	if len(pkColumns) > 0 {
+		identity.Strategy = entity.PKStrategy
+		identity.IdentifyCols = pkColumns
+		identity.HasPK = true
+	} else if len(ukGroups) > 0 {
+		// 选择第一个完整非空唯一索引作为游标
+		identity.Strategy = entity.UKStrategy
+		identity.IdentifyCols = ukGroups[0]
+		identity.HasUK = true
+	} else {
 		// 无主键，使用全列匹配
 		identity.Strategy = entity.FullColumnsStrategy // 使用全列匹配策略
-		identity.HasPK = false // 设置无主键标志
-		identity.HasUK = false // 设置无唯一键标志
+		identity.HasPK = false                         // 设置无主键标志
+		identity.HasUK = false                         // 设置无唯一键标志
 		// 所有列作为标识列
 		for _, col := range columns { // 遍历所有列
 			identity.IdentifyCols = append(identity.IdentifyCols, col.Name) // 将列名添加到标识列
@@ -106,8 +107,8 @@ func (s *IdentityAnalyzerService) GetAllDatabases() ([]string, error) { // 获�
 // TableMetadataRepository 表元数据仓库接口
 type TableMetadataRepository interface { // 定义表元数据仓库接口
 	GetTableColumns(schema, tableName string) ([]entity.ColumnMeta, error) // 获取表的所有列
-	GetPrimaryKeyColumns(schema, tableName string) ([]string, error) // 获取主键列名
-	GetUniqueKeyColumns(schema, tableName string) ([]string, error) // 获取唯一键列名
-	GetAllTables(schema string) ([]entity.TableInfo, error) // 获取所有表信息
-	GetAllDatabases() ([]string, error) // 获取所有数据库名
+	GetPrimaryKeyColumns(schema, tableName string) ([]string, error)       // 获取主键列名
+	GetUniqueKeyColumns(schema, tableName string) ([][]string, error)      // 获取唯一键列名（按 INDEX_NAME 分组，排除 nullable）
+	GetAllTables(schema string) ([]entity.TableInfo, error)                // 获取所有表信息
+	GetAllDatabases() ([]string, error)                                    // 获取所有数据库名
 }
