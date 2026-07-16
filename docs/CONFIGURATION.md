@@ -419,6 +419,113 @@ env:
 
 **投递语义**：`AddBatch` 为带 `context` 的**阻塞投递**——channel 满时 reader 等待空位，直到 `ctx` 取消；不再使用「满则报错 + sleep 重试」。
 
+### 增量 Sink 配置（sink_configs）
+
+`sink_configs` 是任务级配置，用于控制在增量同步阶段将 binlog 变更事件写入哪些目标。仅在 `mode=INCREMENTAL` 时生效；`FULL`/`ALL` 模式含非 `MYSQL` 类型 Sink 时任务拒绝启动。
+
+**支持的类型：** `MYSQL`、`KAFKA`、`HTTP_WEBHOOK`
+
+**默认行为：** 不传 `sink_configs` 时，自动补为 `[{type: "MYSQL"}]`，保持旧任务兼容。
+
+**多 Sink 语义：** 所有 Sink 写入成功后才推进 binlog checkpoint（At-Least-Once）。任一 Sink 写入失败则任务标记 FAILED，位点不推进。
+
+**密钥回显：** 数据库密码、Kafka `security.sasl_password` 和 Webhook `headers` 在任务 API 响应中显示为 `******`。编辑任务时原样提交占位符会保留已有值；提交新值才会替换。
+
+#### KAFKA options
+
+```json
+{
+  "type": "KAFKA",
+  "options": {
+    "brokers": ["127.0.0.1:9092"],
+    "topic": "mysql_cdc",
+    "routing_mode": "single_topic",
+    "topic_prefix": "cdc",
+    "key_mode": "pk",
+    "batch_size": 1000,
+    "batch_timeout_ms": 500,
+    "required_acks": 1,
+    "security": {
+      "sasl_mechanism": "SCRAM-SHA-512",
+      "sasl_username": "user",
+      "sasl_password": "***",
+      "tls_enabled": true,
+      "ca_cert_path": "/etc/kafka/ca.pem",
+      "client_cert_path": "/etc/kafka/client.pem",
+      "client_key_path": "/etc/kafka/client.key",
+      "insecure_skip_verify": false
+    }
+  }
+}
+```
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| brokers | []string | 是 | - | Kafka broker 地址列表 |
+| topic | string | 是 | - | Topic 名称（routing_mode=single_topic 时的固定 topic） |
+| routing_mode | string | 否 | single_topic | `single_topic` 固定 topic / `per_table` 按 `{topic_prefix}.{schema}.{table}` 命名 |
+| topic_prefix | string | 条件必填 | - | `routing_mode=per_table` 时必填的 topic 前缀 |
+| key_mode | string | 否 | pk | `pk` 主键拼接 / `none` 使用 `schema.table:binlog_pos` |
+| batch_size | int | 否 | 1000 | Kafka 批次大小（条数） |
+| batch_timeout_ms | int | 否 | 500 | 批次超时（毫秒） |
+| required_acks | int | 否 | 1 | 发送确认级别：0=无确认 / 1=leader 确认 / -1=all ISR 确认 |
+| security.sasl_mechanism | string | 否 | - | SASL 机制：`PLAIN` / `SCRAM-SHA-256` / `SCRAM-SHA-512` |
+| security.sasl_username | string | 否 | - | SASL 用户名 |
+| security.sasl_password | string | 否 | - | SASL 密码（落盘时 AES-256-GCM 加密） |
+| security.tls_enabled | bool | 否 | false | 是否启用 TLS |
+| security.ca_cert_path | string | 否 | - | CA 证书文件路径 |
+| security.client_cert_path | string | 否 | - | 客户端证书路径（mTLS） |
+| security.client_key_path | string | 否 | - | 客户端密钥路径（mTLS） |
+| security.insecure_skip_verify | bool | 否 | false | 跳过证书校验（仅测试环境） |
+
+> `security` 整段可选，明文 Kafka 连接时省略即可。`routing_mode=per_table` 时需确保 Kafka broker 允许自动创建 topic 或预先创建对应 topic。
+
+#### HTTP_WEBHOOK options
+
+```json
+{
+  "type": "HTTP_WEBHOOK",
+  "options": {
+    "url": "http://127.0.0.1:9000/cdc/event",
+    "method": "POST",
+    "timeout_ms": 3000,
+    "headers": { "Authorization": "Bearer ***" },
+    "retry_times": 3,
+    "retry_backoff_ms": 500
+  }
+}
+```
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| url | string | 是 | - | Webhook 目标 URL |
+| method | string | 否 | POST | HTTP 请求方法 |
+| timeout_ms | int | 否 | 3000 | 请求超时（毫秒） |
+| headers | map[string]string | 否 | - | 自定义 HTTP 头（落盘时 AES-256-GCM 加密） |
+| retry_times | int | 否 | 3 | 失败重试次数（非 2xx 状态码触发重试） |
+| retry_backoff_ms | int | 否 | 500 | 重试退避间隔（毫秒） |
+
+> 重试耗尽后任务标记 FAILED，binlog 位点不推进。重启后从上次 checkpoint 重新消费并重试。
+
+#### 消息体格式
+
+所有 Sink 类型共用统一 JSON 格式：
+
+```json
+{
+  "task_id": "task_001",
+  "source_schema": "db1",
+  "source_table": "orders",
+  "event_type": "UPDATE",
+  "event_time": "2026-07-14T10:00:00+08:00",
+  "binlog_file": "mysql-bin.000001",
+  "binlog_pos": 12345,
+  "primary_keys": { "id": 42 },
+  "before": { "id": 42, "status": 0 },
+  "after": { "id": 42, "status": 1 }
+}
+```
+
 ## 监控和日志
 
 ### 查看同步进度

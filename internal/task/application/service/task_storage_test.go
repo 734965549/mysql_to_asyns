@@ -2,10 +2,67 @@ package service
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	sinkDomain "mysql-to-sync/internal/sync/domain/sink"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 )
+
+func TestFileTaskStorage_EncryptsSinkSecretsWithoutMutatingRuntimeTask(t *testing.T) {
+	dataDir := t.TempDir()
+	storage := NewFileTaskStorage(dataDir, "storage-key")
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:   "sink-secrets",
+		Name: "Sink secrets",
+		SinkConfigs: []sinkDomain.SinkConfig{
+			{Type: sinkDomain.SinkTypeKAFKA, Options: map[string]interface{}{
+				"security": map[string]interface{}{"sasl_password": "kafka-secret"},
+			}},
+			{Type: sinkDomain.SinkTypeHTTPWebhook, Options: map[string]interface{}{
+				"headers": map[string]interface{}{"Authorization": "Bearer webhook-secret"},
+			}},
+		},
+	})
+
+	if err := storage.Save(task); err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+	if got := task.Config.SinkConfigs[0].Options["security"].(map[string]interface{})["sasl_password"]; got != "kafka-secret" {
+		t.Fatalf("runtime Kafka password was mutated: %v", got)
+	}
+	if got := task.Config.SinkConfigs[1].Options["headers"].(map[string]interface{})["Authorization"]; got != "Bearer webhook-secret" {
+		t.Fatalf("runtime webhook header was mutated: %v", got)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dataDir, "sink-secrets.json"))
+	if err != nil {
+		t.Fatalf("read stored task: %v", err)
+	}
+	stored := string(data)
+	if strings.Contains(stored, "kafka-secret") || strings.Contains(stored, "webhook-secret") {
+		t.Fatalf("stored task leaked plaintext sink secrets: %s", stored)
+	}
+	if !strings.Contains(stored, "ENC~") {
+		t.Fatalf("stored task does not contain encrypted values: %s", stored)
+	}
+
+	loaded, err := storage.LoadAll()
+	if err != nil {
+		t.Fatalf("load tasks: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected one loaded task, got %d", len(loaded))
+	}
+	if got := loaded[0].Config.SinkConfigs[0].Options["security"].(map[string]interface{})["sasl_password"]; got != "kafka-secret" {
+		t.Fatalf("Kafka password was not decrypted: %v", got)
+	}
+	if got := loaded[0].Config.SinkConfigs[1].Options["headers"].(map[string]interface{})["Authorization"]; got != "Bearer webhook-secret" {
+		t.Fatalf("webhook headers were not decrypted: %v", got)
+	}
+}
 
 func TestTaskStorage_Save(t *testing.T) {
 	dataDir := t.TempDir()
@@ -13,12 +70,13 @@ func TestTaskStorage_Save(t *testing.T) {
 	storage := NewFileTaskStorage(dataDir)
 
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
-		ID:           "test_task_1",
-		Name:         "Test Task",
-		SourceSchema: "source_db",
-		TargetSchema: "target_db",
-		Tables:       []string{"users", "orders"},
-		Mode:         taskEntity.SyncModeFull,
+		ID:               "test_task_1",
+		Name:             "Test Task",
+		SourceSchema:     "source_db",
+		TargetSchema:     "target_db",
+		Tables:           []string{"users", "orders"},
+		Mode:             taskEntity.SyncModeFull,
+		EnableSkipBinlog: true,
 	})
 
 	err := storage.Save(task)
@@ -30,6 +88,9 @@ func TestTaskStorage_Save(t *testing.T) {
 	tasks, _ := storage.LoadAll()
 	if len(tasks) != 1 {
 		t.Error("task file not created")
+	}
+	if !tasks[0].Config.EnableSkipBinlog {
+		t.Error("enable_skip_binlog was not preserved by task storage")
 	}
 }
 

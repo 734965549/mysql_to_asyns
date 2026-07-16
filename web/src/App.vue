@@ -244,17 +244,31 @@ function getDefaultSinkOptions(type) {
     return {
       brokers: "",
       topic: "",
+      routing_mode: "single_topic",
+      topic_prefix: "",
       key_mode: "pk",
       batch_size: 1000,
+      batch_timeout_ms: 500,
       required_acks: 1,
+      security: {
+        sasl_mechanism: "",
+        sasl_username: "",
+        sasl_password: "",
+        tls_enabled: false,
+        ca_cert_path: "",
+        client_cert_path: "",
+        client_key_path: "",
+        insecure_skip_verify: false,
+      },
     };
   } else if (type === "HTTP_WEBHOOK") {
     return {
       url: "",
       method: "POST",
       headers: "",
-      timeout_ms: 5000,
+      timeout_ms: 3000,
       retry_times: 3,
+      retry_backoff_ms: 500,
     };
   }
   return {};
@@ -316,6 +330,7 @@ const taskForm = ref({
   enable_read_only: false,
 
   enable_drop_table_before_ddl: false,
+  enable_skip_binlog: false,
   tx_commit_every_n_parallel: 0,
 });
 
@@ -766,9 +781,8 @@ function resetForm() {
     index_restore_worker_count: 0,
 
     enable_read_only: false,
-
     enable_drop_table_before_ddl: false,
-
+    enable_skip_binlog: false,
     tx_commit_every_n_parallel: 0,
   };
 
@@ -824,9 +838,9 @@ function resetForm() {
 
   targetType.value = "";
 
-  singleKafkaConfig.value = {};
+  singleKafkaConfig.value = getDefaultSinkOptions("KAFKA");
 
-  singleWebhookConfig.value = {};
+  singleWebhookConfig.value = getDefaultSinkOptions("HTTP_WEBHOOK");
 }
 
 function getQualifiedTableName(database, tableName) {
@@ -1533,6 +1547,7 @@ function fillTaskFormFromTask(task) {
     enable_read_only: task.config.enable_read_only || false,
 
     enable_drop_table_before_ddl: task.config.enable_drop_table_before_ddl || false,
+    enable_skip_binlog: task.config.enable_skip_binlog || false,
     tx_commit_every_n_parallel: task.config.tx_commit_every_n_parallel ?? 0,
   };
 
@@ -3059,6 +3074,9 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                 <a-descriptions-item label="DDL前删除目标">
                   {{ detailPageTask.config.enable_drop_table_before_ddl ? '开启' : '关闭' }}
                 </a-descriptions-item>
+                <a-descriptions-item label="全量关闭目标binlog">
+                  {{ detailPageTask.config.enable_skip_binlog ? '开启' : '关闭' }}
+                </a-descriptions-item>
               </a-descriptions>
 
               <a-descriptions title="源数据库配置" :column="2" bordered style="margin-top: 20px">
@@ -3132,9 +3150,17 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                           : sink.options?.brokers || '-'
                       }}
                       Topic：{{ sink.options?.topic || '-' }}
+                      Routing：{{ sink.options?.routing_mode || '-' }}
+                      <span v-if="sink.options?.security?.sasl_mechanism"
+                        >SASL：{{ sink.options.security.sasl_mechanism }}</span
+                      >
+                      <span v-if="sink.options?.security?.tls_enabled"
+                        >TLS：已启用</span
+                      >
                     </div>
                     <div v-else-if="sink.type === 'HTTP_WEBHOOK'">
                       URL：{{ sink.options?.url || '-' }} Method：{{ sink.options?.method || '-' }}
+                      Retry：{{ sink.options?.retry_times || 0 }}次
                     </div>
                   </a-descriptions-item>
                 </template>
@@ -4236,6 +4262,17 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                     </a-checkbox>
                   </a-form-item>
 
+                  <a-form-item v-if="targetType === 'MYSQL'">
+                    <a-checkbox v-model="taskForm.enable_skip_binlog">
+                      <a-space direction="vertical" :size="4">
+                        <span style="font-weight: 500">全量同步写入前关闭目标端 binlog</span>
+                        <a-typography-text type="secondary" style="font-size: 12px">
+                          勾选后在全量批量写入前执行 SET SESSION sql_log_bin=0，避免目标端 binlog 膨胀与级联复制回环；写入完成后自动恢复。需目标库账号具备 SUPER 权限
+                        </a-typography-text>
+                      </a-space>
+                    </a-checkbox>
+                  </a-form-item>
+
                   <a-collapse :default-active-key="[]">
                     <a-collapse-item key="source" header="自定义源数据库连接">
                       <template #extra
@@ -4447,15 +4484,49 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                         <a-row :gutter="16">
                           <a-col :span="8">
                             <a-form-item
+                              label="路由模式"
+                              style="margin-bottom: 16px"
+                            >
+                              <a-select
+                                v-model="singleKafkaConfig.routing_mode"
+                              >
+                                <a-option value="single_topic"
+                                  >单 Topic (single_topic)</a-option
+                                >
+                                <a-option value="per_table"
+                                  >每表独立 (per_table)</a-option
+                                >
+                              </a-select>
+                            </a-form-item>
+                          </a-col>
+                          <a-col :span="8">
+                            <a-form-item
+                              label="Topic 前缀"
+                              style="margin-bottom: 16px"
+                            >
+                              <a-input
+                                v-model="singleKafkaConfig.topic_prefix"
+                                placeholder="cdc"
+                                :disabled="
+                                  singleKafkaConfig.routing_mode !==
+                                  'per_table'
+                                "
+                              />
+                            </a-form-item>
+                          </a-col>
+                          <a-col :span="8">
+                            <a-form-item
                               label="Key 模式"
                               style="margin-bottom: 16px"
                             >
                               <a-select v-model="singleKafkaConfig.key_mode">
                                 <a-option value="pk">主键 (pk)</a-option>
-                                <a-option value="table">表名 (table)</a-option>
+                                <a-option value="none">无 (none)</a-option>
                               </a-select>
                             </a-form-item>
                           </a-col>
+                        </a-row>
+                        <a-row :gutter="16">
                           <a-col :span="8">
                             <a-form-item
                               label="批量大小"
@@ -4464,6 +4535,18 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                               <a-input-number
                                 v-model="singleKafkaConfig.batch_size"
                                 :min="1"
+                                style="width: 100%"
+                              />
+                            </a-form-item>
+                          </a-col>
+                          <a-col :span="8">
+                            <a-form-item
+                              label="批量超时 (ms)"
+                              style="margin-bottom: 16px"
+                            >
+                              <a-input-number
+                                v-model="singleKafkaConfig.batch_timeout_ms"
+                                :min="0"
                                 style="width: 100%"
                               />
                             </a-form-item>
@@ -4483,6 +4566,151 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                             </a-form-item>
                           </a-col>
                         </a-row>
+                        <a-collapse
+                          :bordered="false"
+                          style="margin-top: 8px"
+                        >
+                          <a-collapse-item
+                            header="Security (SASL / SSL)"
+                            key="security"
+                          >
+                            <a-row :gutter="16">
+                              <a-col :span="8">
+                                <a-form-item
+                                  label="SASL 机制"
+                                  style="margin-bottom: 12px"
+                                >
+                                  <a-select
+                                    v-model="
+                                      singleKafkaConfig.security
+                                        .sasl_mechanism
+                                    "
+                                    placeholder="无"
+                                    allow-clear
+                                  >
+                                    <a-option value="PLAIN">PLAIN</a-option>
+                                    <a-option value="SCRAM-SHA-256"
+                                      >SCRAM-SHA-256</a-option
+                                    >
+                                    <a-option value="SCRAM-SHA-512"
+                                      >SCRAM-SHA-512</a-option
+                                    >
+                                  </a-select>
+                                </a-form-item>
+                              </a-col>
+                              <a-col :span="8">
+                                <a-form-item
+                                  label="SASL 用户名"
+                                  style="margin-bottom: 12px"
+                                >
+                                  <a-input
+                                    v-model="
+                                      singleKafkaConfig.security
+                                        .sasl_username
+                                    "
+                                    placeholder="user"
+                                  />
+                                </a-form-item>
+                              </a-col>
+                              <a-col :span="8">
+                                <a-form-item
+                                  label="SASL 密码"
+                                  style="margin-bottom: 12px"
+                                >
+                                  <a-input-password
+                                    v-model="
+                                      singleKafkaConfig.security
+                                        .sasl_password
+                                    "
+                                    placeholder="******"
+                                  />
+                                </a-form-item>
+                              </a-col>
+                            </a-row>
+                            <a-row :gutter="16">
+                              <a-col :span="4">
+                                <a-form-item
+                                  label="启用 TLS"
+                                  style="margin-bottom: 12px"
+                                >
+                                  <a-switch
+                                    v-model="
+                                      singleKafkaConfig.security.tls_enabled
+                                    "
+                                  />
+                                </a-form-item>
+                              </a-col>
+                              <a-col :span="4">
+                                <a-form-item
+                                  label="跳过证书校验"
+                                  style="margin-bottom: 12px"
+                                >
+                                  <a-switch
+                                    v-model="
+                                      singleKafkaConfig.security
+                                        .insecure_skip_verify
+                                    "
+                                    :disabled="
+                                      !singleKafkaConfig.security.tls_enabled
+                                    "
+                                  />
+                                </a-form-item>
+                              </a-col>
+                              <a-col :span="8">
+                                <a-form-item
+                                  label="CA 证书路径"
+                                  style="margin-bottom: 12px"
+                                >
+                                  <a-input
+                                    v-model="
+                                      singleKafkaConfig.security.ca_cert_path
+                                    "
+                                    placeholder="/etc/kafka/ca.pem"
+                                    :disabled="
+                                      !singleKafkaConfig.security.tls_enabled
+                                    "
+                                  />
+                                </a-form-item>
+                              </a-col>
+                              <a-col :span="8">
+                                <a-form-item
+                                  label="客户端证书路径"
+                                  style="margin-bottom: 12px"
+                                >
+                                  <a-input
+                                    v-model="
+                                      singleKafkaConfig.security
+                                        .client_cert_path
+                                    "
+                                    placeholder="/etc/kafka/client.pem"
+                                    :disabled="
+                                      !singleKafkaConfig.security.tls_enabled
+                                    "
+                                  />
+                                </a-form-item>
+                              </a-col>
+                            </a-row>
+                            <a-row :gutter="16">
+                              <a-col :span="8">
+                                <a-form-item
+                                  label="客户端密钥路径"
+                                  style="margin-bottom: 12px"
+                                >
+                                  <a-input
+                                    v-model="
+                                      singleKafkaConfig.security
+                                        .client_key_path
+                                    "
+                                    placeholder="/etc/kafka/client.key"
+                                    :disabled="
+                                      !singleKafkaConfig.security.tls_enabled
+                                    "
+                                  />
+                                </a-form-item>
+                              </a-col>
+                            </a-row>
+                          </a-collapse-item>
+                        </a-collapse>
                       </a-card>
                     </template>
 
@@ -4513,7 +4741,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                           </a-col>
                         </a-row>
                         <a-row :gutter="16">
-                          <a-col :span="8">
+                          <a-col :span="6">
                             <a-form-item
                               label="超时 (ms)"
                               style="margin-bottom: 16px"
@@ -4525,7 +4753,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                               />
                             </a-form-item>
                           </a-col>
-                          <a-col :span="8">
+                          <a-col :span="6">
                             <a-form-item
                               label="重试次数"
                               style="margin-bottom: 16px"
@@ -4538,7 +4766,19 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                               />
                             </a-form-item>
                           </a-col>
-                          <a-col :span="8">
+                          <a-col :span="6">
+                            <a-form-item
+                              label="重试退避 (ms)"
+                              style="margin-bottom: 16px"
+                            >
+                              <a-input-number
+                                v-model="singleWebhookConfig.retry_backoff_ms"
+                                :min="0"
+                                style="width: 100%"
+                              />
+                            </a-form-item>
+                          </a-col>
+                          <a-col :span="6">
                             <a-form-item
                               label="自定义 Headers"
                               style="margin-bottom: 16px"
@@ -4760,17 +5000,46 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                           <a-row :gutter="16">
                             <a-col :span="8">
                               <a-form-item
+                                label="路由模式"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-select v-model="sc.options.routing_mode">
+                                  <a-option value="single_topic"
+                                    >单 Topic (single_topic)</a-option
+                                  >
+                                  <a-option value="per_table"
+                                    >每表独立 (per_table)</a-option
+                                  >
+                                </a-select>
+                              </a-form-item>
+                            </a-col>
+                            <a-col :span="8">
+                              <a-form-item
+                                label="Topic 前缀"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-input
+                                  v-model="sc.options.topic_prefix"
+                                  placeholder="cdc"
+                                  :disabled="
+                                    sc.options.routing_mode !== 'per_table'
+                                  "
+                                />
+                              </a-form-item>
+                            </a-col>
+                            <a-col :span="8">
+                              <a-form-item
                                 label="Key 模式"
                                 style="margin-bottom: 8px"
                               >
                                 <a-select v-model="sc.options.key_mode">
                                   <a-option value="pk">主键 (pk)</a-option>
-                                  <a-option value="table"
-                                    >表名 (table)</a-option
-                                  >
+                                  <a-option value="none">无 (none)</a-option>
                                 </a-select>
                               </a-form-item>
                             </a-col>
+                          </a-row>
+                          <a-row :gutter="16">
                             <a-col :span="8">
                               <a-form-item
                                 label="批量大小"
@@ -4779,6 +5048,18 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                                 <a-input-number
                                   v-model="sc.options.batch_size"
                                   :min="1"
+                                  style="width: 100%"
+                                />
+                              </a-form-item>
+                            </a-col>
+                            <a-col :span="8">
+                              <a-form-item
+                                label="批量超时 (ms)"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-input-number
+                                  v-model="sc.options.batch_timeout_ms"
+                                  :min="0"
                                   style="width: 100%"
                                 />
                               </a-form-item>
@@ -4796,6 +5077,146 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                               </a-form-item>
                             </a-col>
                           </a-row>
+                          <a-collapse
+                            :bordered="false"
+                            style="margin-top: 4px"
+                          >
+                            <a-collapse-item
+                              header="Security (SASL / SSL)"
+                              key="security"
+                            >
+                              <a-row :gutter="16">
+                                <a-col :span="8">
+                                  <a-form-item
+                                    label="SASL 机制"
+                                    style="margin-bottom: 8px"
+                                  >
+                                    <a-select
+                                      v-model="
+                                        sc.options.security.sasl_mechanism
+                                      "
+                                      placeholder="无"
+                                      allow-clear
+                                    >
+                                      <a-option value="PLAIN">PLAIN</a-option>
+                                      <a-option value="SCRAM-SHA-256"
+                                        >SCRAM-SHA-256</a-option
+                                      >
+                                      <a-option value="SCRAM-SHA-512"
+                                        >SCRAM-SHA-512</a-option
+                                      >
+                                    </a-select>
+                                  </a-form-item>
+                                </a-col>
+                                <a-col :span="8">
+                                  <a-form-item
+                                    label="SASL 用户名"
+                                    style="margin-bottom: 8px"
+                                  >
+                                    <a-input
+                                      v-model="
+                                        sc.options.security.sasl_username
+                                      "
+                                      placeholder="user"
+                                    />
+                                  </a-form-item>
+                                </a-col>
+                                <a-col :span="8">
+                                  <a-form-item
+                                    label="SASL 密码"
+                                    style="margin-bottom: 8px"
+                                  >
+                                    <a-input-password
+                                      v-model="
+                                        sc.options.security.sasl_password
+                                      "
+                                      placeholder="******"
+                                    />
+                                  </a-form-item>
+                                </a-col>
+                              </a-row>
+                              <a-row :gutter="16">
+                                <a-col :span="4">
+                                  <a-form-item
+                                    label="启用 TLS"
+                                    style="margin-bottom: 8px"
+                                  >
+                                    <a-switch
+                                      v-model="
+                                        sc.options.security.tls_enabled
+                                      "
+                                    />
+                                  </a-form-item>
+                                </a-col>
+                                <a-col :span="4">
+                                  <a-form-item
+                                    label="跳过证书校验"
+                                    style="margin-bottom: 8px"
+                                  >
+                                    <a-switch
+                                      v-model="
+                                        sc.options.security
+                                          .insecure_skip_verify
+                                      "
+                                      :disabled="
+                                        !sc.options.security.tls_enabled
+                                      "
+                                    />
+                                  </a-form-item>
+                                </a-col>
+                                <a-col :span="8">
+                                  <a-form-item
+                                    label="CA 证书路径"
+                                    style="margin-bottom: 8px"
+                                  >
+                                    <a-input
+                                      v-model="
+                                        sc.options.security.ca_cert_path
+                                      "
+                                      placeholder="/etc/kafka/ca.pem"
+                                      :disabled="
+                                        !sc.options.security.tls_enabled
+                                      "
+                                    />
+                                  </a-form-item>
+                                </a-col>
+                                <a-col :span="8">
+                                  <a-form-item
+                                    label="客户端证书路径"
+                                    style="margin-bottom: 8px"
+                                  >
+                                    <a-input
+                                      v-model="
+                                        sc.options.security.client_cert_path
+                                      "
+                                      placeholder="/etc/kafka/client.pem"
+                                      :disabled="
+                                        !sc.options.security.tls_enabled
+                                      "
+                                    />
+                                  </a-form-item>
+                                </a-col>
+                              </a-row>
+                              <a-row :gutter="16">
+                                <a-col :span="8">
+                                  <a-form-item
+                                    label="客户端密钥路径"
+                                    style="margin-bottom: 8px"
+                                  >
+                                    <a-input
+                                      v-model="
+                                        sc.options.security.client_key_path
+                                      "
+                                      placeholder="/etc/kafka/client.key"
+                                      :disabled="
+                                        !sc.options.security.tls_enabled
+                                      "
+                                    />
+                                  </a-form-item>
+                                </a-col>
+                              </a-row>
+                            </a-collapse-item>
+                          </a-collapse>
                         </template>
 
                         <!-- HTTP Webhook Options -->
@@ -4825,7 +5246,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                             </a-col>
                           </a-row>
                           <a-row :gutter="16">
-                            <a-col :span="8">
+                            <a-col :span="6">
                               <a-form-item
                                 label="超时 (ms)"
                                 style="margin-bottom: 8px"
@@ -4837,7 +5258,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                                 />
                               </a-form-item>
                             </a-col>
-                            <a-col :span="8">
+                            <a-col :span="6">
                               <a-form-item
                                 label="重试次数"
                                 style="margin-bottom: 8px"
@@ -4850,7 +5271,19 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                                 />
                               </a-form-item>
                             </a-col>
-                            <a-col :span="8">
+                            <a-col :span="6">
+                              <a-form-item
+                                label="重试退避 (ms)"
+                                style="margin-bottom: 8px"
+                              >
+                                <a-input-number
+                                  v-model="sc.options.retry_backoff_ms"
+                                  :min="0"
+                                  style="width: 100%"
+                                />
+                              </a-form-item>
+                            </a-col>
+                            <a-col :span="6">
                               <a-form-item
                                 label="自定义 Headers"
                                 style="margin-bottom: 8px"
@@ -5832,8 +6265,36 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                   }}
                 </a-descriptions-item>
                 <a-descriptions-item label="Topic">{{ sink.options?.topic || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Routing Mode">{{ sink.options?.routing_mode || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Topic Prefix">{{ sink.options?.topic_prefix || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Key Mode">{{ sink.options?.key_mode || '-' }}</a-descriptions-item>
                 <a-descriptions-item label="Batch Size">{{ sink.options?.batch_size || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Batch Timeout (ms)">{{ sink.options?.batch_timeout_ms || '-' }}</a-descriptions-item>
                 <a-descriptions-item label="Required Acks">{{ sink.options?.required_acks || '-' }}</a-descriptions-item>
+                <template v-if="sink.options?.security?.sasl_mechanism">
+                  <a-descriptions-item label="SASL Mechanism">{{
+                    sink.options.security.sasl_mechanism
+                  }}</a-descriptions-item>
+                  <a-descriptions-item label="SASL Username">{{
+                    sink.options.security.sasl_username || '-'
+                  }}</a-descriptions-item>
+                  <a-descriptions-item label="SASL Password">******</a-descriptions-item>
+                </template>
+                <template v-if="sink.options?.security?.tls_enabled">
+                  <a-descriptions-item label="TLS">已启用</a-descriptions-item>
+                  <a-descriptions-item label="CA Cert Path">{{
+                    sink.options.security.ca_cert_path || '-'
+                  }}</a-descriptions-item>
+                  <a-descriptions-item label="Client Cert Path">{{
+                    sink.options.security.client_cert_path || '-'
+                  }}</a-descriptions-item>
+                  <a-descriptions-item label="Client Key Path">{{
+                    sink.options.security.client_key_path || '-'
+                  }}</a-descriptions-item>
+                  <a-descriptions-item label="Insecure Skip Verify">{{
+                    sink.options.security.insecure_skip_verify ? '是' : '否'
+                  }}</a-descriptions-item>
+                </template>
               </template>
 
               <template v-if="sink.type === 'HTTP_WEBHOOK'">
@@ -5841,6 +6302,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                 <a-descriptions-item label="Method">{{ sink.options?.method || '-' }}</a-descriptions-item>
                 <a-descriptions-item label="Timeout (ms)">{{ sink.options?.timeout_ms || '-' }}</a-descriptions-item>
                 <a-descriptions-item label="Retry Times">{{ sink.options?.retry_times || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="Retry Backoff (ms)">{{ sink.options?.retry_backoff_ms || '-' }}</a-descriptions-item>
               </template>
             </a-descriptions>
           </div>

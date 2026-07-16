@@ -64,6 +64,19 @@ Sync 负责实际数据同步执行。
 
 Sync 不保存任务配置和生命周期状态；这些由 TaskService 维护。
 
+#### Sink 抽象（多目标写入）
+
+增量同步通过 Sink 接口抽象目标端写入，支持同时写入多个目标：
+
+- **Sink 接口**：定义 `Type()` / `Open(ctx)` / `Write(ctx, *ChangeEvent)` / `Flush(ctx)` / `Close(ctx)` 生命周期方法，位于 `internal/sync/domain/sink/`
+- **ChangeEvent**：统一事件模型，将 `BinlogEvent` 归一化为 `TaskID` / `SourceSchema` / `SourceTable` / `EventType` / `Before` / `After` / `PrimaryKeys` / `BinlogFile` / `BinlogPos`，隔离 Sink 实现与 binlog 细节
+- **MySQLSink**：封装现有 `BufferedWriter`，保持 MySQL 增量写入行为完全不变（兼容性基准）
+- **KafkaSink**：基于 `kafka-go`，支持 SASL（PLAIN/SCRAM-SHA-256/SCRAM-SHA-512）、TLS 双向认证、per-table topic 路由
+- **WebhookSink**：基于标准库 `net/http`，支持自定义 Header、失败重试与退避策略
+- **SinkFactory**：`NewSinks(configs, deps)` 按 `sink_configs` 类型创建对应 Sink 实例；空配置默认返回 `[{MYSQL}]`
+- **交付语义**：所有 Sink 写入成功后才 `SavePosition` 推进 checkpoint；任一 Sink 失败则任务 FAILED，位点不推进（At-Least-Once）
+- **模式限制**：仅 `INCREMENTAL` 模式支持非 `MYSQL` 类型 Sink；`FULL`/`ALL` 含非 MYSQL Sink 时拒绝启动
+
 ### Checkpoint 领域
 
 Checkpoint 只负责增量 binlog 位点。
@@ -125,7 +138,7 @@ StartTask
 
 重复处理不是单一的“全部跳过”：
 
-- 全量批量写统一使用普通 `INSERT`，目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 在全量前重建为空；非空目标属于不支持场景，可能失败或污染目标数据。
+- 全量批量写统一使用普通 `INSERT`，目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 在全量前重建为空；非空目标属于不支持场景，可能失败或污染目标数据。开启 `enable_skip_binlog=true` 时，全量写入前在目标端写入连接上执行 `SET SESSION sql_log_bin=0`，写入完成后恢复为 1，避免目标端 binlog 膨胀与级联复制回环；需目标库账号具备 SUPER 权限。
 - 增量 PK/UK 表的 INSERT 使用 `INSERT ... ON DUPLICATE KEY UPDATE`，重复到达时要覆盖旧值，保证最终收敛。
 - 增量 UPDATE/DELETE 使用 PK/UK 定位；无主键表使用 before image 或行镜像做全列 WHERE。
 - 无主键表 INSERT 没有真正冲突键，无法可靠去重，仍建议给表补主键或唯一键。
@@ -141,7 +154,7 @@ StartTask
 
 ### 写入语义
 
-全量写统一使用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE）。目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 后由程序在全量前重建为空；如果目标表已有数据，属于不支持场景，可能失败或污染目标数据。全量不是增量回放，不使用 upsert 作为默认语义。
+全量写统一使用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE）。目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 后由程序在全量前重建为空；如果目标表已有数据，属于不支持场景，可能失败或污染目标数据。全量不是增量回放，不使用 upsert 作为默认语义。开启 `enable_skip_binlog=true` 时，全量写入前在目标端写入连接上执行 `SET SESSION sql_log_bin=0`，写入完成后恢复为 1；需目标库账号具备 SUPER 权限。
 
 ## 4. 全量中断处理
 
@@ -170,8 +183,14 @@ SyncTask.Context.FullSyncResume
 TaskService.executeIncrementalSync
   -> IncrementalSyncService.Start
   -> checkpoint.GetPosition
+  -> SinkFactory.NewSinks(sink_configs)
+  -> for each sink: sink.Open() / sink.PrepareTables()
   -> pkg/binlog.Subscriber.Start
   -> syncEventHandler.OnEvent
+    -> event_normalizer.ToChangeEvent -> ChangeEvent
+    -> for each sink: sink.Write(ChangeEvent)
+    -> 全部成功 -> checkpointMgr.SavePosition
+    -> 任一失败 -> 返回错误，任务 FAILED
 ```
 
 增量要求：

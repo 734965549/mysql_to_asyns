@@ -2,28 +2,18 @@ package application
 
 import (
 	"context"
-
 	"database/sql"
-
 	"fmt"
+	"sync"
+	"time"
 
 	"mysql-to-sync/internal/checkpoint"
-
 	"mysql-to-sync/internal/metadata/domain/entity"
-
 	"mysql-to-sync/internal/metadata/domain/service"
-
-	"mysql-to-sync/internal/metrics"
-
-	"mysql-to-sync/internal/sync/infrastructure/writer"
-
+	"mysql-to-sync/internal/sync/domain/sink"
+	infraSink "mysql-to-sync/internal/sync/infrastructure/sink"
 	"mysql-to-sync/pkg/binlog"
-
 	"mysql-to-sync/pkg/logger"
-
-	"sync"
-
-	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 )
@@ -33,8 +23,6 @@ import (
 // 回调失败不会反向影响增量同步本身。
 type PositionPersister func(taskID string, pos mysql.Position)
 
-// IncrementalSyncService 增量同步服务
-
 // IncrementalSyncService replays ROW binlog events into the target database.
 //
 // It owns binlog subscription, target writers, table identities, and incremental
@@ -42,10 +30,7 @@ type PositionPersister func(taskID string, pos mysql.Position)
 // and optionally receives throttled position snapshots for task archives.
 type IncrementalSyncService struct {
 	sourceDB *sql.DB
-
 	targetDB *sql.DB
-
-	writeConn *sql.Conn // 专用写入连接，已禁用外键检查
 
 	analyzer service.IdentityAnalyzer
 
@@ -57,21 +42,18 @@ type IncrementalSyncService struct {
 
 	subscriber *binlog.Subscriber
 
-	writers map[string]*writer.BufferedWriter
+	sinks []sink.Sink
 
+	// identities 保留在 service 中，供 OnEvent 的 normalizer 使用。与 MySQLSink 内部 identities 独立。
 	identities map[string]*entity.TableIdentity
-
-	targetSchemas map[string]string
 
 	mu sync.RWMutex
 
-	ctx context.Context
-
+	ctx    context.Context
 	cancel context.CancelFunc
 
 	auditChan chan *AuditLog
-
-	wg sync.WaitGroup
+	wg        sync.WaitGroup
 }
 
 // SetPositionPersister 注入位点回写回调。允许在 Start 前调用，重复调用会覆盖旧值。
@@ -83,361 +65,190 @@ func (s *IncrementalSyncService) SetPositionPersister(p PositionPersister) {
 }
 
 // AuditLog 审计日志
-
 type AuditLog struct {
-	TaskID string `json:"task_id"`
-
-	TableName string `json:"table_name"`
-
-	EventType string `json:"event_type"`
-
-	Error string `json:"error"`
-
-	BeforeImage string `json:"before_image"`
-
-	AfterImage string `json:"after_image"`
-
-	Timestamp time.Time `json:"timestamp"`
-
-	Success bool `json:"success"`
+	TaskID      string    `json:"task_id"`
+	TableName   string    `json:"table_name"`
+	EventType   string    `json:"event_type"`
+	Error       string    `json:"error"`
+	BeforeImage string    `json:"before_image"`
+	AfterImage  string    `json:"after_image"`
+	Timestamp   time.Time `json:"timestamp"`
+	Success     bool      `json:"success"`
 }
 
 // NewIncrementalSyncService 创建增量同步服务
-
 func NewIncrementalSyncService(
-
 	sourceDB, targetDB *sql.DB,
-
 	analyzer service.IdentityAnalyzer,
-
 	checkpointMgr checkpoint.Manager,
-
 ) *IncrementalSyncService {
-
 	return &IncrementalSyncService{
-
-		sourceDB: sourceDB,
-
-		targetDB: targetDB,
-
-		analyzer: analyzer,
-
+		sourceDB:      sourceDB,
+		targetDB:      targetDB,
+		analyzer:      analyzer,
 		checkpointMgr: checkpointMgr,
-
-		writers: make(map[string]*writer.BufferedWriter),
-
-		identities: make(map[string]*entity.TableIdentity),
-
-		targetSchemas: make(map[string]string),
-
-		auditChan: make(chan *AuditLog, 1000),
+		identities:    make(map[string]*entity.TableIdentity),
+		auditChan:     make(chan *AuditLog, 1000),
 	}
-
 }
 
 // Start 启动增量同步
-
 func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, config *SyncConfig) error {
-
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
 	// 构建数据库映射
-
 	dbMapping := make(map[string]string)
-
 	sourceDBs := config.SourceDatabases
-
 	if len(sourceDBs) == 0 && config.SourceSchema != "" {
-
 		sourceDBs = []string{config.SourceSchema}
-
 	}
-
 	for i, src := range sourceDBs {
-
 		tgt := src
-
 		// 尝试从TargetDatabases获取映射
-
 		if i < len(config.TargetDatabases) && config.TargetDatabases[i] != "" {
-
 			tgt = config.TargetDatabases[i]
-
 		} else if len(config.SourceDatabases) == 0 && config.TargetSchema != "" {
-
 			// 如果是单库模式(SourceDatabases为空)，使用TargetSchema
-
 			tgt = config.TargetSchema
-
 		}
-
 		dbMapping[src] = tgt
-
 	}
 
-	// 获取专用写入连接并关闭外键检查，避免有外键的表在增量同步时报错
-	writeConn, err := s.targetDB.Conn(s.ctx)
+	// 按源库解析表列表。库级同步时每个库的表集合可能不同，不能把
+	// 第一个库的表名复用到其他库，否则事件会因缺少 identity 被跳过。
+	tablesByDatabase, err := resolveTablesByDatabase(s.analyzer, dbMapping, config.Tables)
 	if err != nil {
-		return fmt.Errorf("failed to get write connection: %w", err)
+		return err
 	}
-	s.writeConn = writeConn
-	if _, err := writeConn.ExecContext(s.ctx, "SET SESSION FOREIGN_KEY_CHECKS=0"); err != nil {
-		writeConn.Close()
-		s.writeConn = nil
-		return fmt.Errorf("failed to disable foreign key checks: %w", err)
-	}
+	for srcDB, tables := range tablesByDatabase {
 
-	// 初始化表的标识信息和写入器
-
-	for srcDB, tgtDB := range dbMapping {
-
-		tables := config.Tables
-
-		// 如果未指定表（库级别同步），获取该库所有表
-
-		if len(tables) == 0 {
-
-			allTables, err := s.analyzer.GetAllTables(srcDB)
-
-			if err != nil {
-
-				return err
-
-			}
-
-			tables = make([]string, 0, len(allTables))
-
-			for _, t := range allTables {
-
-				tables = append(tables, t.TableName)
-
-			}
-
-		}
-
+		// 分析表结构，填充 identities（供 OnEvent 的 normalizer 使用）。
 		for _, tableName := range tables {
-
 			identity, err := s.analyzer.AnalyzeTable(srcDB, tableName)
-
 			if err != nil {
-
-				return err
-
+				return fmt.Errorf("analyze table %s.%s: %w", srcDB, tableName, err)
 			}
-
 			key := fmt.Sprintf("%s.%s", srcDB, tableName)
-
-			// 创建写入器（使用专用连接确保外键检查已关闭）
-
-			bw := writer.NewBufferedWriterWithConn(
-
-				writeConn,
-
-				identity,
-
-				config.BatchSize,
-
-				500*time.Millisecond,
-
-				tgtDB,
-			)
-
-			// 修复 10/11：增量路径开启 upsert 语义。
-			// 增量 INSERT 事件可能重复到达（全量期间的变更要由增量回放追平），
-			// 必须用 ON DUPLICATE KEY UPDATE 保证幂等；无主键表内部会自动退化为 INSERT IGNORE。
-			bw.EnableUpsert()
-
-			s.mu.Lock()
-
 			s.identities[key] = identity
-
-			s.targetSchemas[key] = tgtDB
-
-			s.writers[key] = bw
-
-			s.mu.Unlock()
-
 		}
+	}
 
+	// 创建 Sink 实例
+	factoryDeps := infraSink.SinkDeps{
+		TargetDB:  s.targetDB,
+		Analyzer:  s.analyzer,
+		BatchSize: config.BatchSize,
+	}
+	sinks, err := infraSink.NewSinks(config.SinkConfigs, factoryDeps)
+	if err != nil {
+		return fmt.Errorf("failed to create sinks: %w", err)
+	}
+	s.sinks = sinks
+
+	// 打开所有 Sink
+	for _, snk := range s.sinks {
+		if err := snk.Open(s.ctx); err != nil {
+			return fmt.Errorf("failed to open sink %s: %w", snk.Type(), err)
+		}
+	}
+
+	// 对实现了 TablePreparer 的 Sink 调用 PrepareTables
+	for _, snk := range s.sinks {
+		if preparer, ok := snk.(sink.TablePreparer); ok {
+			for srcDB, tables := range tablesByDatabase {
+				mapping := map[string]string{srcDB: dbMapping[srcDB]}
+				if err := preparer.PrepareTables(s.ctx, mapping, tables); err != nil {
+					return fmt.Errorf("failed to prepare tables for sink %s and source %s: %w", snk.Type(), srcDB, err)
+				}
+			}
+		}
 	}
 
 	// 获取保存的位点
-
 	pos, err := s.checkpointMgr.GetPosition(s.ctx, taskID)
 	if err != nil {
-
 		logger.Warn("failed to get checkpoint: %v", err)
-
 	}
 
 	// 创建Binlog订阅器
-
 	s.subscriber = binlog.NewSubscriber(&binlog.SubscriberConfig{
-
-		Host: config.SourceHost,
-
-		Port: config.SourcePort,
-
-		Username: config.SourceUsername,
-
-		Password: config.SourcePassword,
-
-		Database: config.SourceSchema,
-
+		Host:      config.SourceHost,
+		Port:      config.SourcePort,
+		Username:  config.SourceUsername,
+		Password:  config.SourcePassword,
+		Database:  config.SourceSchema,
 		Databases: sourceDBs,
-
-		Tables: config.Tables,
-
-		ServerID: config.ServerID,
+		Tables:    config.Tables,
+		ServerID:  config.ServerID,
 	})
 
 	// 添加事件处理器
-
 	s.subscriber.AddHandler(&syncEventHandler{service: s, taskID: taskID})
 
 	// 启动审计日志处理
-
 	s.wg.Add(1)
-
 	go s.processAuditLogs()
 
 	// 启动订阅
-
 	return s.subscriber.Start(s.ctx, pos)
-
 }
 
 // Stop 停止增量同步
-
 func (s *IncrementalSyncService) Stop() {
-
 	if s.cancel != nil {
-
 		s.cancel()
-
 	}
-
 	if s.subscriber != nil {
-
 		s.subscriber.Stop()
-
 	}
 
-	// 关闭所有写入器
-
-	for _, w := range s.writers {
-
-		w.Close()
-
-	}
-
-	// 恢复外键检查并关闭写入连接
-	if s.writeConn != nil {
-		s.writeConn.ExecContext(context.Background(), "SET SESSION FOREIGN_KEY_CHECKS=1")
-		s.writeConn.Close()
-		s.writeConn = nil
+	// 关闭所有 Sink
+	for _, snk := range s.sinks {
+		snk.Close(context.Background())
 	}
 
 	// 安全关闭审计通道
-
 	s.mu.Lock()
-
 	if s.auditChan != nil {
-
 		close(s.auditChan)
-
 		s.auditChan = nil
-
 	}
-
 	s.mu.Unlock()
 
 	s.wg.Wait() // 等待审计日志处理协程退出
-
 }
 
 // processAuditLogs 处理审计日志
-
 func (s *IncrementalSyncService) processAuditLogs() {
-
 	defer s.wg.Done()
-
 	for auditLog := range s.auditChan {
-
 		// 这里可以写入数据库或发送到日志系统
-
 		if !auditLog.Success {
-
 			logger.Error("[AUDIT] Sync failed - Task: %s, Table: %s, Event: %s, Error: %s",
-
 				auditLog.TaskID, auditLog.TableName, auditLog.EventType, auditLog.Error)
-
 		}
-
 	}
-
 }
 
 // addAuditLog 添加审计日志
-
 func (s *IncrementalSyncService) addAuditLog(log *AuditLog) {
-
 	s.mu.RLock()
-
 	defer s.mu.RUnlock()
-
 	if s.auditChan == nil {
-
 		return // 通道已关闭
-
 	}
-
 	select {
-
 	case s.auditChan <- log:
-
 	default:
-
 		// 通道满了，丢弃
-
 	}
-
-}
-
-// getWriter 获取写入器
-
-func (s *IncrementalSyncService) getWriter(tableName string) *writer.BufferedWriter {
-
-	s.mu.RLock()
-
-	defer s.mu.RUnlock()
-
-	return s.writers[tableName]
-
 }
 
 // getIdentity 获取表标识
-
 func (s *IncrementalSyncService) getIdentity(tableName string) *entity.TableIdentity {
-
 	s.mu.RLock()
-
 	defer s.mu.RUnlock()
-
 	return s.identities[tableName]
-
-}
-
-// getTargetSchema 获取目标数据库名
-
-func (s *IncrementalSyncService) getTargetSchema(key string) string {
-
-	s.mu.RLock()
-
-	defer s.mu.RUnlock()
-
-	return s.targetSchemas[key]
-
 }
 
 // snapshotPositionPersister 在写锁外取一份 persister 的"现值"，避免每事件路径都持锁。
@@ -449,303 +260,208 @@ func (s *IncrementalSyncService) snapshotPositionPersister() PositionPersister {
 }
 
 // SyncConfig 同步配置
-
 type SyncConfig struct {
 	TaskID string
 
-	SourceHost string
-
-	SourcePort int
-
+	SourceHost     string
+	SourcePort     int
 	SourceUsername string
-
 	SourcePassword string
 
 	SourceSchema string
-
 	TargetSchema string
 
 	SourceDatabases []string
-
 	TargetDatabases []string
 
 	Tables []string
 
 	BatchSize int
+	ServerID  uint32
 
-	ServerID uint32
+	SinkConfigs []sink.SinkConfig
 }
 
 // syncEventHandler 同步事件处理器
-
 type syncEventHandler struct {
 	service *IncrementalSyncService
-
-	taskID string
+	taskID  string
 }
 
 // OnEvent 处理Binlog事件
-
 func (h *syncEventHandler) OnEvent(event *binlog.BinlogEvent) error {
-
+	if event == nil {
+		return fmt.Errorf("binlog event is required")
+	}
 	key := fmt.Sprintf("%s.%s", event.Schema, event.Table)
 
-	w := h.service.getWriter(key)
-
-	if w == nil {
-
-		return nil // 不是我们需要同步的表
-
-	}
-
 	identity := h.service.getIdentity(key)
-
 	if identity == nil {
-
-		return nil
-
+		return nil // 不是我们需要同步的表
 	}
 
-	targetSchema := h.service.getTargetSchema(key)
-
-	// 修复 9/14：无主键 / 无唯一键表事件埋点 + 显式告警（按事件级，量级可控）
-	if identity.Strategy == entity.FullColumnsStrategy {
-		metrics.GetMetrics().IncrementIncrementalNoPKTableEvents()
-		logger.Warn("[NoPK][Task %s] Incremental event on table %s.%s (event=%s, strategy=FullColumns): falling back to full-column WHERE + LIMIT 1; idempotency is best-effort, recommend adding a primary or unique key",
-			h.taskID, event.Schema, event.Table, event.EventType)
+	rowCount, rowCountErr := eventRowCount(event)
+	if rowCountErr != nil {
+		return rowCountErr
 	}
 
-	var err error
-
-	switch event.EventType {
-
-	case binlog.EventTypeInsert:
-
-		err = h.handleInsert(event, w)
-
-	case binlog.EventTypeUpdate:
-
-		err = h.handleUpdate(event, w, identity, targetSchema)
-
-	case binlog.EventTypeDelete:
-
-		err = h.handleDelete(event, w, identity, targetSchema)
-
-	}
-
-	// 保存位点
-
-	if err == nil {
-
-		ctx := context.Background()
-
-		if cpErr := h.service.checkpointMgr.SavePosition(ctx, h.taskID, event.Position); cpErr != nil {
-
-			err = fmt.Errorf("save checkpoint failed: %w", cpErr)
-
-			logger.Error("[Task %s] Failed to save checkpoint for %s.%s at %s:%d: %v",
-
-				h.taskID, event.Schema, event.Table, event.Position.Name, event.Position.Pos, cpErr)
-
-		} else if persist := h.service.snapshotPositionPersister(); persist != nil {
-
-			// 节流回写到任务存档：由 task service 注入的 persister 自行决定写盘频率。
-			persist(h.taskID, event.Position)
-
-		}
-
-	}
-
-	// 记录审计日志
-
-	auditLog := &AuditLog{
-
-		TaskID: h.taskID,
-
-		TableName: event.Table,
-
-		EventType: string(event.EventType),
-
-		Timestamp: time.Now(),
-
-		Success: err == nil,
-	}
-
-	if err != nil {
-
-		auditLog.Error = err.Error()
-
-	}
-
-	h.service.addAuditLog(auditLog)
-
-	return err
-
-}
-
-// handleInsert 处理INSERT事件
-
-func (h *syncEventHandler) handleInsert(event *binlog.BinlogEvent, w *writer.BufferedWriter) error {
-
-	for _, row := range event.Rows {
-
-		if err := w.Write(row); err != nil {
-
-			return err
-
-		}
-
-	}
-
-	return w.Flush()
-
-}
-
-// handleUpdate 处理UPDATE事件
-func (h *syncEventHandler) handleUpdate(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity, targetSchema string) error {
-	batchWriter := writer.NewBatchWriterWithConn(h.service.writeConn, identity, 1000, targetSchema)
-	sqlBuilder := batchWriter.GetSQLBuilder()
-
-	for i, row := range event.Rows {
-		var err error
-
-		if identity.Strategy == entity.FullColumnsStrategy && i < len(event.BeforeImage) {
-			// 无主键表：使用 before image 作为 WHERE 条件
-			err = batchWriter.UpdateWithBeforeImage(context.Background(), row, event.BeforeImage[i])
-		} else if i < len(event.BeforeImage) {
-			// PK/UK 表：比较 before/after identity
-			beforeImage := event.BeforeImage[i]
-			if sqlBuilder.IdentityChanged(beforeImage, row) {
-				// identity 变化：同事务内 DELETE 旧行 + UPSERT 新行
-				err = h.deleteAndUpsert(identity, targetSchema, row, beforeImage)
-			} else {
-				// identity 未变：用 before key 定位后更新
-				err = batchWriter.UpdateWithBeforeImage(context.Background(), row, beforeImage)
-			}
-		} else {
-			// 没有 before image：回退到原逻辑（用 after image 做 WHERE）
-			err = batchWriter.Update(context.Background(), row)
-		}
-
+	// 逐行处理：将每行转为 ChangeEvent 并写入所有 Sink。
+	for i := 0; i < rowCount; i++ {
+		se := h.singleRowEvent(event, i)
+		ce, err := ToChangeEvent(se, identity, h.taskID)
 		if err != nil {
 			return err
 		}
-	}
 
-	return nil
-}
-
-// deleteAndUpsert 在同一事务内删除旧行并 upsert 新行，用于 PK/UK 值发生变更的场景。
-// 事务基于已禁用外键检查的 writeConn，保证 DELETE + INSERT 的原子性。
-func (h *syncEventHandler) deleteAndUpsert(identity *entity.TableIdentity, targetSchema string, row, beforeImage map[string]interface{}) error {
-	ctx := context.Background()
-
-	tx, err := h.service.writeConn.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx for identity-change update: %w", err)
-	}
-	defer func() {
-		if tx != nil {
-			tx.Rollback()
+		for _, snk := range h.service.sinks {
+			if err := snk.Write(h.service.ctx, ce); err != nil {
+				return err
+			}
 		}
-	}()
-
-	txWriter := writer.NewBatchWriterWithTx(tx, identity, 1000, targetSchema)
-	txSQLBuilder := txWriter.GetSQLBuilder()
-
-	// DELETE 旧行（直接执行，不检查零行匹配——目标可能尚未有旧行）
-	deleteQuery, deleteArgs := txSQLBuilder.BuildDelete(beforeImage)
-	if _, err := tx.ExecContext(ctx, deleteQuery, deleteArgs...); err != nil {
-		return fmt.Errorf("delete old row in identity-change update: %w", err)
 	}
 
-	// UPSERT 新行（ON DUPLICATE KEY UPDATE 保证幂等）
-	txWriter.EnableUpsert()
-	if err := txWriter.WriteBatch(ctx, []map[string]interface{}{row}); err != nil {
-		return fmt.Errorf("upsert new row in identity-change update: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit identity-change update: %w", err)
-	}
-	tx = nil
-
-	logger.Info("[IdentityChange][Task %s] PK/UK identity changed on table %s.%s; deleted old row and upserted new row in transaction",
-		h.taskID, targetSchema, identity.TableName)
-
-	return nil
-}
-
-// handleDelete 处理DELETE事件
-
-func (h *syncEventHandler) handleDelete(event *binlog.BinlogEvent, w *writer.BufferedWriter, identity *entity.TableIdentity, targetSchema string) error {
-
-	batchWriter := writer.NewBatchWriterWithConn(h.service.writeConn, identity, 1000, targetSchema)
-
-	for _, row := range event.Rows {
-
-		if err := batchWriter.Delete(context.Background(), row); err != nil {
-
+	// 刷新所有 Sink (MySQLSink 的 INSERT 缓冲需要 flush)
+	for _, snk := range h.service.sinks {
+		if err := snk.Flush(h.service.ctx); err != nil {
 			return err
-
 		}
-
 	}
 
-	return nil
+	// 保存位点
+	var err error
+	ctx := context.Background()
+	if cpErr := h.service.checkpointMgr.SavePosition(ctx, h.taskID, event.Position); cpErr != nil {
+		err = fmt.Errorf("save checkpoint failed: %w", cpErr)
+		logger.Error("[Task %s] Failed to save checkpoint for %s.%s at %s:%d: %v",
+			h.taskID, event.Schema, event.Table, event.Position.Name, event.Position.Pos, cpErr)
+	} else if persist := h.service.snapshotPositionPersister(); persist != nil {
+		// 节流回写到任务存档：由 task service 注入的 persister 自行决定写盘频率。
+		persist(h.taskID, event.Position)
+	}
 
+	// 记录审计日志
+	auditLog := &AuditLog{
+		TaskID:    h.taskID,
+		TableName: event.Table,
+		EventType: string(event.EventType),
+		Timestamp: time.Now(),
+		Success:   err == nil,
+	}
+	if err != nil {
+		auditLog.Error = err.Error()
+	}
+	h.service.addAuditLog(auditLog)
+
+	return err
+}
+
+// singleRowEvent 从多行事件中提取单行，用于 normalizer 逐行转换
+func (h *syncEventHandler) singleRowEvent(event *binlog.BinlogEvent, idx int) *binlog.BinlogEvent {
+	se := &binlog.BinlogEvent{
+		Table:     event.Table,
+		Schema:    event.Schema,
+		EventType: event.EventType,
+		Timestamp: event.Timestamp,
+		Position:  event.Position,
+	}
+	if idx < len(event.Rows) {
+		se.Rows = []map[string]interface{}{event.Rows[idx]}
+	}
+	if idx < len(event.BeforeImage) {
+		se.BeforeImage = []map[string]interface{}{event.BeforeImage[idx]}
+	}
+	return se
+}
+
+func eventRowCount(event *binlog.BinlogEvent) (int, error) {
+	switch event.EventType {
+	case binlog.EventTypeInsert:
+		if len(event.Rows) == 0 {
+			return 0, fmt.Errorf("INSERT event for %s.%s has no rows", event.Schema, event.Table)
+		}
+		return len(event.Rows), nil
+	case binlog.EventTypeUpdate:
+		if len(event.Rows) == 0 {
+			return 0, fmt.Errorf("UPDATE event for %s.%s has no rows", event.Schema, event.Table)
+		}
+		return len(event.Rows), nil
+	case binlog.EventTypeDelete:
+		if len(event.BeforeImage) > 0 {
+			return len(event.BeforeImage), nil
+		}
+		if len(event.Rows) > 0 {
+			return len(event.Rows), nil
+		}
+		return 0, fmt.Errorf("DELETE event for %s.%s has no rows", event.Schema, event.Table)
+	default:
+		return 0, fmt.Errorf("unknown binlog event type: %s", event.EventType)
+	}
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func resolveTablesByDatabase(analyzer service.IdentityAnalyzer, dbMapping map[string]string, configuredTables []string) (map[string][]string, error) {
+	if analyzer == nil {
+		return nil, fmt.Errorf("identity analyzer is required")
+	}
+	result := make(map[string][]string, len(dbMapping))
+	for srcDB := range dbMapping {
+		tables := uniqueStrings(configuredTables)
+		if len(tables) == 0 {
+			allTables, err := analyzer.GetAllTables(srcDB)
+			if err != nil {
+				return nil, fmt.Errorf("list tables for %s: %w", srcDB, err)
+			}
+			tables = make([]string, 0, len(allTables))
+			for _, table := range allTables {
+				tables = append(tables, table.TableName)
+			}
+			tables = uniqueStrings(tables)
+		}
+		result[srcDB] = tables
+	}
+	return result, nil
 }
 
 // GetPosition 获取当前位置
-
 func (s *IncrementalSyncService) GetPosition() mysql.Position {
-
 	if s.subscriber == nil {
-
 		return mysql.Position{}
-
 	}
-
 	return s.subscriber.GetPosition()
-
 }
 
 // GetLag 获取延迟（与主库的位置差）
-
 func (s *IncrementalSyncService) GetLag() (uint64, error) {
-
 	if s.subscriber == nil {
-
 		return 0, nil
-
 	}
-
 	masterPos, err := s.subscriber.GetMasterPosition()
-
 	if err != nil {
-
 		return 0, err
-
 	}
-
 	currentPos := s.subscriber.GetPosition()
-
 	// 简单计算位置差（实际生产中可能需要更精确的计算）
-
 	if masterPos.Name == currentPos.Name {
-
 		if masterPos.Pos > currentPos.Pos {
-
 			return uint64(masterPos.Pos - currentPos.Pos), nil
-
 		}
-
 		return 0, nil
-
 	}
-
 	// 不同的binlog文件，返回最大值表示延迟较大
-
 	return ^uint64(0), nil
-
 }

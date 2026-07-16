@@ -1,6 +1,7 @@
 package entity
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -74,6 +75,25 @@ func TestNewSyncTask(t *testing.T) {
 
 	if task.Context.ProcessedRows != 0 {
 		t.Errorf("expected processed rows 0, got %d", task.Context.ProcessedRows)
+	}
+}
+
+func TestTaskConfig_EnableSkipBinlogJSONCompatibility(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "legacy_archive_without_field_defaults_false", raw: `{"id":"legacy"}`, want: false},
+		{name: "new_archive_preserves_true", raw: `{"id":"new","enable_skip_binlog":true}`, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var config TaskConfig
+			require.NoError(t, json.Unmarshal([]byte(tt.raw), &config))
+			assert.Equal(t, tt.want, config.EnableSkipBinlog)
+		})
 	}
 }
 

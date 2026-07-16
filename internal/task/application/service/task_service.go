@@ -55,6 +55,8 @@ import (
 
 	"mysql-to-sync/internal/sync/infrastructure/writer" // 同步写入器包
 
+	sink "mysql-to-sync/internal/sync/domain/sink" // Sink 领域模型
+
 	taskEntity "mysql-to-sync/internal/task/domain/entity" // 任务实体包
 
 	// MySQL binlog 位置
@@ -372,17 +374,19 @@ func (s *MySQLTaskStorage) Save(task *taskEntity.SyncTask) error {
 	if task.Config.TargetDB != nil {
 		origTargetPwd = task.Config.TargetDB.Password
 	}
-	if err := task.EncryptPasswords(s.encryptKey); err != nil {
-		return fmt.Errorf("encrypt passwords: %w", err)
-	}
-	defer func() { // 还原明文密码
+	origSinkConfigs := sink.CloneConfigs(task.Config.SinkConfigs)
+	defer func() { // 还原内存中的明文密码和 sink 密钥
 		if task.Config.SourceDB != nil {
 			task.Config.SourceDB.Password = origSourcePwd
 		}
 		if task.Config.TargetDB != nil {
 			task.Config.TargetDB.Password = origTargetPwd
 		}
+		task.Config.SinkConfigs = origSinkConfigs
 	}()
+	if err := task.EncryptPasswords(s.encryptKey); err != nil {
+		return fmt.Errorf("encrypt passwords: %w", err)
+	}
 
 	data, err := json.Marshal(task) // 序列化任务
 
@@ -1288,6 +1292,10 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 		return err
 	}
 
+	if err := validateSinkMode(task); err != nil {
+		return err
+	}
+
 	wasScheduled := task.Context.Status == taskEntity.TaskStatusScheduled
 
 	// 动态创建数据库连接（如果还没有创建或需要更新）
@@ -1379,6 +1387,22 @@ func fullSyncRestartBlockedError(task *taskEntity.SyncTask) error {
 		"full sync was interrupted before completion (phase=%q, enable_drop_table_before_ddl=false); full-sync resume is disabled for plain INSERT full sync, enable enable_drop_table_before_ddl to rebuild the target, or manually clear/rebuild the target and create/reset the task before starting a new full sync",
 		task.Context.SyncPhase,
 	)
+}
+
+func validateSinkMode(task *taskEntity.SyncTask) error {
+	if task == nil || len(task.Config.SinkConfigs) == 0 {
+		return nil
+	}
+	mode := strings.ToUpper(string(task.Config.Mode))
+	if mode != "FULL" && mode != "ALL" {
+		return nil
+	}
+	for _, sc := range task.Config.SinkConfigs {
+		if sc.Type != sink.SinkTypeMYSQL {
+			return fmt.Errorf("Kafka/Webhook sink (type=%q) 仅支持 INCREMENTAL 模式，当前模式为 %s", sc.Type, mode)
+		}
+	}
+	return nil
 }
 
 func (s *TaskService) resolveSourceSchema(task *taskEntity.SyncTask) string {
@@ -2874,7 +2898,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				}
 
 				writeSessionLabel := fmt.Sprintf("%s.%s", targetSchema, targetTableName)
-				if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+				if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel, task.Config.EnableSkipBinlog); err != nil {
 					conn.Close()
 					errMsg := fmt.Sprintf("Failed to configure target write session for `%s`.`%s`: %v", targetSchema, targetTableName, err)
 					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
@@ -2883,7 +2907,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					return
 				}
 				defer func() {
-					restoreFullSyncWriteSession(conn, writeSessionLabel)
+					restoreFullSyncWriteSession(conn, writeSessionLabel, task.Config.EnableSkipBinlog)
 					conn.Close()
 				}()
 
@@ -3148,14 +3172,14 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 						}
 
 						writeSessionLabel := fmt.Sprintf("%s.%s w%d", targetSchema, targetTableName, wIdx)
-						if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+						if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel, task.Config.EnableSkipBinlog); err != nil {
 							conn.Close()
 							syncErrChan <- err
 							return
 						}
 
 						defer func() {
-							restoreFullSyncWriteSession(conn, writeSessionLabel)
+							restoreFullSyncWriteSession(conn, writeSessionLabel, task.Config.EnableSkipBinlog)
 							conn.Close()
 						}()
 
@@ -3438,14 +3462,14 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 						}
 
 						writeSessionLabel := fmt.Sprintf("%s.%s w%d", targetSchema, targetTableName, wIdx)
-						if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+						if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel, task.Config.EnableSkipBinlog); err != nil {
 							conn.Close()
 							syncErrChan <- err
 							return
 						}
 
 						defer func() {
-							restoreFullSyncWriteSession(conn, writeSessionLabel)
+							restoreFullSyncWriteSession(conn, writeSessionLabel, task.Config.EnableSkipBinlog)
 							conn.Close()
 						}()
 
@@ -3678,7 +3702,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				}
 
 				writeSessionLabel := fmt.Sprintf("%s.%s", targetSchema, targetTableName)
-				if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+				if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel, task.Config.EnableSkipBinlog); err != nil {
 					conn.Close()
 					errMsg := fmt.Sprintf("Failed to configure target write session for `%s`.`%s`: %v", targetSchema, targetTableName, err)
 					logger.Error("[Task %s] ERROR: %s", taskID, errMsg)
@@ -3687,7 +3711,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 					return
 				}
 				defer func() {
-					restoreFullSyncWriteSession(conn, writeSessionLabel)
+					restoreFullSyncWriteSession(conn, writeSessionLabel, task.Config.EnableSkipBinlog)
 					conn.Close()
 				}()
 
@@ -3700,13 +3724,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 				var txStartMark string
 
 				defer func() {
-
 					if curTx != nil {
-
 						curTx.Rollback()
-
 					}
-
 				}()
 
 				if canResume {
@@ -4049,6 +4069,8 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 		BatchSize: task.Config.BatchSize,
 
 		ServerID: generateServerID(taskID),
+
+		SinkConfigs: task.Config.SinkConfigs,
 	}
 
 	// 创建增量同步服务
@@ -6248,9 +6270,7 @@ func (s *FileTaskStorage) Save(task *taskEntity.SyncTask) error {
 	if task.Config.TargetDB != nil {
 		origTargetPwd = task.Config.TargetDB.Password
 	}
-	if err := task.EncryptPasswords(s.encryptKey); err != nil {
-		return fmt.Errorf("encrypt passwords: %w", err)
-	}
+	origSinkConfigs := sink.CloneConfigs(task.Config.SinkConfigs)
 	defer func() {
 		if task.Config.SourceDB != nil {
 			task.Config.SourceDB.Password = origSourcePwd
@@ -6258,7 +6278,11 @@ func (s *FileTaskStorage) Save(task *taskEntity.SyncTask) error {
 		if task.Config.TargetDB != nil {
 			task.Config.TargetDB.Password = origTargetPwd
 		}
+		task.Config.SinkConfigs = origSinkConfigs
 	}()
+	if err := task.EncryptPasswords(s.encryptKey); err != nil {
+		return fmt.Errorf("encrypt passwords: %w", err)
+	}
 
 	// 序列化任务
 

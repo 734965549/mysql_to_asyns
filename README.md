@@ -26,6 +26,8 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 
 - **只读保护机制**：同步期间自动锁定目标库，防止数据冲突
 
+- **多目标写入**：增量同步支持同时写入 MySQL、Kafka、HTTP Webhook
+
 
 
 ## 性能指标
@@ -425,6 +427,7 @@ Content-Type: application/json
   "optimize_index": true,
   "enable_read_only": true,
   "enable_drop_table_before_ddl": true,
+  "enable_skip_binlog": false,
   "source_db": {
     "host": "127.0.0.1",
     "port": 3306,
@@ -438,7 +441,12 @@ Content-Type: application/json
     "database": "production_backup",
     "username": "root",
     "password": "root_password"
-  }
+  },
+  "sink_configs": [
+    {
+      "type": "MYSQL"
+    }
+  ]
 }
 ```
 
@@ -461,7 +469,9 @@ Content-Type: application/json
 | tx_commit_every_n_parallel | int | 否 | 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐 |
 | enable_limit_one | bool | 否 | 无主键表LIMIT 1保护，默认false |
 | enable_drop_table_before_ddl | bool | 否 | 开启后按同步级别删除目标：DATABASE 级别先 `DROP DATABASE IF EXISTS` + `CREATE DATABASE` 重建目标库；TABLE 级别在每张表建表前执行 `DROP TABLE IF EXISTS`。默认false |
+| enable_skip_binlog | bool | 否 | 全量同步写入前在目标端临时关闭 sql_log_bin（`SET SESSION sql_log_bin=0`），写入后恢复；可加速全量导入并减少目标 binlog 体积。需目标库账号具备 SUPER 权限。默认false |
 | index_restore_worker_count | int | 否 | 索引回放表级并发度，0=自动推导 min(worker_count,4)，默认0 |
+| sink_configs | array | 否 | 增量同步目标 Sink 配置列表，不传默认 `[{type:MYSQL}]`，详见下方「Sink 配置说明」 |
 
 
 
@@ -485,6 +495,67 @@ Content-Type: application/json
 - 注意：开启后会删除目标库/目标表及其数据，请确认目标端允许覆盖。按用户选择，不新增"源目标同实例同名库"保护；配置如此映射时仍会执行删除。
 
 - 写入与重启副作用：全量阶段统一使用普通 `INSERT`（无 `IGNORE`、无 upsert），并会使用批量导入会话优化。目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 由程序重建为空；目标端非空属于不支持场景，可能失败或污染目标数据。全量阶段暂停/失败后不再续传；若未开启 DDL 前删除，同一旧任务再次启动会被拒绝，需要开启该开关重建后重新全量，或人工清理目标端后创建/重置任务从头跑。增量阶段仍通过 checkpoint 恢复。
+
+
+
+**Sink 配置说明（sink_configs）：**
+
+`sink_configs` 用于配置增量同步阶段的数据写入目标。支持三种类型：`MYSQL`、`KAFKA`、`HTTP_WEBHOOK`。不传时默认 `[{type: "MYSQL"}]`。
+
+**约束：**
+- 仅 `mode=INCREMENTAL` 支持非 `MYSQL` 类型的 Sink。`FULL`/`ALL` 模式含非 MYSQL Sink 时任务拒绝启动。
+- 多个 Sink 采用 At-Least-Once 语义：所有 Sink 写入成功后才推进 binlog checkpoint，任一 Sink 失败则任务标记 FAILED。
+- 密码/密钥字段（SASL 密码、Webhook headers）持久化时自动使用 AES-256-GCM 加密存储。
+- 任务创建、详情、列表和更新响应中的数据库密码及 Sink 密钥统一返回 `******`；更新时原样提交该占位符会保留已有密钥。
+
+**KAFKA options：**
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| brokers | []string | 是 | - | Kafka broker 地址列表 |
+| topic | string | 是 | - | Topic 名称（routing_mode=single_topic 时使用） |
+| routing_mode | string | 否 | single_topic | Topic 路由模式：`single_topic`（固定 topic）/ `per_table`（按 `{prefix}.{schema}.{table}` 命名） |
+| topic_prefix | string | 条件必填 | - | `routing_mode=per_table` 时必填的 topic 前缀 |
+| key_mode | string | 否 | pk | 消息 key 生成方式：`pk`（主键值拼接）/ `none`（`schema.table:binlog_pos`） |
+| batch_size | int | 否 | 1000 | 批次大小 |
+| batch_timeout_ms | int | 否 | 500 | 批次超时（毫秒） |
+| required_acks | int | 否 | 1 | 发送确认级别（0/1/-1=all） |
+| security.sasl_mechanism | string | 否 | - | SASL 认证机制：`PLAIN` / `SCRAM-SHA-256` / `SCRAM-SHA-512` |
+| security.sasl_username | string | 否 | - | SASL 用户名 |
+| security.sasl_password | string | 否 | - | SASL 密码（持久化加密） |
+| security.tls_enabled | bool | 否 | false | 是否启用 TLS |
+| security.ca_cert_path | string | 否 | - | CA 证书文件路径 |
+| security.client_cert_path | string | 否 | - | 客户端证书文件路径（mTLS） |
+| security.client_key_path | string | 否 | - | 客户端密钥文件路径（mTLS） |
+| security.insecure_skip_verify | bool | 否 | false | 是否跳过证书校验 |
+
+**HTTP_WEBHOOK options：**
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| url | string | 是 | - | Webhook 目标 URL |
+| method | string | 否 | POST | HTTP 请求方法 |
+| timeout_ms | int | 否 | 3000 | 请求超时（毫秒） |
+| headers | map[string]string | 否 | - | 自定义 HTTP 头（持久化加密） |
+| retry_times | int | 否 | 3 | 失败重试次数（非 2xx 触发重试） |
+| retry_backoff_ms | int | 否 | 500 | 重试退避间隔（毫秒） |
+
+**消息体格式（统一 JSON）：**
+
+```json
+{
+  "task_id": "task_001",
+  "source_schema": "db1",
+  "source_table": "orders",
+  "event_type": "UPDATE",
+  "event_time": "2026-07-14T10:00:00+08:00",
+  "binlog_file": "mysql-bin.000001",
+  "binlog_pos": 12345,
+  "primary_keys": { "id": 42 },
+  "before": { "id": 42, "status": 0 },
+  "after": { "id": 42, "status": 1 }
+}
+```
 
 
 
@@ -515,6 +586,7 @@ Content-Type: application/json
   "optimize_index": true,
   "enable_read_only": true,
   "enable_drop_table_before_ddl": true,
+  "enable_skip_binlog": false,
   "source_db": {
     "host": "127.0.0.1",
     "port": 3306,
@@ -888,6 +960,75 @@ curl -X POST http://localhost:8080/api/tasks \
 
 
 
+### 示例4：增量同步到 Kafka
+
+```bash
+curl -X POST http://localhost:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "CDC投递到Kafka",
+    "mode": "INCREMENTAL",
+    "sync_level": "TABLE",
+    "source_schema": "production",
+    "target_schema": "production_slave",
+    "tables": ["orders", "users"],
+    "batch_size": 1000,
+    "sink_configs": [
+      {
+        "type": "KAFKA",
+        "options": {
+          "brokers": ["127.0.0.1:9092"],
+          "topic": "mysql_cdc",
+          "routing_mode": "single_topic",
+          "key_mode": "pk",
+          "batch_size": 1000,
+          "required_acks": 1,
+          "security": {
+            "sasl_mechanism": "SCRAM-SHA-512",
+            "sasl_username": "cdc_user",
+            "sasl_password": "your_sasl_password",
+            "tls_enabled": true,
+            "ca_cert_path": "/etc/kafka/ca.pem"
+          }
+        }
+      }
+    ]
+  }'
+```
+
+### 示例5：增量同步到 Webhook
+
+```bash
+curl -X POST http://localhost:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "CDC事件通知",
+    "mode": "INCREMENTAL",
+    "sync_level": "TABLE",
+    "source_schema": "production",
+    "target_schema": "production_slave",
+    "tables": ["orders"],
+    "batch_size": 1000,
+    "sink_configs": [
+      {
+        "type": "HTTP_WEBHOOK",
+        "options": {
+          "url": "http://127.0.0.1:9000/cdc/event",
+          "method": "POST",
+          "timeout_ms": 3000,
+          "headers": {
+            "Authorization": "Bearer your_token"
+          },
+          "retry_times": 3,
+          "retry_backoff_ms": 500
+        }
+      }
+    ]
+  }'
+```
+
+
+
 ## 架构设计
 
 
@@ -1022,6 +1163,18 @@ mysql-to-sync/
 
 
 
+#### 6. Sink 抽象层 (Sink Abstraction)
+
+- **Sink 接口**：统一的数据写入抽象，定义 `Type()` / `Open()` / `Write()` / `Flush()` / `Close()` 生命周期
+- **MySQLSink**：封装现有 `BufferedWriter`，保持 MySQL 增量写入行为完全不变
+- **KafkaSink**：基于 `kafka-go` 实现，支持 SASL（PLAIN/SCRAM-SHA-256/SCRAM-SHA-512）、TLS（单向/mTLS）、per-table topic 路由
+- **WebhookSink**：基于标准库 `net/http`，支持自定义 Header、可配置重试与退避策略
+- **事件归一化器**：将 `BinlogEvent` 转换为统一的 `ChangeEvent`（INSERT/UPDATE/DELETE），隔离 Sink 与 binlog 细节
+- **SinkFactory**：按 `sink_configs` 配置创建对应 Sink 实例，空配置默认返回 `[{MYSQL}]`
+- **多 Sink 写入**：所有 Sink 写入成功后才推进 checkpoint，任一个失败则任务标记 FAILED
+
+
+
 ## 同步模式详解
 
 
@@ -1074,7 +1227,7 @@ FULL 模式执行一次无缝全表遍历，保证分片边界与读取流程本
 
 - 无主键表：单协程流式读取
 
-- 批量插入：全量阶段统一使用普通 `INSERT`；目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 在全量前重建为空。关闭该开关时若目标表已有数据，属于不支持场景，可能失败或污染目标数据。
+- 批量插入：全量阶段统一使用普通 `INSERT`；目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 在全量前重建为空。关闭该开关时若目标表已有数据，属于不支持场景，可能失败或污染目标数据。开启 `enable_skip_binlog=true` 时，全量写入前会在目标端写入连接上执行 `SET SESSION sql_log_bin=0`，写入完成后恢复为 1，可减少目标端 binlog 膨胀并规避级联复制回环；需目标库账号具备 SUPER 权限（或 MySQL 8 的 `SESSION_VARIABLES_ADMIN`）。
 
 
 

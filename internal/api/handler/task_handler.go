@@ -22,6 +22,7 @@ import (
 	"mysql-to-sync/internal/metadata/domain/service"
 	metadataService "mysql-to-sync/internal/metadata/domain/service"
 	"mysql-to-sync/internal/metadata/infrastructure"
+	sink "mysql-to-sync/internal/sync/domain/sink"
 	taskService "mysql-to-sync/internal/task/application/service"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 	"mysql-to-sync/pkg/logger"
@@ -113,6 +114,14 @@ type DatabaseConfigRequest struct { // 定义数据库配置请求结构体
 	Password string `json:"password"` // 密码
 }
 
+// SinkConfigRequest 增量目标端配置请求结构体
+type SinkConfigRequest struct {
+	Type    string                 `json:"type"`
+	Options map[string]interface{} `json:"options"`
+}
+
+const secretMask = "******"
+
 // CreateTaskRequest 创建任务请求结构体
 type CreateTaskRequest struct { // 定义创建任务请求结构体
 	Name                     string                 `json:"name" binding:"required"`      // 任务名称，必填
@@ -132,9 +141,11 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	OptimizeIndex            bool                   `json:"optimize_index"`               // 索引优化：先删后建
 	EnableReadOnly           bool                   `json:"enable_read_only"`             // 同步前关闭目标只读，同步后恢复
 	EnableDropTableBeforeDDL bool                   `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS
+	EnableSkipBinlog         bool                   `json:"enable_skip_binlog"`           // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
 	TxCommitEveryNParallel   int                    `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
+	SinkConfigs              []SinkConfigRequest    `json:"sink_configs,omitempty"`       // 增量目标端配置（可选，默认 MYSQL）
 }
 
 // CreateTask 创建任务方法
@@ -183,6 +194,8 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		}
 	}
 
+	sinkConfigs := sinkConfigsFromRequest(req.SinkConfigs, true)
+
 	// 设置同步级别（支持大小写不敏感）
 	syncLevel := taskEntity.SyncLevelTable            // 默认为表级别
 	if strings.ToUpper(req.SyncLevel) == "DATABASE" { // 如果是数据库级别
@@ -210,9 +223,11 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		OptimizeIndex:            req.OptimizeIndex,             // 设置索引优化开关
 		EnableReadOnly:           req.EnableReadOnly,            // 设置只读管理开关
 		EnableDropTableBeforeDDL: req.EnableDropTableBeforeDDL,  // 设置DDL前DROP TABLE开关
+		EnableSkipBinlog:         req.EnableSkipBinlog,          // 设置全量写入前关闭binlog开关
 		TxCommitEveryNParallel:   req.TxCommitEveryNParallel,    // 设置并行事务提交间隔
 		SourceDB:                 sourceDB,                      // 设置源数据库配置
 		TargetDB:                 targetDB,                      // 设置目标数据库配置
+		SinkConfigs:              sinkConfigs,                   // 设置增量目标端配置
 	}
 	task, err := h.taskService.CreateTask(taskCfg) // 创建任务
 	if err != nil {                                // 如果创建失败
@@ -220,7 +235,7 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		return
 	}
 
-	c.JSON(http.StatusCreated, task) // 返回创建的任务
+	c.JSON(http.StatusCreated, taskForAPI(task)) // 返回创建的任务
 }
 
 // StartTaskRequest 启动任务请求结构体（可选）
@@ -366,7 +381,7 @@ func (h *TaskHandler) GetTask(c *gin.Context) { // 获取任务详情
 		return
 	}
 
-	c.JSON(http.StatusOK, task) // 返回任务详情
+	c.JSON(http.StatusOK, taskForAPI(task)) // 返回任务详情
 }
 
 // GetAllTasks 获取任务列表方法，支持分页/筛选/搜索/排序
@@ -392,6 +407,9 @@ func (h *TaskHandler) GetAllTasks(c *gin.Context) { // 获取所有任务列表
 	}
 
 	items, total, page, pageSize := h.taskService.GetTasksPage(page, pageSize, status, keyword, sortBy)
+	for i, task := range items {
+		items[i] = taskForAPI(task)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"total":     total,
 		"page":      page,
@@ -787,28 +805,45 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.EnableDropTableBeforeDDL != nil { // 如果提供了DDL前DROP TABLE开关
 		task.Config.EnableDropTableBeforeDDL = *req.EnableDropTableBeforeDDL // 更新DDL前DROP TABLE开关
 	}
+	if req.EnableSkipBinlog != nil { // 如果提供了全量写入前关闭binlog开关
+		task.Config.EnableSkipBinlog = *req.EnableSkipBinlog // 更新全量写入前关闭binlog开关
+	}
 	if req.TxCommitEveryNParallel != nil { // 如果提供了并行事务提交间隔
 		task.Config.TxCommitEveryNParallel = *req.TxCommitEveryNParallel // 更新并行事务提交间隔
 	}
 
 	// 更新数据库配置
 	if req.SourceDB != nil { // 如果提供了源数据库配置
+		password := req.SourceDB.Password
+		if password == secretMask && task.Config.SourceDB != nil {
+			password = task.Config.SourceDB.Password
+		}
 		task.Config.SourceDB = &taskEntity.DatabaseConfig{ // 更新源数据库配置
 			Host:     req.SourceDB.Host,     // 设置主机
 			Port:     req.SourceDB.Port,     // 设置端口
 			Database: req.SourceDB.Database, // 设置数据库名
 			Username: req.SourceDB.Username, // 设置用户名
-			Password: req.SourceDB.Password, // 设置密码
+			Password: password,              // 设置密码
 		}
 	}
 	if req.TargetDB != nil { // 如果提供了目标数据库配置
+		password := req.TargetDB.Password
+		if password == secretMask && task.Config.TargetDB != nil {
+			password = task.Config.TargetDB.Password
+		}
 		task.Config.TargetDB = &taskEntity.DatabaseConfig{ // 更新目标数据库配置
 			Host:     req.TargetDB.Host,     // 设置主机
 			Port:     req.TargetDB.Port,     // 设置端口
 			Database: req.TargetDB.Database, // 设置数据库名
 			Username: req.TargetDB.Username, // 设置用户名
-			Password: req.TargetDB.Password, // 设置密码
+			Password: password,              // 设置密码
 		}
+	}
+
+	if req.SinkConfigs != nil {
+		sinkConfigs := sinkConfigsFromRequest(req.SinkConfigs, true)
+		preserveMaskedSinkSecrets(sinkConfigs, task.Config.SinkConfigs)
+		task.Config.SinkConfigs = sinkConfigs
 	}
 
 	if err := h.taskService.UpdateTask(task); err != nil { // 更新任务
@@ -816,7 +851,7 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 		return
 	}
 
-	c.JSON(http.StatusOK, task) // 返回更新后的任务
+	c.JSON(http.StatusOK, taskForAPI(task)) // 返回更新后的任务
 }
 
 // DeleteTask 删除任务方法
@@ -861,9 +896,142 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`               // 索引优化（可选）
 	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`             // 只读管理（可选）
 	EnableDropTableBeforeDDL *bool                  `json:"enable_drop_table_before_ddl,omitempty"` // DDL前是否先DROP TABLE（可选）
+	EnableSkipBinlog         *bool                  `json:"enable_skip_binlog,omitempty"`           // 全量写入前关闭binlog（可选）
 	TxCommitEveryNParallel   *int                   `json:"tx_commit_every_n_parallel,omitempty"`   // 并行 worker 每 N 批提交一次事务（可选）
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                    // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                    // 目标数据库配置（可选）
+	SinkConfigs              []SinkConfigRequest    `json:"sink_configs,omitempty"`                 // 增量目标端配置（可选）
+}
+
+func sinkConfigsFromRequest(requests []SinkConfigRequest, defaultMySQL bool) []sink.SinkConfig {
+	if len(requests) == 0 && defaultMySQL {
+		return []sink.SinkConfig{{Type: sink.SinkTypeMYSQL, Options: map[string]interface{}{}}}
+	}
+	configs := make([]sink.SinkConfig, 0, len(requests))
+	for _, request := range requests {
+		configs = append(configs, sink.SinkConfig{
+			Type:    sink.SinkType(strings.ToUpper(strings.TrimSpace(request.Type))),
+			Options: request.Options,
+		})
+	}
+	return configs
+}
+
+// taskForAPI creates a response-only copy. Runtime tasks keep plaintext secrets,
+// while every task-returning API endpoint exposes placeholders only.
+func taskForAPI(task *taskEntity.SyncTask) *taskEntity.SyncTask {
+	if task == nil {
+		return nil
+	}
+	cloned := *task
+	cloned.Config = task.Config
+	if task.Config.SourceDB != nil {
+		sourceDB := *task.Config.SourceDB
+		if sourceDB.Password != "" {
+			sourceDB.Password = secretMask
+		}
+		cloned.Config.SourceDB = &sourceDB
+	}
+	if task.Config.TargetDB != nil {
+		targetDB := *task.Config.TargetDB
+		if targetDB.Password != "" {
+			targetDB.Password = secretMask
+		}
+		cloned.Config.TargetDB = &targetDB
+	}
+	cloned.Config.SinkConfigs = sink.CloneConfigs(task.Config.SinkConfigs)
+	redactSinkSecrets(cloned.Config.SinkConfigs)
+	return &cloned
+}
+
+func redactSinkSecrets(configs []sink.SinkConfig) {
+	for i := range configs {
+		switch configs[i].Type {
+		case sink.SinkTypeKAFKA:
+			security, _ := configs[i].Options["security"].(map[string]interface{})
+			if password, ok := security["sasl_password"].(string); ok && password != "" {
+				security["sasl_password"] = secretMask
+			}
+		case sink.SinkTypeHTTPWebhook:
+			maskHeaderValues(configs[i].Options)
+		}
+	}
+}
+
+func maskHeaderValues(options map[string]interface{}) {
+	switch headers := options["headers"].(type) {
+	case map[string]interface{}:
+		for key := range headers {
+			headers[key] = secretMask
+		}
+	case map[string]string:
+		for key := range headers {
+			headers[key] = secretMask
+		}
+	case string:
+		if headers != "" {
+			options["headers"] = secretMask
+		}
+	}
+}
+
+func preserveMaskedSinkSecrets(incoming, existing []sink.SinkConfig) {
+	for i := range incoming {
+		if i >= len(existing) || incoming[i].Type != existing[i].Type {
+			continue
+		}
+		switch incoming[i].Type {
+		case sink.SinkTypeKAFKA:
+			incomingSecurity, _ := incoming[i].Options["security"].(map[string]interface{})
+			existingSecurity, _ := existing[i].Options["security"].(map[string]interface{})
+			if incomingSecurity["sasl_password"] == secretMask {
+				if password, ok := existingSecurity["sasl_password"]; ok {
+					incomingSecurity["sasl_password"] = password
+				}
+			}
+		case sink.SinkTypeHTTPWebhook:
+			preserveMaskedHeaders(incoming[i].Options, existing[i].Options)
+		}
+	}
+}
+
+func preserveMaskedHeaders(incoming, existing map[string]interface{}) {
+	existingHeaders := headerValues(existing["headers"])
+	switch headers := incoming["headers"].(type) {
+	case map[string]interface{}:
+		for key, value := range headers {
+			if value == secretMask {
+				if original, ok := existingHeaders[key]; ok {
+					headers[key] = original
+				}
+			}
+		}
+	case map[string]string:
+		for key, value := range headers {
+			if value == secretMask {
+				if original, ok := existingHeaders[key]; ok {
+					headers[key] = original
+				}
+			}
+		}
+	}
+}
+
+func headerValues(value interface{}) map[string]string {
+	result := make(map[string]string)
+	switch headers := value.(type) {
+	case map[string]interface{}:
+		for key, value := range headers {
+			if text, ok := value.(string); ok {
+				result[key] = text
+			}
+		}
+	case map[string]string:
+		for key, value := range headers {
+			result[key] = value
+		}
+	}
+	return result
 }
 
 // generateID 生成唯一ID函数

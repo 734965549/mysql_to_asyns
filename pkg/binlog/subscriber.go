@@ -3,10 +3,11 @@ package binlog // 声明当前文件属于binlog包，用于MySQL binlog订阅�
 import ( // 导入外部包
 	"context" // 导入context包，用于处理请求超时和取消
 	"errors"
-	"fmt"                       // 导入fmt包，用于格式化输入输出
+	"fmt"                      // 导入fmt包，用于格式化输入输出
 	"mysql-to-sync/pkg/logger" // 导入log包，用于日志输出
-	"sync"                      // 导入sync包，用于并发控制
-	"time"                      // 导入time包，用于时间处理
+	"regexp"
+	"sync" // 导入sync包，用于并发控制
+	"time" // 导入time包，用于时间处理
 
 	"github.com/go-mysql-org/go-mysql/canal"       // 导入canal包，用于MySQL binlog订阅
 	"github.com/go-mysql-org/go-mysql/mysql"       // 导入mysql包，用于MySQL相关功能
@@ -101,29 +102,7 @@ func (s *Subscriber) Start(ctx context.Context, position mysql.Position) error {
 		dbs = []string{s.config.Database} // 使用Database作为单元素列表
 	}
 
-	// 构建 IncludeTableRegex
-	var regexes []string          // 定义正则表达式列表
-	if len(s.config.Tables) > 0 { // 如果指定了表
-		// 指定了表 (通常用于单库模式)
-		// 如果指定了 Databases，则假设 Tables 属于这些库 (或者只取第一个库)
-		// 为了兼容性，如果 Database 字段存在，使用它
-		db := s.config.Database       // 获取数据库名
-		if db == "" && len(dbs) > 0 { // 如果Database为空但有数据库列表
-			db = dbs[0] // 使用第一个数据库
-		}
-		if db != "" { // 如果数据库名不为空
-			for _, table := range s.config.Tables { // 遍历表列表
-				regexes = append(regexes, fmt.Sprintf("%s\\.%s", db, table)) // 构建正则表达式
-			}
-		}
-	} else { // 如果未指定表
-		// 未指定表，订阅库下所有表
-		for _, db := range dbs { // 遍历数据库列表
-			regexes = append(regexes, fmt.Sprintf("%s\\..*", db)) // 构建匹配所有表的正则表达式
-		}
-	}
-
-	cfg.IncludeTableRegex = regexes // 设置表匹配正则表达式
+	cfg.IncludeTableRegex = buildIncludeTableRegex(dbs, s.config.Tables)
 
 	c, err := canal.NewCanal(cfg) // 创建canal实例
 	if err != nil {               // 如果创建失败
@@ -153,6 +132,21 @@ func (s *Subscriber) Start(ctx context.Context, position mysql.Position) error {
 		return fmt.Errorf("binlog subscriber stopped unexpectedly: %w", err)
 	}
 	return nil // 返回nil表示成功
+}
+
+func buildIncludeTableRegex(databases, tables []string) []string {
+	regexes := make([]string, 0)
+	for _, database := range databases {
+		quotedDatabase := regexp.QuoteMeta(database)
+		if len(tables) == 0 {
+			regexes = append(regexes, fmt.Sprintf("^%s\\..*$", quotedDatabase))
+			continue
+		}
+		for _, table := range tables {
+			regexes = append(regexes, fmt.Sprintf("^%s\\.%s$", quotedDatabase, regexp.QuoteMeta(table)))
+		}
+	}
+	return regexes
 }
 
 // Stop 停止订阅方法

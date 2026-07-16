@@ -6,6 +6,7 @@ import ( // 导入外部包和标准库
 	"time" // 导入time包，用于时间处理
 
 	"mysql-to-sync/pkg/crypto"
+	sink "mysql-to-sync/internal/sync/domain/sink"
 )
 
 // TaskStatus 任务状态
@@ -94,9 +95,11 @@ type TaskConfig struct { // 定义任务配置结构体
 	IndexRestoreWorkerCount  int             `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
 	EnableReadOnly           bool            `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
 	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后可重建目标端重新全量
+	EnableSkipBinlog         bool            `json:"enable_skip_binlog"`           // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
 	TxCommitEveryNParallel   int             `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐
 	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`          // 源数据库配置（可选，覆盖配置文件）
 	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`          // 目标数据库配置（可选，覆盖配置文件）
+	SinkConfigs              []sink.SinkConfig `json:"sink_configs,omitempty"`     // 增量目标端配置（可选，默认 MYSQL）
 }
 
 // ProcessContext 处理上下文
@@ -535,6 +538,9 @@ func (t *SyncTask) EncryptPasswords(key string) error {
 		}
 		t.Config.TargetDB.Password = enc
 	}
+	if err := sink.EncryptSinkSecrets(t.Config.SinkConfigs, key); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -558,6 +564,9 @@ func (t *SyncTask) DecryptPasswords(key string) error {
 			return err
 		}
 		t.Config.TargetDB.Password = dec
+	}
+	if err := sink.DecryptSinkSecrets(t.Config.SinkConfigs, key); err != nil {
+		return err
 	}
 	return nil
 }
