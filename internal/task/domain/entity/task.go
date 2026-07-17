@@ -97,6 +97,18 @@ type TaskConfig struct { // 定义任务配置结构体
 	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后可重建目标端重新全量
 	EnableSkipBinlog         bool            `json:"enable_skip_binlog"`           // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
 	TxCommitEveryNParallel   int             `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐
+
+	// === 全量 V2 引擎（任务级流水线）配置 ===
+	// full_load_engine=v1 时保持旧行为（内联 syncDatabasePair）；=v2 时使用任务级
+	// chunk 调度 + 读写解耦流水线。其余 full_load_* 字段 0 表示使用 4C8G 平衡预设自动值。
+	FullLoadEngine        string `json:"full_load_engine,omitempty"`          // v1 / v2；空视为 v1
+	FullLoadReadWorkers   int    `json:"full_load_read_workers,omitempty"`    // 任务级源读取上限；0=自动(4)
+	FullLoadWriteWorkers  int    `json:"full_load_write_workers,omitempty"`   // 任务级目标写入上限；0=自动(4)
+	FullLoadBufferMB      int    `json:"full_load_buffer_mb,omitempty"`       // 任务级数据队列上限(MiB)；0=128
+	FullLoadBatchBytesMB  int    `json:"full_load_batch_bytes_mb,omitempty"`  // 单条 INSERT 字节上限(MiB)；0=4
+	FullLoadCommitRows    int    `json:"full_load_commit_rows,omitempty"`     // 单事务行数上限；0=10000
+	FullLoadCommitBytesMB int    `json:"full_load_commit_bytes_mb,omitempty"` // 单事务字节上限(MiB)；0=32
+
 	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`          // 源数据库配置（可选，覆盖配置文件）
 	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`          // 目标数据库配置（可选，覆盖配置文件）
 	SinkConfigs              []sink.SinkConfig `json:"sink_configs,omitempty"`     // 增量目标端配置（可选，默认 MYSQL）
@@ -515,6 +527,12 @@ func EffectiveIndexRestoreWorkers(configured, workerCount, hardMax int) int {
 		n = 1
 	}
 	return n
+}
+
+// UsesFullLoadV2 返回该任务是否使用全量 V2 任务级流水线引擎。
+// full_load_engine 大小写不敏感，等于 "v2" 时启用；其余（含空值）保持 V1 行为。
+func (c *TaskConfig) UsesFullLoadV2() bool {
+	return strings.EqualFold(strings.TrimSpace(c.FullLoadEngine), "v2")
 }
 
 // EncryptPasswords 将任务中 SourceDB/TargetDB 的密码加密（存储前调用）

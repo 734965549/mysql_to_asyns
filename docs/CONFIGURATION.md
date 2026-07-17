@@ -339,7 +339,8 @@ env:
   "batch_size": 5000,           // 覆盖全局 batch_size
   "worker_count": 8,            // 覆盖全局 worker_count
   "optimize_index": true,        // 覆盖全局 optimize_index
-  "tx_commit_every_n_parallel": 50  // 并行 worker 每 N 批提交一次事务（0=默认5）
+  "tx_commit_every_n_parallel": 50, // 并行 worker 每 N 批提交一次事务（0=默认5）
+  "full_load_engine": "v2"       // 全量引擎 v1/v2，详见「全量 V2 引擎」小节
 }
 ```
 
@@ -382,6 +383,47 @@ env:
 
 > 注意：此参数仅影响并行路径。串行路径（keyset/nopk）的提交间隔固定为 200，
 > 不受此参数影响。
+
+### 全量 V2 引擎（任务级流水线，full_load_engine）
+
+`full_load_engine` 用于选择全量阶段的执行引擎，默认 `v1`（逐表调度，兼容旧行为）。
+设为 `v2` 时启用任务级流水线引擎（`internal/sync/fullload`）：读写 worker 池解耦、
+按字节限流的有界队列做背压、事务合并提交、可重试锁错误整事务重放、免 map 的固定
+结构 `RowBatch`，用于消除逐表调度的长尾并降低 GC 压力。
+
+```json
+{
+  "full_load_engine": "v2",
+  "full_load_read_workers": 4,
+  "full_load_write_workers": 4,
+  "full_load_buffer_mb": 128,
+  "full_load_batch_bytes_mb": 4,
+  "full_load_commit_rows": 10000,
+  "full_load_commit_bytes_mb": 32
+}
+```
+
+| 字段 | 含义 | 默认（0/未配置时） |
+|------|------|---------------------|
+| `full_load_engine` | 全量引擎，`v1` / `v2` | `v1` |
+| `full_load_read_workers` | 读取 worker 数 | 4（范围 1–64） |
+| `full_load_write_workers` | 写入 worker 数 | 4（范围 1–64） |
+| `full_load_buffer_mb` | RowBatch 队列容量（MiB），背压阈值 | 128 |
+| `full_load_batch_bytes_mb` | 单批目标字节数（MiB），达到即入队 | 4 |
+| `full_load_commit_rows` | 单事务累计提交行数阈值 | 10000（不小于 `batch_size`） |
+| `full_load_commit_bytes_mb` | 单事务累计提交字节阈值（MiB） | 32（不小于单批字节） |
+
+说明：
+
+- 所有 V2 字段为 0 或未配置时使用上表默认值（4C8G 平衡预设）。`full_load_read_workers`
+  与 `full_load_write_workers` 会被夹在 `[1, 64]`。
+- 未显式设置 `full_load_commit_rows` 但设置了 `tx_commit_every_n_parallel` 时，
+  提交行数按 `batch_size × tx_commit_every_n_parallel` 推导，兼容旧调优习惯。
+- V2 沿用 V1 的建表 / 删索引 / 索引回放（`optimize_index`、`index_restore_worker_count`）
+  与目标库只读保护、`enable_drop_table_before_ddl`、`enable_skip_binlog` 语义。
+- 全量批量写入仍为普通 `INSERT`：请确保目标表为空或开启 `enable_drop_table_before_ddl`。
+- V2 运行期指标（读/写/提交行数与字节、队列水位、活跃 worker、事务重放与锁重试次数）
+  通过 Prometheus `fullload_*` 指标与任务详情接口暴露。
 
 ### 全量并行读取路径（与 channel buffer 的关系）
 

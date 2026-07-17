@@ -256,6 +256,56 @@ func TestCreateTask_EnableSkipBinlog(t *testing.T) {
 	}
 }
 
+func TestCreateTask_FullLoadV2Fields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	taskSvc := newTestTaskService()
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.POST("/api/tasks", handler.CreateTask)
+
+	body := bytes.NewBufferString(`{
+		"name":"V2 Task",
+		"mode":"FULL",
+		"full_load_engine":"v2",
+		"full_load_read_workers":8,
+		"full_load_write_workers":6,
+		"full_load_buffer_mb":256,
+		"full_load_batch_bytes_mb":8,
+		"full_load_commit_rows":20000,
+		"full_load_commit_bytes_mb":64,
+		"index_restore_worker_count":3
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusCreated, w.Code, w.Body.String())
+	}
+	var task taskEntity.SyncTask
+	if err := json.Unmarshal(w.Body.Bytes(), &task); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	cfg := task.Config
+	if !cfg.UsesFullLoadV2() {
+		t.Fatalf("full_load_engine not mapped: %q", cfg.FullLoadEngine)
+	}
+	if cfg.FullLoadReadWorkers != 8 || cfg.FullLoadWriteWorkers != 6 {
+		t.Fatalf("workers not mapped: %d/%d", cfg.FullLoadReadWorkers, cfg.FullLoadWriteWorkers)
+	}
+	if cfg.FullLoadBufferMB != 256 || cfg.FullLoadBatchBytesMB != 8 {
+		t.Fatalf("buffer/batch bytes not mapped: %d/%d", cfg.FullLoadBufferMB, cfg.FullLoadBatchBytesMB)
+	}
+	if cfg.FullLoadCommitRows != 20000 || cfg.FullLoadCommitBytesMB != 64 {
+		t.Fatalf("commit fields not mapped: %d/%d", cfg.FullLoadCommitRows, cfg.FullLoadCommitBytesMB)
+	}
+	if cfg.IndexRestoreWorkerCount != 3 {
+		t.Fatalf("index_restore_worker_count not mapped: %d", cfg.IndexRestoreWorkerCount)
+	}
+}
+
 func TestGetAllTasks(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)

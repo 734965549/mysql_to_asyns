@@ -332,6 +332,70 @@ const taskForm = ref({
   enable_drop_table_before_ddl: false,
   enable_skip_binlog: false,
   tx_commit_every_n_parallel: 0,
+  index_restore_worker_count: 0,
+
+  // 全量 V2 引擎（任务级流水线）
+  full_load_engine: "v1",
+  full_load_read_workers: 0,
+  full_load_write_workers: 0,
+  full_load_buffer_mb: 0,
+  full_load_batch_bytes_mb: 0,
+  full_load_commit_rows: 0,
+  full_load_commit_bytes_mb: 0,
+});
+
+// 全量 V2 预设：仅调整性能参数，绝不改动删除目标/跳过 binlog 等破坏性开关。
+function applyFullLoadPreset(name) {
+  const f = taskForm.value;
+  f.full_load_engine = "v2";
+  switch (name) {
+    case "balanced": // 4C8G 平衡
+      f.full_load_read_workers = 4;
+      f.full_load_write_workers = 4;
+      f.full_load_buffer_mb = 128;
+      f.full_load_batch_bytes_mb = 4;
+      f.full_load_commit_rows = 10000;
+      f.full_load_commit_bytes_mb = 32;
+      break;
+    case "speed": // 速度优先
+      f.full_load_read_workers = 8;
+      f.full_load_write_workers = 8;
+      f.full_load_buffer_mb = 256;
+      f.full_load_batch_bytes_mb = 8;
+      f.full_load_commit_rows = 20000;
+      f.full_load_commit_bytes_mb = 64;
+      break;
+    case "low": // 低目标负载
+      f.full_load_read_workers = 2;
+      f.full_load_write_workers = 2;
+      f.full_load_buffer_mb = 64;
+      f.full_load_batch_bytes_mb = 2;
+      f.full_load_commit_rows = 5000;
+      f.full_load_commit_bytes_mb = 16;
+      break;
+    case "auto": // 全部自动（0=使用后端默认）
+    default:
+      f.full_load_read_workers = 0;
+      f.full_load_write_workers = 0;
+      f.full_load_buffer_mb = 0;
+      f.full_load_batch_bytes_mb = 0;
+      f.full_load_commit_rows = 0;
+      f.full_load_commit_bytes_mb = 0;
+      break;
+  }
+}
+
+// 展示 V2 最终生效值（0 走后端 4C8G 默认）。
+const fullLoadEffective = computed(() => {
+  const f = taskForm.value;
+  const orDefault = (v, d) => (v && v > 0 ? v : d);
+  return {
+    read: orDefault(f.full_load_read_workers, 4),
+    write: orDefault(f.full_load_write_workers, 4),
+    buffer: orDefault(f.full_load_buffer_mb, 128),
+    commitRows: orDefault(f.full_load_commit_rows, 10000),
+    commitBytes: orDefault(f.full_load_commit_bytes_mb, 32),
+  };
 });
 
 // 刷新状态
@@ -784,6 +848,14 @@ function resetForm() {
     enable_drop_table_before_ddl: false,
     enable_skip_binlog: false,
     tx_commit_every_n_parallel: 0,
+
+    full_load_engine: "v1",
+    full_load_read_workers: 0,
+    full_load_write_workers: 0,
+    full_load_buffer_mb: 0,
+    full_load_batch_bytes_mb: 0,
+    full_load_commit_rows: 0,
+    full_load_commit_bytes_mb: 0,
   };
 
   selectedSyncLevel.value = "database";
@@ -1549,6 +1621,14 @@ function fillTaskFormFromTask(task) {
     enable_drop_table_before_ddl: task.config.enable_drop_table_before_ddl || false,
     enable_skip_binlog: task.config.enable_skip_binlog || false,
     tx_commit_every_n_parallel: task.config.tx_commit_every_n_parallel ?? 0,
+
+    full_load_engine: task.config.full_load_engine || "v1",
+    full_load_read_workers: task.config.full_load_read_workers ?? 0,
+    full_load_write_workers: task.config.full_load_write_workers ?? 0,
+    full_load_buffer_mb: task.config.full_load_buffer_mb ?? 0,
+    full_load_batch_bytes_mb: task.config.full_load_batch_bytes_mb ?? 0,
+    full_load_commit_rows: task.config.full_load_commit_rows ?? 0,
+    full_load_commit_bytes_mb: task.config.full_load_commit_bytes_mb ?? 0,
   };
 
   if (task.config.sync_level === "DATABASE") {
@@ -3058,6 +3138,17 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                 <a-descriptions-item label="并行事务提交间隔">
                   {{ detailPageTask.config.tx_commit_every_n_parallel > 0 ? detailPageTask.config.tx_commit_every_n_parallel : '默认（5批）' }}
                 </a-descriptions-item>
+                <a-descriptions-item label="全量引擎">
+                  {{ (detailPageTask.config.full_load_engine || 'v1').toLowerCase() === 'v2' ? 'V2（任务级流水线）' : 'V1（兼容）' }}
+                </a-descriptions-item>
+                <a-descriptions-item
+                  v-if="(detailPageTask.config.full_load_engine || 'v1').toLowerCase() === 'v2'"
+                  label="V2 读/写并发"
+                >
+                  {{ (detailPageTask.config.full_load_read_workers > 0 ? detailPageTask.config.full_load_read_workers : 4) }}
+                  /
+                  {{ (detailPageTask.config.full_load_write_workers > 0 ? detailPageTask.config.full_load_write_workers : 4) }}
+                </a-descriptions-item>
                 <a-descriptions-item label="启用索引优化">
                   {{ detailPageTask.config.optimize_index ? '开启' : '关闭' }}
                 </a-descriptions-item>
@@ -4174,6 +4265,132 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                       </a-form-item>
                     </a-col>
                   </a-row>
+
+                  <a-form-item v-if="targetType === 'MYSQL'" label="全量引擎">
+                    <a-radio-group
+                      v-model="taskForm.full_load_engine"
+                      type="button"
+                    >
+                      <a-radio value="v1">V1（兼容，逐表调度）</a-radio>
+                      <a-radio value="v2">V2（任务级流水线）</a-radio>
+                    </a-radio-group>
+                    <a-typography-text
+                      type="secondary"
+                      style="font-size: 12px; display: block; margin-top: 4px"
+                    >
+                      V2 使用任务级 chunk 调度与读写解耦流水线，统一控制源读取/目标写入并发，
+                      并修复并行事务重试的正确性问题。默认 V1，建议先灰度验证后切换。
+                    </a-typography-text>
+                  </a-form-item>
+
+                  <template
+                    v-if="targetType === 'MYSQL' && taskForm.full_load_engine === 'v2'"
+                  >
+                    <a-form-item label="V2 预设">
+                      <a-space wrap>
+                        <a-button size="small" @click="applyFullLoadPreset('balanced')"
+                          >4C8G 平衡</a-button
+                        >
+                        <a-button size="small" @click="applyFullLoadPreset('speed')"
+                          >速度优先</a-button
+                        >
+                        <a-button size="small" @click="applyFullLoadPreset('low')"
+                          >低目标负载</a-button
+                        >
+                        <a-button size="small" @click="applyFullLoadPreset('auto')"
+                          >全部自动</a-button
+                        >
+                      </a-space>
+                      <a-typography-text
+                        type="secondary"
+                        style="font-size: 12px; display: block; margin-top: 4px"
+                      >
+                        当前生效：读 {{ fullLoadEffective.read }} / 写
+                        {{ fullLoadEffective.write }} worker，队列
+                        {{ fullLoadEffective.buffer }} MiB，单事务
+                        {{ fullLoadEffective.commitRows }} 行 /
+                        {{ fullLoadEffective.commitBytes }} MiB。删除目标或跳过 binlog
+                        仍需在下方单独确认，预设不会静默开启。
+                      </a-typography-text>
+                    </a-form-item>
+
+                    <a-row :gutter="16">
+                      <a-col :span="12">
+                        <a-form-item label="源读取并发 (read workers)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_read_workers"
+                            @change="(v) => (taskForm.full_load_read_workers = v ?? 0)"
+                            :min="0"
+                            :max="64"
+                            style="width: 100%"
+                            placeholder="0=自动(4)"
+                          />
+                        </a-form-item>
+                      </a-col>
+                      <a-col :span="12">
+                        <a-form-item label="目标写入并发 (write workers)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_write_workers"
+                            @change="(v) => (taskForm.full_load_write_workers = v ?? 0)"
+                            :min="0"
+                            :max="64"
+                            style="width: 100%"
+                            placeholder="0=自动(4)"
+                          />
+                        </a-form-item>
+                      </a-col>
+                    </a-row>
+
+                    <a-row :gutter="16">
+                      <a-col :span="12">
+                        <a-form-item label="数据队列上限 (MiB)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_buffer_mb"
+                            @change="(v) => (taskForm.full_load_buffer_mb = v ?? 0)"
+                            :min="0"
+                            style="width: 100%"
+                            placeholder="0=自动(128)"
+                          />
+                        </a-form-item>
+                      </a-col>
+                      <a-col :span="12">
+                        <a-form-item label="单条 INSERT 字节上限 (MiB)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_batch_bytes_mb"
+                            @change="(v) => (taskForm.full_load_batch_bytes_mb = v ?? 0)"
+                            :min="0"
+                            style="width: 100%"
+                            placeholder="0=自动(4)"
+                          />
+                        </a-form-item>
+                      </a-col>
+                    </a-row>
+
+                    <a-row :gutter="16">
+                      <a-col :span="12">
+                        <a-form-item label="单事务行数上限">
+                          <a-input-number
+                            :model-value="taskForm.full_load_commit_rows"
+                            @change="(v) => (taskForm.full_load_commit_rows = v ?? 0)"
+                            :min="0"
+                            style="width: 100%"
+                            placeholder="0=自动(10000)"
+                          />
+                        </a-form-item>
+                      </a-col>
+                      <a-col :span="12">
+                        <a-form-item label="单事务字节上限 (MiB)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_commit_bytes_mb"
+                            @change="(v) => (taskForm.full_load_commit_bytes_mb = v ?? 0)"
+                            :min="0"
+                            style="width: 100%"
+                            placeholder="0=自动(32)"
+                          />
+                        </a-form-item>
+                      </a-col>
+                    </a-row>
+                  </template>
 
                   <a-form-item v-if="targetType === 'MYSQL'">
                     <a-checkbox v-model="taskForm.optimize_index">
@@ -6165,6 +6382,9 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
           </a-descriptions-item>
           <a-descriptions-item label="并行事务提交间隔">
             {{ selectedTaskForDetail.config.tx_commit_every_n_parallel > 0 ? selectedTaskForDetail.config.tx_commit_every_n_parallel : '默认（5批）' }}
+          </a-descriptions-item>
+          <a-descriptions-item label="全量引擎">
+            {{ (selectedTaskForDetail.config.full_load_engine || 'v1').toLowerCase() === 'v2' ? 'V2（任务级流水线）' : 'V1（兼容）' }}
           </a-descriptions-item>
           <a-descriptions-item label="启用索引优化">
             {{ selectedTaskForDetail.config.optimize_index ? '开启' : '关闭' }}

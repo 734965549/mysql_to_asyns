@@ -137,12 +137,20 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	BatchSize                int                    `json:"batch_size"`                   // 批处理大小
 	WorkerCount              int                    `json:"worker_count"`                 // 工作线程数
 	IntraTableWorkerCount    int                    `json:"intra_table_worker_count"`     // 表内工作线程数
+	IndexRestoreWorkerCount  int                    `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
 	EnableLimitOne           bool                   `json:"enable_limit_one"`             // 是否启用LIMIT 1优化
 	OptimizeIndex            bool                   `json:"optimize_index"`               // 索引优化：先删后建
 	EnableReadOnly           bool                   `json:"enable_read_only"`             // 同步前关闭目标只读，同步后恢复
 	EnableDropTableBeforeDDL bool                   `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS
 	EnableSkipBinlog         bool                   `json:"enable_skip_binlog"`           // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
 	TxCommitEveryNParallel   int                    `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5
+	FullLoadEngine           string                 `json:"full_load_engine,omitempty"`          // 全量引擎：v1 / v2；空视为 v1
+	FullLoadReadWorkers      int                    `json:"full_load_read_workers,omitempty"`    // V2 任务级源读取上限；0=自动
+	FullLoadWriteWorkers     int                    `json:"full_load_write_workers,omitempty"`   // V2 任务级目标写入上限；0=自动
+	FullLoadBufferMB         int                    `json:"full_load_buffer_mb,omitempty"`       // V2 队列上限(MiB)；0=128
+	FullLoadBatchBytesMB     int                    `json:"full_load_batch_bytes_mb,omitempty"`  // V2 单条INSERT字节上限(MiB)；0=4
+	FullLoadCommitRows       int                    `json:"full_load_commit_rows,omitempty"`     // V2 单事务行数上限；0=10000
+	FullLoadCommitBytesMB    int                    `json:"full_load_commit_bytes_mb,omitempty"` // V2 单事务字节上限(MiB)；0=32
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
 	SinkConfigs              []SinkConfigRequest    `json:"sink_configs,omitempty"`       // 增量目标端配置（可选，默认 MYSQL）
@@ -219,12 +227,20 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		BatchSize:                req.BatchSize,                 // 设置批处理大小
 		WorkerCount:              req.WorkerCount,               // 设置工作线程数
 		IntraTableWorkerCount:    req.IntraTableWorkerCount,     // 设置表内工作线程数
+		IndexRestoreWorkerCount:  req.IndexRestoreWorkerCount,   // 设置索引回放并发度
 		EnableLimitOne:           req.EnableLimitOne,            // 设置LIMIT 1优化开关
 		OptimizeIndex:            req.OptimizeIndex,             // 设置索引优化开关
 		EnableReadOnly:           req.EnableReadOnly,            // 设置只读管理开关
 		EnableDropTableBeforeDDL: req.EnableDropTableBeforeDDL,  // 设置DDL前DROP TABLE开关
 		EnableSkipBinlog:         req.EnableSkipBinlog,          // 设置全量写入前关闭binlog开关
 		TxCommitEveryNParallel:   req.TxCommitEveryNParallel,    // 设置并行事务提交间隔
+		FullLoadEngine:           req.FullLoadEngine,            // 设置全量引擎版本
+		FullLoadReadWorkers:      req.FullLoadReadWorkers,       // 设置V2源读取上限
+		FullLoadWriteWorkers:     req.FullLoadWriteWorkers,      // 设置V2目标写入上限
+		FullLoadBufferMB:         req.FullLoadBufferMB,          // 设置V2队列上限
+		FullLoadBatchBytesMB:     req.FullLoadBatchBytesMB,      // 设置V2单条INSERT字节上限
+		FullLoadCommitRows:       req.FullLoadCommitRows,        // 设置V2单事务行数上限
+		FullLoadCommitBytesMB:    req.FullLoadCommitBytesMB,     // 设置V2单事务字节上限
 		SourceDB:                 sourceDB,                      // 设置源数据库配置
 		TargetDB:                 targetDB,                      // 设置目标数据库配置
 		SinkConfigs:              sinkConfigs,                   // 设置增量目标端配置
@@ -794,6 +810,9 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.IntraTableWorkerCount != nil { // 如果提供了表内工作线程数
 		task.Config.IntraTableWorkerCount = *req.IntraTableWorkerCount // 更新表内工作线程数
 	}
+	if req.IndexRestoreWorkerCount != nil { // 如果提供了索引回放并发度
+		task.Config.IndexRestoreWorkerCount = *req.IndexRestoreWorkerCount // 更新索引回放并发度
+	}
 	// enable_limit_one 是 bool 类型，直接赋值
 	task.Config.EnableLimitOne = req.EnableLimitOne // 更新LIMIT 1优化开关
 	if req.OptimizeIndex != nil {                   // 如果提供了索引优化开关
@@ -810,6 +829,27 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	}
 	if req.TxCommitEveryNParallel != nil { // 如果提供了并行事务提交间隔
 		task.Config.TxCommitEveryNParallel = *req.TxCommitEveryNParallel // 更新并行事务提交间隔
+	}
+	if req.FullLoadEngine != nil { // 如果提供了全量引擎版本
+		task.Config.FullLoadEngine = *req.FullLoadEngine
+	}
+	if req.FullLoadReadWorkers != nil {
+		task.Config.FullLoadReadWorkers = *req.FullLoadReadWorkers
+	}
+	if req.FullLoadWriteWorkers != nil {
+		task.Config.FullLoadWriteWorkers = *req.FullLoadWriteWorkers
+	}
+	if req.FullLoadBufferMB != nil {
+		task.Config.FullLoadBufferMB = *req.FullLoadBufferMB
+	}
+	if req.FullLoadBatchBytesMB != nil {
+		task.Config.FullLoadBatchBytesMB = *req.FullLoadBatchBytesMB
+	}
+	if req.FullLoadCommitRows != nil {
+		task.Config.FullLoadCommitRows = *req.FullLoadCommitRows
+	}
+	if req.FullLoadCommitBytesMB != nil {
+		task.Config.FullLoadCommitBytesMB = *req.FullLoadCommitBytesMB
 	}
 
 	// 更新数据库配置
@@ -892,12 +932,20 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	BatchSize                int                    `json:"batch_size"`                             // 批处理大小
 	WorkerCount              int                    `json:"worker_count"`                           // 工作线程数
 	IntraTableWorkerCount    *int                   `json:"intra_table_worker_count,omitempty"`     // 表内工作线程数（可选）
+	IndexRestoreWorkerCount  *int                   `json:"index_restore_worker_count,omitempty"`   // 索引回放并发度（可选）
 	EnableLimitOne           bool                   `json:"enable_limit_one"`                       // 是否启用LIMIT 1优化
 	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`               // 索引优化（可选）
 	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`             // 只读管理（可选）
 	EnableDropTableBeforeDDL *bool                  `json:"enable_drop_table_before_ddl,omitempty"` // DDL前是否先DROP TABLE（可选）
 	EnableSkipBinlog         *bool                  `json:"enable_skip_binlog,omitempty"`           // 全量写入前关闭binlog（可选）
 	TxCommitEveryNParallel   *int                   `json:"tx_commit_every_n_parallel,omitempty"`   // 并行 worker 每 N 批提交一次事务（可选）
+	FullLoadEngine           *string                `json:"full_load_engine,omitempty"`             // 全量引擎：v1 / v2（可选）
+	FullLoadReadWorkers      *int                   `json:"full_load_read_workers,omitempty"`       // V2 源读取上限（可选）
+	FullLoadWriteWorkers     *int                   `json:"full_load_write_workers,omitempty"`      // V2 目标写入上限（可选）
+	FullLoadBufferMB         *int                   `json:"full_load_buffer_mb,omitempty"`          // V2 队列上限MiB（可选）
+	FullLoadBatchBytesMB     *int                   `json:"full_load_batch_bytes_mb,omitempty"`     // V2 单条INSERT字节上限MiB（可选）
+	FullLoadCommitRows       *int                   `json:"full_load_commit_rows,omitempty"`        // V2 单事务行数上限（可选）
+	FullLoadCommitBytesMB    *int                   `json:"full_load_commit_bytes_mb,omitempty"`    // V2 单事务字节上限MiB（可选）
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                    // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                    // 目标数据库配置（可选）
 	SinkConfigs              []SinkConfigRequest    `json:"sink_configs,omitempty"`                 // 增量目标端配置（可选）

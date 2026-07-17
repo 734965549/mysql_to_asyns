@@ -32,6 +32,20 @@ type Metrics struct { // 定义Prometheus指标结构体
 	// === 修复 9/14：无主键表增量事件计数 ===
 	// 用户选择"无主键表照走"，至少要把无主键事件流量量化出来，方便定位风险表与衡量影响面。
 	IncrementalNoPKTableEventsTotal prometheus.Counter
+
+	// === 全量 V2 引擎观测指标（低基数聚合，不带任务 ID / 表名标签）===
+	FullLoadReadRowsTotal     prometheus.Counter // V2 已读取行数
+	FullLoadReadBytesTotal    prometheus.Counter // V2 已读取字节数
+	FullLoadWriteRowsTotal    prometheus.Counter // V2 已写入（未必已提交）行数
+	FullLoadWriteBytesTotal   prometheus.Counter // V2 已写入字节数
+	FullLoadCommitRowsTotal   prometheus.Counter // V2 已提交行数
+	FullLoadCommitBytesTotal  prometheus.Counter // V2 已提交字节数
+	FullLoadCommitsTotal      prometheus.Counter // V2 事务提交次数
+	FullLoadTxReplaysTotal    prometheus.Counter // V2 整事务重放次数
+	FullLoadLockRetriesTotal  prometheus.Counter // V2 可重试锁错误次数
+	FullLoadQueueBytes        prometheus.Gauge   // V2 队列当前字节数
+	FullLoadActiveReaders     prometheus.Gauge   // V2 当前活跃读取 worker
+	FullLoadActiveWriters     prometheus.Gauge   // V2 当前活跃写入 worker
 }
 
 var ( // 定义包级别变量
@@ -100,6 +114,54 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 				Name: "mysql_sync_incremental_no_pk_table_events_total",
 				Help: "Total number of incremental events targeting tables without primary/unique key (idempotency at risk)",
 			}),
+			FullLoadReadRowsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_read_rows_total",
+				Help: "Total rows read by the full-load V2 engine",
+			}),
+			FullLoadReadBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_read_bytes_total",
+				Help: "Total bytes read by the full-load V2 engine",
+			}),
+			FullLoadWriteRowsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_write_rows_total",
+				Help: "Total rows written (not necessarily committed) by the full-load V2 engine",
+			}),
+			FullLoadWriteBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_write_bytes_total",
+				Help: "Total bytes written by the full-load V2 engine",
+			}),
+			FullLoadCommitRowsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_commit_rows_total",
+				Help: "Total committed rows by the full-load V2 engine",
+			}),
+			FullLoadCommitBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_commit_bytes_total",
+				Help: "Total committed bytes by the full-load V2 engine",
+			}),
+			FullLoadCommitsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_commits_total",
+				Help: "Total transaction commits by the full-load V2 engine",
+			}),
+			FullLoadTxReplaysTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_tx_replays_total",
+				Help: "Total whole-transaction replays after retryable lock errors in the full-load V2 engine",
+			}),
+			FullLoadLockRetriesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_lock_retries_total",
+				Help: "Total retryable lock errors hit by the full-load V2 engine",
+			}),
+			FullLoadQueueBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "mysql_sync_full_load_queue_bytes",
+				Help: "Current buffered bytes in the full-load V2 row-batch queue",
+			}),
+			FullLoadActiveReaders: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "mysql_sync_full_load_active_readers",
+				Help: "Current active source read workers in the full-load V2 engine",
+			}),
+			FullLoadActiveWriters: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "mysql_sync_full_load_active_writers",
+				Help: "Current active target write workers in the full-load V2 engine",
+			}),
 		}
 		
 		// 注册指标
@@ -117,6 +179,18 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 		prometheus.MustRegister(instance.IncrementalZeroRowUpdateTotal)
 		prometheus.MustRegister(instance.IncrementalZeroRowDeleteTotal)
 		prometheus.MustRegister(instance.IncrementalNoPKTableEventsTotal)
+		prometheus.MustRegister(instance.FullLoadReadRowsTotal)
+		prometheus.MustRegister(instance.FullLoadReadBytesTotal)
+		prometheus.MustRegister(instance.FullLoadWriteRowsTotal)
+		prometheus.MustRegister(instance.FullLoadWriteBytesTotal)
+		prometheus.MustRegister(instance.FullLoadCommitRowsTotal)
+		prometheus.MustRegister(instance.FullLoadCommitBytesTotal)
+		prometheus.MustRegister(instance.FullLoadCommitsTotal)
+		prometheus.MustRegister(instance.FullLoadTxReplaysTotal)
+		prometheus.MustRegister(instance.FullLoadLockRetriesTotal)
+		prometheus.MustRegister(instance.FullLoadQueueBytes)
+		prometheus.MustRegister(instance.FullLoadActiveReaders)
+		prometheus.MustRegister(instance.FullLoadActiveWriters)
 	})
 	
 	return instance // 返回实例
@@ -135,6 +209,47 @@ func (m *Metrics) IncrementIncrementalZeroRowDelete() {
 // IncrementIncrementalNoPKTableEvents 增量事件落到无主键/无唯一键表时调用，按事件计数。
 func (m *Metrics) IncrementIncrementalNoPKTableEvents() {
 	m.IncrementalNoPKTableEventsTotal.Inc()
+}
+
+// addNonNegative 仅累加非负增量，防止快照差为负时污染 Counter。
+func addNonNegative(c prometheus.Counter, delta int64) {
+	if delta > 0 {
+		c.Add(float64(delta))
+	}
+}
+
+// AddFullLoadRead 累加 V2 已读取行数/字节数。
+func (m *Metrics) AddFullLoadRead(rows, bytes int64) {
+	addNonNegative(m.FullLoadReadRowsTotal, rows)
+	addNonNegative(m.FullLoadReadBytesTotal, bytes)
+}
+
+// AddFullLoadWrite 累加 V2 已写入行数/字节数。
+func (m *Metrics) AddFullLoadWrite(rows, bytes int64) {
+	addNonNegative(m.FullLoadWriteRowsTotal, rows)
+	addNonNegative(m.FullLoadWriteBytesTotal, bytes)
+}
+
+// AddFullLoadCommit 累加 V2 已提交行数/字节数/提交次数。
+func (m *Metrics) AddFullLoadCommit(rows, bytes, commits int64) {
+	addNonNegative(m.FullLoadCommitRowsTotal, rows)
+	addNonNegative(m.FullLoadCommitBytesTotal, bytes)
+	addNonNegative(m.FullLoadCommitsTotal, commits)
+}
+
+// AddFullLoadTxReplays 累加 V2 整事务重放次数。
+func (m *Metrics) AddFullLoadTxReplays(n int64) { addNonNegative(m.FullLoadTxReplaysTotal, n) }
+
+// AddFullLoadLockRetries 累加 V2 可重试锁错误次数。
+func (m *Metrics) AddFullLoadLockRetries(n int64) { addNonNegative(m.FullLoadLockRetriesTotal, n) }
+
+// SetFullLoadQueueBytes 设置 V2 队列当前字节数。
+func (m *Metrics) SetFullLoadQueueBytes(bytes int64) { m.FullLoadQueueBytes.Set(float64(bytes)) }
+
+// SetFullLoadActiveWorkers 设置 V2 当前活跃读/写 worker 数。
+func (m *Metrics) SetFullLoadActiveWorkers(readers, writers int64) {
+	m.FullLoadActiveReaders.Set(float64(readers))
+	m.FullLoadActiveWriters.Set(float64(writers))
 }
 
 // UpdateTaskMetrics 更新任务指标方法

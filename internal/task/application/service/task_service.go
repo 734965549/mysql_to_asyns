@@ -2371,14 +2371,21 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		}
 
-		if err := s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt); err != nil {
+		// full_load_engine=v2 时使用任务级流水线引擎；否则保持 V1 内联逐表调度。
+		var pairErr error
+		if task.Config.UsesFullLoadV2() {
+			pairErr = s.syncDatabasePairV2(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt)
+		} else {
+			pairErr = s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt)
+		}
+		if pairErr != nil {
 
 			// 一并区分"被停止"和"真实失败"：库级 err 时再核查一次任务状态。
 			if s.isTaskStopped(taskID) {
-				logger.Info("[Task %s] Full sync stopped during pair %s->%s: %v", taskID, p.src, p.dst, err)
+				logger.Info("[Task %s] Full sync stopped during pair %s->%s: %v", taskID, p.src, p.dst, pairErr)
 				return errFullSyncStoppedByUser
 			}
-			return err
+			return pairErr
 
 		}
 
@@ -6189,6 +6196,11 @@ func (s *TaskService) GetTaskMetrics(taskID string) (map[string]interface{}, err
 		"status": task.Context.Status,
 
 		"current_position": task.Context.CurrentPosition,
+	}
+
+	// 全量 V2 引擎任务级观测数据（若该任务本轮使用了 V2）
+	if snap, ok := fullLoadStatsSnapshot(taskID); ok {
+		metrics["full_load_v2"] = snap
 	}
 
 	// 如果是增量同步，添加增量同步特有的指标

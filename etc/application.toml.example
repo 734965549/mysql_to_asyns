@@ -112,6 +112,13 @@
   # 建议值：50000 - 200000
   # chunk_size = 100000
 
+  # ========== 全量 V2 引擎（任务级流水线）==========
+  # 全量引擎通过任务级配置字段 full_load_engine 选择（v1 默认 / v2 流水线），
+  # 无对应全局 TOML 开关。V2 相关字段（full_load_read_workers、full_load_write_workers、
+  # full_load_buffer_mb、full_load_batch_bytes_mb、full_load_commit_rows、
+  # full_load_commit_bytes_mb）均在创建/更新任务的 JSON 中设置，
+  # 详见 docs/CONFIGURATION.md「全量 V2 引擎」小节。
+
 # ========== 功能开关 ==========
 
 [features]
