@@ -1,6 +1,6 @@
 # 全量同步性能诊断与 V2 优化方案
 
-> 状态：待实施  
+> 状态：V2 已实现并完成首轮代码复核；自动化检查通过，真实 MySQL 与 4C8G 性能验收待执行
 > 适用范围：MySQL 到 MySQL 的 FULL / ALL 初始全量阶段  
 > 默认目标：在 4C8G 目标库上兼顾同步速度、目标负载与数据正确性
 
@@ -140,6 +140,9 @@ type RowBatch struct {
 - 错误、阶段切换、锁重试耗尽和索引恢复失败仍立即记录。
 - 数据写审计改为有界异步队列和批量文件写入；队列拥塞时记录丢弃计数和告警，不阻塞数据库数据面。
 - 进度存储继续节流，但存储调用移出全局任务互斥锁，避免慢文件或慢 MySQL 存储阻塞 worker。
+- 锁外落盘前再次校验快照是否仍有效：比较 `Status` 与 `LastUpdateTime`。若 Pause/End/Fail
+  等已在锁内同步保存较新的终态，则丢弃滞后的 RUNNING 快照，避免其反向覆盖 `PAUSED` /
+  `STOPPED` / `FAILED` 存档；进程崩溃后重启时不会读到错误状态。
 
 ## 5. 配置与接口变更
 
@@ -174,6 +177,8 @@ type RowBatch struct {
 - 分片边界无重复、无遗漏，目标行数与源端一致。
 - 锁超时、死锁、连接断开和提交失败时重放完整未提交事务。
 - 暂停和取消时所有未提交事务回滚，任务不能错误进入 FULL_COMPLETED。
+- 进度持久化锁外落盘与 Pause/End/Fail 并发时，陈旧 RUNNING 快照不得覆盖
+  `PAUSED` / `STOPPED` / `FAILED` 存档（`TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave`）。
 - 索引删除与恢复失败时状态、错误和残留索引信息可追踪。
 - ALL 模式完成全量后，从原始起点继续增量并最终收敛。
 
@@ -223,3 +228,55 @@ type RowBatch struct {
 - 不默认关闭目标 binlog，不静默删除目标库表或索引。
 - 不将 FULL 模式伪装成一致快照；FULL 期间的源端变化仍只有 ALL 模式能通过 binlog 追平。
 
+## 9. 2026-07-17 实现复核记录
+
+本轮复核在 V2 初始实现基础上补齐了以下问题：
+
+- 锁冲突继续回滚并重放全部未提交批次；连接错误和 `COMMIT` 结果未知时禁止自动重放普通
+  `INSERT`，避免无主键表重复数据。
+- 事务等待不到下一批时也会按 2 秒上限提交；暂停、取消和外层 context 取消不能误报成功。
+- 复合游标通过 PK-only keyset 边界生成多个 chunk；有符号整数全域分片使用无溢出计算，
+  unsigned 整数改走 keyset 边界。
+- 读取批次同时受行数和字节数约束，宽行不会先构造超大批次再等待队列背压。
+- 每个目标连接增加有界预处理语句缓存；库、表、列名统一转义；行宽异常在执行 SQL 前失败。
+- 并行 V2 任务的队列与 worker Gauge 改为差量聚合，任务删除时清理最近一次统计对象。
+- 进度持久化改为锁内冻结快照、锁外执行存储 I/O，消除慢存储阻塞全局任务锁的问题。
+- 锁外落盘前通过 `shouldPersistAsyncProgressSnapshot` 比较快照与内存任务的 `Status`、
+  `LastUpdateTime`，丢弃已被 Pause/End/Fail 等同步存档超越的陈旧进度快照，修复写序竞争。
+- V2 数值配置增加安全上限，前端、后端推导和配置文档保持一致。
+
+已通过：
+
+- `go test ./...`
+- `go vet ./...`
+- `go test -race ./internal/sync/fullload ./internal/task/application/service`
+- `web` 目录下 `npm run build`
+- `git diff --check`
+
+以下项目不能由 sqlmock 单元测试替代，仍属于发布前验收项：
+
+- 使用真实 MySQL 覆盖连续/稀疏整数、UUID、复合键、无主键、BLOB/JSON/NULL/超宽行，
+  校验源目标行数与抽样校验和。
+- 注入真实死锁、锁等待、连接中断和 `COMMIT` 回包丢失，确认任务失败后的目标残留与重跑流程。
+- 验证 ALL 模式从全量前捕获的位点继续增量并最终收敛。
+- 对索引删除/恢复失败、权限不足导致 `sql_log_bin=0` 失败和暂停/取消做端到端状态机测试。
+- 在同一源、网络、4C8G 目标和相同表数据上执行三轮 V1/V2/云服务对照；没有这组数据，
+  不能宣称已达到 4.5 小时或 V1 两倍吞吐的性能目标。
+
+计划中“连接池等待与逐 chunk 详细统计”和“有界异步审计队列”目前仍未完整落地；当前已有任务级
+读/写/提交/队列/worker/重放指标和 5 秒聚合日志，但这两项应在正式将 V2 设为默认前继续补齐。
+
+## 10. 2026-07-19 进度落盘写序修复
+
+`incrementTaskProgress` 为降低 I/O 频率，采用“锁内序列化快照、锁外 `storage.Save`”策略。
+Pause/End/Fail 等生命周期操作仍在锁内同步落盘。二者并发时，已出锁但尚未执行的旧 RUNNING
+快照可能在终态存档之后落盘，把 `PAUSED` / `STOPPED` / `FAILED` 覆盖回 `RUNNING`；内存状态
+正确、下一次保存会纠正，但若此时进程崩溃，重启后会读到错误存档。
+
+修复方式：
+
+- 新增 `shouldPersistAsyncProgressSnapshot`：锁外落盘前再次读取内存任务，仅当 `Status` 与快照
+  一致且 `LastUpdateTime` 不早于快照时才执行 `Save`。
+- 不引入额外版本号字段；Pause/End/Fail 等路径本来就会更新 `LastUpdateTime` 与终态
+  `Status`，足以识别陈旧快照。
+- 单元测试：`TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave`。

@@ -95,7 +95,11 @@ func TestResolveOptions_CommitFloorAtBatch(t *testing.T) {
 }
 
 func TestResolveOptions_Clamp(t *testing.T) {
-	opt := ResolveOptions(RawOptions{ReadWorkers: 1000, WriteWorkers: -3, BatchSize: 999999999})
+	opt := ResolveOptions(RawOptions{
+		ReadWorkers: 1000, WriteWorkers: -3, BatchSize: 999999999,
+		BufferMB: int(^uint(0) >> 1), BatchBytesMB: int(^uint(0) >> 1),
+		CommitRows: int(^uint(0) >> 1), CommitBytesMB: int(^uint(0) >> 1),
+	})
 	if opt.ReadWorkers != hardMaxWorkers {
 		t.Errorf("ReadWorkers=%d want clamp %d", opt.ReadWorkers, hardMaxWorkers)
 	}
@@ -104,6 +108,28 @@ func TestResolveOptions_Clamp(t *testing.T) {
 	}
 	if opt.BatchRows != hardMaxBatchRow {
 		t.Errorf("BatchRows=%d want clamp %d", opt.BatchRows, hardMaxBatchRow)
+	}
+	if opt.BufferBytes != int64(hardMaxBufferMB)*1024*1024 {
+		t.Errorf("BufferBytes=%d want capped MiB=%d", opt.BufferBytes, hardMaxBufferMB)
+	}
+	if opt.BatchBytes != int64(hardMaxBatchMB)*1024*1024 {
+		t.Errorf("BatchBytes=%d want capped MiB=%d", opt.BatchBytes, hardMaxBatchMB)
+	}
+	if opt.CommitRows != hardMaxCommitRows {
+		t.Errorf("CommitRows=%d want cap %d", opt.CommitRows, hardMaxCommitRows)
+	}
+	if opt.CommitBytes != int64(hardMaxCommitMB)*1024*1024 {
+		t.Errorf("CommitBytes=%d want capped MiB=%d", opt.CommitBytes, hardMaxCommitMB)
+	}
+}
+
+func TestResolveOptions_LegacyCommitDerivationCannotOverflow(t *testing.T) {
+	opt := ResolveOptions(RawOptions{
+		BatchSize:                    hardMaxBatchRow,
+		LegacyTxCommitEveryNParallel: int(^uint(0) >> 1),
+	})
+	if opt.CommitRows != hardMaxCommitRows {
+		t.Fatalf("CommitRows=%d want cap %d", opt.CommitRows, hardMaxCommitRows)
 	}
 }
 

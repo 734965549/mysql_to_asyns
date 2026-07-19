@@ -8,20 +8,20 @@ import ( // 导入外部包和标准库
 
 // Metrics Prometheus指标结构体
 type Metrics struct { // 定义Prometheus指标结构体
-	TasksTotal       prometheus.Gauge // 任务总数指标
-	TasksRunning     prometheus.Gauge // 运行中任务数指标
-	TasksCompleted   prometheus.Gauge // 已完成任务数指标
-	TasksFailed      prometheus.Gauge // 失败任务数指标
-	
+	TasksTotal     prometheus.Gauge // 任务总数指标
+	TasksRunning   prometheus.Gauge // 运行中任务数指标
+	TasksCompleted prometheus.Gauge // 已完成任务数指标
+	TasksFailed    prometheus.Gauge // 失败任务数指标
+
 	RowsProcessed    prometheus.Counter // 已处理行数计数器
-	RowsTotal        prometheus.Gauge // 总行数指标
+	RowsTotal        prometheus.Gauge   // 总行数指标
 	BytesTransferred prometheus.Counter // 传输字节数计数器
-	
-	SyncDuration     prometheus.Histogram // 同步耗时直方图
-	SyncErrors       prometheus.Counter // 同步错误计数器
-	
-	BinlogLag        prometheus.Gauge // Binlog延迟指标
-	BinlogPosition   prometheus.Gauge // Binlog位置指标
+
+	SyncDuration prometheus.Histogram // 同步耗时直方图
+	SyncErrors   prometheus.Counter   // 同步错误计数器
+
+	BinlogLag      prometheus.Gauge // Binlog延迟指标
+	BinlogPosition prometheus.Gauge // Binlog位置指标
 
 	// === 修复 10/14：增量阶段 UPDATE/DELETE 命中 0 行的累计指标 ===
 	// 0 行匹配通常意味着目标侧已与事件不一致（漂移）；当前实现选择 warn + 埋点而非 hard fail，
@@ -34,22 +34,22 @@ type Metrics struct { // 定义Prometheus指标结构体
 	IncrementalNoPKTableEventsTotal prometheus.Counter
 
 	// === 全量 V2 引擎观测指标（低基数聚合，不带任务 ID / 表名标签）===
-	FullLoadReadRowsTotal     prometheus.Counter // V2 已读取行数
-	FullLoadReadBytesTotal    prometheus.Counter // V2 已读取字节数
-	FullLoadWriteRowsTotal    prometheus.Counter // V2 已写入（未必已提交）行数
-	FullLoadWriteBytesTotal   prometheus.Counter // V2 已写入字节数
-	FullLoadCommitRowsTotal   prometheus.Counter // V2 已提交行数
-	FullLoadCommitBytesTotal  prometheus.Counter // V2 已提交字节数
-	FullLoadCommitsTotal      prometheus.Counter // V2 事务提交次数
-	FullLoadTxReplaysTotal    prometheus.Counter // V2 整事务重放次数
-	FullLoadLockRetriesTotal  prometheus.Counter // V2 可重试锁错误次数
-	FullLoadQueueBytes        prometheus.Gauge   // V2 队列当前字节数
-	FullLoadActiveReaders     prometheus.Gauge   // V2 当前活跃读取 worker
-	FullLoadActiveWriters     prometheus.Gauge   // V2 当前活跃写入 worker
+	FullLoadReadRowsTotal    prometheus.Counter // V2 已读取行数
+	FullLoadReadBytesTotal   prometheus.Counter // V2 已读取字节数
+	FullLoadWriteRowsTotal   prometheus.Counter // V2 已写入（未必已提交）行数
+	FullLoadWriteBytesTotal  prometheus.Counter // V2 已写入字节数
+	FullLoadCommitRowsTotal  prometheus.Counter // V2 已提交行数
+	FullLoadCommitBytesTotal prometheus.Counter // V2 已提交字节数
+	FullLoadCommitsTotal     prometheus.Counter // V2 事务提交次数
+	FullLoadTxReplaysTotal   prometheus.Counter // V2 整事务重放次数
+	FullLoadLockRetriesTotal prometheus.Counter // V2 可重试锁错误次数
+	FullLoadQueueBytes       prometheus.Gauge   // V2 队列当前字节数
+	FullLoadActiveReaders    prometheus.Gauge   // V2 当前活跃读取 worker
+	FullLoadActiveWriters    prometheus.Gauge   // V2 当前活跃写入 worker
 }
 
 var ( // 定义包级别变量
-	instance *Metrics // Metrics实例，单例模式
+	instance *Metrics  // Metrics实例，单例模式
 	once     sync.Once // 用于确保只初始化一次
 )
 
@@ -58,49 +58,49 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 	once.Do(func() { // 确保只执行一次初始化
 		instance = &Metrics{ // 创建Metrics实例
 			TasksTotal: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建任务总数指标
-				Name: "mysql_sync_tasks_total", // 指标名称
+				Name: "mysql_sync_tasks_total",     // 指标名称
 				Help: "Total number of sync tasks", // 指标帮助信息
 			}),
 			TasksRunning: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建运行中任务数指标
 				Name: "mysql_sync_tasks_running", // 指标名称
-				Help: "Number of running tasks", // 指标帮助信息
+				Help: "Number of running tasks",  // 指标帮助信息
 			}),
 			TasksCompleted: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建已完成任务数指标
 				Name: "mysql_sync_tasks_completed", // 指标名称
-				Help: "Number of completed tasks", // 指标帮助信息
+				Help: "Number of completed tasks",  // 指标帮助信息
 			}),
 			TasksFailed: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建失败任务数指标
 				Name: "mysql_sync_tasks_failed", // 指标名称
-				Help: "Number of failed tasks", // 指标帮助信息
+				Help: "Number of failed tasks",  // 指标帮助信息
 			}),
 			RowsProcessed: prometheus.NewCounter(prometheus.CounterOpts{ // 创建已处理行数计数器
 				Name: "mysql_sync_rows_processed_total", // 指标名称
-				Help: "Total number of rows processed", // 指标帮助信息
+				Help: "Total number of rows processed",  // 指标帮助信息
 			}),
 			RowsTotal: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建总行数指标
-				Name: "mysql_sync_rows_total", // 指标名称
+				Name: "mysql_sync_rows_total",           // 指标名称
 				Help: "Total number of rows to process", // 指标帮助信息
 			}),
 			BytesTransferred: prometheus.NewCounter(prometheus.CounterOpts{ // 创建传输字节数计数器
 				Name: "mysql_sync_bytes_transferred_total", // 指标名称
-				Help: "Total bytes transferred", // 指标帮助信息
+				Help: "Total bytes transferred",            // 指标帮助信息
 			}),
 			SyncDuration: prometheus.NewHistogram(prometheus.HistogramOpts{ // 创建同步耗时直方图
 				Name:    "mysql_sync_duration_seconds", // 指标名称
 				Help:    "Duration of sync operations", // 指标帮助信息
-				Buckets: prometheus.DefBuckets, // 使用默认桶配置
+				Buckets: prometheus.DefBuckets,         // 使用默认桶配置
 			}),
 			SyncErrors: prometheus.NewCounter(prometheus.CounterOpts{ // 创建同步错误计数器
-				Name: "mysql_sync_errors_total", // 指标名称
+				Name: "mysql_sync_errors_total",     // 指标名称
 				Help: "Total number of sync errors", // 指标帮助信息
 			}),
 			BinlogLag: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建Binlog延迟指标
 				Name: "mysql_sync_binlog_lag_seconds", // 指标名称
-				Help: "Binlog lag in seconds", // 指标帮助信息
+				Help: "Binlog lag in seconds",         // 指标帮助信息
 			}),
 			BinlogPosition: prometheus.NewGauge(prometheus.GaugeOpts{ // 创建Binlog位置指标
 				Name: "mysql_sync_binlog_position", // 指标名称
-				Help: "Current binlog position", // 指标帮助信息
+				Help: "Current binlog position",    // 指标帮助信息
 			}),
 			IncrementalZeroRowUpdateTotal: prometheus.NewCounter(prometheus.CounterOpts{
 				Name: "mysql_sync_incremental_zero_row_update_total",
@@ -163,19 +163,19 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 				Help: "Current active target write workers in the full-load V2 engine",
 			}),
 		}
-		
+
 		// 注册指标
-		prometheus.MustRegister(instance.TasksTotal) // 注册任务总数指标
-		prometheus.MustRegister(instance.TasksRunning) // 注册运行中任务数指标
-		prometheus.MustRegister(instance.TasksCompleted) // 注册已完成任务数指标
-		prometheus.MustRegister(instance.TasksFailed) // 注册失败任务数指标
-		prometheus.MustRegister(instance.RowsProcessed) // 注册已处理行数指标
-		prometheus.MustRegister(instance.RowsTotal) // 注册总行数指标
+		prometheus.MustRegister(instance.TasksTotal)       // 注册任务总数指标
+		prometheus.MustRegister(instance.TasksRunning)     // 注册运行中任务数指标
+		prometheus.MustRegister(instance.TasksCompleted)   // 注册已完成任务数指标
+		prometheus.MustRegister(instance.TasksFailed)      // 注册失败任务数指标
+		prometheus.MustRegister(instance.RowsProcessed)    // 注册已处理行数指标
+		prometheus.MustRegister(instance.RowsTotal)        // 注册总行数指标
 		prometheus.MustRegister(instance.BytesTransferred) // 注册传输字节数指标
-		prometheus.MustRegister(instance.SyncDuration) // 注册同步耗时指标
-		prometheus.MustRegister(instance.SyncErrors) // 注册同步错误指标
-		prometheus.MustRegister(instance.BinlogLag) // 注册Binlog延迟指标
-		prometheus.MustRegister(instance.BinlogPosition) // 注册Binlog位置指标
+		prometheus.MustRegister(instance.SyncDuration)     // 注册同步耗时指标
+		prometheus.MustRegister(instance.SyncErrors)       // 注册同步错误指标
+		prometheus.MustRegister(instance.BinlogLag)        // 注册Binlog延迟指标
+		prometheus.MustRegister(instance.BinlogPosition)   // 注册Binlog位置指标
 		prometheus.MustRegister(instance.IncrementalZeroRowUpdateTotal)
 		prometheus.MustRegister(instance.IncrementalZeroRowDeleteTotal)
 		prometheus.MustRegister(instance.IncrementalNoPKTableEventsTotal)
@@ -192,7 +192,7 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 		prometheus.MustRegister(instance.FullLoadActiveReaders)
 		prometheus.MustRegister(instance.FullLoadActiveWriters)
 	})
-	
+
 	return instance // 返回实例
 }
 
@@ -252,12 +252,23 @@ func (m *Metrics) SetFullLoadActiveWorkers(readers, writers int64) {
 	m.FullLoadActiveWriters.Set(float64(writers))
 }
 
+// AddFullLoadQueueBytes 按任务快照差值更新聚合队列字节数，支持多个 V2 任务并行运行。
+func (m *Metrics) AddFullLoadQueueBytes(delta int64) {
+	m.FullLoadQueueBytes.Add(float64(delta))
+}
+
+// AddFullLoadActiveWorkers 按任务快照差值更新聚合 worker 数，避免任务间互相覆盖 Gauge。
+func (m *Metrics) AddFullLoadActiveWorkers(readersDelta, writersDelta int64) {
+	m.FullLoadActiveReaders.Add(float64(readersDelta))
+	m.FullLoadActiveWriters.Add(float64(writersDelta))
+}
+
 // UpdateTaskMetrics 更新任务指标方法
 func (m *Metrics) UpdateTaskMetrics(total, running, completed, failed int) { // 更新任务相关指标
-	m.TasksTotal.Set(float64(total)) // 设置任务总数
-	m.TasksRunning.Set(float64(running)) // 设置运行中任务数
+	m.TasksTotal.Set(float64(total))         // 设置任务总数
+	m.TasksRunning.Set(float64(running))     // 设置运行中任务数
 	m.TasksCompleted.Set(float64(completed)) // 设置已完成任务数
-	m.TasksFailed.Set(float64(failed)) // 设置失败任务数
+	m.TasksFailed.Set(float64(failed))       // 设置失败任务数
 }
 
 // IncrementRowsProcessed 增加已处理行数方法

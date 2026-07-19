@@ -28,6 +28,12 @@ func setFullLoadStats(taskID string, stats *fullload.Stats) {
 	fullLoadStatsStore.Unlock()
 }
 
+func clearFullLoadStats(taskID string) {
+	fullLoadStatsStore.Lock()
+	delete(fullLoadStatsStore.m, taskID)
+	fullLoadStatsStore.Unlock()
+}
+
 // fullLoadStatsSnapshot 返回任务最近一次 V2 运行的统计快照；无数据时返回 (nil,false)。
 func fullLoadStatsSnapshot(taskID string) (fullload.StatsSnapshot, bool) {
 	fullLoadStatsStore.RLock()
@@ -137,7 +143,7 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	stats := &fullload.Stats{}
 	setFullLoadStats(taskID, stats)
 
-	taskStartTime := task.Context.StartTime
+	taskStartTime := s.getTaskStartTime(taskID)
 	if taskStartTime.IsZero() {
 		taskStartTime = time.Now()
 	}
@@ -151,9 +157,9 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		IsStopped: func() bool { return s.isTaskStopped(taskID) },
 		OnCommit: func(schema, table string, rows, bytes int64) {
 			mark := schema + "." + table
-			s.incrementTaskProgress(taskID, rows, mark)
+			taskTotalRows := s.incrementTaskProgress(taskID, rows, mark)
 			elapsed := time.Since(taskStartTime).Seconds()
-			s.updateTableProgress(taskID, schema, table, rows, elapsed, taskStartTime, task.Context.EstimatedTotalRows)
+			s.updateTableProgress(taskID, schema, table, rows, elapsed, taskStartTime, taskTotalRows)
 		},
 	}
 
@@ -188,4 +194,13 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	}
 
 	return nil
+}
+
+func (s *TaskService) getTaskStartTime(taskID string) time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if task := s.tasks[taskID]; task != nil {
+		return task.Context.StartTime
+	}
+	return time.Time{}
 }

@@ -863,3 +863,290 @@ func TestGetTaskProgress_Success(t *testing.T) {
 		t.Errorf("expected status 404 for uninitialized progress, got %d", w.Code)
 	}
 }
+
+// newHandlerTaskService 为 handler 测试创建独立的临时文件存储任务服务，避免污染 data/ 目录。
+func newHandlerTaskService(t *testing.T) *taskService.TaskService {
+	t.Helper()
+	return taskService.NewTaskService(&config.Config{
+		Storage: config.StorageConfig{Mode: "file", DataDir: t.TempDir()},
+	})
+}
+
+// stageAllTaskAtIncremental 在服务中放入一个 RUNNING + ALL + INCREMENTAL_STARTED 的任务。
+func stageAllTaskAtIncremental(t *testing.T, taskSvc *taskService.TaskService, taskID string) {
+	t.Helper()
+	task, err := taskSvc.CreateTask(taskEntity.TaskConfig{
+		ID:           taskID,
+		Name:         "end-test",
+		Mode:         taskEntity.SyncModeAll,
+		SyncLevel:    taskEntity.SyncLevelTable,
+		SourceSchema: "src_db",
+		TargetSchema: "tgt_db",
+		Tables:       []string{"users"},
+		TargetTables: []string{"users"},
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Start()
+	task.MarkIncrementalStarted()
+	// 通过 UpdateTask 把运行中状态写回服务映射
+	if err := taskSvc.UpdateTask(task); err != nil {
+		t.Fatalf("stage task: %v", err)
+	}
+}
+
+// TestUpdateTaskHandler_RejectsStopped STOPPED 任务更新返回 409，且不改脏内存配置。
+func TestUpdateTaskHandler_RejectsStopped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newHandlerTaskService(t)
+	defer taskSvc.Close()
+	stageAllTaskAtIncremental(t, taskSvc, "update_stopped")
+	if err := taskSvc.EndTask("update_stopped"); err != nil {
+		t.Fatalf("end task: %v", err)
+	}
+
+	original, ok := taskSvc.GetTask("update_stopped")
+	if !ok {
+		t.Fatal("task not found")
+	}
+	originalName := original.Config.Name
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.PUT("/api/tasks/:id", handler.UpdateTask)
+
+	body, _ := json.Marshal(map[string]string{"name": "should-not-apply"})
+	req := httptest.NewRequest(http.MethodPut, "/api/tasks/update_stopped", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+
+	task, _ := taskSvc.GetTask("update_stopped")
+	if task.Config.Name != originalName {
+		t.Errorf("in-memory config mutated: got name %q, want %q", task.Config.Name, originalName)
+	}
+}
+
+// TestEndTaskHandler_OK 结束合法任务返回 200。
+func TestEndTaskHandler_OK(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newHandlerTaskService(t)
+	defer taskSvc.Close()
+	stageAllTaskAtIncremental(t, taskSvc, "end_ok")
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.POST("/api/tasks/:id/end", handler.EndTask)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/end_ok/end", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	task, ok := taskSvc.GetTask("end_ok")
+	if !ok {
+		t.Fatal("task not found")
+	}
+	if task.Context.Status != taskEntity.TaskStatusStopped {
+		t.Errorf("expected STOPPED, got %s", task.Context.Status)
+	}
+}
+
+// TestEndTaskHandler_NotFound 结束不存在的任务返回 404。
+func TestEndTaskHandler_NotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newHandlerTaskService(t)
+	defer taskSvc.Close()
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.POST("/api/tasks/:id/end", handler.EndTask)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/missing/end", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestEndTaskHandler_Conlict 暂停状态（不允许结束）返回 409。
+func TestEndTaskHandler_Conflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newHandlerTaskService(t)
+	defer taskSvc.Close()
+
+	task, err := taskSvc.CreateTask(taskEntity.TaskConfig{
+		ID: "end_conflict", Mode: taskEntity.SyncModeAll, SourceSchema: "s", TargetSchema: "t",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Start()
+	task.MarkIncrementalStarted()
+	task.Pause() // 暂停 -> 非 RUNNING，不允许结束
+	if err := taskSvc.UpdateTask(task); err != nil {
+		t.Fatalf("stage task: %v", err)
+	}
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.POST("/api/tasks/:id/end", handler.EndTask)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/end_conflict/end", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRowCountComparisonHandler_Accepted STOPPED + ALL 任务启动核对返回 202。
+// 后台 goroutine 会因无真实 DB 失败，但接口本身返回 202。
+func TestRowCountComparisonHandler_Accepted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newHandlerTaskService(t)
+	defer taskSvc.Close()
+	stageAllTaskAtIncremental(t, taskSvc, "cmp_ok")
+	// 结束任务进入 STOPPED
+	if err := taskSvc.EndTask("cmp_ok"); err != nil {
+		t.Fatalf("end task: %v", err)
+	}
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.POST("/api/tasks/:id/row-count-comparison", handler.RowCountComparison)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/cmp_ok/row-count-comparison", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRowCountComparisonHandler_NotFound 不存在的任务返回 404。
+func TestRowCountComparisonHandler_NotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newHandlerTaskService(t)
+	defer taskSvc.Close()
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.POST("/api/tasks/:id/row-count-comparison", handler.RowCountComparison)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/missing/row-count-comparison", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRowCountComparisonHandler_Conflict RUNNING 状态任务（不可对比）返回 409。
+func TestRowCountComparisonHandler_Conflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newHandlerTaskService(t)
+	defer taskSvc.Close()
+	// RUNNING + ALL + INCREMENTAL_STARTED 状态不可对比（需 COMPLETED/STOPPED）
+	stageAllTaskAtIncremental(t, taskSvc, "cmp_conflict")
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.POST("/api/tasks/:id/row-count-comparison", handler.RowCountComparison)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/cmp_conflict/row-count-comparison", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestGetTaskReturnsRowCountComparison GET /api/tasks/:id 返回行数对比结果（脱敏后仍含结果）。
+func TestGetTaskReturnsRowCountComparison(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newHandlerTaskService(t)
+	defer taskSvc.Close()
+
+	// 创建一个 FULL 任务并完成全量，进入 COMPLETED（可对比状态）
+	task, err := taskSvc.CreateTask(taskEntity.TaskConfig{
+		ID:           "cmp_get",
+		Name:         "cmp-get-test",
+		Mode:         taskEntity.SyncModeFull,
+		SyncLevel:    taskEntity.SyncLevelTable,
+		SourceSchema: "src_db",
+		TargetSchema: "tgt_db",
+		Tables:       []string{"users"},
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Start()
+	task.MarkFullSyncCompleted()
+	task.Complete()
+	// COMPLETED 状态允许 UpdateTask
+	if err := taskSvc.UpdateTask(task); err != nil {
+		t.Fatalf("stage completed task: %v", err)
+	}
+
+	// 注入一个已完成的结果（COMPLETED 状态允许更新）
+	task, _ = taskSvc.GetTask("cmp_get")
+	srcRows := int64(100)
+	tgtRows := int64(100)
+	diff := int64(0)
+	task.Context.RowCountComparison = &taskEntity.RowCountComparison{
+		Status:        taskEntity.RowCountComparisonMatched,
+		TotalTables:   1,
+		CheckedTables: 1,
+		MatchedTables: 1,
+		SourceTotal:   100,
+		TargetTotal:   100,
+		Difference:    0,
+		Tables: []taskEntity.RowCountComparisonTable{
+			{
+				SourceSchema: "src_db", SourceTable: "users",
+				TargetSchema: "tgt_db", TargetTable: "users",
+				SourceRows: &srcRows, TargetRows: &tgtRows,
+				Difference: &diff, Matched: true,
+			},
+		},
+	}
+	if err := taskSvc.UpdateTask(task); err != nil {
+		t.Fatalf("update task with comparison: %v", err)
+	}
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.GET("/api/tasks/:id", handler.GetTask)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/tasks/cmp_get", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp taskEntity.SyncTask
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Context.RowCountComparison == nil {
+		t.Fatal("row_count_comparison not returned")
+	}
+	if resp.Context.RowCountComparison.Status != taskEntity.RowCountComparisonMatched {
+		t.Errorf("expected MATCHED, got %s", resp.Context.RowCountComparison.Status)
+	}
+}

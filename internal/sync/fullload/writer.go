@@ -12,6 +12,8 @@ import (
 
 const writeMaxRetries = 5
 
+const maxPreparedStatementsPerWriter = 128
+
 // CommitCallback 在一个事务成功提交后按表回调，用于推进进度（提交后才计数）。
 type CommitCallback func(schema, table string, rows, bytes int64)
 
@@ -21,11 +23,19 @@ type CommitCallback func(schema, table string, rows, bytes int64)
 // 回滚整个事务并重放全部未提交批次，而不是只重试当前批次；只有事务提交成功后
 // 才通过 onCommit 推进进度，避免静默缺数。
 func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, isStopped func() bool) error {
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	q.watchContext(workerCtx)
+
 	var wg sync.WaitGroup
-	var firstErr atomic.Value
+	var firstErr error
+	var errOnce sync.Once
 	setErr := func(err error) {
 		if err != nil {
-			firstErr.CompareAndSwap(nil, err)
+			errOnce.Do(func() {
+				firstErr = err
+				cancel()
+			})
 		}
 	}
 
@@ -35,17 +45,14 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 			defer wg.Done()
 			atomic.AddInt64(&stats.ActiveWriters, 1)
 			defer atomic.AddInt64(&stats.ActiveWriters, -1)
-			if err := writerLoop(ctx, id, targetDB, q, opt, stats, onCommit, isStopped); err != nil {
+			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, isStopped); err != nil {
 				setErr(err)
 			}
 		}(w)
 	}
 
 	wg.Wait()
-	if v := firstErr.Load(); v != nil {
-		return v.(error)
-	}
-	return nil
+	return firstErr
 }
 
 func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, isStopped func() bool) error {
@@ -55,12 +62,12 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	}
 	defer conn.Close()
 
-	label := fmt.Sprintf("v2-writer-%d", id)
 	if err := setupWriteSession(ctx, conn, opt.SkipBinlog); err != nil {
 		return fmt.Errorf("writer %d setup session: %w", id, err)
 	}
 	defer restoreWriteSession(conn, opt.SkipBinlog)
-	_ = label
+	stmtCache := newPreparedStmtCache(conn, maxPreparedStatementsPerWriter)
+	defer stmtCache.Close()
 
 	var (
 		tx      *sql.Tx
@@ -86,23 +93,10 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 		cs := time.Now()
 		cErr := tx.Commit()
 		if cErr != nil {
-			tx.Rollback()
 			tx = nil
-			if !isRetryableWriteErr(cErr) {
-				return fmt.Errorf("writer %d commit: %w", id, cErr)
-			}
-			// 提交阶段的可重试错误：重放整个事务缓冲后重试提交。
-			newTx, rErr := replayInFreshTx(ctx, conn, buf, opt)
-			if rErr != nil {
-				return fmt.Errorf("writer %d replay after commit failure: %w", id, rErr)
-			}
-			stats.incTxReplays()
-			cs = time.Now()
-			if cErr2 := newTx.Commit(); cErr2 != nil {
-				newTx.Rollback()
-				tx = nil
-				return fmt.Errorf("writer %d commit after replay: %w", id, cErr2)
-			}
+			// Commit 返回连接类错误时，服务端是否已经提交不可判定。普通 INSERT 不是幂等写，
+			// 此处禁止重放，否则可能把已提交事务再插入一次，尤其会静默复制无主键行。
+			return fmt.Errorf("writer %d commit (outcome unknown; transaction not replayed): %w", id, cErr)
 		}
 		dur := time.Since(cs)
 		stats.addCommit(txRows, txBytes, dur)
@@ -120,7 +114,21 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			return nil
 		}
 
-		batch, ok := q.Get(ctx)
+		var deadline time.Time
+		if tx != nil {
+			deadline = txStart.Add(opt.CommitInterval)
+		}
+		batch, ok, timedOut := q.GetUntil(ctx, deadline)
+		if ctx.Err() != nil || (isStopped != nil && isStopped()) {
+			rollback()
+			return nil
+		}
+		if timedOut {
+			if err := commit(); err != nil {
+				return err
+			}
+			continue
+		}
 		if !ok {
 			break
 		}
@@ -137,9 +145,9 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			txStart = time.Now()
 		}
 
-		wErr := writeBatchInTx(ctx, tx, batch, opt)
+		wErr := writeBatchInTxCached(ctx, tx, batch, opt, stmtCache)
 		if wErr != nil {
-			if !isRetryableWriteErr(wErr) {
+			if !isRetryableTxConflict(wErr) {
 				rollback()
 				return fmt.Errorf("writer %d write batch %s: %w", id, batch.ChunkID, wErr)
 			}
@@ -148,7 +156,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			tx.Rollback()
 			tx = nil
 			replayBatches := append(append([]*RowBatch{}, buf...), batch)
-			newTx, rErr := replayInFreshTx(ctx, conn, replayBatches, opt)
+			newTx, rErr := replayInFreshTx(ctx, conn, replayBatches, opt, stmtCache, stats)
 			if rErr != nil {
 				buf = nil
 				txRows, txBytes = 0, 0
@@ -158,7 +166,6 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			txStart = time.Now()
 			buf = replayBatches
 			txRows, txBytes = sumBuf(buf)
-			stats.incTxReplays()
 		} else {
 			buf = append(buf, batch)
 			txRows += rows
@@ -206,7 +213,7 @@ func sumBuf(buf []*RowBatch) (rows, bytes int64) {
 	return
 }
 
-func replayInFreshTx(ctx context.Context, conn *sql.Conn, batches []*RowBatch, opt Options) (*sql.Tx, error) {
+func replayInFreshTx(ctx context.Context, conn *sql.Conn, batches []*RowBatch, opt Options, stmtCache *preparedStmtCache, stats *Stats) (*sql.Tx, error) {
 	var lastErr error
 	for attempt := 1; attempt <= writeMaxRetries; attempt++ {
 		select {
@@ -216,18 +223,19 @@ func replayInFreshTx(ctx context.Context, conn *sql.Conn, batches []*RowBatch, o
 		}
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, err
 		}
+		stats.incTxReplays()
 		ok := true
 		for _, b := range batches {
-			if err := writeBatchInTx(ctx, tx, b, opt); err != nil {
+			if err := writeBatchInTxCached(ctx, tx, b, opt, stmtCache); err != nil {
 				lastErr = err
 				tx.Rollback()
 				ok = false
-				if !isRetryableWriteErr(err) {
+				if !isRetryableTxConflict(err) {
 					return nil, err
 				}
+				stats.incLockRetries()
 				break
 			}
 		}
@@ -240,6 +248,10 @@ func replayInFreshTx(ctx context.Context, conn *sql.Conn, batches []*RowBatch, o
 
 // writeBatchInTx 用普通多值 INSERT 写入一个批次，按占位符上限与字节上限拆分为多条语句。
 func writeBatchInTx(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Options) error {
+	return writeBatchInTxCached(ctx, tx, batch, opt, nil)
+}
+
+func writeBatchInTxCached(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Options, stmtCache *preparedStmtCache) error {
 	nCols := len(batch.Columns)
 	if nCols == 0 || len(batch.Rows) == 0 {
 		return nil
@@ -255,6 +267,11 @@ func writeBatchInTx(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Option
 
 	prefix := insertPrefix(batch)
 	rowPlaceholder := "(" + strings.TrimSuffix(strings.Repeat("?, ", nCols), ", ") + ")"
+	for rowIndex, row := range batch.Rows {
+		if len(row) != nCols {
+			return fmt.Errorf("row %d has %d values, want %d columns", rowIndex, len(row), nCols)
+		}
+	}
 
 	i := 0
 	for i < len(batch.Rows) {
@@ -292,7 +309,7 @@ func writeBatchInTx(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Option
 			sb.WriteString(rowPlaceholder)
 			args = append(args, row...)
 		}
-		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+		if err := execInsert(ctx, tx, stmtCache, sb.String(), args...); err != nil {
 			return err
 		}
 		i = j
@@ -303,21 +320,96 @@ func writeBatchInTx(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Option
 func insertPrefix(batch *RowBatch) string {
 	cols := make([]string, len(batch.Columns))
 	for i, c := range batch.Columns {
-		cols[i] = "`" + strings.ReplaceAll(c, "`", "``") + "`"
+		cols[i] = quoteIdentifier(c)
 	}
-	return fmt.Sprintf("INSERT INTO `%s`.`%s` (%s) VALUES ",
-		batch.TargetSchema, batch.TargetTable, strings.Join(cols, ", "))
+	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES ",
+		quoteIdentifier(batch.TargetSchema), quoteIdentifier(batch.TargetTable), strings.Join(cols, ", "))
 }
 
-// isRetryableWriteErr 判断写入错误是否为可重试的锁冲突或连接失效。
-func isRetryableWriteErr(err error) bool {
+// isRetryableTxConflict 仅判断事务内语句可安全重放的锁冲突。
+// 连接错误和 Commit 错误的提交结果可能未知，不能用普通 INSERT 自动重放。
+func isRetryableTxConflict(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "deadlock") ||
 		strings.Contains(s, "lock wait timeout") ||
-		strings.Contains(s, "try restarting transaction") ||
-		strings.Contains(s, "bad connection") ||
-		strings.Contains(s, "invalid connection")
+		strings.Contains(s, "try restarting transaction")
+}
+
+type preparedStmtCache struct {
+	conn    *sql.Conn
+	limit   int
+	stmts   map[string]*sql.Stmt
+	order   []string
+	tx      *sql.Tx
+	txStmts map[string]*sql.Stmt
+}
+
+func newPreparedStmtCache(conn *sql.Conn, limit int) *preparedStmtCache {
+	return &preparedStmtCache{conn: conn, limit: limit, stmts: make(map[string]*sql.Stmt)}
+}
+
+func (c *preparedStmtCache) statement(ctx context.Context, query string) (*sql.Stmt, error) {
+	if stmt := c.stmts[query]; stmt != nil {
+		return stmt, nil
+	}
+	stmt, err := c.conn.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if c.limit > 0 && len(c.order) >= c.limit {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		_ = c.stmts[oldest].Close()
+		delete(c.stmts, oldest)
+	}
+	c.stmts[query] = stmt
+	c.order = append(c.order, query)
+	return stmt, nil
+}
+
+func (c *preparedStmtCache) transactionStatement(ctx context.Context, tx *sql.Tx, query string) (*sql.Stmt, error) {
+	if c.tx != tx {
+		// database/sql 会在 Commit/Rollback 时关闭由 Tx.StmtContext 派生的语句。
+		c.tx = tx
+		c.txStmts = make(map[string]*sql.Stmt)
+	}
+	if stmt := c.txStmts[query]; stmt != nil {
+		return stmt, nil
+	}
+	parent, err := c.statement(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	stmt := tx.StmtContext(ctx, parent)
+	c.txStmts[query] = stmt
+	return stmt, nil
+}
+
+func (c *preparedStmtCache) Close() {
+	if c == nil {
+		return
+	}
+	for _, stmt := range c.stmts {
+		_ = stmt.Close()
+	}
+	c.stmts = nil
+	c.order = nil
+	c.tx = nil
+	c.txStmts = nil
+}
+
+func execInsert(ctx context.Context, tx *sql.Tx, cache *preparedStmtCache, query string, args ...any) error {
+	if cache == nil {
+		_, err := tx.ExecContext(ctx, query, args...)
+		return err
+	}
+	stmt, err := cache.transactionStatement(ctx, tx, query)
+	if err != nil {
+		return err
+	}
+	_, err = stmt.ExecContext(ctx, args...)
+	return err
 }

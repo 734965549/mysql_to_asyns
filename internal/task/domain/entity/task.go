@@ -15,10 +15,11 @@ type TaskStatus string // 定义任务状态为字符串类型
 const ( // 定义常量
 	TaskStatusPending   TaskStatus = "PENDING"   // 待执行：任务已创建但未开始
 	TaskStatusRunning   TaskStatus = "RUNNING"   // 执行中：任务正在执行
-	TaskStatusPaused    TaskStatus = "PAUSED"    // 已暂停：任务被暂停
-	TaskStatusCompleted TaskStatus = "COMPLETED" // 已完成：任务执行完成
+	TaskStatusPaused    TaskStatus = "PAUSED"    // 已暂停：任务被暂停，允许原任务继续启动
+	TaskStatusCompleted TaskStatus = "COMPLETED" // 已完成：一次性任务（如 FULL）自然执行完成
 	TaskStatusFailed    TaskStatus = "FAILED"    // 失败：任务执行失败
 	TaskStatusScheduled TaskStatus = "SCHEDULED" // 已计划：任务已设定定时启动时间
+	TaskStatusStopped   TaskStatus = "STOPPED"   // 已结束：用户在增量阶段手动结束持续运行的 ALL 任务，终态，不允许原任务再次启动/编辑/调度；仍允许查看、行数对比、复制新建和删除
 )
 
 // SyncMode 同步模式
@@ -156,6 +157,138 @@ type ProcessContext struct { // 定义处理上下文结构体
 	// 历史兼容字段：曾用于记录每张表的全量同步进度，key = "sourceSchema.tableName"。
 	// 当前全量使用普通 INSERT，暂停/失败后不再续传；进入新一轮全量前会清空。
 	FullSyncResume map[string]*TableSyncProgress `json:"full_sync_resume,omitempty"`
+
+	// === 行数对比（手动触发，与同步流程解耦）===
+	// 由用户在任务结束/完成后点击"对比行数"触发，后台精确统计源端和目标端 COUNT(*)，
+	// 结果随任务存档持久化。不会因为同步完成自动触发，也不会因不一致而修改原任务终态。
+	// 旧任务 JSON 没有该字段时按 nil 处理，无需数据库表结构迁移。
+	RowCountComparison *RowCountComparison `json:"row_count_comparison,omitempty"`
+}
+
+// RowCountComparisonStatus 行数对比汇总状态。
+type RowCountComparisonStatus string
+
+const (
+	RowCountComparisonChecking  RowCountComparisonStatus = "CHECKING"  // 后台核对进行中
+	RowCountComparisonMatched   RowCountComparisonStatus = "MATCHED"   // 全部表查询成功且行数一致
+	RowCountComparisonMismatched RowCountComparisonStatus = "MISMATCHED" // 全部表查询成功，至少一张表不一致
+	RowCountComparisonPartial   RowCountComparisonStatus = "PARTIAL"   // 部分表查询失败，其余结果正常保存
+	RowCountComparisonFailed    RowCountComparisonStatus = "FAILED"    // 连接/表清单获取失败，或所有表均无法完成核对
+)
+
+// RowCountComparison 行数对比汇总结果。
+//
+// difference 统一定义为"目标端行数减源端行数"。
+// source_total / target_total 只汇总两端都查询成功的表。
+// 行数使用 *int64 指针区分真实的 0 与查询失败时的未知值（nil）。
+type RowCountComparison struct {
+	Status           RowCountComparisonStatus  `json:"status"`            // 汇总状态
+	StartedAt        *time.Time                `json:"started_at,omitempty"`   // 核对开始时间
+	CompletedAt      *time.Time                `json:"completed_at,omitempty"` // 核对完成时间（CHECKING 时为空）
+	TotalTables      int                       `json:"total_tables"`      // 待核对表总数
+	CheckedTables    int                       `json:"checked_tables"`    // 已完成核对表数（含失败）
+	MatchedTables    int                       `json:"matched_tables"`    // 行数一致表数
+	MismatchedTables int                       `json:"mismatched_tables"` // 行数不一致表数
+	FailedTables     int                       `json:"failed_tables"`     // 查询失败表数
+	SourceTotal      int64                     `json:"source_total"`      // 源端总行数（仅两端均成功）
+	TargetTotal      int64                     `json:"target_total"`      // 目标端总行数（仅两端均成功）
+	Difference       int64                     `json:"difference"`        // 目标总行数 - 源端总行数
+	FailureReason    string                    `json:"failure_reason,omitempty"` // FAILED 时的原因（如服务重启中断）
+	Tables           []RowCountComparisonTable `json:"tables,omitempty"`  // 逐表结果
+}
+
+// RowCountComparisonTable 单表行数对比结果。
+type RowCountComparisonTable struct {
+	SourceSchema string `json:"source_schema"`           // 源库
+	SourceTable  string `json:"source_table"`            // 源表
+	TargetSchema string `json:"target_schema"`           // 目标库
+	TargetTable  string `json:"target_table"`            // 目标表
+	SourceRows   *int64 `json:"source_rows,omitempty"`   // 源端行数；nil 表示查询失败
+	TargetRows   *int64 `json:"target_rows,omitempty"`   // 目标端行数；nil 表示查询失败
+	Difference   *int64 `json:"difference,omitempty"`    // 目标端 - 源端；nil 表示至少一端查询失败
+	Matched      bool   `json:"matched"`                 // 两端均成功且行数一致
+	Error        string `json:"error,omitempty"`         // 查询失败时的错误信息（按端区分：source: ... / target: ...）
+}
+
+func cloneInt64Ptr(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	copied := *v
+	return &copied
+}
+
+func cloneTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	copied := *t
+	return &copied
+}
+
+// CloneRowCountComparison 深拷贝行数对比结果，供 API 在锁外安全序列化。
+func CloneRowCountComparison(rc *RowCountComparison) *RowCountComparison {
+	if rc == nil {
+		return nil
+	}
+	cloned := *rc
+	cloned.StartedAt = cloneTimePtr(rc.StartedAt)
+	cloned.CompletedAt = cloneTimePtr(rc.CompletedAt)
+	if len(rc.Tables) > 0 {
+		cloned.Tables = make([]RowCountComparisonTable, len(rc.Tables))
+		for i, tbl := range rc.Tables {
+			cloned.Tables[i] = RowCountComparisonTable{
+				SourceSchema: tbl.SourceSchema,
+				SourceTable:  tbl.SourceTable,
+				TargetSchema: tbl.TargetSchema,
+				TargetTable:  tbl.TargetTable,
+				SourceRows:   cloneInt64Ptr(tbl.SourceRows),
+				TargetRows:   cloneInt64Ptr(tbl.TargetRows),
+				Difference:   cloneInt64Ptr(tbl.Difference),
+				Matched:      tbl.Matched,
+				Error:        tbl.Error,
+			}
+		}
+	}
+	return &cloned
+}
+
+// CloneForRead 返回 ProcessContext 的只读快照，避免与后台 goroutine 并发读写同一指针字段。
+func (ctx ProcessContext) CloneForRead() ProcessContext {
+	cloned := ctx
+	cloned.ScheduledAt = cloneTimePtr(ctx.ScheduledAt)
+	if ctx.ScheduledFromStatus != nil {
+		status := *ctx.ScheduledFromStatus
+		cloned.ScheduledFromStatus = &status
+	}
+	cloned.FullSyncStartedAt = cloneTimePtr(ctx.FullSyncStartedAt)
+	cloned.FullSyncCompletedAt = cloneTimePtr(ctx.FullSyncCompletedAt)
+	cloned.RowCountComparison = CloneRowCountComparison(ctx.RowCountComparison)
+	return cloned
+}
+
+// CloneForRead 返回任务只读快照；GetTask 仍返回 live 指针供服务内部修改，API 读取应优先使用 TaskService.GetTaskSnapshot。
+func (t *SyncTask) CloneForRead() *SyncTask {
+	if t == nil {
+		return nil
+	}
+	cloned := *t
+	cloned.Context = t.Context.CloneForRead()
+	cloned.Config = t.Config
+	cloned.Config.SourceDatabases = append([]string(nil), t.Config.SourceDatabases...)
+	cloned.Config.TargetDatabases = append([]string(nil), t.Config.TargetDatabases...)
+	cloned.Config.Tables = append([]string(nil), t.Config.Tables...)
+	cloned.Config.TargetTables = append([]string(nil), t.Config.TargetTables...)
+	if t.Config.SourceDB != nil {
+		sourceDB := *t.Config.SourceDB
+		cloned.Config.SourceDB = &sourceDB
+	}
+	if t.Config.TargetDB != nil {
+		targetDB := *t.Config.TargetDB
+		cloned.Config.TargetDB = &targetDB
+	}
+	cloned.Config.SinkConfigs = sink.CloneConfigs(t.Config.SinkConfigs)
+	return &cloned
 }
 
 // ResumeKey 历史全量断点键：主键各列的字符串化值（单列主键长度为 1，复合主键按列顺序）。
@@ -298,6 +431,18 @@ func (t *SyncTask) CancelSchedule() { // 取消定时启动
 func (t *SyncTask) Pause() { // 暂停任务
 	t.Context.Status = TaskStatusPaused   // 设置状态为已暂停
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
+}
+
+// Stop 结束任务方法。
+// 用于持续运行的 ALL 任务在增量阶段被用户手动结束：进入终态 STOPPED，记录结束时间，
+// 清除 Cron/repeat 等调度配置。STOPPED 不允许原任务再次启动、编辑或设置定时调度。
+// 人工结束不计入自然完成任务数（tasks_completed 指标仍只统计 COMPLETED）。
+func (t *SyncTask) Stop() {
+	now := time.Now()
+	t.Context.Status = TaskStatusStopped // 设置状态为已结束
+	t.Context.EndTime = now              // 记录结束时间
+	t.Context.LastUpdateTime = now       // 更新最后更新时间
+	t.ClearScheduleConfig()              // 清除 Cron/repeat/once 调度配置
 }
 
 // Complete 完成任务方法

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestGetMetrics(t *testing.T) {
@@ -17,6 +18,42 @@ func TestGetMetrics(t *testing.T) {
 	if metrics != metrics2 {
 		t.Error("expected same metrics instance")
 	}
+}
+
+func TestFullLoadGaugesAggregateDeltas(t *testing.T) {
+	metrics := GetMetrics()
+	metrics.SetFullLoadQueueBytes(0)
+	metrics.SetFullLoadActiveWorkers(0, 0)
+
+	// 模拟两个并行任务分别上报快照差值；一个任务结束不能清零另一个任务的值。
+	metrics.AddFullLoadQueueBytes(100)
+	metrics.AddFullLoadQueueBytes(50)
+	metrics.AddFullLoadActiveWorkers(2, 3)
+	metrics.AddFullLoadActiveWorkers(1, 1)
+	metrics.AddFullLoadQueueBytes(-100)
+	metrics.AddFullLoadActiveWorkers(-2, -3)
+
+	if got := gaugeValue(t, metrics.FullLoadQueueBytes); got != 50 {
+		t.Fatalf("queue gauge=%v want 50", got)
+	}
+	if got := gaugeValue(t, metrics.FullLoadActiveReaders); got != 1 {
+		t.Fatalf("reader gauge=%v want 1", got)
+	}
+	if got := gaugeValue(t, metrics.FullLoadActiveWriters); got != 1 {
+		t.Fatalf("writer gauge=%v want 1", got)
+	}
+
+	metrics.AddFullLoadQueueBytes(-50)
+	metrics.AddFullLoadActiveWorkers(-1, -1)
+}
+
+func gaugeValue(t *testing.T, gauge prometheus.Gauge) float64 {
+	t.Helper()
+	metric := &dto.Metric{}
+	if err := gauge.Write(metric); err != nil {
+		t.Fatal(err)
+	}
+	return metric.GetGauge().GetValue()
 }
 
 func TestUpdateTaskMetrics(t *testing.T) {

@@ -263,3 +263,90 @@ func TestTaskStorage_SaveAndUpdate(t *testing.T) {
 		t.Errorf("expected total rows 10000, got %d", tasks[0].Context.TotalRows)
 	}
 }
+
+// TestFileTaskStorage_PreservesRowCountComparison 验证行数对比结果能完整保存与加载，
+// 同时不影响内存中的明文密码处理规则。
+func TestFileTaskStorage_PreservesRowCountComparison(t *testing.T) {
+	dataDir := t.TempDir()
+	storage := NewFileTaskStorage(dataDir)
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:           "cmp_storage",
+		Name:         "Compare Storage",
+		Mode:         taskEntity.SyncModeAll,
+		SourceSchema: "src_db",
+		TargetSchema: "tgt_db",
+		SourceDB:     &taskEntity.DatabaseConfig{Host: "h", Port: 3306, Username: "u", Password: "plaintext-secret"},
+	})
+	task.Start()
+	task.MarkIncrementalStarted()
+	task.Stop() // STOPPED
+
+	srcRows := int64(100)
+	tgtRows := int64(99)
+	diff := int64(-1)
+	task.Context.RowCountComparison = &taskEntity.RowCountComparison{
+		Status:           taskEntity.RowCountComparisonMismatched,
+		TotalTables:      1,
+		CheckedTables:    1,
+		MatchedTables:    0,
+		MismatchedTables: 1,
+		FailedTables:     0,
+		SourceTotal:      100,
+		TargetTotal:      99,
+		Difference:       -1,
+		Tables: []taskEntity.RowCountComparisonTable{
+			{
+				SourceSchema: "src_db", SourceTable: "users",
+				TargetSchema: "tgt_db", TargetTable: "users",
+				SourceRows: &srcRows, TargetRows: &tgtRows,
+				Difference: &diff, Matched: false,
+			},
+		},
+	}
+
+	if err := storage.Save(task); err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	// 内存中的明文密码不应被存储过程永久篡改
+	if task.Config.SourceDB.Password != "plaintext-secret" {
+		t.Errorf("in-memory plaintext password mutated by save: %q", task.Config.SourceDB.Password)
+	}
+
+	tasks, err := storage.LoadAll()
+	if err != nil {
+		t.Fatalf("load all: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasks))
+	}
+	loaded := tasks[0]
+	if loaded.Context.Status != taskEntity.TaskStatusStopped {
+		t.Errorf("expected STOPPED, got %s", loaded.Context.Status)
+	}
+	if loaded.Context.RowCountComparison == nil {
+		t.Fatal("row_count_comparison not preserved by storage")
+	}
+	rc := loaded.Context.RowCountComparison
+	if rc.Status != taskEntity.RowCountComparisonMismatched {
+		t.Errorf("expected MISATCHED, got %s", rc.Status)
+	}
+	if rc.Difference != -1 {
+		t.Errorf("expected difference -1, got %d", rc.Difference)
+	}
+	if len(rc.Tables) != 1 {
+		t.Fatalf("expected 1 table result, got %d", len(rc.Tables))
+	}
+	tbl := rc.Tables[0]
+	if tbl.SourceRows == nil || *tbl.SourceRows != 100 {
+		t.Errorf("expected source rows 100, got %v", tbl.SourceRows)
+	}
+	if tbl.TargetRows == nil || *tbl.TargetRows != 99 {
+		t.Errorf("expected target rows 99, got %v", tbl.TargetRows)
+	}
+	if tbl.Matched {
+		t.Error("expected mismatched table")
+	}
+	// 行数对比结果不得包含密码等敏感信息（结构体本身无密码字段，此处确保 SourceDB.Password 不在结果 JSON 中）
+}

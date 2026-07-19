@@ -3,6 +3,7 @@ package fullload
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,13 +14,13 @@ import (
 
 // Engine 是全量 V2 任务级流水线引擎。
 type Engine struct {
-	SourceDB *sql.DB
-	TargetDB *sql.DB
-	Options  Options
-	Stats    *Stats
-	OnCommit CommitCallback // 事务提交后按表回调，用于推进进度
-	IsStopped func() bool   // 返回 true 时引擎尽快停止（用户暂停/取消）
-	TaskID   string
+	SourceDB  *sql.DB
+	TargetDB  *sql.DB
+	Options   Options
+	Stats     *Stats
+	OnCommit  CommitCallback // 事务提交后按表回调，用于推进进度
+	IsStopped func() bool    // 返回 true 时引擎尽快停止（用户暂停/取消）
+	TaskID    string
 
 	reported StatsSnapshot // 已上报到 Prometheus 的累计快照（仅 reportLoop / pushFinalMetrics 访问）
 }
@@ -30,9 +31,36 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		e.Stats = &Stats{}
 	}
 	opt := e.Options
+	if e.SourceDB == nil || e.TargetDB == nil {
+		return fmt.Errorf("full-load V2 requires non-nil source and target databases")
+	}
+	if opt.ReadWorkers < 1 || opt.WriteWorkers < 1 || opt.BatchRows < 1 || opt.BufferBytes < 1 {
+		return fmt.Errorf("full-load V2 received unresolved or invalid options")
+	}
 
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopWatchDone := make(chan struct{})
+	if e.IsStopped != nil {
+		go func() {
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopWatchDone:
+					return
+				case <-cctx.Done():
+					return
+				case <-ticker.C:
+					if e.IsStopped() {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+	defer close(stopWatchDone)
 
 	planner := NewPlanner(e.SourceDB)
 	targetChunks := opt.ReadWorkers * opt.ChunkOvershoot
@@ -47,6 +75,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 
 	q := newBatchQueue(opt.BufferBytes, e.Stats)
 	q.watchContext(cctx)
+	e.reported = e.Stats.Snapshot()
 
 	chunkCh := make(chan *Chunk, len(chunks))
 	for _, c := range chunks {
@@ -104,13 +133,18 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	if writerErr != nil {
 		return writerErr
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if cctx.Err() != nil {
+		return context.Canceled
+	}
 	return nil
 }
 
 func (e *Engine) reportLoop(ctx context.Context, stop <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	e.reported = e.Stats.Snapshot()
 	for {
 		select {
 		case <-ctx.Done():
@@ -135,14 +169,12 @@ func (e *Engine) pushMetrics(prev, cur StatsSnapshot) {
 	m.AddFullLoadCommit(cur.CommittedRows-prev.CommittedRows, cur.CommittedBytes-prev.CommittedBytes, cur.Commits-prev.Commits)
 	m.AddFullLoadTxReplays(cur.TxReplays - prev.TxReplays)
 	m.AddFullLoadLockRetries(cur.LockRetries - prev.LockRetries)
-	m.SetFullLoadQueueBytes(cur.QueueBytes)
-	m.SetFullLoadActiveWorkers(cur.ActiveReaders, cur.ActiveWriters)
+	m.AddFullLoadQueueBytes(cur.QueueBytes - prev.QueueBytes)
+	m.AddFullLoadActiveWorkers(cur.ActiveReaders-prev.ActiveReaders, cur.ActiveWriters-prev.ActiveWriters)
 }
 
 func (e *Engine) pushFinalMetrics() {
 	// 结束时补一次增量（reportLoop 已在 reportWG.Wait() 后停止，无并发访问 e.reported）。
 	cur := e.Stats.Snapshot()
 	e.pushMetrics(e.reported, cur)
-	metrics.GetMetrics().SetFullLoadQueueBytes(0)
-	metrics.GetMetrics().SetFullLoadActiveWorkers(0, 0)
 }

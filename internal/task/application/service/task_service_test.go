@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1691,6 +1692,49 @@ func TestIncrementTaskProgress_ThrottleReset(t *testing.T) {
 	// 新运行首次调用应触发 Save（因为节流记录已被清理）
 	ts.incrementTaskProgress("task_1", 200, "pos_2")
 	assert.Equal(t, 1, spy.SaveCount(), "清理节流记录后，新运行首次调用应触发 Save")
+}
+
+// TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave 验证 Pause 等锁内同步存档后，
+// 滞后的 RUNNING 进度快照不会在锁外落盘，避免把 PAUSED/STOPPED 覆盖回 RUNNING。
+func TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave(t *testing.T) {
+	dataDir := t.TempDir()
+
+	ts, spy := newTestTaskServiceWithSpy(dataDir)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	require.NoError(t, err)
+	task.Start()
+	task.Context.TotalRows = 1000
+	spy.ResetCount()
+
+	// 模拟 incrementTaskProgress 已出锁、尚未 Save 的陈旧 RUNNING 快照。
+	ts.mu.Lock()
+	task.Context.ProcessedRows = 100
+	task.Context.CurrentPosition = "pos_stale"
+	staleTime := time.Now().Add(-2 * time.Second)
+	task.Context.LastUpdateTime = staleTime
+	staleJSON, marshalErr := json.Marshal(task)
+	require.NoError(t, marshalErr)
+	var staleSnapshot taskEntity.SyncTask
+	require.NoError(t, json.Unmarshal(staleJSON, &staleSnapshot))
+	task.Pause()
+	ts.mu.Unlock()
+
+	require.NoError(t, ts.storage.Save(task))
+	spy.ResetCount()
+
+	assert.False(t, ts.shouldPersistAsyncProgressSnapshot("task_1", &staleSnapshot))
+	if ts.shouldPersistAsyncProgressSnapshot("task_1", &staleSnapshot) {
+		_ = ts.storage.Save(&staleSnapshot)
+	}
+	assert.Equal(t, 0, spy.SaveCount(), "stale snapshot must not be persisted")
+
+	loadedTasks, loadErr := ts.storage.LoadAll()
+	require.NoError(t, loadErr)
+	require.Len(t, loadedTasks, 1)
+	loaded := loadedTasks[0]
+	assert.Equal(t, taskEntity.TaskStatusPaused, loaded.Context.Status)
+	assert.Equal(t, int64(100), loaded.Context.ProcessedRows)
 }
 
 // TestDeleteTask_CleansThrottleRecord 验证 DeleteTask 会清理 lastProgressPersist。

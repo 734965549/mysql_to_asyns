@@ -2,6 +2,7 @@ package fullload
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"mysql-to-sync/internal/metadata/domain/entity"
@@ -21,8 +22,8 @@ func TestIsIntegerColumn(t *testing.T) {
 	if isIntegerColumn(id, "code") {
 		t.Error("varchar should not be integer")
 	}
-	if !isIntegerColumn(id, "cnt") {
-		t.Error("int unsigned should be integer")
+	if isIntegerColumn(id, "cnt") {
+		t.Error("unsigned integer should use keyset planning because NullInt64 cannot cover its full range")
 	}
 }
 
@@ -48,6 +49,17 @@ func TestBuildKeysetLower_Composite(t *testing.T) {
 	}
 }
 
+func TestBuildKeysetUpperInclusive_Composite(t *testing.T) {
+	where, args := buildKeysetUpperInclusive([]string{"a", "b"}, []any{1, 2})
+	want := "(`a` < ?) OR (`a` = ? AND `b` <= ?)"
+	if where != want {
+		t.Errorf("where=%q want %q", where, want)
+	}
+	if len(args) != 3 || args[0] != 1 || args[1] != 1 || args[2] != 2 {
+		t.Errorf("args=%v", args)
+	}
+}
+
 func TestPlanTable_NoPK(t *testing.T) {
 	db, _, _ := sqlmock.New()
 	defer db.Close()
@@ -63,21 +75,65 @@ func TestPlanTable_NoPK(t *testing.T) {
 }
 
 func TestPlanTable_Composite(t *testing.T) {
-	db, _, _ := sqlmock.New()
+	db, mock, _ := sqlmock.New()
 	defer db.Close()
 	p := NewPlanner(db)
-	spec := &TableSpec{SourceSchema: "s", SourceTable: "t", Identity: &entity.TableIdentity{
+	spec := &TableSpec{SourceSchema: "s", SourceTable: "t", EstimatedRows: 3000, Identity: &entity.TableIdentity{
 		Strategy:     entity.PKStrategy,
 		IdentifyCols: []string{"a", "b"},
 		CursorCols:   []string{"a", "b"},
 		Columns:      []entity.ColumnMeta{{Name: "a", DataType: "int"}, {Name: "b", DataType: "int"}},
 	}}
+	mock.ExpectQuery("SELECT `a`, `b`").WillReturnRows(sqlmock.NewRows([]string{"a", "b"}).AddRow(1, 1000))
+	mock.ExpectQuery("SELECT `a`, `b`").WillReturnRows(sqlmock.NewRows([]string{"a", "b"}).AddRow(2, 2000))
+	mock.ExpectQuery("SELECT `a`, `b`").WillReturnRows(sqlmock.NewRows([]string{"a", "b"}))
+	chunks, err := p.planTable(context.Background(), spec, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 3 || chunks[0].Sequential || chunks[0].NoPK {
+		t.Fatalf("composite plan wrong: %+v", chunks)
+	}
+	if chunks[0].Start != nil || chunks[2].End != nil {
+		t.Fatalf("first/last boundaries wrong: %+v", chunks)
+	}
+	for i := 1; i < len(chunks); i++ {
+		if len(chunks[i-1].End) != 2 || len(chunks[i].Start) != 2 ||
+			chunks[i-1].End[0] != chunks[i].Start[0] || chunks[i-1].End[1] != chunks[i].Start[1] {
+			t.Fatalf("chunk boundary gap/overlap at %d: prev=%v next=%v", i, chunks[i-1].End, chunks[i].Start)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlanIntegerRangeFullInt64DoesNotOverflow(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	p := NewPlanner(db)
+	spec := &TableSpec{SourceSchema: "s", SourceTable: "t", Identity: &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		IdentifyCols: []string{"id"},
+		CursorCols:   []string{"id"},
+		Columns:      []entity.ColumnMeta{{Name: "id", DataType: "bigint"}},
+	}}
+	mock.ExpectQuery("SELECT MIN").WillReturnRows(
+		sqlmock.NewRows([]string{"min", "max"}).AddRow(int64(math.MinInt64), int64(math.MaxInt64)))
 	chunks, err := p.planTable(context.Background(), spec, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chunks) != 1 || !chunks[0].Sequential || chunks[0].NoPK {
-		t.Fatalf("composite plan wrong: %+v", chunks)
+	if len(chunks) != 8 || chunks[0].Start != nil || chunks[len(chunks)-1].End != nil {
+		t.Fatalf("unexpected chunks: %+v", chunks)
+	}
+	for i := 1; i < len(chunks); i++ {
+		if chunks[i-1].End[0] != chunks[i].Start[0] {
+			t.Fatalf("boundary mismatch at %d: %v vs %v", i, chunks[i-1].End, chunks[i].Start)
+		}
 	}
 }
 

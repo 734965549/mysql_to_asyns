@@ -408,15 +408,16 @@ env:
 | `full_load_engine` | 全量引擎，`v1` / `v2` | `v1` |
 | `full_load_read_workers` | 读取 worker 数 | 4（范围 1–64） |
 | `full_load_write_workers` | 写入 worker 数 | 4（范围 1–64） |
-| `full_load_buffer_mb` | RowBatch 队列容量（MiB），背压阈值 | 128 |
-| `full_load_batch_bytes_mb` | 单批目标字节数（MiB），达到即入队 | 4 |
-| `full_load_commit_rows` | 单事务累计提交行数阈值 | 10000（不小于 `batch_size`） |
-| `full_load_commit_bytes_mb` | 单事务累计提交字节阈值（MiB） | 32（不小于单批字节） |
+| `full_load_buffer_mb` | RowBatch 队列容量（MiB），背压阈值 | 128（范围 1–4096） |
+| `full_load_batch_bytes_mb` | 单批目标字节数（MiB），达到即入队 | 4（范围 1–64） |
+| `full_load_commit_rows` | 单事务累计提交行数阈值 | 10000（不小于 `batch_size`，上限 10000000） |
+| `full_load_commit_bytes_mb` | 单事务累计提交字节阈值（MiB） | 32（不小于单批字节，上限 4096） |
 
 说明：
 
 - 所有 V2 字段为 0 或未配置时使用上表默认值（4C8G 平衡预设）。`full_load_read_workers`
-  与 `full_load_write_workers` 会被夹在 `[1, 64]`。
+  与 `full_load_write_workers` 会被夹在 `[1, 64]`；其余显式值超过上表上限时也会被夹紧，
+  防止异常 API 参数造成整数溢出或无界内存申请。
 - 未显式设置 `full_load_commit_rows` 但设置了 `tx_commit_every_n_parallel` 时，
   提交行数按 `batch_size × tx_commit_every_n_parallel` 推导，兼容旧调优习惯。
 - V2 沿用 V1 的建表 / 删索引 / 索引回放（`optimize_index`、`index_restore_worker_count`）

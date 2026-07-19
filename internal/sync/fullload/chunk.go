@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math/big"
 	"strings"
 
 	"mysql-to-sync/internal/metadata/domain/entity"
@@ -11,11 +12,11 @@ import (
 
 // TableSpec 描述一张待全量同步的表（源与目标已就绪，仅差数据复制）。
 type TableSpec struct {
-	SourceSchema string
-	TargetSchema string
-	SourceTable  string
-	TargetTable  string
-	Identity     *entity.TableIdentity
+	SourceSchema  string
+	TargetSchema  string
+	SourceTable   string
+	TargetTable   string
+	Identity      *entity.TableIdentity
 	EstimatedRows int64
 }
 
@@ -49,6 +50,9 @@ func (p *Planner) Plan(ctx context.Context, specs []*TableSpec, targetChunks int
 	}
 	var chunks []*Chunk
 	for _, spec := range specs {
+		if spec == nil {
+			return nil, fmt.Errorf("table spec is nil")
+		}
 		tc, err := p.planTable(ctx, spec, targetChunks)
 		if err != nil {
 			return nil, fmt.Errorf("plan chunks for %s.%s: %w", spec.SourceSchema, spec.SourceTable, err)
@@ -60,17 +64,23 @@ func (p *Planner) Plan(ctx context.Context, specs []*TableSpec, targetChunks int
 
 func (p *Planner) planTable(ctx context.Context, spec *TableSpec, targetChunks int) ([]*Chunk, error) {
 	id := spec.Identity
+	if id == nil {
+		return nil, fmt.Errorf("table identity is nil")
+	}
 
 	// 无主键表：单个流式 chunk。
-	if id == nil || id.Strategy == entity.FullColumnsStrategy {
+	if id.Strategy == entity.FullColumnsStrategy {
 		return []*Chunk{{ID: chunkID(spec, 0), Spec: spec, NoPK: true, Sequential: true}}, nil
 	}
 
 	cursorCols := id.EffectiveCursorCols()
+	if len(cursorCols) == 0 {
+		return nil, fmt.Errorf("table identity has no cursor columns")
+	}
 
-	// 复合游标：整表 keyset 顺序读取（保证正确性，暂不并行切分）。
-	if len(cursorCols) != 1 {
-		return []*Chunk{{ID: chunkID(spec, 0), Spec: spec, Sequential: true}}, nil
+	// 复合游标通过 PK-only keyset 扫描生成近似等行边界，避免退化成单 reader 长尾。
+	if len(cursorCols) > 1 {
+		return p.planKeysetBoundaries(ctx, spec, cursorCols, targetChunks)
 	}
 
 	col := cursorCols[0]
@@ -81,13 +91,15 @@ func (p *Planner) planTable(ctx context.Context, spec *TableSpec, targetChunks i
 	}
 
 	// 单列字符串/其他类型：PK-only keyset 扫描生成近似等行数边界。
-	return p.planKeysetBoundaries(ctx, spec, col, targetChunks)
+	return p.planKeysetBoundaries(ctx, spec, cursorCols, targetChunks)
 }
 
 // planIntegerRange 对连续/稀疏整数主键做值域等分；过量分片配合工作窃取降低倾斜影响。
 func (p *Planner) planIntegerRange(ctx context.Context, spec *TableSpec, col string, targetChunks int) ([]*Chunk, error) {
 	var minV, maxV sql.NullInt64
-	q := fmt.Sprintf("SELECT MIN(`%s`), MAX(`%s`) FROM `%s`.`%s`", col, col, spec.SourceSchema, spec.SourceTable)
+	q := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s.%s",
+		quoteIdentifier(col), quoteIdentifier(col),
+		quoteIdentifier(spec.SourceSchema), quoteIdentifier(spec.SourceTable))
 	if err := p.sourceDB.QueryRowContext(ctx, q).Scan(&minV, &maxV); err != nil {
 		return nil, err
 	}
@@ -96,50 +108,42 @@ func (p *Planner) planIntegerRange(ctx context.Context, spec *TableSpec, col str
 		return []*Chunk{{ID: chunkID(spec, 0), Spec: spec}}, nil
 	}
 
-	span := maxV.Int64 - minV.Int64 + 1
+	// 使用任意精度整数计算边界，避免 MININT64..MAXINT64 范围的减法/加法溢出。
+	minBig := big.NewInt(minV.Int64)
+	span := new(big.Int).Sub(big.NewInt(maxV.Int64), minBig)
+	span.Add(span, big.NewInt(1))
 	nChunks := int64(targetChunks)
-	if nChunks > span {
-		nChunks = span
+	if span.Cmp(big.NewInt(nChunks)) < 0 {
+		nChunks = span.Int64()
 	}
 	if nChunks < 1 {
 		nChunks = 1
 	}
-	step := span / nChunks
-	if step < 1 {
-		step = 1
-	}
 
-	var chunks []*Chunk
-	idx := 0
-	// 第一个 chunk 下界为表头（nil），保证覆盖 MIN；末尾 chunk 上界为 nil，覆盖 MAX 之外的空洞。
-	var prevEnd int64 = minV.Int64 - 1
-	for prevEnd < maxV.Int64 {
-		end := prevEnd + step
-		if end >= maxV.Int64 {
-			// 末尾 chunk：无上界，吸收所有剩余行。
-			var start []any
-			if idx > 0 {
-				start = []any{prevEnd}
-			}
-			chunks = append(chunks, &Chunk{ID: chunkID(spec, idx), Spec: spec, Start: start, End: nil})
-			break
-		}
+	chunks := make([]*Chunk, 0, nChunks)
+	var previousEnd int64
+	for idx := int64(0); idx < nChunks; idx++ {
 		var start []any
 		if idx > 0 {
-			start = []any{prevEnd}
+			start = []any{previousEnd}
 		}
-		chunks = append(chunks, &Chunk{ID: chunkID(spec, idx), Spec: spec, Start: start, End: []any{end}})
-		prevEnd = end
-		idx++
-	}
-	if len(chunks) == 0 {
-		chunks = append(chunks, &Chunk{ID: chunkID(spec, 0), Spec: spec})
+		var end []any
+		if idx < nChunks-1 {
+			// inclusiveEnd = min + floor(span*(idx+1)/nChunks) - 1
+			boundary := new(big.Int).Mul(span, big.NewInt(idx+1))
+			boundary.Quo(boundary, big.NewInt(nChunks))
+			boundary.Add(boundary, minBig)
+			boundary.Sub(boundary, big.NewInt(1))
+			previousEnd = boundary.Int64()
+			end = []any{previousEnd}
+		}
+		chunks = append(chunks, &Chunk{ID: chunkID(spec, int(idx)), Spec: spec, Start: start, End: end})
 	}
 	return chunks, nil
 }
 
-// planKeysetBoundaries 通过一次 PK-only keyset 步进扫描生成近似等行数边界。
-func (p *Planner) planKeysetBoundaries(ctx context.Context, spec *TableSpec, col string, targetChunks int) ([]*Chunk, error) {
+// planKeysetBoundaries 通过 PK-only keyset 步进扫描生成近似等行数边界。
+func (p *Planner) planKeysetBoundaries(ctx context.Context, spec *TableSpec, cols []string, targetChunks int) ([]*Chunk, error) {
 	est := spec.EstimatedRows
 	if est <= 0 {
 		est = p.estimateCount(ctx, spec)
@@ -155,30 +159,42 @@ func (p *Planner) planKeysetBoundaries(ctx context.Context, spec *TableSpec, col
 	}
 
 	// 逐个取第 step 行的主键值作为边界。
-	var boundaries []any
-	var last any
+	var boundaries [][]any
+	var last []any
+	selectCols := quotedIdentifiers(cols)
+	orderBy := orderByColumns(cols)
 	for {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		var v any
+		values := make([]any, len(cols))
+		scanArgs := make([]any, len(cols))
+		for i := range values {
+			scanArgs[i] = &values[i]
+		}
 		var q string
 		var args []any
 		if last == nil {
-			q = fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` ORDER BY `%s` ASC LIMIT 1 OFFSET ?", col, spec.SourceSchema, spec.SourceTable, col)
+			q = fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY %s LIMIT 1 OFFSET ?",
+				selectCols, quoteIdentifier(spec.SourceSchema), quoteIdentifier(spec.SourceTable), orderBy)
 			args = []any{step - 1}
 		} else {
-			q = fmt.Sprintf("SELECT `%s` FROM `%s`.`%s` WHERE `%s` > ? ORDER BY `%s` ASC LIMIT 1 OFFSET ?", col, spec.SourceSchema, spec.SourceTable, col, col)
-			args = []any{last, step - 1}
+			lower, lowerArgs := buildKeysetLower(cols, last)
+			q = fmt.Sprintf("SELECT %s FROM %s.%s WHERE (%s) ORDER BY %s LIMIT 1 OFFSET ?",
+				selectCols, quoteIdentifier(spec.SourceSchema), quoteIdentifier(spec.SourceTable), lower, orderBy)
+			args = append(lowerArgs, step-1)
 		}
 		row := p.sourceDB.QueryRowContext(ctx, q, args...)
-		if err := row.Scan(&v); err != nil {
+		if err := row.Scan(scanArgs...); err != nil {
 			if err == sql.ErrNoRows {
 				break
 			}
 			return nil, err
 		}
-		nv := normalizeScanned(v)
+		nv := make([]any, len(values))
+		for i, v := range values {
+			nv[i] = normalizeScanned(v)
+		}
 		boundaries = append(boundaries, nv)
 		last = nv
 		// 边界过多时停止（防止极端情况下无限逼近）。
@@ -194,8 +210,8 @@ func (p *Planner) planKeysetBoundaries(ctx context.Context, spec *TableSpec, col
 	var chunks []*Chunk
 	var start []any
 	for i, b := range boundaries {
-		chunks = append(chunks, &Chunk{ID: chunkID(spec, i), Spec: spec, Start: start, End: []any{b}})
-		start = []any{b}
+		chunks = append(chunks, &Chunk{ID: chunkID(spec, i), Spec: spec, Start: start, End: b})
+		start = b
 	}
 	// 末尾 chunk：最后一个边界之后无上界。
 	chunks = append(chunks, &Chunk{ID: chunkID(spec, len(boundaries)), Spec: spec, Start: start, End: nil})
@@ -220,10 +236,14 @@ func isIntegerColumn(id *entity.TableIdentity, col string) bool {
 			continue
 		}
 		dt := strings.ToLower(strings.TrimSpace(c.DataType))
+		if strings.Contains(dt, "unsigned") {
+			// database/sql 的 NullInt64 无法覆盖 BIGINT UNSIGNED 全域，改走 keyset 边界规划。
+			return false
+		}
 		if i := strings.IndexByte(dt, '('); i >= 0 {
 			dt = dt[:i]
 		}
-		dt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(dt, " zerofill"), " unsigned"))
+		dt = strings.TrimSpace(strings.TrimSuffix(dt, " zerofill"))
 		switch dt {
 		case "tinyint", "smallint", "mediumint", "int", "integer", "bigint":
 			return true

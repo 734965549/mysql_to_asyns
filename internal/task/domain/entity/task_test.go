@@ -231,6 +231,130 @@ func TestTaskComplete_PreservesTotalRows(t *testing.T) {
 	}
 }
 
+// TestTaskStop 验证 Stop() 设置 STOPPED 终态、记录 end_time、清除调度配置。
+func TestTaskStop(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "test_stop", Name: "Test"})
+	task.Start()
+	// 模拟增量阶段 + cron 调度配置
+	task.MarkIncrementalStarted()
+	task.ConfigureCronSchedule("*/5 * * * *", "Asia/Shanghai")
+
+	task.Stop()
+
+	assert.Equal(t, TaskStatusStopped, task.Context.Status)
+	assert.False(t, task.Context.EndTime.IsZero(), "end time should be set on stop")
+	assert.False(t, task.Context.LastUpdateTime.IsZero())
+	// 调度配置应被清除
+	assert.Equal(t, "", task.Context.ScheduleMode)
+	assert.Equal(t, "", task.Context.CronExpression)
+	assert.Nil(t, task.Context.ScheduledAt)
+	// Stop 不应改变 SyncPhase（增量阶段标志保留，供行数对比判断全量已完成）
+	assert.Equal(t, SyncPhaseIncrementalStarted, task.Context.SyncPhase)
+}
+
+// TestTaskStop_JSONRoundTrip 验证 STOPPED 状态与行数对比结果 JSON 往返兼容。
+func TestTaskStop_JSONRoundTrip(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "test_stop_json", Name: "Test", Mode: SyncModeAll})
+	task.Start()
+	task.MarkIncrementalStarted()
+	task.Stop()
+
+	srcRows := int64(100)
+	tgtRows := int64(99)
+	diff := int64(-1)
+	task.Context.RowCountComparison = &RowCountComparison{
+		Status:           RowCountComparisonMismatched,
+		TotalTables:      1,
+		CheckedTables:    1,
+		MatchedTables:    0,
+		MismatchedTables: 1,
+		FailedTables:     0,
+		SourceTotal:      100,
+		TargetTotal:      99,
+		Difference:       -1,
+		Tables: []RowCountComparisonTable{
+			{
+				SourceSchema: "src_db", SourceTable: "users",
+				TargetSchema: "tgt_db", TargetTable: "users",
+				SourceRows: &srcRows, TargetRows: &tgtRows,
+				Difference: &diff, Matched: false,
+			},
+		},
+	}
+
+	data, err := json.Marshal(task)
+	require.NoError(t, err)
+
+	var restored SyncTask
+	require.NoError(t, json.Unmarshal(data, &restored))
+
+	assert.Equal(t, TaskStatusStopped, restored.Context.Status)
+	require.NotNil(t, restored.Context.RowCountComparison)
+	assert.Equal(t, RowCountComparisonMismatched, restored.Context.RowCountComparison.Status)
+	assert.Equal(t, int64(-1), restored.Context.RowCountComparison.Difference)
+	require.Len(t, restored.Context.RowCountComparison.Tables, 1)
+	tbl := restored.Context.RowCountComparison.Tables[0]
+	require.NotNil(t, tbl.SourceRows)
+	require.NotNil(t, tbl.TargetRows)
+	assert.Equal(t, int64(100), *tbl.SourceRows)
+	assert.Equal(t, int64(99), *tbl.TargetRows)
+	assert.False(t, tbl.Matched)
+}
+
+// TestRowCountComparison_NilRows 验证行数指针区分真实 0 与查询失败（nil）。
+func TestRowCountComparison_NilRows(t *testing.T) {
+	zero := int64(0)
+	matched := RowCountComparisonTable{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "s", TargetTable: "t",
+		SourceRows: &zero, TargetRows: &zero,
+	}
+	matched.Difference = &zero
+	matched.Matched = true
+	assert.True(t, matched.Matched)
+
+	failed := RowCountComparisonTable{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "s", TargetTable: "t",
+		Error: "source: connection refused",
+	}
+	assert.Nil(t, failed.SourceRows)
+	assert.Nil(t, failed.TargetRows)
+	assert.False(t, failed.Matched)
+}
+
+func TestCloneRowCountComparison_DeepCopy(t *testing.T) {
+	started := time.Date(2026, 7, 17, 10, 0, 0, 0, time.UTC)
+	startedAt := started
+	srcRows := int64(10)
+	tgtRows := int64(9)
+	diff := int64(-1)
+	original := &RowCountComparison{
+		Status:      RowCountComparisonChecking,
+		StartedAt:   &startedAt,
+		TotalTables: 1,
+		Tables: []RowCountComparisonTable{
+			{
+				SourceSchema: "s", SourceTable: "t", TargetSchema: "s", TargetTable: "t",
+				SourceRows: &srcRows, TargetRows: &tgtRows, Difference: &diff,
+			},
+		},
+	}
+
+	cloned := CloneRowCountComparison(original)
+	require.NotNil(t, cloned)
+	require.NotSame(t, original, cloned)
+	require.NotSame(t, original.StartedAt, cloned.StartedAt)
+	require.NotSame(t, &original.Tables[0], &cloned.Tables[0])
+	require.NotSame(t, original.Tables[0].SourceRows, cloned.Tables[0].SourceRows)
+
+	*original.Tables[0].SourceRows = 99
+	*original.StartedAt = started.Add(time.Hour)
+	original.Status = RowCountComparisonFailed
+
+	assert.Equal(t, int64(10), *cloned.Tables[0].SourceRows)
+	assert.Equal(t, started, *cloned.StartedAt)
+	assert.Equal(t, RowCountComparisonChecking, cloned.Status)
+}
+
 func TestTaskUpdateProgress(t *testing.T) {
 	config := TaskConfig{
 		ID:   "test_task_5",

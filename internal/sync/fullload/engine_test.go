@@ -2,6 +2,7 @@ package fullload
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -42,10 +43,13 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"fk", "uk"}).AddRow(0, 0))
 	dstMock.ExpectExec("SET SESSION innodb_lock_wait_timeout=300").WillReturnResult(sqlmock.NewResult(0, 0))
 	dstMock.ExpectBegin()
-	dstMock.ExpectExec("INSERT INTO `s`.`t`").WillReturnResult(sqlmock.NewResult(0, 2))
+	dstMock.ExpectPrepare("INSERT INTO `s`.`t`")
+	dstMock.ExpectPrepare("INSERT INTO `s`.`t`").
+		ExpectExec().WillReturnResult(sqlmock.NewResult(0, 2))
 	dstMock.ExpectCommit()
 	dstMock.ExpectExec("SET @@SESSION.FOREIGN_KEY_CHECKS=1").WillReturnResult(sqlmock.NewResult(0, 0))
 	dstMock.ExpectExec("SET @@SESSION.UNIQUE_CHECKS=1").WillReturnResult(sqlmock.NewResult(0, 0))
+	dstMock.ExpectExec("SET SESSION innodb_lock_wait_timeout=50").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	spec := &TableSpec{
 		SourceSchema: "s", TargetSchema: "s", SourceTable: "t", TargetTable: "t",
@@ -91,5 +95,32 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 	}
 	if err := dstMock.ExpectationsWereMet(); err != nil {
 		t.Errorf("target unmet: %v", err)
+	}
+}
+
+func TestEngineCanceledContextCannotReportSuccess(t *testing.T) {
+	srcDB, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcDB.Close()
+	dstDB, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dstDB.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	eng := &Engine{
+		SourceDB: srcDB,
+		TargetDB: dstDB,
+		Options:  ResolveOptions(RawOptions{ReadWorkers: 1, WriteWorkers: 1}),
+	}
+	spec := &TableSpec{SourceSchema: "s", SourceTable: "t", Identity: &entity.TableIdentity{
+		Strategy: entity.FullColumnsStrategy,
+		Columns:  []entity.ColumnMeta{{Name: "id"}},
+	}}
+	if err := eng.Run(ctx, []*TableSpec{spec}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled engine must fail with context cancellation, got %v", err)
 	}
 }

@@ -718,6 +718,45 @@ POST /api/tasks/:id/pause
 
 全量进行中暂停后 `sync_phase` 保持为 `FULL_STARTED`。再次调用启动接口不会续传全量；未开启「DDL 前 DROP TABLE」时会被拒绝。同一旧任务需开启该开关重建后重新全量，或人工清理目标端后创建/重置任务从头跑。若任务已完成全量并进入增量阶段，再启动会从增量 checkpoint 继续。
 
+#### 结束任务（仅 ALL 模式增量阶段）
+
+```bash
+
+POST /api/tasks/:id/end
+
+```
+
+将一个持续运行的 `ALL` 任务在增量阶段手动结束，进入新的终态 `STOPPED`。仅在同时满足以下条件时允许：
+
+- `status=RUNNING`
+- `mode=ALL`
+- `sync_phase=INCREMENTAL_STARTED`
+
+结束为终态操作：原任务**不能**再次启动、编辑或设置定时调度；仍允许查看、行数对比、复制新建和删除。结束采用「立即优雅停止」语义——完成当前正在退出的处理和资源关闭，但不捕获新的结束位点，也不等待持续产生的源端写入全部追平。`FULL` 等一次性任务自然完成仍走 `COMPLETED`，不通过此接口。
+
+返回：`200` 成功；`404` 任务不存在；`409` 模式/阶段/状态不允许结束。人工结束不计入 `mysql_sync_tasks_completed` 指标（该指标仍只统计 `COMPLETED`）。
+
+#### 行数对比（手动触发）
+
+```bash
+
+POST /api/tasks/:id/row-count-comparison
+
+```
+
+在任务结束/完成后由用户手动触发，后台精确统计源端和目标端逐表 `COUNT(*)`，结果随任务存档持久化并在详情页展示。接口只负责校验并启动后台任务，成功返回 `202 Accepted`。允许条件：
+
+- 任务状态为 `COMPLETED` 或 `STOPPED`
+- 任务模式为 `FULL` 或 `ALL`
+- `HasFullSyncEverCompleted()` 为真（`sync_phase` 为 `FULL_COMPLETED` 或 `INCREMENTAL_STARTED`）
+- 目标端为 MySQL
+
+同一任务已存在 `CHECKING` 核对时再次请求返回 `409`。核对结束后允许重新执行，新结果覆盖旧结果，不保存历史版本。**行数对比不会由同步完成流程自动触发，也不会因不一致而修改原任务的 `COMPLETED` 或 `STOPPED` 状态**。
+
+汇总状态：`CHECKING`（进行中）/ `MATCHED`（全部一致）/ `MISMATCHED`（至少一张表不一致）/ `PARTIAL`（部分表查询失败）/ `FAILED`（连接或表清单获取失败，或所有表均无法完成核对）。`difference` 统一定义为「目标端行数减源端行数」。服务重启时若存档仍为 `CHECKING`，会自动改为 `FAILED` 并注明服务重启导致核对中断。
+
+> ⚠️ 结果为点击核对期间获得的行数快照。源端在任务结束后仍可能继续写入，因此这不是事务一致性证明，仅用于粗略核对。
+
 #### 取消定时启动
 
 ```bash
@@ -1423,7 +1462,7 @@ ALL 模式先捕获 binlog 位点（P0），再执行与 FULL 相同的无缝全
 
 
 
-- **任务状态**: PENDING/RUNNING/PAUSED/COMPLETED/FAILED
+- **任务状态**: PENDING/RUNNING/PAUSED/COMPLETED/FAILED/SCHEDULED/STOPPED
 
 - **进度百分比**: 已处理行数/总行数
 

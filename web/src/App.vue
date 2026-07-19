@@ -389,11 +389,15 @@ function applyFullLoadPreset(name) {
 const fullLoadEffective = computed(() => {
   const f = taskForm.value;
   const orDefault = (v, d) => (v && v > 0 ? v : d);
+  const legacyCommitRows =
+    f.tx_commit_every_n_parallel > 0
+      ? orDefault(f.batch_size, 1000) * f.tx_commit_every_n_parallel
+      : 10000;
   return {
     read: orDefault(f.full_load_read_workers, 4),
     write: orDefault(f.full_load_write_workers, 4),
     buffer: orDefault(f.full_load_buffer_mb, 128),
-    commitRows: orDefault(f.full_load_commit_rows, 10000),
+    commitRows: orDefault(f.full_load_commit_rows, legacyCommitRows),
     commitBytes: orDefault(f.full_load_commit_bytes_mb, 32),
   };
 });
@@ -1410,6 +1414,91 @@ async function pauseTask(taskId) {
   }
 }
 
+// 结束任务（仅 RUNNING + ALL + INCREMENTAL_STARTED，进入 STOPPED 终态）
+
+async function endTask(taskId) {
+  try {
+    const res = await fetch(`${API_BASE}/tasks/${taskId}/end`, {
+      method: "POST",
+    });
+
+    if (res.ok) {
+      fetchTasks();
+
+      Message.success("任务已结束");
+    } else {
+      const errorMsg = await handleApiError(res, "结束失败");
+
+      Message.error(errorMsg);
+    }
+  } catch (e) {
+    Message.error("结束失败: " + e.message);
+  }
+}
+
+// 确认结束任务（二次确认，说明为终态、原任务不能重新启动）
+
+function confirmEndTask(taskId) {
+  Modal.warning({
+    title: "确认结束任务",
+
+    content:
+      "结束为终态操作，结束后原任务不能重新启动、编辑或设置定时调度（仍可查看、行数对比、复制新建和删除）。确定要结束该任务吗？",
+
+    okText: "确认结束",
+
+    cancelText: "取消",
+
+    hideCancel: false,
+
+    onOk: async () => {
+      await endTask(taskId);
+    },
+  });
+}
+
+// 启动行数对比（后台核对源/目标端 COUNT(*)，返回 202）
+
+async function startRowCountComparison(taskId) {
+  try {
+    const res = await fetch(
+      `${API_BASE}/tasks/${taskId}/row-count-comparison`,
+      { method: "POST" }
+    );
+
+    if (res.status === 202) {
+      Message.success("已开始行数对比，请稍后在详情页查看结果");
+      return true;
+    }
+
+    const errorMsg = await handleApiError(res, "启动行数对比失败");
+    Message.error(errorMsg);
+    return false;
+  } catch (e) {
+    Message.error("启动行数对比失败: " + e.message);
+    return false;
+  }
+}
+
+// 确认启动行数对比（提示精确 COUNT(*) 可能扫描大表）
+
+function confirmStartRowCountComparison(taskId) {
+  Modal.confirm({
+    title: "对比行数",
+
+    content:
+      "将对源端和目标端逐表执行精确 COUNT(*)，可能扫描大表并占用数据库资源。源端在任务结束后仍可能继续写入，结果为核对期间的行数快照。是否继续？",
+
+    okText: "开始对比",
+
+    cancelText: "取消",
+
+    onOk: async () => {
+      await startRowCountComparison(taskId);
+    },
+  });
+}
+
 // 删除任务
 
 async function deleteTask(taskId) {
@@ -1574,6 +1663,22 @@ function closeTaskDetailPage() {
 
 async function detailPagePause() {
   await pauseTask(detailPageTaskId.value);
+
+  refreshDetailPage();
+}
+
+// 详情页：结束任务后刷新
+
+async function detailPageEndTask() {
+  await endTask(detailPageTaskId.value);
+
+  refreshDetailPage();
+}
+
+// 详情页：启动行数对比后刷新
+
+async function detailPageCompareRows() {
+  await startRowCountComparison(detailPageTaskId.value);
 
   refreshDetailPage();
 }
@@ -1963,6 +2068,8 @@ function getStatusColor(status) {
     FAILED: "red",
 
     SCHEDULED: "arcoblue",
+
+    STOPPED: "gray",
   };
 
   return colors[status] || "gray";
@@ -1983,9 +2090,86 @@ function getStatusText(status) {
     FAILED: "失败",
 
     SCHEDULED: "定时中",
+
+    STOPPED: "已结束",
   };
 
   return texts[status] || status;
+}
+
+// 判断任务是否可结束：仅 RUNNING + ALL + INCREMENTAL_STARTED
+
+function canEndTask(task) {
+  return (
+    !!task?.context &&
+    task.context.status === "RUNNING" &&
+    task.config.mode === "ALL" &&
+    task.context.sync_phase === "INCREMENTAL_STARTED"
+  );
+}
+
+// 判断任务是否可对比行数：COMPLETED/STOPPED 且全量已完成（后端再校验）
+
+function canCompareRows(task) {
+  if (!task?.context) return false;
+  const status = task.context.status;
+  if (status !== "COMPLETED" && status !== "STOPPED") return false;
+  const phase = task.context.sync_phase;
+  if (phase !== "FULL_COMPLETED" && phase !== "INCREMENTAL_STARTED") return false;
+  return true;
+}
+
+// 判断任务是否正在行数对比中
+
+function isComparingRows(task) {
+  return task?.context?.row_count_comparison?.status === "CHECKING";
+}
+
+// 行数对比汇总状态文案
+
+function rowComparisonStatusText(status) {
+  const texts = {
+    CHECKING: "对比中",
+    MATCHED: "一致",
+    MISMATCHED: "不一致",
+    PARTIAL: "部分失败",
+    FAILED: "失败",
+  };
+  return texts[status] || status || "-";
+}
+
+// 行数对比汇总状态颜色
+
+function rowComparisonStatusColor(status) {
+  const colors = {
+    CHECKING: "blue",
+    MATCHED: "green",
+    MISMATCHED: "orange",
+    PARTIAL: "orange",
+    FAILED: "red",
+  };
+  return colors[status] || "gray";
+}
+
+// 格式化可空行数（nil 显示为 "-"，区分真实 0）
+
+function formatNullableRows(v) {
+  if (v == null) return "-";
+  return Number(v).toLocaleString("zh-CN");
+}
+
+// 格式化可空差值（nil 显示为 "-"，正负号显示）
+
+function formatNullableDiff(v) {
+  if (v == null) return "-";
+  const n = Number(v);
+  const s = Math.abs(n).toLocaleString("zh-CN");
+  if (n > 0) return "+" + s;
+  return s;
+}
+
+function rowCountComparisonRowKey(record) {
+  return `${record.source_schema}.${record.source_table}`;
 }
 
 // 计算进度（0-100，供文案展示）
@@ -2773,6 +2957,22 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
             <template #icon><icon-pause /></template>
             暂停
           </a-button>
+          <a-button
+            v-if="canEndTask(detailPageTask)"
+            status="danger"
+            @click="confirmEndTask(detailPageTaskId)"
+          >
+            <template #icon><icon-stop /></template>
+            结束
+          </a-button>
+          <a-button
+            v-if="canCompareRows(detailPageTask)"
+            :disabled="isComparingRows(detailPageTask)"
+            @click="confirmStartRowCountComparison(detailPageTaskId)"
+          >
+            <template #icon><icon-sync /></template>
+            {{ isComparingRows(detailPageTask) ? "对比中" : "对比行数" }}
+          </a-button>
           <a-button type="text" @click="refreshDetailPage">
             <template #icon><icon-refresh /></template>
           </a-button>
@@ -3328,6 +3528,174 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                 title="暂无错误日志"
                 description="任务当前没有记录到错误堆栈或全量失败原因。"
               />
+            </a-tab-pane>
+
+            <!-- 行数对比 -->
+            <a-tab-pane key="row-compare" title="行数对比">
+              <template v-if="!detailPageTask.context.row_count_comparison">
+                <a-empty
+                  description="暂无行数对比结果。仅 COMPLETED / STOPPED 且全量已完成的任务可发起对比。"
+                  style="margin-top: 24px"
+                />
+                <div style="text-align: center; margin-top: 16px">
+                  <a-button
+                    v-if="canCompareRows(detailPageTask)"
+                    type="primary"
+                    :disabled="isComparingRows(detailPageTask)"
+                    @click="confirmStartRowCountComparison(detailPageTaskId)"
+                  >
+                    <template #icon><icon-sync /></template>
+                    {{ isComparingRows(detailPageTask) ? "对比中" : "开始对比行数" }}
+                  </a-button>
+                </div>
+              </template>
+              <template v-else>
+                <a-alert
+                  type="info"
+                  :show-icon="true"
+                  style="margin-bottom: 16px"
+                  title="行数对比说明"
+                >
+                  结果为点击核对期间获得的行数快照，源端在任务结束后仍可能继续写入，不构成事务一致性证明。difference 定义为目标端行数减源端行数。
+                </a-alert>
+
+                <!-- 汇总卡片 -->
+                <a-row :gutter="16" class="runtime-overview-row">
+                  <a-col :xs="12" :md="6">
+                    <a-card class="overview-card">
+                      <div class="overview-label">核对状态</div>
+                      <div class="overview-value overview-value-sm">
+                        <a-tag :color="rowComparisonStatusColor(detailPageTask.context.row_count_comparison.status)" size="small">
+                          {{ rowComparisonStatusText(detailPageTask.context.row_count_comparison.status) }}
+                        </a-tag>
+                      </div>
+                      <div class="overview-sub">
+                        开始：{{ formatTime(detailPageTask.context.row_count_comparison.started_at) }}
+                      </div>
+                      <div class="overview-sub">
+                        完成：{{ formatTime(detailPageTask.context.row_count_comparison.completed_at) }}
+                      </div>
+                    </a-card>
+                  </a-col>
+                  <a-col :xs="12" :md="6">
+                    <a-card class="overview-card">
+                      <div class="overview-label">源端总行数</div>
+                      <div class="overview-value">{{ formatRowCount(detailPageTask.context.row_count_comparison.source_total) }}</div>
+                      <div class="overview-sub">
+                        目标端：{{ formatRowCount(detailPageTask.context.row_count_comparison.target_total) }}
+                      </div>
+                    </a-card>
+                  </a-col>
+                  <a-col :xs="12" :md="6">
+                    <a-card class="overview-card">
+                      <div class="overview-label">总差值</div>
+                      <div
+                        class="overview-value"
+                        :style="{ color: detailPageTask.context.row_count_comparison.difference === 0 ? 'var(--color-success-6)' : 'var(--color-warning-6)' }"
+                      >
+                        {{ formatNullableDiff(detailPageTask.context.row_count_comparison.difference) }}
+                      </div>
+                      <div class="overview-sub">目标端 - 源端</div>
+                    </a-card>
+                  </a-col>
+                  <a-col :xs="12" :md="6">
+                    <a-card class="overview-card">
+                      <div class="overview-label">已核对 / 总表数</div>
+                      <div class="overview-value">
+                        {{ detailPageTask.context.row_count_comparison.checked_tables }} /
+                        {{ detailPageTask.context.row_count_comparison.total_tables }}
+                      </div>
+                      <div class="overview-sub">
+                        一致 {{ detailPageTask.context.row_count_comparison.matched_tables }} · 不一致
+                        {{ detailPageTask.context.row_count_comparison.mismatched_tables }} · 失败
+                        {{ detailPageTask.context.row_count_comparison.failed_tables }}
+                      </div>
+                    </a-card>
+                  </a-col>
+                </a-row>
+
+                <a-alert
+                  v-if="detailPageTask.context.row_count_comparison.failure_reason"
+                  type="warning"
+                  :show-icon="true"
+                  style="margin-bottom: 16px"
+                  title="核对失败原因"
+                >
+                  {{ detailPageTask.context.row_count_comparison.failure_reason }}
+                </a-alert>
+
+                <!-- 逐表结果 -->
+                <div class="runtime-section-title">
+                  <icon-storage />
+                  <span>逐表行数对比</span>
+                  <a-tag color="arcoblue" size="small" style="margin-left: 8px">
+                    共 {{ (detailPageTask.context.row_count_comparison.tables || []).length }} 张表
+                  </a-tag>
+                </div>
+                <a-table
+                  :columns="[
+                    { title: '源表', slotName: 'sourceTable', width: 240 },
+                    { title: '目标表', slotName: 'targetTable', width: 240 },
+                    { title: '源端行数', slotName: 'sourceRows', width: 140 },
+                    { title: '目标端行数', slotName: 'targetRows', width: 140 },
+                    { title: '差值', slotName: 'diff', width: 120 },
+                    { title: '状态', slotName: 'rowStatus', width: 110 },
+                    { title: '错误信息', slotName: 'rowError' },
+                  ]"
+                  :data="detailPageTask.context.row_count_comparison.tables || []"
+                  :pagination="false"
+                  size="medium"
+                  :scroll="{ y: 480 }"
+                  :row-key="rowCountComparisonRowKey"
+                >
+                  <template #sourceTable="{ record }">
+                    <span>{{ record.source_schema }}.{{ record.source_table }}</span>
+                  </template>
+                  <template #targetTable="{ record }">
+                    <span>{{ record.target_schema }}.{{ record.target_table }}</span>
+                  </template>
+                  <template #sourceRows="{ record }">
+                    {{ formatNullableRows(record.source_rows) }}
+                  </template>
+                  <template #targetRows="{ record }">
+                    {{ formatNullableRows(record.target_rows) }}
+                  </template>
+                  <template #diff="{ record }">
+                    <span
+                      :style="{ color: record.difference == null ? 'var(--color-text-3)' : (record.difference === 0 ? 'var(--color-success-6)' : 'var(--color-warning-6)') }"
+                    >
+                      {{ formatNullableDiff(record.difference) }}
+                    </span>
+                  </template>
+                  <template #rowStatus="{ record }">
+                    <a-tag
+                      v-if="record.source_rows != null && record.target_rows != null"
+                      :color="record.matched ? 'green' : 'orange'"
+                      size="small"
+                    >
+                      {{ record.matched ? '一致' : '不一致' }}
+                    </a-tag>
+                    <a-tag v-else color="red" size="small">失败</a-tag>
+                  </template>
+                  <template #rowError="{ record }">
+                    <a-typography-text v-if="record.error" type="secondary" style="font-size: 12px">
+                      {{ record.error }}
+                    </a-typography-text>
+                    <span v-else>-</span>
+                  </template>
+                </a-table>
+
+                <div style="margin-top: 16px; text-align: right">
+                  <a-button
+                    v-if="canCompareRows(detailPageTask)"
+                    :disabled="isComparingRows(detailPageTask)"
+                    @click="confirmStartRowCountComparison(detailPageTaskId)"
+                  >
+                    <template #icon><icon-refresh /></template>
+                    {{ isComparingRows(detailPageTask) ? "对比中" : "重新对比" }}
+                  </a-button>
+                </div>
+              </template>
             </a-tab-pane>
           </a-tabs>
         </div>
@@ -4348,6 +4716,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                             :model-value="taskForm.full_load_buffer_mb"
                             @change="(v) => (taskForm.full_load_buffer_mb = v ?? 0)"
                             :min="0"
+                            :max="4096"
                             style="width: 100%"
                             placeholder="0=自动(128)"
                           />
@@ -4359,6 +4728,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                             :model-value="taskForm.full_load_batch_bytes_mb"
                             @change="(v) => (taskForm.full_load_batch_bytes_mb = v ?? 0)"
                             :min="0"
+                            :max="64"
                             style="width: 100%"
                             placeholder="0=自动(4)"
                           />
@@ -4373,6 +4743,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                             :model-value="taskForm.full_load_commit_rows"
                             @change="(v) => (taskForm.full_load_commit_rows = v ?? 0)"
                             :min="0"
+                            :max="10000000"
                             style="width: 100%"
                             placeholder="0=自动(10000)"
                           />
@@ -4384,6 +4755,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                             :model-value="taskForm.full_load_commit_bytes_mb"
                             @change="(v) => (taskForm.full_load_commit_bytes_mb = v ?? 0)"
                             :min="0"
+                            :max="4096"
                             style="width: 100%"
                             placeholder="0=自动(32)"
                           />
@@ -5616,6 +5988,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                     <a-option value="PAUSED">已暂停</a-option>
                     <a-option value="SCHEDULED">已计划</a-option>
                     <a-option value="COMPLETED">已完成</a-option>
+                    <a-option value="STOPPED">已结束</a-option>
                     <a-option value="FAILED">失败</a-option>
                   </a-select>
                   <a-select
@@ -5982,6 +6355,26 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                       >
                         <template #icon><icon-pause /></template>
                         暂停
+                      </a-button>
+
+                      <a-button
+                        v-if="canEndTask(task)"
+                        size="small"
+                        status="danger"
+                        @click="confirmEndTask(task.config.id)"
+                      >
+                        <template #icon><icon-stop /></template>
+                        结束
+                      </a-button>
+
+                      <a-button
+                        v-if="canCompareRows(task)"
+                        size="small"
+                        :disabled="isComparingRows(task)"
+                        @click="confirmStartRowCountComparison(task.config.id)"
+                      >
+                        <template #icon><icon-sync /></template>
+                        {{ isComparingRows(task) ? "对比中" : "对比行数" }}
                       </a-button>
 
                       <a-button

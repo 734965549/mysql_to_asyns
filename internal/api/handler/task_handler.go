@@ -387,12 +387,61 @@ func (h *TaskHandler) PauseTask(c *gin.Context) { // 暂停指定任务
 	c.JSON(http.StatusOK, gin.H{"message": "Task paused"}) // 返回成功消息
 }
 
+// EndTask 结束持续运行的 ALL 任务（用户在增量阶段点击"结束"，进入 STOPPED 终态）。
+// 返回：200 成功；404 任务不存在；409 模式/阶段/状态不允许结束。
+func (h *TaskHandler) EndTask(c *gin.Context) {
+	taskID := c.Param("id")
+
+	if err := h.taskService.EndTask(taskID); err != nil {
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "task not found"):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "cannot be ended"),
+			strings.Contains(errMsg, "only ALL mode"),
+			strings.Contains(errMsg, "not running"),
+			strings.Contains(errMsg, "incremental phase"):
+			c.JSON(http.StatusConflict, gin.H{"error": errMsg})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Task stopped"})
+}
+
+// RowCountComparison 启动行数对比后台任务。成功返回 202 Accepted。
+// 返回：202 已启动；404 任务不存在；409 不满足对比条件或已有核对进行中。
+func (h *TaskHandler) RowCountComparison(c *gin.Context) {
+	taskID := c.Param("id")
+
+	if err := h.taskService.StartRowCountComparison(taskID); err != nil {
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "task not found"):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "already in progress"),
+			strings.Contains(errMsg, "not in a comparable status"),
+			strings.Contains(errMsg, "does not support row count comparison"),
+			strings.Contains(errMsg, "has not completed yet"),
+			strings.Contains(errMsg, "requires MySQL target"):
+			c.JSON(http.StatusConflict, gin.H{"error": errMsg})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		}
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{"message": "Row count comparison started"})
+}
+
 // GetTask 获取任务详情方法
 func (h *TaskHandler) GetTask(c *gin.Context) { // 获取任务详情
 	taskID := c.Param("id") // 获取任务ID参数
 
-	task, exists := h.taskService.GetTask(taskID) // 获取任务
-	if !exists {                                  // 如果任务不存在
+	task, exists := h.taskService.GetTaskSnapshot(taskID) // 锁内快照，避免与后台行数核对并发读写
+	if !exists {                                         // 如果任务不存在
 		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"}) // 返回错误
 		return
 	}
@@ -766,9 +815,13 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 		return
 	}
 
-	// 只允许更新非运行状态的任务
+	// 只允许更新非运行、非终态任务
 	if task.Context.Status == taskEntity.TaskStatusRunning { // 如果任务正在运行
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot update running task"}) // 返回错误
+		return
+	}
+	if task.Context.Status == taskEntity.TaskStatusStopped {
+		c.JSON(http.StatusConflict, gin.H{"error": "Cannot update stopped task"})
 		return
 	}
 
@@ -887,7 +940,15 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	}
 
 	if err := h.taskService.UpdateTask(task); err != nil { // 更新任务
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}) // 返回错误
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "task not found"):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "stopped and cannot be edited"):
+			c.JSON(http.StatusConflict, gin.H{"error": errMsg})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		}
 		return
 	}
 
@@ -972,6 +1033,7 @@ func taskForAPI(task *taskEntity.SyncTask) *taskEntity.SyncTask {
 		return nil
 	}
 	cloned := *task
+	cloned.Context = task.Context.CloneForRead()
 	cloned.Config = task.Config
 	if task.Config.SourceDB != nil {
 		sourceDB := *task.Config.SourceDB

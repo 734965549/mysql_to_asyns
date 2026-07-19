@@ -60,9 +60,9 @@ func (s *Stats) addCommit(rows, bytes int64, dur time.Duration) {
 }
 
 func (s *Stats) addEnqueueWait(dur time.Duration) { atomic.AddInt64(&s.EnqueueWaitNanos, int64(dur)) }
-func (s *Stats) incTxReplays()                     { atomic.AddInt64(&s.TxReplays, 1) }
-func (s *Stats) incLockRetries()                   { atomic.AddInt64(&s.LockRetries, 1) }
-func (s *Stats) incChunkDone()                     { atomic.AddInt64(&s.ChunksDone, 1) }
+func (s *Stats) incTxReplays()                    { atomic.AddInt64(&s.TxReplays, 1) }
+func (s *Stats) incLockRetries()                  { atomic.AddInt64(&s.LockRetries, 1) }
+func (s *Stats) incChunkDone()                    { atomic.AddInt64(&s.ChunksDone, 1) }
 func (s *Stats) setQueue(bytes, cap int64) {
 	atomic.StoreInt64(&s.QueueBytes, bytes)
 	atomic.StoreInt64(&s.QueueCap, cap)

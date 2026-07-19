@@ -58,6 +58,9 @@ func restoreWriteSession(conn *sql.Conn, skipBinlog bool) {
 	if _, err := conn.ExecContext(ctx, "SET @@SESSION.UNIQUE_CHECKS=1"); err != nil {
 		logger.Warn("[FullLoadV2] restore unique checks failed: %v", err)
 	}
+	if _, err := conn.ExecContext(ctx, "SET SESSION innodb_lock_wait_timeout=50"); err != nil {
+		logger.Warn("[FullLoadV2] restore lock wait timeout failed: %v", err)
+	}
 	if skipBinlog {
 		if _, err := conn.ExecContext(ctx, "SET SESSION sql_log_bin=1"); err != nil {
 			logger.Warn("[FullLoadV2] restore sql_log_bin failed: %v", err)

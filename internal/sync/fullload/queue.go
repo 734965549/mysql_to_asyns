@@ -3,6 +3,7 @@ package fullload
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // batchQueue 是按字节数限流的有界 RowBatch 队列。
@@ -74,8 +75,28 @@ func (q *batchQueue) Put(ctx context.Context, b *RowBatch) error {
 // Get 取出一个批次；队列为空时阻塞，直到有数据、队列关闭或 ctx 取消。
 // 队列关闭且清空后返回 (nil, false)。
 func (q *batchQueue) Get(ctx context.Context) (*RowBatch, bool) {
+	b, ok, _ := q.GetUntil(ctx, time.Time{})
+	return b, ok
+}
+
+// GetUntil 与 Get 相同，但 deadline 到达且队列仍为空时返回 timedOut=true。
+// writer 用它确保低流量时事务也会按 CommitInterval 提交，而不是无限等待下一批。
+func (q *batchQueue) GetUntil(ctx context.Context, deadline time.Time) (*RowBatch, bool, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return nil, true, true
+		}
+		timer = time.AfterFunc(wait, func() {
+			q.mu.Lock()
+			q.notEmpty.Broadcast()
+			q.mu.Unlock()
+		})
+		defer timer.Stop()
+	}
 	for {
 		if len(q.items) > 0 {
 			b := q.items[0]
@@ -89,13 +110,16 @@ func (q *batchQueue) Get(ctx context.Context) (*RowBatch, bool) {
 				q.stats.setQueue(q.curBytes, q.maxBytes)
 			}
 			q.notFull.Signal()
-			return b, true
+			return b, true, false
 		}
 		if q.closed {
-			return nil, false
+			return nil, false, false
 		}
 		if ctx.Err() != nil {
-			return nil, false
+			return nil, false, false
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return nil, true, true
 		}
 		q.notEmpty.Wait()
 	}

@@ -25,8 +25,12 @@ const (
 	// mysqlMaxPlaceholders 单条预处理语句占位符上限（留余量），与 writer 包保持一致。
 	mysqlMaxPlaceholders = 62000
 
-	hardMaxWorkers  = 64
-	hardMaxBatchRow = 100000
+	hardMaxWorkers    = 64
+	hardMaxBatchRow   = 100000
+	hardMaxBufferMB   = 4096
+	hardMaxBatchMB    = 64
+	hardMaxCommitMB   = 4096
+	hardMaxCommitRows = 10000000
 )
 
 // RawOptions 是从任务配置直接读取的原始参数（未经默认值推导）。
@@ -72,33 +76,25 @@ func ResolveOptions(raw RawOptions) Options {
 		SkipBinlog:     raw.SkipBinlog,
 	}
 
-	if raw.BufferMB > 0 {
-		opt.BufferBytes = int64(raw.BufferMB) * 1024 * 1024
-	} else {
-		opt.BufferBytes = defaultBufferBytes
-	}
-
-	if raw.BatchBytesMB > 0 {
-		opt.BatchBytes = int64(raw.BatchBytesMB) * 1024 * 1024
-	} else {
-		opt.BatchBytes = defaultBatchBytes
-	}
+	opt.BufferBytes = mebibytes(raw.BufferMB, defaultBufferBytes, hardMaxBufferMB)
+	opt.BatchBytes = mebibytes(raw.BatchBytesMB, defaultBatchBytes, hardMaxBatchMB)
 
 	switch {
 	case raw.CommitRows > 0:
-		opt.CommitRows = int64(raw.CommitRows)
+		opt.CommitRows = int64(clampUpper(raw.CommitRows, hardMaxCommitRows))
 	case raw.LegacyTxCommitEveryNParallel > 0 && opt.BatchRows > 0:
 		// 兼容旧字段：提交行数 = batch_size × tx_commit_every_n_parallel。
-		opt.CommitRows = int64(opt.BatchRows) * int64(raw.LegacyTxCommitEveryNParallel)
+		legacyN := int64(raw.LegacyTxCommitEveryNParallel)
+		maxN := int64(hardMaxCommitRows / opt.BatchRows)
+		if legacyN > maxN {
+			legacyN = maxN
+		}
+		opt.CommitRows = int64(opt.BatchRows) * legacyN
 	default:
 		opt.CommitRows = defaultCommitRows
 	}
 
-	if raw.CommitBytesMB > 0 {
-		opt.CommitBytes = int64(raw.CommitBytesMB) * 1024 * 1024
-	} else {
-		opt.CommitBytes = defaultCommitBytes
-	}
+	opt.CommitBytes = mebibytes(raw.CommitBytesMB, defaultCommitBytes, hardMaxCommitMB)
 
 	// 单事务提交阈值不应小于单条 INSERT 上限，否则每批都提交、失去合并意义。
 	if opt.CommitRows < int64(opt.BatchRows) {
@@ -109,6 +105,20 @@ func ResolveOptions(raw RawOptions) Options {
 	}
 
 	return opt
+}
+
+func mebibytes(valueMB int, defaultBytes int64, maxMB int) int64 {
+	if valueMB <= 0 {
+		return defaultBytes
+	}
+	return int64(clampUpper(valueMB, maxMB)) * 1024 * 1024
+}
+
+func clampUpper(value, max int) int {
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func clampInt(v, def, min, max int) int {

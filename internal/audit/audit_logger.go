@@ -22,6 +22,7 @@ const ( // 定义常量
 	EventTypeTaskDeleted  EventType = "TASK_DELETED" // 任务删除事件
 	EventTypeTaskPaused   EventType = "TASK_PAUSED" // 任务暂停事件
 	EventTypeTaskResumed  EventType = "TASK_RESUMED" // 任务恢复事件
+	EventTypeTaskStopped  EventType = "TASK_STOPPED" // 任务手动结束事件（ALL 任务增量阶段用户结束，进入 STOPPED 终态）
 	EventTypeDataRead     EventType = "DATA_READ" // 数据读取事件
 	EventTypeDataWrite    EventType = "DATA_WRITE" // 数据写入事件
 	EventTypeDataUpdate   EventType = "DATA_UPDATE" // 数据更新事件
@@ -244,6 +245,15 @@ func (al *AuditLogger) LogTaskResumed(taskID string) { // 记录任务恢复事�
 		TaskID:    taskID, // 设置任务ID
 		EventType: EventTypeTaskResumed, // 设置事件类型为任务恢复
 		Success:   true, // 设置成功标志
+	})
+}
+
+// LogTaskStopped 记录任务手动结束事件（ALL 任务在增量阶段被用户结束，进入 STOPPED 终态）。
+func (al *AuditLogger) LogTaskStopped(taskID string) {
+	al.Log(&Event{
+		TaskID:    taskID,
+		EventType: EventTypeTaskStopped,
+		Success:   true,
 	})
 }
 

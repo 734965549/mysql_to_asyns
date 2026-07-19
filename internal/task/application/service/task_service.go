@@ -130,6 +130,13 @@ type TaskService struct {
 
 	// 进度持久化节流：记录每个任务上次落盘时间，避免每批都写存储
 	lastProgressPersist map[string]time.Time
+
+	// 行数对比后台任务追踪：每个任务最多一个核对 goroutine。
+	// cancelCancels 保存对比 context 的 cancel；comparisonWgs 等待 goroutine 退出。
+	// 删除任务 / 关闭服务时先 cancel 并 wg.Wait，避免后台 goroutine 写入已关闭的存储。
+	comparisonCancels map[string]context.CancelFunc
+	comparisonWgs     map[string]*sync.WaitGroup
+	comparisonMu      sync.Mutex // 保护 comparisonCancels / comparisonWgs
 }
 
 // taskRuntime contains resources that must not be shared across running tasks.
@@ -629,6 +636,10 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 		lastProgressPersist: make(map[string]time.Time), // 初始化进度持久化节流
 
+		comparisonCancels: make(map[string]context.CancelFunc), // 初始化行数对比 cancel 映射
+
+		comparisonWgs: make(map[string]*sync.WaitGroup), // 初始化行数对比 wait group 映射
+
 		config: cfg, // 设置配置
 
 		auditLogger: audit.NewAuditLogger("logs/audit"), // 创建审计日志器
@@ -716,6 +727,10 @@ func NewTaskServiceWithDB(sourceDB, targetDB *sql.DB, analyzer service.IdentityA
 
 		lastProgressPersist: make(map[string]time.Time), // 初始化进度持久化节流
 
+		comparisonCancels: make(map[string]context.CancelFunc), // 初始化行数对比 cancel 映射
+
+		comparisonWgs: make(map[string]*sync.WaitGroup), // 初始化行数对比 wait group 映射
+
 		auditLogger: audit.NewAuditLogger("logs/audit"), // 创建审计日志器
 
 	}
@@ -761,6 +776,10 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 		runningProgress: make(map[string]*taskEntity.RunningProgress),
 
 		lastProgressPersist: make(map[string]time.Time),
+
+		comparisonCancels: make(map[string]context.CancelFunc),
+
+		comparisonWgs: make(map[string]*sync.WaitGroup),
 
 		config: cfg,
 
@@ -904,6 +923,19 @@ func (s *TaskService) loadTasks() {
 
 	for _, task := range tasks { // 遍历任务列表
 
+		// 行数对比恢复：服务重启时若存档仍为 CHECKING，说明后台核对被中断，
+		// 改为 FAILED 并注明原因。后台 goroutine 已随进程退出，不会继续写入。
+		if task.Context.RowCountComparison != nil &&
+			task.Context.RowCountComparison.Status == taskEntity.RowCountComparisonChecking {
+			now := time.Now()
+			task.Context.RowCountComparison.Status = taskEntity.RowCountComparisonFailed
+			task.Context.RowCountComparison.CompletedAt = &now
+			task.Context.RowCountComparison.FailureReason = "服务重启导致核对中断"
+			if saveErr := s.storage.Save(task); saveErr != nil {
+				logger.Warn("[Task %s] failed to persist row-count comparison recovery: %v", task.Config.ID, saveErr)
+			}
+		}
+
 		s.tasks[task.Config.ID] = task // 添加到任务映射
 
 	}
@@ -948,6 +980,18 @@ func (s *TaskService) GetTask(taskID string) (*taskEntity.SyncTask, bool) {
 
 }
 
+// GetTaskSnapshot 在锁内深拷贝任务后返回，供 API 序列化，避免与后台行数核对等并发写共享 live 对象。
+func (s *TaskService) GetTaskSnapshot(taskID string) (*taskEntity.SyncTask, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	task, exists := s.tasks[taskID]
+	if !exists || task == nil {
+		return nil, false
+	}
+	return task.CloneForRead(), true
+}
+
 // GetAllTasks 获取所有任务
 
 func (s *TaskService) GetAllTasks() []*taskEntity.SyncTask {
@@ -983,8 +1027,10 @@ func taskStatusRank(status taskEntity.TaskStatus) int {
 		return 4
 	case taskEntity.TaskStatusCompleted:
 		return 5
-	default:
+	case taskEntity.TaskStatusStopped:
 		return 6
+	default:
+		return 7
 	}
 }
 
@@ -1081,7 +1127,7 @@ func (s *TaskService) getTasksPageFromMemory(page, pageSize int, status, keyword
 				continue
 			}
 		}
-		tasks = append(tasks, task)
+		tasks = append(tasks, task.CloneForRead())
 	}
 
 	sort.Slice(tasks, func(i, j int) bool {
@@ -1167,10 +1213,21 @@ func (s *TaskService) UpdateTask(task *taskEntity.SyncTask) error {
 
 	defer s.mu.Unlock()
 
-	if _, exists := s.tasks[task.Config.ID]; !exists {
+	existing, exists := s.tasks[task.Config.ID]
+	if !exists {
 
 		return fmt.Errorf("task not found: %s", task.Config.ID)
 
+	}
+
+	// STOPPED 为终态，不允许编辑原任务（可复制新建或删除）。
+	if existing.Context.Status == taskEntity.TaskStatusStopped {
+		return fmt.Errorf("task is stopped and cannot be edited: %s", task.Config.ID)
+	}
+
+	// 编辑不应清空已归档的行数对比结果（请求体一般不携带该字段）。
+	if task.Context.RowCountComparison == nil && existing.Context.RowCountComparison != nil {
+		task.Context.RowCountComparison = existing.Context.RowCountComparison
 	}
 
 	s.tasks[task.Config.ID] = task
@@ -1222,9 +1279,15 @@ func (s *TaskService) DeleteTask(taskID string) error {
 	}
 
 	delete(s.tasks, taskID)
+	clearFullLoadStats(taskID)
 
 	// 清理进度持久化节流记录
 	delete(s.lastProgressPersist, taskID)
+
+	// 释放主锁后取消并等待行数对比后台 goroutine 退出，避免 goroutine 写入已删除的任务。
+	s.mu.Unlock()
+	s.cancelRowComparisonAndWait(taskID)
+	s.mu.Lock()
 
 	// 从存储删除
 
@@ -1280,6 +1343,11 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 
 		return fmt.Errorf("task is already running: %s", taskID) // 返回错误
 
+	}
+
+	// STOPPED 为用户确认结束的终态，原任务不允许再次启动（可复制新建或删除）。
+	if task.Context.Status == taskEntity.TaskStatusStopped {
+		return fmt.Errorf("task is stopped and cannot be restarted: %s", taskID)
 	}
 
 	if err := fullSyncRestartBlockedError(task); err != nil {
@@ -5644,6 +5712,26 @@ func (s *TaskService) clearLastProgressPersistLocked(taskID string) {
 	delete(s.lastProgressPersist, taskID)
 }
 
+// shouldPersistAsyncProgressSnapshot 判断锁外进度快照是否仍应落盘。
+// incrementTaskProgress 在锁内序列化、锁外 Save；Pause/End/Fail 等在锁内同步保存较新状态。
+// 若不做校验，滞后的 RUNNING 快照可能在终态存档之后落盘，进程崩溃时重启会读到错误状态。
+func (s *TaskService) shouldPersistAsyncProgressSnapshot(taskID string, snapshot *taskEntity.SyncTask) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return false
+	}
+	if task.Context.Status != snapshot.Context.Status {
+		return false
+	}
+	if task.Context.LastUpdateTime.After(snapshot.Context.LastUpdateTime) {
+		return false
+	}
+	return true
+}
+
 // updateTaskProgress 更新任务进度
 
 func (s *TaskService) updateTaskProgress(taskID string, processedRows int64, position string) {
@@ -5665,21 +5753,15 @@ func (s *TaskService) updateTaskProgress(taskID string, processedRows int64, pos
 // incrementTaskProgress 原子增加任务进度，并返回当前任务总行数供运行时 ETA 复用。
 // 内存进度每批都更新，但存储落盘按 1 秒节流，避免高频 I/O。
 func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position string) int64 {
-
 	s.mu.Lock()
-
-	defer s.mu.Unlock()
-
+	var snapshotJSON []byte
+	var effectiveTotal int64
 	if task, exists := s.tasks[taskID]; exists {
-
 		task.Context.ProcessedRows += delta
-
 		task.Context.CurrentPosition = position
-
 		task.Context.LastUpdateTime = time.Now()
-
 		// 进度计算优先使用精确总数，未到位时用估算总数兜底（仅 ETA）
-		effectiveTotal := task.Context.TotalRows
+		effectiveTotal = task.Context.TotalRows
 		if effectiveTotal <= 0 {
 			effectiveTotal = task.Context.EstimatedTotalRows
 		}
@@ -5692,13 +5774,22 @@ func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position
 		last, ok := s.lastProgressPersist[taskID]
 		if !ok || now.Sub(last) >= time.Second {
 			s.lastProgressPersist[taskID] = now
-			s.storage.Save(task)
+			// 在锁内冻结一份不可变快照；真正的文件/MySQL I/O 在释放全局任务锁后执行。
+			// 这样慢存储不会阻塞其他 worker，同时避免把仍在变化的任务指针交给存储层。
+			snapshotJSON, _ = json.Marshal(task)
 		}
-
-		return effectiveTotal
 	}
+	s.mu.Unlock()
 
-	return 0
+	if len(snapshotJSON) > 0 {
+		var snapshot taskEntity.SyncTask
+		if err := json.Unmarshal(snapshotJSON, &snapshot); err == nil {
+			if s.shouldPersistAsyncProgressSnapshot(taskID, &snapshot) {
+				_ = s.storage.Save(&snapshot)
+			}
+		}
+	}
+	return effectiveTotal
 }
 
 // updateTaskEstimatedRows 更新任务估算总行数（information_schema），仅用于 ETA
@@ -5865,6 +5956,90 @@ func (s *TaskService) PauseTask(taskID string) error {
 
 		s.auditLogger.LogTaskPaused(taskID)
 
+	}
+
+	return nil
+
+}
+
+// EndTask 结束持续运行的 ALL 任务（用户在增量阶段点击"结束"）。
+//
+// 仅当同时满足 status=RUNNING、mode=ALL、sync_phase=INCREMENTAL_STARTED 时允许结束。
+// 结束为终态：任务进入 STOPPED，记录 end_time，清除 Cron/repeat 调度配置，
+// 从运行时映射中摘除增量服务和 task runtime，并写入 TASK_STOPPED 审计事件。
+//
+// 采用"立即优雅停止"语义：完成当前正在退出的处理和资源关闭，但不捕获新的结束位点，
+// 也不等待持续产生的源端写入全部追平。结束后原任务不能重启、编辑或调度；
+// 仍允许查看、行数对比、复制新建和删除。
+//
+// 锁策略：在任务锁内原子地校验、设置 STOPPED、清除调度、从映射摘除增量服务和 runtime
+// 引用并持久化状态、写审计；释放锁后再依次停止增量订阅与 Sink、关闭任务数据库连接，
+// 避免在全局任务锁内等待外部资源（与 DeleteTask/Close 一致）。
+//
+// 返回错误：task not found（404）、模式/阶段/状态不允许（409）。
+func (s *TaskService) EndTask(taskID string) error {
+	// 第一阶段：持锁完成状态变更与映射摘除
+	s.mu.Lock()
+
+	task, exists := s.tasks[taskID]
+
+	if !exists {
+		s.mu.Unlock()
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+
+	// 校验结束条件：仅 RUNNING + ALL + INCREMENTAL_STARTED 允许结束
+	if task.Context.Status != taskEntity.TaskStatusRunning {
+		s.mu.Unlock()
+		return fmt.Errorf("task is not running and cannot be ended (status=%s): %s", task.Context.Status, taskID)
+	}
+	if task.Config.Mode != taskEntity.SyncModeAll {
+		s.mu.Unlock()
+		return fmt.Errorf("only ALL mode tasks can be ended (mode=%s): %s", task.Config.Mode, taskID)
+	}
+	if task.Context.SyncPhase != taskEntity.SyncPhaseIncrementalStarted {
+		s.mu.Unlock()
+		return fmt.Errorf("task can only be ended in incremental phase (sync_phase=%s): %s", task.Context.SyncPhase, taskID)
+	}
+
+	// 原子地设置 STOPPED、记录 end_time、清除调度配置
+	task.Stop()
+
+	// 从映射摘除增量服务和 runtime 引用（实际停止在释放锁后进行）
+	var incrSyncToStop *syncApp.IncrementalSyncService
+	if incrSync, exists := s.incrementalSyncs[taskID]; exists {
+		incrSyncToStop = incrSync
+		delete(s.incrementalSyncs, taskID)
+	}
+	var runtimeToClose *taskRuntime
+	if runtime, exists := s.runtimes[taskID]; exists {
+		runtimeToClose = runtime
+		delete(s.runtimes, taskID)
+	}
+
+	// 清除运行时进度（任务结束）
+	s.clearRunningProgress(taskID)
+	s.clearLastProgressPersistLocked(taskID)
+
+	// 保存状态
+	if err := s.storage.Save(task); err != nil {
+		fmt.Printf("保存任务状态失败: %v\n", err)
+	}
+
+	// 记录审计日志
+	if s.auditLogger != nil {
+		s.auditLogger.LogTaskStopped(taskID)
+	}
+
+	s.mu.Unlock()
+
+	// 第二阶段：释放锁后关闭外部资源，避免在全局任务锁内等待
+	if incrSyncToStop != nil {
+		logger.Info("[Task %s] Stopping incremental sync service on end", taskID)
+		incrSyncToStop.Stop()
+	}
+	if runtimeToClose != nil {
+		runtimeToClose.Close()
 	}
 
 	return nil
@@ -6538,7 +6713,19 @@ func (s *TaskService) Close() error {
 
 	}
 
-	// 2. 保存所有任务状态
+	// 2. 取消所有行数对比后台 goroutine 并等待退出，避免写入即将关闭的存储。
+	//    先收集 WaitGroup 再释放锁等待，防止持锁等待 goroutine 造成死锁（goroutine 可能需要 s.mu）。
+	s.comparisonMu.Lock()
+	for _, cancel := range s.comparisonCancels {
+		cancel()
+	}
+	wgSnapshot := make([]*sync.WaitGroup, 0, len(s.comparisonWgs))
+	for _, wg := range s.comparisonWgs {
+		wgSnapshot = append(wgSnapshot, wg)
+	}
+	s.comparisonMu.Unlock()
+
+	// 3. 保存所有任务状态
 
 	for taskID, task := range s.tasks {
 
@@ -6561,6 +6748,13 @@ func (s *TaskService) Close() error {
 		}
 
 	}
+
+	// 释放主锁后等待对比 goroutine 退出，再关闭存储。
+	s.mu.Unlock()
+	for _, wg := range wgSnapshot {
+		wg.Wait()
+	}
+	s.mu.Lock()
 
 	closeResource(s.checkpointCloser, "checkpoint manager")
 	s.checkpointCloser = nil
