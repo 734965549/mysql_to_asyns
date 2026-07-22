@@ -1,3 +1,13 @@
+export const SECRET_MASK = "******";
+
+export function isMaskedSecret(value) {
+  return String(value || "") === SECRET_MASK;
+}
+
+export function unmaskSecret(value) {
+  return isMaskedSecret(value) ? "" : String(value || "");
+}
+
 function hasMySQLConnectionOptions(options) {
   const opts = options || {};
   return Boolean(
@@ -5,6 +15,15 @@ function hasMySQLConnectionOptions(options) {
       String(opts.port || "").trim() ||
       String(opts.username || "").trim() ||
       String(opts.database || "").trim(),
+  );
+}
+
+export function isSingleExplicitMySQLSink(sinkConfigs) {
+  return Boolean(
+    sinkConfigs &&
+      sinkConfigs.length === 1 &&
+      sinkConfigs[0].type === "MYSQL" &&
+      hasMySQLConnectionOptions(sinkConfigs[0].options),
   );
 }
 

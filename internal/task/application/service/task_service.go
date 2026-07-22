@@ -5404,7 +5404,10 @@ func isConnRetryable(err error) bool {
 	return strings.Contains(s, "invalid connection") ||
 		strings.Contains(s, "bad connection") ||
 		strings.Contains(s, "unexpected packet") ||
-		strings.Contains(s, "connection was bad")
+		strings.Contains(s, "connection was bad") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection reset")
 }
 
 func retryIndexRestoreConn(ctx context.Context, attempt int) error {

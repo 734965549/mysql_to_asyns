@@ -9,8 +9,11 @@ import {
 } from "./utils/databaseMappings.js";
 import {
   hasExplicitSinkConfigs,
+  isMaskedSecret,
+  isSingleExplicitMySQLSink,
   resolveMySQLSinkConnectionDisplay,
   resolveTaskTargetMySQLDisplay,
+  unmaskSecret,
 } from "./utils/taskTargetDisplay.js";
 
 const API_BASE = "/api";
@@ -293,6 +296,8 @@ function getDefaultSinkOptions(type) {
 
 const targetType = ref("MYSQL"); // 'MYSQL', 'KAFKA', 'WEBHOOK', 'MULTI'
 
+const cloneFromTaskId = ref(null);
+
 const singleKafkaConfig = ref(getDefaultSinkOptions("KAFKA"));
 
 const singleWebhookConfig = ref(getDefaultSinkOptions("HTTP_WEBHOOK"));
@@ -316,7 +321,33 @@ function onSinkTypeChange(index) {
 }
 
 function getSinkTypeLabel(type) {
+  if (type === "MULTI") {
+    return "高级: 多目标 (Multi-Sink)";
+  }
   return SINK_TYPES.find((t) => t.value === type)?.label || type;
+}
+
+function normalizeSinkOptionsForForm(type, options) {
+  const opts = { ...(options || {}) };
+  if (type === "MYSQL") {
+    opts.password = unmaskSecret(opts.password);
+  } else if (type === "KAFKA") {
+    if (Array.isArray(opts.brokers)) {
+      opts.brokers = opts.brokers.join(", ");
+    }
+    const security = { ...(opts.security || {}) };
+    security.sasl_password = unmaskSecret(security.sasl_password);
+    opts.security = security;
+  } else if (type === "HTTP_WEBHOOK") {
+    if (opts.headers && typeof opts.headers === "object") {
+      opts.headers = Object.entries(opts.headers)
+        .map(([k, v]) => `${k}: ${isMaskedSecret(v) ? "" : v}`)
+        .join("\n");
+    } else if (isMaskedSecret(opts.headers)) {
+      opts.headers = "";
+    }
+  }
+  return opts;
 }
 
 const taskForm = ref({
@@ -931,6 +962,10 @@ function resetForm() {
 
   targetType.value = "";
 
+  sinkConfigs.value = [];
+
+  cloneFromTaskId.value = null;
+
   singleKafkaConfig.value = getDefaultSinkOptions("KAFKA");
 
   singleWebhookConfig.value = getDefaultSinkOptions("HTTP_WEBHOOK");
@@ -1259,6 +1294,10 @@ async function createTask() {
     target_db: useCustomTargetDB.value ? customTargetDB.value : null,
 
     sink_configs: sinkConfigsPayload,
+
+    clone_from_task_id: !editMode.value && cloneFromTaskId.value
+      ? cloneFromTaskId.value
+      : undefined,
   };
 
   loading.value = true;
@@ -1863,7 +1902,7 @@ function fillTaskFormFromTask(task) {
 
       username: task.config.source_db.username,
 
-      password: task.config.source_db.password,
+      password: unmaskSecret(task.config.source_db.password),
     };
   }
 
@@ -1879,14 +1918,30 @@ function fillTaskFormFromTask(task) {
 
       username: task.config.target_db.username,
 
-      password: task.config.target_db.password,
+      password: unmaskSecret(task.config.target_db.password),
     };
   }
 
   // 回填 sink_configs：默认占位 MYSQL sink 视为隐式目标端，与详情展示逻辑一致
 
   if (hasExplicitSinkConfigs(task.config.sink_configs)) {
-    if (
+    if (isSingleExplicitMySQLSink(task.config.sink_configs)) {
+      targetType.value = "MYSQL";
+      sinkConfigs.value = [];
+
+      if (!task.config.target_db) {
+        const opts = task.config.sink_configs[0].options || {};
+
+        useCustomTargetDB.value = true;
+        customTargetDB.value = {
+          host: opts.host || "",
+          port: opts.port || 3306,
+          database: opts.database || "",
+          username: opts.username || "",
+          password: unmaskSecret(opts.password),
+        };
+      }
+    } else if (
       task.config.sink_configs.length === 1 &&
       task.config.sink_configs[0].type !== "MYSQL"
     ) {
@@ -1894,21 +1949,11 @@ function fillTaskFormFromTask(task) {
 
       targetType.value = sc.type;
 
-      const opts = { ...(sc.options || {}) };
+      const opts = normalizeSinkOptionsForForm(sc.type, sc.options);
 
       if (sc.type === "KAFKA") {
-        if (Array.isArray(opts.brokers)) {
-          opts.brokers = opts.brokers.join(", ");
-        }
-
         singleKafkaConfig.value = opts;
       } else if (sc.type === "HTTP_WEBHOOK") {
-        if (opts.headers && typeof opts.headers === "object") {
-          opts.headers = Object.entries(opts.headers)
-            .map(([k, v]) => `${k}: ${v}`)
-            .join("\n");
-        }
-
         singleWebhookConfig.value = opts;
       }
 
@@ -1916,24 +1961,10 @@ function fillTaskFormFromTask(task) {
     } else {
       targetType.value = "MULTI";
 
-      sinkConfigs.value = task.config.sink_configs.map((sc) => {
-        const opts = { ...(sc.options || {}) };
-        // Kafka: brokers 数组转为逗号分隔字符串供编辑
-        if (sc.type === "KAFKA" && Array.isArray(opts.brokers)) {
-          opts.brokers = opts.brokers.join(", ");
-        }
-        // Webhook: headers 对象转为 "Key: Value\n" 供编辑
-        if (
-          sc.type === "HTTP_WEBHOOK" &&
-          opts.headers &&
-          typeof opts.headers === "object"
-        ) {
-          opts.headers = Object.entries(opts.headers)
-            .map(([k, v]) => `${k}: ${v}`)
-            .join("\n");
-        }
-        return { type: sc.type, options: opts };
-      });
+      sinkConfigs.value = task.config.sink_configs.map((sc) => ({
+        type: sc.type,
+        options: normalizeSinkOptionsForForm(sc.type, sc.options),
+      }));
     }
   } else {
     targetType.value = "MYSQL";
@@ -1969,6 +2000,8 @@ function openDuplicateFromTask(task) {
   editMode.value = false;
 
   editingTaskId.value = null;
+
+  cloneFromTaskId.value = task.config.id;
 
   fillTaskFormFromTask(task);
 

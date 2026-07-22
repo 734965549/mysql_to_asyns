@@ -568,6 +568,9 @@ func TestIsConnRetryable(t *testing.T) {
 	assert.False(t, isConnRetryable(nil))
 	assert.True(t, isConnRetryable(driver.ErrBadConn))
 	assert.True(t, isConnRetryable(fmt.Errorf("invalid connection")))
+	assert.True(t, isConnRetryable(fmt.Errorf("dial tcp 10.0.0.1:3306: connect: connection refused")))
+	assert.True(t, isConnRetryable(fmt.Errorf("write: broken pipe")))
+	assert.True(t, isConnRetryable(fmt.Errorf("read: connection reset by peer")))
 	assert.False(t, isConnRetryable(fmt.Errorf("Error 1062: Duplicate entry")))
 }
 

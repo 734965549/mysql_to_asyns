@@ -2,9 +2,38 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   hasExplicitSinkConfigs,
+  isMaskedSecret,
+  isSingleExplicitMySQLSink,
   resolveMySQLSinkConnectionDisplay,
   resolveTaskTargetMySQLDisplay,
+  unmaskSecret,
 } from "./taskTargetDisplay.js";
+
+test("unmaskSecret strips API password placeholders", () => {
+  assert.equal(unmaskSecret("******"), "");
+  assert.equal(unmaskSecret("real-secret"), "real-secret");
+  assert.equal(isMaskedSecret("******"), true);
+});
+
+test("isSingleExplicitMySQLSink detects lone MYSQL sink with connection options", () => {
+  assert.equal(
+    isSingleExplicitMySQLSink([
+      { type: "MYSQL", options: { host: "10.0.0.2", port: 3306 } },
+    ]),
+    true,
+  );
+  assert.equal(
+    isSingleExplicitMySQLSink([{ type: "MYSQL", options: {} }]),
+    false,
+  );
+  assert.equal(
+    isSingleExplicitMySQLSink([
+      { type: "MYSQL", options: { host: "10.0.0.2" } },
+      { type: "KAFKA", options: { topic: "events" } },
+    ]),
+    false,
+  );
+});
 
 test("hasExplicitSinkConfigs treats default MYSQL placeholder as implicit", () => {
   assert.equal(hasExplicitSinkConfigs([]), false);

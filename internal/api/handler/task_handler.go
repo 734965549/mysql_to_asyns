@@ -154,6 +154,7 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
 	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
 	SinkConfigs              []SinkConfigRequest    `json:"sink_configs,omitempty"`       // 增量目标端配置（可选，默认 MYSQL）
+	CloneFromTaskID          string                 `json:"clone_from_task_id,omitempty"` // 复制新建时沿用源任务密码等敏感字段
 }
 
 // CreateTask 创建任务方法
@@ -203,6 +204,22 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 	}
 
 	sinkConfigs := sinkConfigsFromRequest(req.SinkConfigs, true)
+
+	if req.CloneFromTaskID != "" {
+		sourceTask, ok := h.taskService.GetTask(req.CloneFromTaskID)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "clone source task not found"})
+			return
+		}
+		preserveCloneSecrets(sourceTask, sourceDB, targetDB, sinkConfigs)
+	} else {
+		if sourceDB != nil && sourceDB.Password == secretMask {
+			sourceDB.Password = ""
+		}
+		if targetDB != nil && targetDB.Password == secretMask {
+			targetDB.Password = ""
+		}
+	}
 
 	// 设置同步级别（支持大小写不敏感）
 	syncLevel := taskEntity.SyncLevelTable            // 默认为表级别
@@ -1123,6 +1140,45 @@ func preserveMaskedHeaders(incoming, existing map[string]interface{}) {
 					headers[key] = original
 				}
 			}
+		}
+	}
+}
+
+func preserveCloneSecrets(sourceTask *taskEntity.SyncTask, sourceDB, targetDB *taskEntity.DatabaseConfig, sinkConfigs []sink.SinkConfig) {
+	if sourceTask == nil {
+		return
+	}
+	if sourceDB != nil && sourceTask.Config.SourceDB != nil {
+		if sourceDB.Password == "" || sourceDB.Password == secretMask {
+			sourceDB.Password = sourceTask.Config.SourceDB.Password
+		}
+	}
+	if targetDB != nil && sourceTask.Config.TargetDB != nil {
+		if targetDB.Password == "" || targetDB.Password == secretMask {
+			targetDB.Password = sourceTask.Config.TargetDB.Password
+		}
+	}
+	preserveMaskedSinkSecrets(sinkConfigs, sourceTask.Config.SinkConfigs)
+	preserveCloneMySQLSinkPasswords(sinkConfigs, sourceTask.Config.SinkConfigs)
+}
+
+func preserveCloneMySQLSinkPasswords(incoming, existing []sink.SinkConfig) {
+	for i := range incoming {
+		if i >= len(existing) || incoming[i].Type != existing[i].Type {
+			continue
+		}
+		if incoming[i].Type != sink.SinkTypeMYSQL {
+			continue
+		}
+		if incoming[i].Options == nil {
+			continue
+		}
+		password, _ := incoming[i].Options["password"].(string)
+		if password != "" && password != secretMask {
+			continue
+		}
+		if existingPassword, ok := existing[i].Options["password"].(string); ok && existingPassword != "" {
+			incoming[i].Options["password"] = existingPassword
 		}
 	}
 }

@@ -122,6 +122,73 @@ func TestUpdateTaskPreservesMaskedSinkSecrets(t *testing.T) {
 	}
 }
 
+func TestCreateTaskPreservesSecretsWhenCloning(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	taskSvc := newTestTaskService()
+	sourceTask, err := taskSvc.CreateTask(taskEntity.TaskConfig{
+		ID:   "clone_source_task",
+		Name: "Clone source",
+		Mode: taskEntity.SyncModeFull,
+		SourceDB: &taskEntity.DatabaseConfig{
+			Host:     "source-host",
+			Port:     3306,
+			Database: "source_db",
+			Username: "source-user",
+			Password: "source-password",
+		},
+		TargetDB: &taskEntity.DatabaseConfig{
+			Host:     "target-host",
+			Port:     3306,
+			Database: "target_db",
+			Username: "target-user",
+			Password: "target-password",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create source task: %v", err)
+	}
+
+	handler := NewTaskHandler(taskSvc, &MockIdentityAnalyzer{})
+	router := gin.New()
+	router.POST("/api/tasks", handler.CreateTask)
+	body := `{
+		"name":"Cloned task",
+		"mode":"FULL",
+		"clone_from_task_id":"` + sourceTask.Config.ID + `",
+		"source_db":{"host":"source-host","port":3306,"database":"source_db","username":"source-user","password":"******"},
+		"target_db":{"host":"target-host","port":3306,"database":"target_db","username":"target-user","password":"******"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var created taskEntity.SyncTask
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if created.Config.SourceDB == nil || created.Config.SourceDB.Password != secretMask {
+		t.Fatalf("response should redact source password, got %v", created.Config.SourceDB)
+	}
+	if created.Config.TargetDB == nil || created.Config.TargetDB.Password != secretMask {
+		t.Fatalf("response should redact target password, got %v", created.Config.TargetDB)
+	}
+
+	cloned, ok := taskSvc.GetTask(created.Config.ID)
+	if !ok {
+		t.Fatal("cloned task not found")
+	}
+	if cloned.Config.SourceDB.Password != "source-password" {
+		t.Fatalf("cloned source password not preserved: %q", cloned.Config.SourceDB.Password)
+	}
+	if cloned.Config.TargetDB.Password != "target-password" {
+		t.Fatalf("cloned target password not preserved: %q", cloned.Config.TargetDB.Password)
+	}
+}
+
 func newTestTaskService() *taskService.TaskService {
 
 	return taskService.NewTaskService(&config.Config{
