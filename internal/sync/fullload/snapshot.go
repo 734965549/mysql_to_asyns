@@ -34,8 +34,13 @@ type tableSnapshot struct {
 	conn *sql.Conn
 }
 
-func (ts *tableSnapshot) commit(ctx context.Context) error {
-	_, err := ts.conn.ExecContext(ctx, "COMMIT")
+func (ts *tableSnapshot) commit(_ context.Context) error {
+	// 与 rollback/UNLOCK 一致：收尾 COMMIT 不能绑在可能已取消的父 ctx 上。
+	// 读表完成进入 commit 时，共享 cctx 可能因停止、写端失败或其他表错误已被 cancel；
+	// 若此处跟随父 ctx，会把正常收尾误报成 context canceled。
+	commitCtx, cancel := context.WithTimeout(context.Background(), snapshotStepTimeout)
+	defer cancel()
+	_, err := ts.conn.ExecContext(commitCtx, "COMMIT")
 	return err
 }
 

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "codebase-memory-mcp": {
+      "env": {
+        "CBM_ALLOWED_ROOT": "C:/temp/mysql_to_asyns",
+        "CBM_LOG_LEVEL": "info"
+      }
+    }
+  }
+}

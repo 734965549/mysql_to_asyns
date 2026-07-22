@@ -368,6 +368,34 @@ func TestGroupChunksByTable(t *testing.T) {
 	}
 }
 
+func TestCommitSnapshots_IgnoresCanceledParentContext(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	expectInnoDBTable(mock, "s", "t")
+	expectConsistentSnapshot(mock, "s", "t", "id")
+	expectInnoDBTable(mock, "s", "t") // 无锁路径：持 MDL 后权威校验
+	expectSnapshotCommit(mock)
+
+	snap, err := openTableSnapshot(context.Background(), db, "s", "t", "id", SnapshotOptions{})
+	if err != nil {
+		t.Fatalf("open snapshot: %v", err)
+	}
+	defer snap.close()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := commitSnapshots(canceled, []*tableSnapshot{snap}); err != nil {
+		t.Fatalf("commit with canceled parent ctx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOpenAlignedTableSnapshots_MultiReaders(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(false))
 	if err != nil {

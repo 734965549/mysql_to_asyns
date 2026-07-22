@@ -1,0 +1,31 @@
+# codebase-memory indexer exclusions (gitignore syntax)
+# See: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/cbmignore.md
+
+# Frontend dependencies and build output
+node_modules/
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Go test/runtime artifacts (generated locally, not source fixtures)
+internal/**/data/
+internal/**/logs/
+**/test_data/
+
+# Binary, coverage, and log noise
+*.exe
+*.test
+coverage*
+*.log
+logs/
+data/
+
+# Secrets and local config
+etc/application.toml
+
+# Minified bundles (fast mode skips these; explicit for full mode)
+**/*.min.js
+**/*.min.css
+
+# Git internals and tool caches
+.git/worktrees/

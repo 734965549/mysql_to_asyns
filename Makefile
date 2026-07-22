@@ -80,6 +80,10 @@ web-build:
 build-all: build web-build
 	@echo "Full build complete"
 
+# codebase-memory 知识图谱索引（Windows 请用 PowerShell 脚本）
+index-codebase:
+	@powershell -NoProfile -ExecutionPolicy Bypass -File scripts/index-codebase.ps1
+
 # 开发模式（同时启动前后端）
 dev:
 	@echo "Starting development environment..."
@@ -104,6 +108,7 @@ help:
 	@echo "  web-dev        Start frontend dev server"
 	@echo "  web-build      Build frontend"
 	@echo "  build-all      Build both frontend and backend"
+	@echo "  index-codebase Refresh codebase-memory graph (use scripts/index-codebase.ps1 on Windows)"
 	@echo "  dev            Start development environment"
 	@echo "  help           Show this help message"
 	@echo ""

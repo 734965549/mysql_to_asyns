@@ -9,6 +9,19 @@ These instructions apply to the entire repository. Read this file before making 
 - Read the smallest relevant source files before editing. Do not rely only on documentation.
 - Preserve user changes. Do not revert unrelated modified files.
 
+### Codebase-memory indexing (Windows)
+
+Do **not** rely on the MCP `index_repository` tool while Cursor is connected — the MCP server holds the SQLite graph open and the worker exits immediately. Paths containing non-ASCII characters (e.g. `E盘`) also crash the worker.
+
+Use the project script instead, then restart Cursor (or reload MCP):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/index-codebase.ps1
+# or: make index-codebase
+```
+
+The script creates an ASCII junction at `C:\temp\mysql_to_asyns`, runs the standalone CLI, and writes `.codebase-memory/graph.db.zst`. Exclusions live in `.cbmignore`.
+
 Useful context files:
 
 - `README.md`: product behavior, public API, operations, and examples.
