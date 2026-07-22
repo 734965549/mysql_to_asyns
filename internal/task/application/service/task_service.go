@@ -7103,7 +7103,7 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 }
 
 // restorePendingIndexes 在所有表数据同步完成后，按表级并发恢复全量同步期间移除的索引。
-// 单表内多个索引仍串行重建（避免同表 MDL 锁竞争）；不同表之间按 workers 并发。
+// 单表内多个索引合并为一条 ALTER TABLE（一次扫描建齐所有索引）；不同表之间按 workers 并发。
 // 任一表失败或任务被停止时，通过 context 取消其余在途任务并尽快返回。
 func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRuntime, taskID string, pending []pendingIndexRestore, workers int) error {
 	if len(pending) == 0 {
@@ -7261,29 +7261,47 @@ func targetIndexExists(ctx context.Context, targetDB *sql.DB, schema, tableName,
 
 }
 
-// restoreIndexes 恢复索引
+// buildAddIndexClause 构造 ALTER TABLE 中的单条 ADD INDEX 子句。
+func buildAddIndexClause(indexName string, nonUnique int, indexType, columns string) string {
+	if nonUnique == 0 {
+		return fmt.Sprintf("ADD UNIQUE INDEX `%s` (%s)", indexName, columns)
+	}
+	if strings.EqualFold(indexType, "FULLTEXT") {
+		return fmt.Sprintf("ADD FULLTEXT INDEX `%s` (%s)", indexName, columns)
+	}
+	if strings.EqualFold(indexType, "SPATIAL") {
+		return fmt.Sprintf("ADD SPATIAL INDEX `%s` (%s)", indexName, columns)
+	}
+	return fmt.Sprintf("ADD INDEX `%s` (%s)", indexName, columns)
+}
 
+// buildAlterAddIndexesSQL 将同表多个索引合并为一条 ALTER TABLE，避免多次全表扫描建索引。
+func buildAlterAddIndexesSQL(schema, tableName string, clauses []string) string {
+	return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", schema, tableName, strings.Join(clauses, ", "))
+}
+
+// restoreIndexes 恢复索引：同表待建索引合并为一条 ALTER TABLE，InnoDB 一次扫描建齐。
 func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string, indexes []map[string]interface{}) error {
-
 	if runtime == nil || runtime.targetDB == nil {
-
 		return fmt.Errorf("task runtime target db is not initialized")
-
+	}
+	targetDB := runtime.targetDB
+	if len(indexes) == 0 {
+		return nil
 	}
 
-	targetDB := runtime.targetDB
-
-	if len(indexes) == 0 {
-
-		return nil
-
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 
 	logger.Info("[Task] Restoring %d indexes for table %s.%s...", len(indexes), schema, tableName)
 
-	for _, indexInfo := range indexes {
+	addClauses := make([]string, 0, len(indexes))
+	addNames := make([]string, 0, len(indexes))
 
-		// 单表内串行：先做一次取消检查，再构造 DDL，避免无谓的 SQL 生成
+	for _, indexInfo := range indexes {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -7333,71 +7351,44 @@ func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, 
 		}
 
 		if exists {
-
 			if match {
-
 				logger.Info("Index `%s` already exists on `%s`.`%s` with matching definition, skipping", indexName, schema, tableName)
-
 				continue
-
 			}
-
 			return fmt.Errorf("index `%s` already exists on `%s`.`%s` but with a different definition", indexName, schema, tableName)
-
 		}
 
-		// 构建 CREATE INDEX 语句（区分 UNIQUE / FULLTEXT / SPATIAL / 普通索引）
-
-		var createSQL string
-
-		if nonUnique == 0 {
-
-			createSQL = fmt.Sprintf("CREATE UNIQUE INDEX `%s` ON `%s`.`%s` (%s)",
-
-				indexName, schema, tableName, columns)
-
-		} else if strings.EqualFold(indexType, "FULLTEXT") {
-
-			createSQL = fmt.Sprintf("CREATE FULLTEXT INDEX `%s` ON `%s`.`%s` (%s)",
-
-				indexName, schema, tableName, columns)
-
-		} else if strings.EqualFold(indexType, "SPATIAL") {
-
-			createSQL = fmt.Sprintf("CREATE SPATIAL INDEX `%s` ON `%s`.`%s` (%s)",
-
-				indexName, schema, tableName, columns)
-
-		} else {
-
-			createSQL = fmt.Sprintf("CREATE INDEX `%s` ON `%s`.`%s` (%s)",
-
-				indexName, schema, tableName, columns)
-
-		}
-
-		for attempt := 0; attempt <= indexRestoreConnMaxRetries; attempt++ {
-			if retryErr := retryIndexRestoreConn(ctx, attempt); retryErr != nil {
-				return retryErr
-			}
-			_, err = targetDB.ExecContext(ctx, createSQL)
-			if err == nil || !isConnRetryable(err) || attempt >= indexRestoreConnMaxRetries {
-				break
-			}
-			logger.Warn("Retrying CREATE INDEX `%s` on `%s`.`%s` after connection error (attempt %d): %v",
-				indexName, schema, tableName, attempt+1, err)
-		}
-		if err != nil {
-			logger.Warn("Warning: failed to create index %s: %v (SQL: %s)", indexName, err, createSQL)
-			return fmt.Errorf("create index `%s` on `%s`.`%s`: %w", indexName, schema, tableName, err)
-		}
-
-		logger.Info("Created index %s on table %s.%s", indexName, schema, tableName)
-
+		addClauses = append(addClauses, buildAddIndexClause(indexName, nonUnique, indexType, columns))
+		addNames = append(addNames, indexName)
 	}
 
-	return nil
+	if len(addClauses) == 0 {
+		return nil
+	}
 
+	alterSQL := buildAlterAddIndexesSQL(schema, tableName, addClauses)
+	logger.Info("[Task] Restoring %d indexes on `%s`.`%s` in one ALTER TABLE: %s",
+		len(addClauses), schema, tableName, strings.Join(addNames, ", "))
+
+	var err error
+	for attempt := 0; attempt <= indexRestoreConnMaxRetries; attempt++ {
+		if retryErr := retryIndexRestoreConn(ctx, attempt); retryErr != nil {
+			return retryErr
+		}
+		_, err = targetDB.ExecContext(ctx, alterSQL)
+		if err == nil || !isConnRetryable(err) || attempt >= indexRestoreConnMaxRetries {
+			break
+		}
+		logger.Warn("Retrying ALTER TABLE ADD INDEX on `%s`.`%s` after connection error (attempt %d): %v",
+			schema, tableName, attempt+1, err)
+	}
+	if err != nil {
+		logger.Warn("Warning: failed to restore indexes on `%s`.`%s`: %v (SQL: %s)", schema, tableName, err, alterSQL)
+		return fmt.Errorf("restore indexes on `%s`.`%s` (%s): %w", schema, tableName, strings.Join(addNames, ", "), err)
+	}
+
+	logger.Info("Created %d indexes on table %s.%s: %s", len(addNames), schema, tableName, strings.Join(addNames, ", "))
+	return nil
 }
 
 // ReinitStorage 动态切换存储后端

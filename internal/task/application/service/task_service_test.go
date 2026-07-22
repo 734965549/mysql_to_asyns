@@ -128,7 +128,7 @@ func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 
 	// sqlmock checks expectations in order by default. Disable ordered matching
 	// because the concurrent implementation may dispatch the two tables in any
-	// order, and each table's CREATE INDEX may overlap with the other table's.
+	// order, and each table's ALTER TABLE may overlap with the other table's.
 	mock.MatchExpectationsInOrder(false)
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("target_db", "users", "idx_users_name").
@@ -136,9 +136,9 @@ func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("target_db", "orders", "uk_orders_no").
 		WillReturnRows(emptyStatsRows)
-	mock.ExpectExec("CREATE INDEX `idx_users_name` ON `target_db`.`users` \\(`name`\\)").
+	mock.ExpectExec("ALTER TABLE `target_db`.`users` ADD INDEX `idx_users_name` \\(`name`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("CREATE UNIQUE INDEX `uk_orders_no` ON `target_db`.`orders` \\(`order_no`\\)").
+	mock.ExpectExec("ALTER TABLE `target_db`.`orders` ADD UNIQUE INDEX `uk_orders_no` \\(`order_no`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{
@@ -173,7 +173,7 @@ func TestRestorePendingIndexes_RespectsStopSignal(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	// 不期望任何 CREATE INDEX 被执行
+	// 不期望任何 ALTER TABLE ADD INDEX 被执行
 	ts := &TaskService{
 		tasks: map[string]*taskEntity.SyncTask{
 			"task-stop": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusPaused}},
@@ -206,7 +206,7 @@ func TestRestorePendingIndexes_FailsFastOnFirstError_Sequential(t *testing.T) {
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "a", "idx_a").
 		WillReturnRows(emptyStatsRows)
-	mock.ExpectExec("CREATE INDEX `idx_a` ON `db`.`a` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`a` ADD INDEX `idx_a` \\(`c`\\)").
 		WillReturnError(fmt.Errorf("DDL failed"))
 
 	ts := &TaskService{
@@ -500,7 +500,7 @@ func TestRestoreIndexes_SkipsExistingMatchingIndex(t *testing.T) {
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "t", "idx_c").
 		WillReturnRows(rows)
-	// 不应再执行 CREATE INDEX
+	// 不应再执行 ALTER TABLE ADD INDEX
 
 	ts := &TaskService{}
 	runtime := &taskRuntime{targetDB: targetDB}
@@ -538,6 +538,46 @@ func TestRestoreIndexes_FailsOnConflictingExistingIndex(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestRestoreIndexes_BatchesMultipleIndexesIntoOneAlter(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	empty := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_a").
+		WillReturnRows(empty)
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "uk_b").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "ft_c").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a` \\(`a`\\), ADD UNIQUE INDEX `uk_b` \\(`b`\\), ADD FULLTEXT INDEX `ft_c` \\(`c`\\)").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ts := &TaskService{}
+	runtime := &taskRuntime{targetDB: targetDB}
+	indexes := []map[string]interface{}{
+		{"name": "idx_a", "non_unique": 1, "type": "BTREE", "columns": "`a`"},
+		{"name": "uk_b", "non_unique": 0, "type": "BTREE", "columns": "`b`"},
+		{"name": "ft_c", "non_unique": 1, "type": "FULLTEXT", "columns": "`c`"},
+	}
+
+	err = ts.restoreIndexes(context.Background(), runtime, "db", "t", indexes)
+
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestBuildAlterAddIndexesSQL(t *testing.T) {
+	sql := buildAlterAddIndexesSQL("db", "t", []string{
+		buildAddIndexClause("idx_a", 1, "BTREE", "`a`"),
+		buildAddIndexClause("uk_b", 0, "BTREE", "`b`"),
+	})
+	assert.Equal(t, "ALTER TABLE `db`.`t` ADD INDEX `idx_a` (`a`), ADD UNIQUE INDEX `uk_b` (`b`)", sql)
+}
+
 func TestRestoreIndexes_RetriesInvalidConnection(t *testing.T) {
 	targetDB, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -547,9 +587,9 @@ func TestRestoreIndexes_RetriesInvalidConnection(t *testing.T) {
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "t", "idx_c").
 		WillReturnRows(rows)
-	mock.ExpectExec("CREATE INDEX `idx_c` ON `db`.`t` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
 		WillReturnError(fmt.Errorf("invalid connection"))
-	mock.ExpectExec("CREATE INDEX `idx_c` ON `db`.`t` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{}
