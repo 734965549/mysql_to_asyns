@@ -538,6 +538,39 @@ func TestRestoreIndexes_FailsOnConflictingExistingIndex(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestRestoreIndexes_RetriesInvalidConnection(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_c").
+		WillReturnRows(rows)
+	mock.ExpectExec("CREATE INDEX `idx_c` ON `db`.`t` \\(`c`\\)").
+		WillReturnError(fmt.Errorf("invalid connection"))
+	mock.ExpectExec("CREATE INDEX `idx_c` ON `db`.`t` \\(`c`\\)").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ts := &TaskService{}
+	runtime := &taskRuntime{targetDB: targetDB}
+	indexes := []map[string]interface{}{
+		{"name": "idx_c", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+	}
+
+	err = ts.restoreIndexes(context.Background(), runtime, "db", "t", indexes)
+
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestIsConnRetryable(t *testing.T) {
+	assert.False(t, isConnRetryable(nil))
+	assert.True(t, isConnRetryable(driver.ErrBadConn))
+	assert.True(t, isConnRetryable(fmt.Errorf("invalid connection")))
+	assert.False(t, isConnRetryable(fmt.Errorf("Error 1062: Duplicate entry")))
+}
+
 func TestEffectiveIndexRestoreWorkers(t *testing.T) {
 	cases := []struct{ configured, workerCount, hardMax, want int }{
 		{0, 0, 0, 4},    // 全默认 -> 4

@@ -7,7 +7,8 @@ import (
 	"errors"
 	"sort"
 
-	"database/sql" // 数据库操作
+	"database/sql"        // 数据库操作
+	"database/sql/driver" // 驱动错误（ErrBadConn）
 
 	"encoding/json" // JSON 编解码
 
@@ -5389,6 +5390,35 @@ func isRetryableLockError(err error) bool {
 		strings.Contains(s, "Deadlock found")
 }
 
+const indexRestoreConnMaxRetries = 3
+
+// isConnRetryable 判断是否为连接失效类错误，可安全换连接重试。
+func isConnRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "invalid connection") ||
+		strings.Contains(s, "bad connection") ||
+		strings.Contains(s, "unexpected packet") ||
+		strings.Contains(s, "connection was bad")
+}
+
+func retryIndexRestoreConn(ctx context.Context, attempt int) error {
+	if attempt <= 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Duration(25+attempt*25) * time.Millisecond):
+		return nil
+	}
+}
+
 // isNumericPKColumn 检查单列主键是否为整数类型（支持表内并行范围分片）
 
 func isNumericPKColumn(identity *entity.TableIdentity, pkCol string) bool {
@@ -7279,13 +7309,24 @@ func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, 
 		}
 
 		// 恢复前检查目标表上是否已存在同名索引；定义一致则跳过，不一致则报错。
-
-		exists, match, err := targetIndexExists(ctx, targetDB, schema, tableName, indexName, nonUnique, indexType, columns)
-
+		var (
+			exists bool
+			match  bool
+			err    error
+		)
+		for attempt := 0; attempt <= indexRestoreConnMaxRetries; attempt++ {
+			if retryErr := retryIndexRestoreConn(ctx, attempt); retryErr != nil {
+				return retryErr
+			}
+			exists, match, err = targetIndexExists(ctx, targetDB, schema, tableName, indexName, nonUnique, indexType, columns)
+			if err == nil || !isConnRetryable(err) || attempt >= indexRestoreConnMaxRetries {
+				break
+			}
+			logger.Warn("Retrying index existence check for `%s` on `%s`.`%s` after connection error (attempt %d): %v",
+				indexName, schema, tableName, attempt+1, err)
+		}
 		if err != nil {
-
 			return fmt.Errorf("check existing index `%s` on `%s`.`%s`: %w", indexName, schema, tableName, err)
-
 		}
 
 		if exists {
@@ -7332,14 +7373,20 @@ func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, 
 
 		}
 
-		_, err = targetDB.ExecContext(ctx, createSQL)
-
+		for attempt := 0; attempt <= indexRestoreConnMaxRetries; attempt++ {
+			if retryErr := retryIndexRestoreConn(ctx, attempt); retryErr != nil {
+				return retryErr
+			}
+			_, err = targetDB.ExecContext(ctx, createSQL)
+			if err == nil || !isConnRetryable(err) || attempt >= indexRestoreConnMaxRetries {
+				break
+			}
+			logger.Warn("Retrying CREATE INDEX `%s` on `%s`.`%s` after connection error (attempt %d): %v",
+				indexName, schema, tableName, attempt+1, err)
+		}
 		if err != nil {
-
 			logger.Warn("Warning: failed to create index %s: %v (SQL: %s)", indexName, err, createSQL)
-
 			return fmt.Errorf("create index `%s` on `%s`.`%s`: %w", indexName, schema, tableName, err)
-
 		}
 
 		logger.Info("Created index %s on table %s.%s", indexName, schema, tableName)
