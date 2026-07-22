@@ -31,6 +31,22 @@ func TestResolveOptions_Defaults(t *testing.T) {
 	if opt.CommitInterval != defaultCommitInterval {
 		t.Errorf("CommitInterval=%v want %v", opt.CommitInterval, defaultCommitInterval)
 	}
+	if opt.TableParallelReaders != defaultReadWorkers {
+		t.Errorf("TableParallelReaders=%d want %d", opt.TableParallelReaders, defaultReadWorkers)
+	}
+	if opt.MaxSnapshotGroups != defaultReadWorkers {
+		t.Errorf("MaxSnapshotGroups=%d want %d", opt.MaxSnapshotGroups, defaultReadWorkers)
+	}
+	wantConns := defaultReadWorkers * (defaultReadWorkers + 1)
+	if opt.MaxSnapshotConns != wantConns {
+		t.Errorf("MaxSnapshotConns=%d want %d", opt.MaxSnapshotConns, wantConns)
+	}
+	if opt.LargeTableRows != defaultLargeTableRows {
+		t.Errorf("LargeTableRows=%d want %d", opt.LargeTableRows, defaultLargeTableRows)
+	}
+	if !opt.DegradeOnAlignLockFail {
+		t.Error("DegradeOnAlignLockFail should default true")
+	}
 }
 
 func TestResolveOptions_ExplicitMB(t *testing.T) {
@@ -137,5 +153,28 @@ func TestResolveOptions_CommitIntervalStable(t *testing.T) {
 	opt := ResolveOptions(RawOptions{})
 	if opt.CommitInterval != 2*time.Second {
 		t.Errorf("commit interval=%v", opt.CommitInterval)
+	}
+}
+
+func TestOptions_CapBySourcePool(t *testing.T) {
+	opt := ResolveOptions(RawOptions{ReadWorkers: 8})
+	if opt.MaxSnapshotConns != 8*(8+1) {
+		t.Fatalf("precondition MaxSnapshotConns=%d", opt.MaxSnapshotConns)
+	}
+	opt.CapBySourcePool(32)
+	if opt.MaxSnapshotConns != 32 {
+		t.Fatalf("MaxSnapshotConns=%d want 32", opt.MaxSnapshotConns)
+	}
+	if opt.TableParallelReaders != 8 {
+		t.Fatalf("TableParallelReaders=%d want 8 (8+1 <= 32)", opt.TableParallelReaders)
+	}
+
+	opt2 := ResolveOptions(RawOptions{ReadWorkers: 8})
+	opt2.CapBySourcePool(5)
+	if opt2.TableParallelReaders != 4 {
+		t.Fatalf("TableParallelReaders=%d want 4", opt2.TableParallelReaders)
+	}
+	if opt2.MaxSnapshotConns != 5 {
+		t.Fatalf("MaxSnapshotConns=%d want 5", opt2.MaxSnapshotConns)
 	}
 }

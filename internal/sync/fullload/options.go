@@ -20,7 +20,12 @@ const (
 	defaultCommitRows     = 10000
 	defaultCommitBytes    = 32 * 1024 * 1024 // 32 MiB
 	defaultCommitInterval = 2 * time.Second
-	defaultChunkOvershoot = 8 // chunk 数量约为读取 worker 数的 8 倍，用于工作窃取消除长尾
+	defaultChunkOvershoot = 8 // 每表 chunk 数量约为读取 worker 数的 8 倍，用于单连接顺序分段
+
+	// 超大表判定：估算行数达到该阈值且 chunk>1 时，走短暂 FTWRL 对齐多连接快照。
+	defaultLargeTableRows = int64(1_000_000)
+	// 取表锁等待超时（秒），同时用于客户端 context 与 SESSION lock_wait_timeout。
+	defaultLockWaitTimeoutSec = 10
 
 	// mysqlMaxPlaceholders 单条预处理语句占位符上限（留余量），与 writer 包保持一致。
 	mysqlMaxPlaceholders = 62000
@@ -63,17 +68,33 @@ type Options struct {
 	CommitInterval time.Duration
 	ChunkOvershoot int
 	SkipBinlog     bool
+
+	// TableParallelReaders 单表内对齐快照的最大并行读连接数（超大表）。
+	TableParallelReaders int
+	// LargeTableRows 触发单表多连接对齐快照的估算行数阈值。
+	LargeTableRows int64
+	// MaxSnapshotGroups 同时活跃的表级 snapshot group 上限（并发表数）。
+	MaxSnapshotGroups int
+	// MaxSnapshotConns 同时持有的快照连接上限（含短暂协调锁连接预留）。
+	MaxSnapshotConns int
+	// LockWaitTimeoutSec 取表锁的双保险超时（context + SESSION lock_wait_timeout）。
+	LockWaitTimeoutSec int
+	// DegradeOnAlignLockFail 对齐多连接取锁失败时是否降级为单连接快照（ALL+无PK 捕获 HWM 时仍 fail-closed）。
+	DegradeOnAlignLockFail bool
 }
 
 // ResolveOptions 将原始配置推导为生效运行参数，应用 4C8G 平衡预设。
 func ResolveOptions(raw RawOptions) Options {
 	opt := Options{
-		ReadWorkers:    clampInt(raw.ReadWorkers, defaultReadWorkers, 1, hardMaxWorkers),
-		WriteWorkers:   clampInt(raw.WriteWorkers, defaultWriteWorkers, 1, hardMaxWorkers),
-		BatchRows:      clampInt(raw.BatchSize, defaultBatchRows, 1, hardMaxBatchRow),
-		CommitInterval: defaultCommitInterval,
-		ChunkOvershoot: defaultChunkOvershoot,
-		SkipBinlog:     raw.SkipBinlog,
+		ReadWorkers:            clampInt(raw.ReadWorkers, defaultReadWorkers, 1, hardMaxWorkers),
+		WriteWorkers:           clampInt(raw.WriteWorkers, defaultWriteWorkers, 1, hardMaxWorkers),
+		BatchRows:              clampInt(raw.BatchSize, defaultBatchRows, 1, hardMaxBatchRow),
+		CommitInterval:         defaultCommitInterval,
+		ChunkOvershoot:         defaultChunkOvershoot,
+		SkipBinlog:             raw.SkipBinlog,
+		LargeTableRows:         defaultLargeTableRows,
+		LockWaitTimeoutSec:     defaultLockWaitTimeoutSec,
+		DegradeOnAlignLockFail: true,
 	}
 
 	opt.BufferBytes = mebibytes(raw.BufferMB, defaultBufferBytes, hardMaxBufferMB)
@@ -104,7 +125,45 @@ func ResolveOptions(raw RawOptions) Options {
 		opt.CommitBytes = opt.BatchBytes
 	}
 
+	// 表级并行与信号量：默认单表并行度=ReadWorkers，并发表数=ReadWorkers，
+	// 连接上限预留协调锁连接（每组 +1）。
+	opt.TableParallelReaders = opt.ReadWorkers
+	opt.MaxSnapshotGroups = opt.ReadWorkers
+	opt.MaxSnapshotConns = opt.ReadWorkers * (opt.TableParallelReaders + 1)
+
 	return opt
+}
+
+// CapBySourcePool 用真实源库连接池上限约束快照预算，避免 limiter 允许超过 pool 的占用量，
+// 进而在持表锁后阻塞于 db.Conn。maxOpen<=0 时不调整。
+func (opt *Options) CapBySourcePool(maxOpen int) {
+	if opt == nil || maxOpen <= 0 {
+		return
+	}
+	// 单组最坏需要 readers + 1（协调锁连接）。
+	if opt.TableParallelReaders+1 > maxOpen {
+		opt.TableParallelReaders = maxOpen - 1
+		if opt.TableParallelReaders < 1 {
+			opt.TableParallelReaders = 1
+		}
+	}
+	if opt.MaxSnapshotConns > maxOpen {
+		opt.MaxSnapshotConns = maxOpen
+	}
+	if opt.MaxSnapshotGroups > maxOpen {
+		opt.MaxSnapshotGroups = maxOpen
+	}
+	// 保证至少能开一组单 reader（可选 +锁）。
+	minPerGroup := 1
+	if opt.TableParallelReaders > 1 {
+		minPerGroup = opt.TableParallelReaders + 1
+	}
+	if opt.MaxSnapshotConns < minPerGroup {
+		opt.MaxSnapshotConns = minPerGroup
+		if opt.MaxSnapshotConns > maxOpen {
+			opt.MaxSnapshotConns = maxOpen
+		}
+	}
 }
 
 func mebibytes(valueMB int, defaultBytes int64, maxMB int) int64 {

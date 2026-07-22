@@ -13,6 +13,7 @@ import (
 
 	"fmt" // 格式化输出
 
+	"mysql-to-sync/pkg/binlog"
 	"mysql-to-sync/pkg/logger" // 日志记录
 
 	"os" // 操作系统接口
@@ -1943,6 +1944,73 @@ func formatBinlogPosition(pos mysql.Position) string {
 	return fmt.Sprintf("%s:%d", pos.Name, pos.Pos)
 }
 
+// persistTableBinlogHWM 在 MarkFullSyncCompleted 之前同步落盘单表 HWM（fail-closed）。
+func (s *TaskService) persistTableBinlogHWM(taskID, schema, table string, pos mysql.Position) error {
+	posStr := formatBinlogPosition(pos)
+	if posStr == "" {
+		return fmt.Errorf("empty table binlog HWM for %s.%s", schema, table)
+	}
+	if _, err := parseBinlogPosition(posStr); err != nil {
+		return fmt.Errorf("invalid table binlog HWM for %s.%s: %w", schema, table, err)
+	}
+	tableKey := schema + "." + table
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return fmt.Errorf("task %s not found while persisting table HWM for %s", taskID, tableKey)
+	}
+	task.SetTableBinlogHWM(tableKey, posStr)
+	if err := s.storage.Save(task); err != nil {
+		return fmt.Errorf("persist table binlog HWM for %s: %w", tableKey, err)
+	}
+	return nil
+}
+
+// parseTableBinlogHWMs 将任务存档中的 "schema.table" -> "file:pos" 解析为增量过滤用位点图。
+// 非法条目跳过并打日志；ALL + full_load_engine=v2 由 IncrementalSyncService.RequireNoPKTableHWM
+// 在启动时对每张 FullColumnsStrategy 表做 fail-closed 校验（缺项/非法都会拒绝接管）。
+// V1 ALL 不生成表级 HWM，也不强校验，存在无 PK/UK 表增量重复行风险。
+func parseTableBinlogHWMs(raw map[string]string) map[string]mysql.Position {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]mysql.Position, len(raw))
+	for key, val := range raw {
+		pos, err := parseBinlogPosition(val)
+		if err != nil {
+			logger.Warn("skip invalid table binlog HWM %s=%q: %v", key, val, err)
+			continue
+		}
+		out[key] = pos
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// parseBinlogPosition 解析 "file:pos"；与 formatBinlogPosition 互逆。
+func parseBinlogPosition(s string) (mysql.Position, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return mysql.Position{}, fmt.Errorf("empty binlog position")
+	}
+	idx := strings.LastIndex(s, ":")
+	if idx <= 0 || idx == len(s)-1 {
+		return mysql.Position{}, fmt.Errorf("invalid binlog position %q", s)
+	}
+	pos, err := strconv.ParseUint(s[idx+1:], 10, 32)
+	if err != nil {
+		return mysql.Position{}, fmt.Errorf("invalid binlog position %q: %w", s, err)
+	}
+	p := mysql.Position{Name: s[:idx], Pos: uint32(pos)}
+	if err := binlog.ValidatePosition(p); err != nil {
+		return mysql.Position{}, fmt.Errorf("invalid binlog position %q: %w", s, err)
+	}
+	return p, nil
+}
+
 // makeThrottledIncrementalPositionPersister 构造一个"节流型"位点回写回调，每 minInterval 最多
 // 写一次任务存档。增量同步每事件都会调它，但只有间隔足够时才真正落盘，避免频繁写引发的存储开销。
 //
@@ -2380,7 +2448,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	// 进入"全量已开始"阶段，持久化到任务存档。
 	// 失败/暂停后恢复时，根据这个标志决定是不是要重跑全量。
 	// FULL 模式 startPosStr 为空，ALL 模式包含实际 binlog 位点。
+	// 新一轮全量开始时清空旧表级 HWM，避免沿用上一轮快照边界。
 	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+		t.ClearTableBinlogHWMs()
 		t.MarkFullSyncStarted(startPosStr)
 	})
 
@@ -4146,6 +4216,9 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 		ServerID: generateServerID(taskID),
 
 		SinkConfigs: task.Config.SinkConfigs,
+		// 表级 HWM 仅由 full_load_engine=v2 的 syncDatabasePairV2 生成。
+		// 默认 V1 全量不会落盘 HWM；若对所有 ALL 任务强校验，会在 FULL_COMPLETED 后永久卡死增量启动。
+		RequireNoPKTableHWM: task.Config.Mode == taskEntity.SyncModeAll && task.Config.UsesFullLoadV2(),
 	}
 
 	// 创建增量同步服务
@@ -4164,6 +4237,18 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 	// 注入节流型位点回写回调（修复 4：把"最近落库位点"冗余到任务存档，方便恢复/审计）。
 	// 5 秒间隔足够把"任务存档里的位点"控制在合理新鲜度，又不会被每事件存储 IO 拖垮。
 	incrSync.SetPositionPersister(s.makeThrottledIncrementalPositionPersister(5 * time.Second))
+
+	// ALL + V1：无表级 HWM，增量可能对无 PK/UK 表重复 INSERT；明确记录风险，避免静默误用。
+	if task.Config.Mode == taskEntity.SyncModeAll && !task.Config.UsesFullLoadV2() {
+		logger.Warn("[Task %s] full_load_engine=v1 ALL mode does not capture table-level binlog HWM; no-PK/UK tables may receive duplicate rows during incremental takeover (set full_load_engine=v2 for fail-closed HWM filtering)", taskID)
+	}
+
+	// ALL + V2 无 PK/UK 表级 HWM：从任务存档注入增量过滤边界（CommitPosition <= HWM 跳过写 Sink）。
+	// 非法条目会被跳过；随后 Start 在 RequireNoPKTableHWM 下对每张无 PK 表 fail-closed 校验。
+	if hwms := parseTableBinlogHWMs(task.Context.TableBinlogHWMs); len(hwms) > 0 {
+		incrSync.SetTableHWMs(hwms)
+		logger.Info("[Task %s] Injected %d table binlog HWM(s) into incremental sync", taskID, len(hwms))
+	}
 
 	// 保存到映射中
 

@@ -637,3 +637,57 @@ func TestBatchWriter_WriteBatch_PlainInsertOverridesUpsert(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestBufferedWriter_FlushFailureRestoresBuffer(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	bw := NewBufferedWriter(db, identity, 100, time.Hour)
+	bw.PauseAutoFlush()
+	defer bw.Close()
+
+	assert.NoError(t, bw.Write(map[string]interface{}{"id": 1, "name": "Alice"}))
+
+	mock.ExpectExec("INSERT").WillReturnError(sql.ErrConnDone)
+	err = bw.Flush()
+	assert.Error(t, err)
+
+	// 失败行应回灌 buffer，重试 Flush 能再次写出同一行。
+	mock.ExpectExec("INSERT").WillReturnResult(sqlmock.NewResult(0, 1))
+	assert.NoError(t, bw.Flush())
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestBufferedWriter_PauseAutoFlushSkipsTimerFlush(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		Strategy:     entity.PKStrategy,
+		Columns:      []entity.ColumnMeta{{Name: "id"}, {Name: "name"}},
+		IdentifyCols: []string{"id"},
+	}
+
+	bw := NewBufferedWriter(db, identity, 100, 20*time.Millisecond)
+	bw.PauseAutoFlush()
+	assert.NoError(t, bw.Write(map[string]interface{}{"id": 1, "name": "Alice"}))
+
+	time.Sleep(80 * time.Millisecond)
+	// paused 期间不得触发 WriteBatch；清空后再 Close，避免最终 flush 写库。
+	bw.DiscardBuffer()
+	bw.ResumeAutoFlush()
+	assert.NoError(t, bw.Close())
+	assert.NoError(t, mock.ExpectationsWereMet())
+}

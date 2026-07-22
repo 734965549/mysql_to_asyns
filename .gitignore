@@ -53,3 +53,6 @@ etc/application.toml
 # Test data directories (test runtime artifacts, not tracked fixtures)
 internal/task/application/service/test_task_service_*/
 internal/task/application/service/test_task_storage_*/
+
+# Local codebase-memory MCP index cache (do not commit)
+.codebase-memory/

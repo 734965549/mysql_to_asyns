@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
+
 	"mysql-to-sync/pkg/crypto"
 )
 
@@ -43,6 +45,23 @@ type Sink interface {
 	Write(ctx context.Context, event *ChangeEvent) error
 	Flush(ctx context.Context) error
 	Close(ctx context.Context) error
+}
+
+// TransactionalSink 支持按源 binlog 事务边界延迟提交的目标端。
+// 同一源事务内的 Write 在 CommitTransaction 之前不得对外可见；失败时必须 RollbackTransaction。
+type TransactionalSink interface {
+	Sink
+	BeginTransaction(ctx context.Context) error
+	CommitTransaction(ctx context.Context) error
+	RollbackTransaction(ctx context.Context) error
+}
+
+// DurableTxnPositionSink 在目标端事务内持久化源 binlog 提交位点。
+// 用于消除「目标事务已提交、外部 checkpoint 尚未保存」窗口：重启重放前先查位点，已应用则跳过写入。
+// MarkAppliedTxn 必须在活跃目标事务内、CommitTransaction 之前调用，与业务数据同事务提交。
+type DurableTxnPositionSink interface {
+	HasAppliedTxn(ctx context.Context, taskID string, pos mysql.Position) (bool, error)
+	MarkAppliedTxn(ctx context.Context, taskID string, pos mysql.Position) error
 }
 
 type TablePreparer interface {

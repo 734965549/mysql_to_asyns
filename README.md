@@ -479,7 +479,11 @@ Content-Type: application/json
 
 - **FULL 模式**不捕获 binlog 位点、不保存增量 checkpoint。FULL 只做一次无缝全表遍历，保证分片边界与读取流程不漏数据；同步期间发生的新增、更新和删除不进行追平。
 
-- **ALL 模式**在全量扫描开始前，短暂执行 `FLUSH TABLES WITH READ LOCK` 取 binlog 位点（P0），随后立即 `UNLOCK TABLES`（毫秒级）。P0 捕获或持久化失败时任务立即终止。全量完成后从 P0 回放 binlog 追平变化并进入持续同步。
+- **ALL 模式**在全量扫描开始前，短暂执行 `FLUSH TABLES WITH READ LOCK` 取全局 binlog 位点（P0），随后立即 `UNLOCK TABLES`（毫秒级）。P0 捕获或持久化失败时任务立即终止。全量完成后从 P0 回放 binlog 追平变化并进入持续同步。
+
+- **V1 全量（默认 `full_load_engine=v1`）**：P0 之外不生成表级 HWM；全量读取为普通短查询，不长期持有源库 MDL。ALL + 无主键/无唯一键表在增量接管阶段存在重复 INSERT 风险。
+
+- **V2 全量（`full_load_engine=v2`）**：除 P0 外，ALL 模式下无 PK/UK 表在表级一致性快照窗口内额外捕获**表级 binlog HWM**（持久化到 `table_binlog_hwms`）；增量启动时对这类表 fail-closed 校验，并按 HWM 过滤已覆盖行。V2 全量读取使用表级长生命周期 `REPEATABLE READ` 快照事务，读期间持有表级 `MDL_SHARED_READ`，大表并行读前可能短暂表锁；运维需关注源库 undo 保留与 MDL 等待。
 
 - 历史版本曾提供 `enable_consistent_snapshot` 任务级字段，现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
 
@@ -1342,13 +1346,14 @@ FULL 模式执行一次无缝全表遍历，保证分片边界与读取流程本
 
 **语义定义**：
 
-ALL 模式先捕获 binlog 位点（P0），再执行与 FULL 相同的无缝全量扫描，全量结束后从 P0 回放 binlog 追平变化，最终进入持续同步。
+ALL 模式先捕获全局 binlog 位点（P0），再执行全量扫描，全量结束后从 P0 回放 binlog 追平变化，最终进入持续同步。
 
 - 第一次读取前获取并持久化 P0（`FLUSH TABLES WITH READ LOCK` → `SHOW MASTER STATUS` → `UNLOCK TABLES`，毫秒级），失败必须终止
-- 使用与 FULL 相同的分片全量扫描
+- 全量引擎：`full_load_engine=v1`（默认）使用普通短查询；`v2` 使用表级一致性快照（长生命周期 RR 事务，读期间持有表级 MDL，详见配置文档）
+- V2 + ALL：无 PK/UK 表在快照窗口内额外捕获表级 binlog HWM（`table_binlog_hwms`），增量启动 fail-closed 校验并按 HWM 过滤
 - 全量结束后从 P0 回放 binlog：PK/UK INSERT 使用 upsert，UPDATE 正确处理 before/after key
 - 追平后进入实时同步
-- 无 PK/UK 表不能承诺严格收敛
+- V1 ALL + 无 PK/UK 表不能承诺严格收敛；需正确去重时请使用 `full_load_engine=v2`
 
 **工作流程**：
 

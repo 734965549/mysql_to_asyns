@@ -619,3 +619,58 @@ func TestSortedKeys(t *testing.T) {
 	keys := sortedKeys(m)
 	assert.Equal(t, []string{"a", "b", "c"}, keys)
 }
+
+func TestKafkaSink_TxnBufferHardLimitByEvents(t *testing.T) {
+	writer := &fakeMessageWriter{}
+	s := NewKafkaSink(map[string]interface{}{
+		"brokers":                 []string{"127.0.0.1:9092"},
+		"topic":                   "cdc",
+		"max_txn_buffered_events": 2,
+		"max_txn_buffered_bytes":  float64(1 << 20),
+	})
+	s.writer = writer
+	require.NoError(t, s.BeginTransaction(context.Background()))
+
+	event := &sink.ChangeEvent{
+		TaskID: "task", SourceSchema: "db", SourceTable: "users",
+		EventType: "INSERT", BinlogPos: 1,
+		PrimaryKeys: map[string]interface{}{"id": int64(1)},
+		After:       map[string]interface{}{"id": int64(1)},
+	}
+	require.NoError(t, s.Write(context.Background(), event))
+	event.BinlogPos = 2
+	event.After = map[string]interface{}{"id": int64(2)}
+	require.NoError(t, s.Write(context.Background(), event))
+	event.BinlogPos = 3
+	event.After = map[string]interface{}{"id": int64(3)}
+	err := s.Write(context.Background(), event)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hard limit")
+	assert.Empty(t, writer.messages, "rejected event must not flush early")
+	require.NoError(t, s.RollbackTransaction(context.Background()))
+}
+
+func TestKafkaSink_TxnBufferHardLimitByBytes(t *testing.T) {
+	writer := &fakeMessageWriter{}
+	s := NewKafkaSink(map[string]interface{}{
+		"brokers":                 []string{"127.0.0.1:9092"},
+		"topic":                   "cdc",
+		"max_txn_buffered_events": 1000,
+		"max_txn_buffered_bytes":  float64(64),
+	})
+	s.writer = writer
+	require.NoError(t, s.BeginTransaction(context.Background()))
+
+	big := make([]byte, 80)
+	for i := range big {
+		big[i] = 'x'
+	}
+	err := s.Write(context.Background(), &sink.ChangeEvent{
+		TaskID: "task", SourceSchema: "db", SourceTable: "users",
+		EventType: "INSERT", BinlogPos: 1,
+		After: map[string]interface{}{"payload": string(big)},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hard limit")
+	require.NoError(t, s.RollbackTransaction(context.Background()))
+}

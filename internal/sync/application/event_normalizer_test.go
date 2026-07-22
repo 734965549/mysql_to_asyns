@@ -30,7 +30,7 @@ func TestToChangeEvent_Insert(t *testing.T) {
 		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 12345},
 	}
 
-	event, err := ToChangeEvent(binlogEvent, identity, "task_001")
+	event, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -68,6 +68,9 @@ func TestToChangeEvent_Insert(t *testing.T) {
 	if event.PrimaryKeys["id"] != int64(1) {
 		t.Errorf("expected PrimaryKeys.id=1, got %v", event.PrimaryKeys["id"])
 	}
+	if event.TraceID != "task_001:mysql-bin.000001:12345:0" {
+		t.Errorf("expected TraceID 'task_001:mysql-bin.000001:12345:0', got %s", event.TraceID)
+	}
 }
 
 func TestToChangeEvent_Update(t *testing.T) {
@@ -92,7 +95,7 @@ func TestToChangeEvent_Update(t *testing.T) {
 		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 12346},
 	}
 
-	event, err := ToChangeEvent(binlogEvent, identity, "task_001")
+	event, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -139,7 +142,7 @@ func TestToChangeEvent_Delete(t *testing.T) {
 		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 12347},
 	}
 
-	event, err := ToChangeEvent(binlogEvent, identity, "task_001")
+	event, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -180,7 +183,7 @@ func TestToChangeEvent_DeleteNoBeforeImage(t *testing.T) {
 		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 12347},
 	}
 
-	event, err := ToChangeEvent(binlogEvent, identity, "task_001")
+	event, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -209,7 +212,7 @@ func TestToChangeEvent_InsertEmptyRows(t *testing.T) {
 		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 100},
 	}
 
-	_, err := ToChangeEvent(binlogEvent, identity, "task_001")
+	_, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
 	if err == nil {
 		t.Fatal("expected error for INSERT with empty rows")
 	}
@@ -229,7 +232,7 @@ func TestToChangeEvent_InvalidInput(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := ToChangeEvent(tt.event, tt.identity, "task")
+			_, err := ToChangeEvent(tt.event, tt.identity, "task", 0)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -253,7 +256,7 @@ func TestToChangeEvent_DeleteEmptyRows(t *testing.T) {
 		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 100},
 	}
 
-	_, err := ToChangeEvent(binlogEvent, identity, "task_001")
+	_, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
 	if err == nil {
 		t.Fatal("expected error for DELETE with empty rows")
 	}
@@ -278,7 +281,7 @@ func TestToChangeEvent_CompositeKey(t *testing.T) {
 		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 200},
 	}
 
-	event, err := ToChangeEvent(binlogEvent, identity, "task_001")
+	event, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -317,7 +320,7 @@ func TestToChangeEvent_FullColumnsStrategy(t *testing.T) {
 		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 300},
 	}
 
-	event, err := ToChangeEvent(binlogEvent, identity, "task_001")
+	event, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -327,6 +330,51 @@ func TestToChangeEvent_FullColumnsStrategy(t *testing.T) {
 	}
 	if event.PrimaryKeys["level"] != "info" {
 		t.Errorf("expected PrimaryKeys.level='info', got %v", event.PrimaryKeys["level"])
+	}
+}
+
+func TestChangeEventTraceID_MultiRowIndex(t *testing.T) {
+	if got := ChangeEventTraceID("task_a", "mysql-bin.000002", 999, 3); got != "task_a:mysql-bin.000002:999:3" {
+		t.Errorf("unexpected trace id: %s", got)
+	}
+}
+
+func TestToChangeEvent_TraceIDPerRowIndex(t *testing.T) {
+	identity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.PKStrategy,
+		IdentifyCols: []string{"id"},
+		HasPK:        true,
+	}
+	binlogEvent := &binlog.BinlogEvent{
+		Table:     "users",
+		Schema:    "mydb",
+		EventType: binlog.EventTypeInsert,
+		Rows: []map[string]interface{}{
+			{"id": int64(1)},
+			{"id": int64(2)},
+		},
+		Timestamp: time.Now(),
+		Position:  mysql.Position{Name: "mysql-bin.000001", Pos: 500},
+	}
+
+	first, err := ToChangeEvent(binlogEvent, identity, "task_001", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	second, err := ToChangeEvent(binlogEvent, identity, "task_001", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if first.TraceID == second.TraceID {
+		t.Fatalf("expected distinct trace ids, both=%s", first.TraceID)
+	}
+	if first.TraceID != "task_001:mysql-bin.000001:500:0" {
+		t.Errorf("unexpected first trace id: %s", first.TraceID)
+	}
+	if second.TraceID != "task_001:mysql-bin.000001:500:1" {
+		t.Errorf("unexpected second trace id: %s", second.TraceID)
 	}
 }
 

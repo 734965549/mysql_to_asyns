@@ -34,13 +34,19 @@ type Chunk struct {
 }
 
 // Planner 负责为每张表生成 chunk。
+// 查询应绑定到表级一致性快照连接，使边界与后续读取看到同一 ReadView（P2）。
 type Planner struct {
-	sourceDB *sql.DB
+	q planQueryer
 }
 
-// NewPlanner 创建 chunk 规划器。
-func NewPlanner(sourceDB *sql.DB) *Planner {
-	return &Planner{sourceDB: sourceDB}
+// planQueryer 是 chunk 边界规划所需的最小查询接口（*sql.DB / *sql.Conn / *sql.Tx 均满足）。
+type planQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// NewPlanner 创建 chunk 规划器。推荐传入表级快照连接；测试可用 *sql.DB。
+func NewPlanner(q planQueryer) *Planner {
+	return &Planner{q: q}
 }
 
 // Plan 为一批表生成全部 chunk。targetChunks 是期望的总 chunk 数（读取 worker × overshoot）。
@@ -100,7 +106,7 @@ func (p *Planner) planIntegerRange(ctx context.Context, spec *TableSpec, col str
 	q := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s.%s",
 		quoteIdentifier(col), quoteIdentifier(col),
 		quoteIdentifier(spec.SourceSchema), quoteIdentifier(spec.SourceTable))
-	if err := p.sourceDB.QueryRowContext(ctx, q).Scan(&minV, &maxV); err != nil {
+	if err := p.q.QueryRowContext(ctx, q).Scan(&minV, &maxV); err != nil {
 		return nil, err
 	}
 	if !minV.Valid || !maxV.Valid || maxV.Int64 < minV.Int64 {
@@ -184,7 +190,7 @@ func (p *Planner) planKeysetBoundaries(ctx context.Context, spec *TableSpec, col
 				selectCols, quoteIdentifier(spec.SourceSchema), quoteIdentifier(spec.SourceTable), lower, orderBy)
 			args = append(lowerArgs, step-1)
 		}
-		row := p.sourceDB.QueryRowContext(ctx, q, args...)
+		row := p.q.QueryRowContext(ctx, q, args...)
 		if err := row.Scan(scanArgs...); err != nil {
 			if err == sql.ErrNoRows {
 				break
@@ -221,7 +227,7 @@ func (p *Planner) planKeysetBoundaries(ctx context.Context, spec *TableSpec, col
 func (p *Planner) estimateCount(ctx context.Context, spec *TableSpec) int64 {
 	var c int64
 	q := "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
-	_ = p.sourceDB.QueryRowContext(ctx, q, spec.SourceSchema, spec.SourceTable).Scan(&c)
+	_ = p.q.QueryRowContext(ctx, q, spec.SourceSchema, spec.SourceTable).Scan(&c)
 	return c
 }
 

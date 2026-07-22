@@ -11,8 +11,14 @@ import (
 	"sync"
 	"time"
 
+	"mysql-to-sync/internal/metrics"
 	"mysql-to-sync/internal/sync/domain/sink"
 	"mysql-to-sync/pkg/logger"
+)
+
+const (
+	defaultMaxTxnBufferedEvents = 100_000
+	defaultMaxTxnBufferedBytes  = 256 << 20 // 256 MiB
 )
 
 type WebhookSink struct {
@@ -26,6 +32,14 @@ type WebhookSink struct {
 	headers        map[string]string
 	retryTimes     int
 	retryBackoffMs int
+
+	maxTxnEvents int
+	maxTxnBytes  int64
+
+	txnActive bool
+	txnBytes  int64
+	// txnBuffer 暂存同一源事务内的事件；超 maxTxnEvents/maxTxnBytes 硬上限时拒绝，避免绕过 subscriber spill 后 OOM。
+	txnBuffer []*sink.ChangeEvent
 }
 
 func NewWebhookSink(options map[string]interface{}) *WebhookSink {
@@ -41,6 +55,8 @@ func NewWebhookSink(options map[string]interface{}) *WebhookSink {
 		headers:        headers,
 		retryTimes:     getIntWithDefault(options, "retry_times", 3),
 		retryBackoffMs: getIntWithDefault(options, "retry_backoff_ms", 500),
+		maxTxnEvents:   getIntWithDefault(options, "max_txn_buffered_events", defaultMaxTxnBufferedEvents),
+		maxTxnBytes:    getInt64WithDefault(options, "max_txn_buffered_bytes", defaultMaxTxnBufferedBytes),
 	}
 }
 
@@ -74,6 +90,12 @@ func (s *WebhookSink) Validate() error {
 	if s.retryBackoffMs < 0 {
 		return fmt.Errorf("retry_backoff_ms must not be negative")
 	}
+	if s.maxTxnEvents <= 0 {
+		return fmt.Errorf("max_txn_buffered_events must be greater than 0")
+	}
+	if s.maxTxnBytes <= 0 {
+		return fmt.Errorf("max_txn_buffered_bytes must be greater than 0")
+	}
 	return nil
 }
 
@@ -102,17 +124,89 @@ func (s *WebhookSink) Open(ctx context.Context) error {
 }
 
 func (s *WebhookSink) Write(ctx context.Context, event *sink.ChangeEvent) error {
-	s.mu.RLock()
-	client := s.client
-	s.mu.RUnlock()
-
-	if client == nil {
-		return fmt.Errorf("webhook sink is not open")
-	}
 	if event == nil {
 		return fmt.Errorf("change event is required")
 	}
 
+	s.mu.Lock()
+	client := s.client
+	txnActive := s.txnActive
+	if client == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("webhook sink is not open")
+	}
+	if txnActive {
+		approx := estimateChangeEventBytes(event)
+		if len(s.txnBuffer)+1 > s.maxTxnEvents || s.txnBytes+approx > s.maxTxnBytes {
+			metrics.GetMetrics().IncrementIncrementalSinkTxnBufferLimit()
+			err := fmt.Errorf("webhook sink transaction buffer exceeded hard limit (events=%d+%d bytes=%d+%d max_events=%d max_bytes=%d): "+
+				"raise max_txn_buffered_events/max_txn_buffered_bytes or reduce source transaction size",
+				len(s.txnBuffer), 1, s.txnBytes, approx, s.maxTxnEvents, s.maxTxnBytes)
+			s.mu.Unlock()
+			return err
+		}
+		copied := *event
+		if event.PrimaryKeys != nil {
+			copied.PrimaryKeys = cloneMap(event.PrimaryKeys)
+		}
+		if event.Before != nil {
+			copied.Before = cloneMap(event.Before)
+		}
+		if event.After != nil {
+			copied.After = cloneMap(event.After)
+		}
+		s.txnBuffer = append(s.txnBuffer, &copied)
+		s.txnBytes += approx
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+
+	return s.deliver(ctx, client, event)
+}
+
+func (s *WebhookSink) BeginTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.client == nil {
+		return fmt.Errorf("webhook sink is not open")
+	}
+	if s.txnActive {
+		return fmt.Errorf("webhook sink transaction already active")
+	}
+	s.txnActive = true
+	s.txnBuffer = s.txnBuffer[:0]
+	s.txnBytes = 0
+	return nil
+}
+
+func (s *WebhookSink) CommitTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	client := s.client
+	events := append([]*sink.ChangeEvent(nil), s.txnBuffer...)
+	s.txnBuffer = s.txnBuffer[:0]
+	s.txnBytes = 0
+	s.txnActive = false
+	s.mu.Unlock()
+
+	for _, event := range events {
+		if err := s.deliver(ctx, client, event); err != nil {
+			return fmt.Errorf("commit webhook sink transaction: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *WebhookSink) RollbackTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.txnBuffer = s.txnBuffer[:0]
+	s.txnBytes = 0
+	s.txnActive = false
+	return nil
+}
+
+func (s *WebhookSink) deliver(ctx context.Context, client *http.Client, event *sink.ChangeEvent) error {
 	body, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("serialize event: %w", err)
@@ -141,6 +235,9 @@ func (s *WebhookSink) Write(ctx context.Context, event *sink.ChangeEvent) error 
 		req.Header.Set("Content-Type", "application/json")
 		for k, v := range s.headers {
 			req.Header.Set(k, v)
+		}
+		if event.TraceID != "" && req.Header.Get("Idempotency-Key") == "" {
+			req.Header.Set("Idempotency-Key", event.TraceID)
 		}
 
 		resp, err := client.Do(req)
@@ -222,6 +319,68 @@ func getIntWithDefault(m map[string]interface{}, key string, defaultVal int) int
 		return int(n)
 	}
 	return defaultVal
+}
+
+func getInt64WithDefault(m map[string]interface{}, key string, defaultVal int64) int64 {
+	v, ok := m[key]
+	if !ok {
+		return defaultVal
+	}
+	switch val := v.(type) {
+	case float64:
+		return int64(val)
+	case int:
+		return int64(val)
+	case int64:
+		return val
+	case json.Number:
+		n, err := val.Int64()
+		if err != nil {
+			return defaultVal
+		}
+		return n
+	}
+	return defaultVal
+}
+
+func cloneMap(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]interface{}, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func estimateChangeEventBytes(event *sink.ChangeEvent) int64 {
+	if event == nil {
+		return 0
+	}
+	var total int64
+	total += int64(len(event.TaskID) + len(event.SourceSchema) + len(event.SourceTable) + len(event.EventType) + len(event.BinlogFile) + len(event.TraceID))
+	total += estimateMapBytes(event.PrimaryKeys)
+	total += estimateMapBytes(event.Before)
+	total += estimateMapBytes(event.After)
+	return total
+}
+
+func estimateMapBytes(m map[string]interface{}) int64 {
+	var total int64
+	for k, v := range m {
+		total += int64(len(k))
+		switch x := v.(type) {
+		case nil:
+		case []byte:
+			total += int64(len(x))
+		case string:
+			total += int64(len(x))
+		default:
+			total += 64
+		}
+	}
+	return total
 }
 
 func getStringMap(m map[string]interface{}, key string) map[string]string {

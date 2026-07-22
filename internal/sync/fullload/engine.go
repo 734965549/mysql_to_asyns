@@ -22,6 +22,15 @@ type Engine struct {
 	IsStopped func() bool    // 返回 true 时引擎尽快停止（用户暂停/取消）
 	TaskID    string
 
+	// CaptureTableHWM 为 true 时，无 PK/UK 表在打开快照时短锁表并捕获 binlog HWM（ALL 模式）。
+	CaptureTableHWM bool
+	// OnTableSnapshotReady 在表级快照就绪且 HWM 捕获完成后调用；由集成层持久化 table_binlog_hwms。
+	OnTableSnapshotReady TableSnapshotCallback
+	// OnTableDataReady 在表数据全部提交后调用；用于逐表重建索引（P2）。
+	OnTableDataReady TableDataReadyCallback
+
+	limiter  *snapshotLimiter
+	tracker  *tableCompletionTracker
 	reported StatsSnapshot // 已上报到 Prometheus 的累计快照（仅 reportLoop / pushFinalMetrics 访问）
 }
 
@@ -36,6 +45,16 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	}
 	if opt.ReadWorkers < 1 || opt.WriteWorkers < 1 || opt.BatchRows < 1 || opt.BufferBytes < 1 {
 		return fmt.Errorf("full-load V2 received unresolved or invalid options")
+	}
+
+	// 快照连接预算不得超过真实源池上限（默认 source_max_open_conns=32）。
+	poolMax := e.SourceDB.Stats().MaxOpenConnections
+	beforeConns := opt.MaxSnapshotConns
+	opt.CapBySourcePool(poolMax)
+	e.Options = opt
+	if poolMax > 0 && opt.MaxSnapshotConns != beforeConns {
+		logger.Info("[Task %s] FullLoadV2: capped MaxSnapshotConns %d -> %d by source pool max_open=%d",
+			e.TaskID, beforeConns, opt.MaxSnapshotConns, poolMax)
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
@@ -62,28 +81,23 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	}
 	defer close(stopWatchDone)
 
-	planner := NewPlanner(e.SourceDB)
-	targetChunks := opt.ReadWorkers * opt.ChunkOvershoot
-	chunks, err := planner.Plan(cctx, specs, targetChunks)
-	if err != nil {
-		return err
+	// chunk 在每表快照事务内规划（P2），此处仅组装表级任务。
+	jobs := make([]*tableReadJob, 0, len(specs))
+	for _, spec := range specs {
+		jobs = append(jobs, &tableReadJob{spec: spec})
 	}
-	atomic.StoreInt64(&e.Stats.ChunksTotal, int64(len(chunks)))
-	logger.Info("[Task %s] FullLoadV2: planned %d chunks over %d table(s), read_workers=%d write_workers=%d buffer=%dMiB commit_rows=%d commit_bytes=%dMiB",
-		e.TaskID, len(chunks), len(specs), opt.ReadWorkers, opt.WriteWorkers,
-		opt.BufferBytes/1024/1024, opt.CommitRows, opt.CommitBytes/1024/1024)
+	e.tracker = newTableCompletionTracker(specs, e.OnTableDataReady)
+	e.limiter = newSnapshotLimiter(opt.MaxSnapshotGroups, opt.MaxSnapshotConns)
 
 	q := newBatchQueue(opt.BufferBytes, e.Stats)
 	q.watchContext(cctx)
 	e.reported = e.Stats.Snapshot()
 
-	chunkCh := make(chan *Chunk, len(chunks))
-	for _, c := range chunks {
-		chunkCh <- c
-	}
-	close(chunkCh)
+	logger.Info("[Task %s] FullLoadV2: %d table(s), read_workers=%d write_workers=%d buffer=%dMiB commit_rows=%d commit_bytes=%dMiB (plan-in-snapshot)",
+		e.TaskID, len(specs), opt.ReadWorkers, opt.WriteWorkers,
+		opt.BufferBytes/1024/1024, opt.CommitRows, opt.CommitBytes/1024/1024)
 
-	// 周期性聚合日志与 Prometheus 上报（P4：不再逐批 INFO 日志）。
+	// 周期性聚合日志与 Prometheus 上报。
 	stopReport := make(chan struct{})
 	var reportWG sync.WaitGroup
 	reportWG.Add(1)
@@ -101,7 +115,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		writerErr = runWriters(cctx, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.IsStopped)
+		writerErr = runWriters(cctx, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.IsStopped)
 		if writerErr != nil {
 			cancel()
 		}
@@ -110,7 +124,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		readerErr = runReaders(cctx, e.SourceDB, chunkCh, q, opt, e.Stats, e.IsStopped)
+		readerErr = runTableReaders(cctx, e.SourceDB, jobs, q, e, opt, e.Stats, e.IsStopped)
 		// 读取全部完成（或出错）后关闭队列，写入 worker 排空后退出。
 		q.Close()
 		if readerErr != nil {
@@ -152,11 +166,17 @@ func (e *Engine) reportLoop(ctx context.Context, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
+			if e.limiter != nil {
+				g, _, age := e.limiter.snapshot()
+				atomic.StoreInt64(&e.Stats.ActiveSnapshotGroups, g)
+				atomic.StoreInt64(&e.Stats.OldestSnapshotAgeMillis, age.Milliseconds())
+			}
 			cur := e.Stats.Snapshot()
 			e.pushMetrics(e.reported, cur)
-			logger.Info("[Task %s] FullLoadV2 progress: read=%d rows write=%d rows commit=%d rows queue=%d/%d bytes readers=%d writers=%d replays=%d",
+			logger.Info("[Task %s] FullLoadV2 progress: read=%d rows write=%d rows commit=%d rows queue=%d/%d bytes readers=%d writers=%d replays=%d snap_groups=%d snap_txns=%d oldest_snap=%dms align_degrades=%d",
 				e.TaskID, cur.ReadRows, cur.WrittenRows, cur.CommittedRows,
-				cur.QueueBytes, cur.QueueCap, cur.ActiveReaders, cur.ActiveWriters, cur.TxReplays)
+				cur.QueueBytes, cur.QueueCap, cur.ActiveReaders, cur.ActiveWriters, cur.TxReplays,
+				cur.ActiveSnapshotGroups, cur.ActiveSnapshotTxns, cur.OldestSnapshotAgeMillis, cur.SnapshotAlignDegrades)
 			e.reported = cur
 		}
 	}
@@ -171,10 +191,44 @@ func (e *Engine) pushMetrics(prev, cur StatsSnapshot) {
 	m.AddFullLoadLockRetries(cur.LockRetries - prev.LockRetries)
 	m.AddFullLoadQueueBytes(cur.QueueBytes - prev.QueueBytes)
 	m.AddFullLoadActiveWorkers(cur.ActiveReaders-prev.ActiveReaders, cur.ActiveWriters-prev.ActiveWriters)
+	m.AddFullLoadSnapshotGroups(cur.ActiveSnapshotGroups - prev.ActiveSnapshotGroups)
+	m.AddFullLoadSnapshotTxns(cur.ActiveSnapshotTxns - prev.ActiveSnapshotTxns)
+	m.AddFullLoadSnapshotAlignDegrades(cur.SnapshotAlignDegrades - prev.SnapshotAlignDegrades)
+	taskID := e.TaskID
+	if taskID == "" {
+		taskID = "_unknown"
+	}
+	m.SetTaskFullLoadOldestSnapshotAgeMillis(taskID, cur.OldestSnapshotAgeMillis)
 }
 
 func (e *Engine) pushFinalMetrics() {
+	// 结束时从 limiter 刷新瞬时 gauge，避免最后一次 5s 采样残留非零活跃组/最老快照时长。
+	// ActiveSnapshotTxns 由 reader 路径实时维护，语义是快照事务数（不含协调锁连接），不在此用 limiter.conn 覆盖。
+	if e.limiter != nil {
+		g, _, age := e.limiter.snapshot()
+		atomic.StoreInt64(&e.Stats.ActiveSnapshotGroups, g)
+		atomic.StoreInt64(&e.Stats.OldestSnapshotAgeMillis, age.Milliseconds())
+	} else {
+		atomic.StoreInt64(&e.Stats.ActiveSnapshotGroups, 0)
+		atomic.StoreInt64(&e.Stats.OldestSnapshotAgeMillis, 0)
+	}
 	// 结束时补一次增量（reportLoop 已在 reportWG.Wait() 后停止，无并发访问 e.reported）。
 	cur := e.Stats.Snapshot()
 	e.pushMetrics(e.reported, cur)
+}
+
+func groupChunksByTable(chunks []*Chunk) map[string][]*Chunk {
+	m := make(map[string][]*Chunk)
+	for _, c := range chunks {
+		if c == nil || c.Spec == nil {
+			continue
+		}
+		key := tableKey(c.Spec.SourceSchema, c.Spec.SourceTable)
+		m[key] = append(m[key], c)
+	}
+	return m
+}
+
+func tableKey(schema, table string) string {
+	return schema + "." + table
 }

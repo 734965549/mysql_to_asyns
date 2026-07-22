@@ -740,3 +740,20 @@ func TestStart_DoesNotMutateScheduleMode(t *testing.T) {
 	assert.Nil(t, task.Context.ScheduledAt)
 	assert.Nil(t, task.Context.ScheduledFromStatus)
 }
+
+func TestTableBinlogHWM_Lifecycle(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "hwm_life", Mode: SyncModeAll})
+	task.SetTableBinlogHWM("db.nopk", "mysql-bin.000001:100")
+	require.Equal(t, "mysql-bin.000001:100", task.Context.TableBinlogHWMs["db.nopk"])
+
+	// 全量完成后清历史断点不得带走表级 HWM。
+	task.ResetFullSyncResume()
+	assert.Equal(t, "mysql-bin.000001:100", task.Context.TableBinlogHWMs["db.nopk"])
+
+	task.ClearTableBinlogHWMs()
+	assert.Nil(t, task.Context.TableBinlogHWMs)
+
+	task.SetTableBinlogHWM("db.nopk", "mysql-bin.000002:200")
+	task.ResetSyncPhase()
+	assert.Nil(t, task.Context.TableBinlogHWMs)
+}

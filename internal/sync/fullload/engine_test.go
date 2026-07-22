@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"mysql-to-sync/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/metrics"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestEngine_NoPKEndToEnd 用双 sqlmock 验证无主键表的完整流水线：
@@ -29,12 +32,17 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 	}
 	defer dstDB.Close()
 	dstMock.MatchExpectationsInOrder(false)
+	srcMock.MatchExpectationsInOrder(false)
 
-	// 源：一次流式 SELECT 返回 2 行。
+	// 源：InnoDB 预检 + 表级一致性快照 + MDL 后权威校验 + 流式 SELECT。
+	expectInnoDBTable(srcMock, "s", "t")
+	expectConsistentSnapshot(srcMock, "s", "t", "id")
+	expectInnoDBTable(srcMock, "s", "t")
 	srcMock.ExpectQuery("SELECT `id`, `name` FROM `s`.`t`").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).
 			AddRow(int64(1), "a").
 			AddRow(int64(2), "b"))
+	expectSnapshotCommit(srcMock)
 
 	// 目标：会话优化 + 事务写入 + 提交 + 恢复会话。
 	dstMock.ExpectExec("SET @@SESSION.FOREIGN_KEY_CHECKS=0").WillReturnResult(sqlmock.NewResult(0, 0))
@@ -62,6 +70,7 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 
 	var mu sync.Mutex
 	var committedRows int64
+	var readyFired int
 	eng := &Engine{
 		SourceDB: srcDB,
 		TargetDB: dstDB,
@@ -73,6 +82,12 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 			committedRows += rows
 			mu.Unlock()
 		},
+		OnTableDataReady: func(schema, table string) error {
+			mu.Lock()
+			readyFired++
+			mu.Unlock()
+			return nil
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -83,9 +98,13 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 
 	mu.Lock()
 	got := committedRows
+	ready := readyFired
 	mu.Unlock()
 	if got != 2 {
 		t.Fatalf("committed rows=%d want 2", got)
+	}
+	if ready != 1 {
+		t.Fatalf("OnTableDataReady fired=%d want 1", ready)
 	}
 	if snap := eng.Stats.Snapshot(); snap.CommittedRows != 2 {
 		t.Fatalf("stats committed=%d want 2", snap.CommittedRows)
@@ -123,4 +142,33 @@ func TestEngineCanceledContextCannotReportSuccess(t *testing.T) {
 	if err := eng.Run(ctx, []*TableSpec{spec}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled engine must fail with context cancellation, got %v", err)
 	}
+}
+
+func TestPushFinalMetricsClearsStaleSnapshotGauges(t *testing.T) {
+	eng := &Engine{
+		TaskID:  "task-final",
+		Stats:   &Stats{},
+		limiter: newSnapshotLimiter(2, 2),
+	}
+	atomic.StoreInt64(&eng.Stats.ActiveSnapshotGroups, 3)
+	atomic.StoreInt64(&eng.Stats.OldestSnapshotAgeMillis, 12_000)
+	eng.reported = eng.Stats.Snapshot()
+
+	metrics.GetMetrics().SetTaskFullLoadOldestSnapshotAgeMillis("task-final", 12_000)
+	metrics.GetMetrics().SetTaskFullLoadOldestSnapshotAgeMillis("task-other", 9_000)
+
+	eng.pushFinalMetrics()
+
+	snap := eng.Stats.Snapshot()
+	if snap.ActiveSnapshotGroups != 0 {
+		t.Fatalf("ActiveSnapshotGroups=%d want 0", snap.ActiveSnapshotGroups)
+	}
+	if snap.OldestSnapshotAgeMillis != 0 {
+		t.Fatalf("OldestSnapshotAgeMillis=%d want 0", snap.OldestSnapshotAgeMillis)
+	}
+	// 本任务清零后，全局 gauge 仍应保留其他任务的 max。
+	if got := testutil.ToFloat64(metrics.GetMetrics().FullLoadOldestSnapshotMs); got != 9000 {
+		t.Fatalf("global oldest snapshot gauge=%v want 9000", got)
+	}
+	metrics.GetMetrics().ClearTaskFullLoadOldestSnapshotAge("task-other")
 }

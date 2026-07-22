@@ -21,22 +21,33 @@ const ( // 常量定义
 	EventTypeInsert BinlogEventType = "INSERT" // 插入事件类型
 	EventTypeUpdate BinlogEventType = "UPDATE" // 更新事件类型
 	EventTypeDelete BinlogEventType = "DELETE" // 删除事件类型
+
+	// defaultMaxTxnBufferedRows 单个 binlog 事务在内存中可缓冲的 row map 软上限
+	//（Rows + BeforeImage；UPDATE 会同时计入 before/after）。超限后溢写磁盘，避免硬失败毒事务。
+	defaultMaxTxnBufferedRows = 100_000
+	// defaultMaxTxnBufferedBytes 内存缓冲字节软上限（估算值）。少量大 BLOB 也会触发溢写。
+	defaultMaxTxnBufferedBytes = 256 << 20 // 256 MiB
 )
 
 // BinlogEvent Binlog事件结构体
 type BinlogEvent struct { // 定义binlog事件结构体
-	Table       string                   `json:"table"`        // 表名
-	Schema      string                   `json:"schema"`       // 数据库名
-	EventType   BinlogEventType          `json:"event_type"`   // 事件类型
-	Rows        []map[string]interface{} `json:"rows"`         // 行数据
-	BeforeImage []map[string]interface{} `json:"before_image"` // 更新前的镜像数据，用于无主键表的WHERE条件
-	Timestamp   time.Time                `json:"timestamp"`    // 事件时间戳
-	Position    mysql.Position           `json:"position"`     // binlog位置
+	Table          string                   `json:"table"`           // 表名
+	Schema         string                   `json:"schema"`          // 数据库名
+	EventType      BinlogEventType          `json:"event_type"`      // 事件类型
+	Rows           []map[string]interface{} `json:"rows"`            // 行数据
+	BeforeImage    []map[string]interface{} `json:"before_image"`    // 更新前的镜像数据，用于无主键表的WHERE条件
+	Timestamp      time.Time                `json:"timestamp"`       // 事件时间戳
+	Position       mysql.Position           `json:"position"`        // 事务提交位点，与 CommitPosition 一致
+	EventEndPos    mysql.Position           `json:"event_end_pos"`   // 当前 row event 结束位置
+	CommitPosition mysql.Position           `json:"commit_position"` // XID 后的下一事件起始位点
 }
 
-// EventHandler 事件处理器接口定义
-type EventHandler interface { // 定义事件处理器接口
-	OnEvent(event *BinlogEvent) error // 处理事件方法
+// EventHandler 事件处理器接口定义。
+// OnEvent 只负责应用单条事件；位点推进必须在 OnTransactionCommit 中、整事务成功后完成。
+type EventHandler interface {
+	OnEvent(event *BinlogEvent) error
+	// OnTransactionCommit 在同一事务内全部 OnEvent 成功后调用一次，传入 XID 提交位点。
+	OnTransactionCommit(pos mysql.Position) error
 }
 
 // Subscriber Binlog订阅器结构体
@@ -49,6 +60,9 @@ type Subscriber struct { // 定义binlog订阅器结构体
 	ctx      context.Context    // 上下文
 	cancel   context.CancelFunc // 取消函数
 	running  bool               // 运行状态标志
+
+	// eventHandler 持有当前 canal handler，便于 Stop/退出时关闭并删除 spill 临时文件。
+	eventHandler *binlogHandler
 }
 
 // SubscriberConfig 订阅器配置结构体
@@ -61,6 +75,13 @@ type SubscriberConfig struct { // 定义订阅器配置结构体
 	Databases []string // 要订阅的数据库列表
 	Tables    []string // 要订阅的表列表（如果为空，订阅Databases中的所有表）
 	ServerID  uint32   // 服务器ID，用于标识订阅者
+
+	// MaxTxnBufferedRows 单事务内存缓冲 row map 软上限；0=默认 100000。超限溢写磁盘。
+	MaxTxnBufferedRows int
+	// MaxTxnBufferedBytes 单事务内存缓冲估算字节软上限；0=默认 256MiB。超限溢写磁盘。
+	MaxTxnBufferedBytes int64
+	// TxnSpillDir 事务溢写目录；空则使用系统临时目录下 mysql-to-sync-txn-spill。
+	TxnSpillDir string
 }
 
 // NewSubscriber 创建Binlog订阅器函数
@@ -110,9 +131,6 @@ func (s *Subscriber) Start(ctx context.Context, position mysql.Position) error {
 	}
 	s.canal = c // 设置canal实例
 
-	// 设置事件处理器
-	s.canal.SetEventHandler(&binlogHandler{subscriber: s}) // 设置binlog事件处理器
-
 	startPos := position
 	if startPos.Name == "" { // 如果未指定位置
 		// 从最新位置开始
@@ -122,9 +140,26 @@ func (s *Subscriber) Start(ctx context.Context, position mysql.Position) error {
 		}
 	}
 
+	// 设置事件处理器（事务缓冲 + OnXID 派发；超内存软上限时溢写磁盘）
+	cfgRows := 0
+	var cfgBytes int64
+	spillDir := ""
+	if s.config != nil {
+		cfgRows = s.config.MaxTxnBufferedRows
+		cfgBytes = s.config.MaxTxnBufferedBytes
+		spillDir = s.config.TxnSpillDir
+	}
+	handler := &binlogHandler{
+		subscriber:  s,
+		currentFile: startPos.Name,
+		txnBuf:      newTxnEventBuffer(cfgRows, cfgBytes, spillDir),
+	}
 	s.mu.Lock()
+	s.eventHandler = handler
 	s.position = startPos
 	s.mu.Unlock()
+	s.canal.SetEventHandler(handler)
+	defer s.closeTxnSpill()
 
 	logger.Info("Binlog subscriber started from position: %v", startPos) // 输出启动日志
 	err = s.canal.RunFrom(startPos)
@@ -162,10 +197,26 @@ func (s *Subscriber) Stop() { // 停止binlog订阅
 		s.cancel() // 取消上下文
 	}
 	if s.canal != nil { // 如果canal实例存在
-		s.canal.Close() // 关闭canal
+		s.canal.Close() // 关闭canal；RunFrom 返回后由 Start defer 清理事务缓冲
 	}
 	s.running = false                        // 设置运行状态为false
 	logger.Info("Binlog subscriber stopped") // 输出停止日志
+}
+
+// closeTxnSpill 关闭并删除当前事务 spill 临时文件（Start 退出路径）。
+func (s *Subscriber) closeTxnSpill() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeTxnSpillLocked()
+}
+
+func (s *Subscriber) closeTxnSpillLocked() {
+	if s.eventHandler == nil {
+		return
+	}
+	if s.eventHandler.txnBuf != nil {
+		s.eventHandler.txnBuf.reset()
+	}
 }
 
 // GetPosition 获取当前位置方法
@@ -194,55 +245,112 @@ func (s *Subscriber) dispatchEvent(event *BinlogEvent) error { // 分发事件�
 type binlogHandler struct { // 定义canal事件处理器结构体
 	canal.DummyEventHandler             // 嵌入DummyEventHandler
 	subscriber              *Subscriber // 订阅器引用
+	currentFile             string      // 当前 binlog 文件名，由 OnRotate 维护
+	txnBuf                  *txnEventBuffer
 }
 
-func (h *binlogHandler) OnRow(e *canal.RowsEvent) error { // 处理行事件
-	var eventType BinlogEventType // 定义事件类型变量
-	switch e.Action {             // 根据动作类型确定事件类型
-	case canal.InsertAction: // 如果是插入动作
-		eventType = EventTypeInsert // 设置为插入事件
-	case canal.UpdateAction: // 如果是更新动作
-		eventType = EventTypeUpdate // 设置为更新事件
-	case canal.DeleteAction: // 如果是删除动作
-		eventType = EventTypeDelete // 设置为删除事件
+func (h *binlogHandler) buildRowEvent(e *canal.RowsEvent) *BinlogEvent {
+	var eventType BinlogEventType
+	switch e.Action {
+	case canal.InsertAction:
+		eventType = EventTypeInsert
+	case canal.UpdateAction:
+		eventType = EventTypeUpdate
+	case canal.DeleteAction:
+		eventType = EventTypeDelete
 	}
 
-	// 转换行数据
-	rows := make([]map[string]interface{}, 0, len(e.Rows)) // 创建行数据列表
-	beforeImage := make([]map[string]interface{}, 0)       // 创建更新前镜像列表
+	rows := make([]map[string]interface{}, 0, len(e.Rows))
+	beforeImage := make([]map[string]interface{}, 0)
 
-	for i := 0; i < len(e.Rows); i++ { // 遍历所有行
-		rowMap := make(map[string]interface{}) // 创建行映射表
-		for j, col := range e.Table.Columns {  // 遍历所有列
-			if j < len(e.Rows[i]) { // 检查列索引是否有效
-				rowMap[col.Name] = e.Rows[i][j] // 将列值存入映射表
+	for i := 0; i < len(e.Rows); i++ {
+		rowMap := make(map[string]interface{})
+		for j, col := range e.Table.Columns {
+			if j < len(e.Rows[i]) {
+				rowMap[col.Name] = e.Rows[i][j]
 			}
 		}
 
-		if e.Action == canal.UpdateAction { // 如果是更新事件
-			if i%2 == 0 { // 如果是偶数索引
-				beforeImage = append(beforeImage, rowMap) // 添加到更新前镜像
-			} else { // 如果是奇数索引
-				rows = append(rows, rowMap) // 添加到行数据
+		if e.Action == canal.UpdateAction {
+			if i%2 == 0 {
+				beforeImage = append(beforeImage, rowMap)
+			} else {
+				rows = append(rows, rowMap)
 			}
-		} else if e.Action == canal.DeleteAction { // 如果是删除事件
-			beforeImage = append(beforeImage, rowMap) // 添加到更新前镜像
-		} else { // 其他情况（插入事件）
-			rows = append(rows, rowMap) // 添加到行数据
+		} else if e.Action == canal.DeleteAction {
+			beforeImage = append(beforeImage, rowMap)
+		} else {
+			rows = append(rows, rowMap)
 		}
 	}
 
-	event := &BinlogEvent{ // 创建binlog事件
-		Table:       e.Table.Name,                        // 设置表名
-		Schema:      e.Table.Schema,                      // 设置数据库名
-		EventType:   eventType,                           // 设置事件类型
-		Rows:        rows,                                // 设置行数据
-		BeforeImage: beforeImage,                         // 设置更新前镜像
-		Timestamp:   time.Now(),                          // 设置时间戳
-		Position:    h.subscriber.canal.SyncedPosition(), // 设置binlog位置
+	eventEndPos := mysql.Position{Name: h.currentFile}
+	if e.Header != nil {
+		eventEndPos.Pos = e.Header.LogPos
 	}
 
-	return h.subscriber.dispatchEvent(event) // 分发事件到处理器
+	return &BinlogEvent{
+		Table:       e.Table.Name,
+		Schema:      e.Table.Schema,
+		EventType:   eventType,
+		Rows:        rows,
+		BeforeImage: beforeImage,
+		Timestamp:   time.Now(),
+		EventEndPos: eventEndPos,
+	}
+}
+
+func (h *binlogHandler) buffer() *txnEventBuffer {
+	if h.txnBuf == nil {
+		h.txnBuf = newTxnEventBuffer(0, 0, "")
+	}
+	return h.txnBuf
+}
+
+func (h *binlogHandler) hasBuffered() bool {
+	b := h.buffer()
+	return b.hasBuffered()
+}
+
+func (h *binlogHandler) finishTransactionBoundary(commitPos mysql.Position) error {
+	if h.hasBuffered() {
+		err := h.buffer().flush(func(event *BinlogEvent) error {
+			event.CommitPosition = commitPos
+			event.Position = commitPos
+			return h.subscriber.dispatchEvent(event)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return h.subscriber.dispatchTransactionCommit(commitPos)
+}
+
+func (h *binlogHandler) flushTransaction(commitPos mysql.Position) error {
+	return h.finishTransactionBoundary(commitPos)
+}
+
+// dispatchTransactionCommit 通知所有 handler 事务已完整应用，可安全推进位点。
+func (s *Subscriber) dispatchTransactionCommit(pos mysql.Position) error {
+	s.mu.Lock()
+	s.position = pos
+	s.mu.Unlock()
+
+	for _, handler := range s.handlers {
+		if err := handler.OnTransactionCommit(pos); err != nil {
+			logger.Error("Transaction commit handler error: %v", err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *binlogHandler) OnRow(e *canal.RowsEvent) error {
+	event := h.buildRowEvent(e)
+	if err := h.buffer().append(event); err != nil {
+		return fmt.Errorf("buffer binlog row event until XID: %w", err)
+	}
+	return nil
 }
 
 func (h *binlogHandler) String() string { // 获取处理器名称
@@ -250,17 +358,34 @@ func (h *binlogHandler) String() string { // 获取处理器名称
 }
 
 // OnRotate 处理binlog文件切换方法
-func (h *binlogHandler) OnRotate(header *replication.EventHeader, rotateEvent *replication.RotateEvent) error { // 处理binlog文件切换事件
-	logger.Info("Binlog rotate: %s:%d", string(rotateEvent.NextLogName), rotateEvent.Position) // 输出binlog切换日志
-	return nil                                                                                 // 返回nil
+func (h *binlogHandler) OnRotate(header *replication.EventHeader, rotateEvent *replication.RotateEvent) error {
+	h.currentFile = string(rotateEvent.NextLogName)
+	logger.Info("Binlog rotate: %s:%d", h.currentFile, rotateEvent.Position)
+	return nil
+}
+
+// OnDDL 在表结构变更前刷新未提交的 row 事件；纯 DDL 位点由紧随其后的 OnPosSynced(force) 推进。
+func (h *binlogHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent) error {
+	if h.hasBuffered() {
+		return h.finishTransactionBoundary(nextPos)
+	}
+	return nil
+}
+
+// OnPosSynced 覆盖非 XID 提交边界：MyISAM 等引擎的 COMMIT Query、Rotate、canal 关闭。
+func (h *binlogHandler) OnPosSynced(header *replication.EventHeader, pos mysql.Position, _ mysql.GTIDSet, force bool) error {
+	if h.hasBuffered() {
+		return h.finishTransactionBoundary(pos)
+	}
+	if force {
+		return h.subscriber.dispatchTransactionCommit(pos)
+	}
+	return nil
 }
 
 // OnXID 处理XID事件（事务提交）方法
-func (h *binlogHandler) OnXID(header *replication.EventHeader, pos mysql.Position) error { // 处理XID事件
-	h.subscriber.mu.Lock()      // 获取锁
-	h.subscriber.position = pos // 更新位置
-	h.subscriber.mu.Unlock()    // 释放锁
-	return nil                  // 返回nil
+func (h *binlogHandler) OnXID(header *replication.EventHeader, pos mysql.Position) error {
+	return h.flushTransaction(pos)
 }
 
 // GetMasterPosition 获取主库当前位置方法

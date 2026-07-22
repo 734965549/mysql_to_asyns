@@ -181,7 +181,7 @@ func TestWriterLoopReplaysWholeTransactionOnDeadlock(t *testing.T) {
 	var committed int64
 	err = writerLoop(context.Background(), 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 10}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil)
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestWriterLoopDoesNotReplayUnknownCommitOutcome(t *testing.T) {
 	})
 	q.Close()
 	stats := &Stats{}
-	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats, nil, nil)
+	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "outcome unknown") {
 		t.Fatalf("expected unknown commit outcome error, got %v", err)
 	}
@@ -251,7 +251,7 @@ func TestWriterLoopCommitsOnIntervalWithoutNextBatch(t *testing.T) {
 	opt.CommitInterval = 20 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err = writerLoop(ctx, 0, db, q, opt, &Stats{}, func(_, _ string, _, _ int64) { q.Close() }, nil)
+	err = writerLoop(ctx, 0, db, q, opt, &Stats{}, func(_, _ string, _, _ int64) { q.Close() }, nil, nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}

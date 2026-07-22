@@ -25,7 +25,12 @@ type MySQLSink struct {
 	writers       map[string]*writer.BufferedWriter
 	identities    map[string]*entity.TableIdentity
 	targetSchemas map[string]string
+	activeTx      *sql.Tx
 	closed        bool
+
+	// metaSchema 存放 `_mts_applied_txn`；在 PrepareTables 时取字典序最小的目标库。
+	metaSchema     string
+	metaTableReady bool
 }
 
 func NewMySQLSink(targetDB *sql.DB, analyzer service.IdentityAnalyzer, batchSize int) *MySQLSink {
@@ -85,6 +90,9 @@ func (s *MySQLSink) PrepareTables(ctx context.Context, dbMapping map[string]stri
 	if writeConn == nil {
 		return fmt.Errorf("mysql sink is not open")
 	}
+	s.mu.Lock()
+	s.ensureMetaSchemaLocked(dbMapping)
+	s.mu.Unlock()
 	for srcDB, tgtDB := range dbMapping {
 		for _, tableName := range tables {
 			key := fmt.Sprintf("%s.%s", srcDB, tableName)
@@ -136,7 +144,7 @@ func (s *MySQLSink) Write(ctx context.Context, event *sink.ChangeEvent) error {
 
 	if identity.Strategy == entity.FullColumnsStrategy {
 		metrics.GetMetrics().IncrementIncrementalNoPKTableEvents()
-		logger.Warn("[NoPK][Task %s] Incremental event on table %s.%s (event=%s, strategy=FullColumns): falling back to full-column WHERE + LIMIT 1; idempotency is best-effort, recommend adding a primary or unique key",
+		logger.Warn("[NoPK][Task %s] Incremental event on table %s.%s (event=%s, strategy=FullColumns): falling back to full-column WHERE + LIMIT 1; INSERT replay safety relies on durable txn position mark",
 			event.TaskID, event.SourceSchema, event.SourceTable, event.EventType)
 	}
 
@@ -150,10 +158,16 @@ func (s *MySQLSink) Write(ctx context.Context, event *sink.ChangeEvent) error {
 		if event.After == nil {
 			return fmt.Errorf("UPDATE event for %s has no after image", key)
 		}
+		if err := s.ensureTableInsertsFlushed(key); err != nil {
+			return err
+		}
 		return s.handleUpdate(ctx, identity, targetSchema, event)
 	case "DELETE":
 		if event.Before == nil {
 			return fmt.Errorf("DELETE event for %s has no before image", key)
+		}
+		if err := s.ensureTableInsertsFlushed(key); err != nil {
+			return err
 		}
 		return s.handleDelete(ctx, identity, targetSchema, event)
 	default:
@@ -168,8 +182,21 @@ func (s *MySQLSink) handleInsert(w *writer.BufferedWriter, event *sink.ChangeEve
 	return nil
 }
 
+// ensureTableInsertsFlushed 在事务模式下，UPDATE/DELETE 前先 flush 同表待处理 INSERT，
+// 避免 BufferedWriter 延迟写入导致源事务内事件在目标端重排。
+func (s *MySQLSink) ensureTableInsertsFlushed(key string) error {
+	s.mu.RLock()
+	tx := s.activeTx
+	w := s.writers[key]
+	s.mu.RUnlock()
+	if tx == nil || w == nil {
+		return nil
+	}
+	return w.Flush()
+}
+
 func (s *MySQLSink) handleUpdate(ctx context.Context, identity *entity.TableIdentity, targetSchema string, event *sink.ChangeEvent) error {
-	batchWriter := writer.NewBatchWriterWithConn(s.writeConn, identity, 1000, targetSchema)
+	batchWriter := s.newBatchWriter(identity, targetSchema)
 	sqlBuilder := batchWriter.GetSQLBuilder()
 
 	if identity.Strategy == entity.FullColumnsStrategy && event.Before != nil {
@@ -184,11 +211,46 @@ func (s *MySQLSink) handleUpdate(ctx context.Context, identity *entity.TableIden
 }
 
 func (s *MySQLSink) handleDelete(ctx context.Context, identity *entity.TableIdentity, targetSchema string, event *sink.ChangeEvent) error {
-	batchWriter := writer.NewBatchWriterWithConn(s.writeConn, identity, 1000, targetSchema)
+	batchWriter := s.newBatchWriter(identity, targetSchema)
 	return batchWriter.Delete(ctx, event.Before)
 }
 
+func (s *MySQLSink) newBatchWriter(identity *entity.TableIdentity, targetSchema string) *writer.BatchWriter {
+	s.mu.RLock()
+	tx := s.activeTx
+	conn := s.writeConn
+	s.mu.RUnlock()
+
+	if tx != nil {
+		return writer.NewBatchWriterWithTx(tx, identity, 1000, targetSchema)
+	}
+	return writer.NewBatchWriterWithConn(conn, identity, 1000, targetSchema)
+}
+
 func (s *MySQLSink) deleteAndUpsert(ctx context.Context, identity *entity.TableIdentity, targetSchema string, row, beforeImage map[string]interface{}) error {
+	s.mu.RLock()
+	activeTx := s.activeTx
+	s.mu.RUnlock()
+
+	if activeTx != nil {
+		txWriter := writer.NewBatchWriterWithTx(activeTx, identity, 1000, targetSchema)
+		txSQLBuilder := txWriter.GetSQLBuilder()
+
+		deleteQuery, deleteArgs := txSQLBuilder.BuildDelete(beforeImage)
+		if _, err := activeTx.ExecContext(ctx, deleteQuery, deleteArgs...); err != nil {
+			return fmt.Errorf("delete old row in identity-change update: %w", err)
+		}
+
+		txWriter.EnableUpsert()
+		if err := txWriter.WriteBatch(ctx, []map[string]interface{}{row}); err != nil {
+			return fmt.Errorf("upsert new row in identity-change update: %w", err)
+		}
+
+		logger.Info("[IdentityChange][Task ...] PK/UK identity changed on table %s.%s; deleted old row and upserted new row in transaction",
+			targetSchema, identity.TableName)
+		return nil
+	}
+
 	tx, err := s.writeConn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx for identity-change update: %w", err)
@@ -234,6 +296,79 @@ func (s *MySQLSink) Flush(ctx context.Context) error {
 	return nil
 }
 
+func (s *MySQLSink) BeginTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("mysql sink is closed")
+	}
+	if s.writeConn == nil {
+		return fmt.Errorf("mysql sink is not open")
+	}
+	if s.activeTx != nil {
+		return fmt.Errorf("mysql sink transaction already active")
+	}
+
+	tx, err := s.writeConn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin mysql sink transaction: %w", err)
+	}
+	s.activeTx = tx
+	for _, w := range s.writers {
+		// 事务路径禁用后台 timer flush，错误由显式 Flush/CommitTransaction 同步传播。
+		w.PauseAutoFlush()
+		w.SetExecutor(tx)
+	}
+	return nil
+}
+
+func (s *MySQLSink) CommitTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeTx == nil {
+		return nil
+	}
+
+	for _, w := range s.writers {
+		if err := w.Flush(); err != nil {
+			_ = s.rollbackLocked()
+			return fmt.Errorf("flush mysql sink transaction: %w", err)
+		}
+	}
+	if err := s.activeTx.Commit(); err != nil {
+		_ = s.rollbackLocked()
+		return fmt.Errorf("commit mysql sink transaction: %w", err)
+	}
+	s.activeTx = nil
+	for _, w := range s.writers {
+		w.SetExecutor(s.writeConn)
+		w.ResumeAutoFlush()
+	}
+	return nil
+}
+
+func (s *MySQLSink) RollbackTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rollbackLocked()
+}
+
+func (s *MySQLSink) rollbackLocked() error {
+	if s.activeTx == nil {
+		return nil
+	}
+	for _, w := range s.writers {
+		w.DiscardBuffer()
+	}
+	err := s.activeTx.Rollback()
+	s.activeTx = nil
+	for _, w := range s.writers {
+		w.SetExecutor(s.writeConn)
+		w.ResumeAutoFlush()
+	}
+	return err
+}
+
 func (s *MySQLSink) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
@@ -241,6 +376,10 @@ func (s *MySQLSink) Close(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
+	if err := s.rollbackLocked(); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("rollback active mysql sink transaction on close: %w", err)
+	}
 	writers := make([]*writer.BufferedWriter, 0, len(s.writers))
 	for _, w := range s.writers {
 		writers = append(writers, w)

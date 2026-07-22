@@ -11,6 +11,8 @@ import (
 	"mysql-to-sync/internal/sync/infrastructure/reader"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 	"mysql-to-sync/pkg/logger"
+
+	"github.com/go-mysql-org/go-mysql/mysql"
 )
 
 // fullLoadStatsStore 保存每个任务最近一次 V2 引擎运行的统计快照指针，供任务详情接口读取。
@@ -55,9 +57,8 @@ type tableReadyV2 struct {
 
 // syncDatabasePairV2 使用全量 V2 任务级流水线引擎同步单个源库到目标库。
 //
-// 结构与 V1 syncDatabasePair 保持一致：阶段1 串行准备表结构（复用 ensureTargetTable /
-// dropNonPrimaryKeyIndexes），阶段2 由 fullload.Engine 以任务级 chunk 调度 + 读写解耦
-// 流水线复制数据，索引恢复任务写入 pending 由最外层统一执行。
+// 阶段1 串行准备表结构；阶段2 表级一致性快照 + 任务级读写流水线；
+// 每表数据全部提交后立即异步重建该表索引（P2），不再攒到任务末尾统一阶段3。
 func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, pending *[]pendingIndexRestore, dbLevelRebuilt bool) error {
 	taskID := task.Config.ID
 
@@ -114,10 +115,11 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		return nil
 	}
 
-	// 构建引擎输入并标记表进度开始。
+	readyByKey := make(map[string]tableReadyV2, len(ready))
 	specs := make([]*fullload.TableSpec, 0, len(ready))
 	for _, r := range ready {
 		s.startTableProgress(taskID, sourceSchema, r.sourceName, r.estimated)
+		readyByKey[sourceSchema+"."+r.sourceName] = r
 		specs = append(specs, &fullload.TableSpec{
 			SourceSchema:  sourceSchema,
 			TargetSchema:  targetSchema,
@@ -148,51 +150,113 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		taskStartTime = time.Now()
 	}
 
+	engineCtx, engineCancel := context.WithCancel(ctx)
+	defer engineCancel()
+
+	var (
+		restoreWG      sync.WaitGroup
+		restoreErrOnce sync.Once
+		restoreErr     error
+	)
+	hardMax := 0
+	if s.config != nil {
+		hardMax = s.config.Sync.IndexRestoreHardMax
+	}
+	indexWorkers := taskEntity.EffectiveIndexRestoreWorkers(
+		task.Config.IndexRestoreWorkerCount,
+		task.Config.WorkerCount,
+		hardMax,
+	)
+	restoreSem := make(chan struct{}, indexWorkers)
+
+	setRestoreErr := func(err error) {
+		if err == nil {
+			return
+		}
+		restoreErrOnce.Do(func() {
+			restoreErr = err
+			engineCancel()
+		})
+	}
+
 	engine := &fullload.Engine{
-		SourceDB:  runtime.sourceDB,
-		TargetDB:  runtime.targetDB,
-		Options:   opt,
-		Stats:     stats,
-		TaskID:    taskID,
-		IsStopped: func() bool { return s.isTaskStopped(taskID) },
+		SourceDB:        runtime.sourceDB,
+		TargetDB:        runtime.targetDB,
+		Options:         opt,
+		Stats:           stats,
+		TaskID:          taskID,
+		IsStopped:       func() bool { return s.isTaskStopped(taskID) },
+		CaptureTableHWM: task.Config.Mode == taskEntity.SyncModeAll,
+		OnTableSnapshotReady: func(schema, table string, pos mysql.Position) error {
+			if err := s.persistTableBinlogHWM(taskID, schema, table, pos); err != nil {
+				return err
+			}
+			logger.Info("[Task %s] FullLoadV2: persisted table binlog HWM for %s.%s at %s:%d",
+				taskID, schema, table, pos.Name, pos.Pos)
+			return nil
+		},
 		OnCommit: func(schema, table string, rows, bytes int64) {
 			mark := schema + "." + table
 			taskTotalRows := s.incrementTaskProgress(taskID, rows, mark)
 			elapsed := time.Since(taskStartTime).Seconds()
 			s.updateTableProgress(taskID, schema, table, rows, elapsed, taskStartTime, taskTotalRows)
 		},
+		OnTableDataReady: func(schema, table string) error {
+			key := schema + "." + table
+			r, ok := readyByKey[key]
+			if !ok {
+				return fmt.Errorf("unknown table ready callback for %s", key)
+			}
+			s.completeTableProgress(taskID, schema, table)
+
+			if !task.Config.OptimizeIndex || len(r.savedIndexes) == 0 {
+				return nil
+			}
+			// 异步重建索引，不阻塞写入路径；失败则取消引擎。
+			indexes := append([]map[string]interface{}(nil), r.savedIndexes...)
+			targetSchemaName := targetSchema
+			targetTableName := r.targetName
+			restoreWG.Add(1)
+			go func() {
+				defer restoreWG.Done()
+				select {
+				case restoreSem <- struct{}{}:
+					defer func() { <-restoreSem }()
+				case <-engineCtx.Done():
+					return
+				}
+				if s.isTaskStopped(taskID) || engineCtx.Err() != nil {
+					return
+				}
+				logger.Info("[Task %s] FullLoadV2: restoring indexes for %s.%s (per-table)", taskID, targetSchemaName, targetTableName)
+				if err := s.restoreIndexes(engineCtx, runtime, targetSchemaName, targetTableName, indexes); err != nil {
+					setRestoreErr(fmt.Errorf("restore indexes for %s.%s: %w", targetSchemaName, targetTableName, err))
+					return
+				}
+				logger.Info("[Task %s] FullLoadV2: restored indexes for %s.%s", taskID, targetSchemaName, targetTableName)
+			}()
+			return nil
+		},
 	}
 
-	if err := engine.Run(ctx, specs); err != nil {
-		if s.isTaskStopped(taskID) {
-			logger.Info("[Task %s] FullLoadV2 stopped during pair %s->%s: %v", taskID, sourceSchema, targetSchema, err)
-			return errFullSyncStoppedByUser
-		}
-		s.failTaskUnlessCancelled(ctx, taskID, err.Error())
-		return err
-	}
+	runErr := engine.Run(engineCtx, specs)
+	restoreWG.Wait()
 
 	if s.isTaskStopped(taskID) {
+		logger.Info("[Task %s] FullLoadV2 stopped during pair %s->%s: %v", taskID, sourceSchema, targetSchema, runErr)
 		return errFullSyncStoppedByUser
 	}
-
-	// 数据复制完成：标记表进度完成，索引恢复任务入队。
-	for _, r := range ready {
-		s.completeTableProgress(taskID, sourceSchema, r.sourceName)
+	if restoreErr != nil {
+		s.failTaskUnlessCancelled(ctx, taskID, restoreErr.Error())
+		return restoreErr
 	}
-	if pending != nil && task.Config.OptimizeIndex {
-		for _, r := range ready {
-			if len(r.savedIndexes) == 0 {
-				continue
-			}
-			*pending = append(*pending, pendingIndexRestore{
-				targetSchema: targetSchema,
-				targetTable:  r.targetName,
-				indexes:      append([]map[string]interface{}(nil), r.savedIndexes...),
-			})
-		}
+	if runErr != nil {
+		s.failTaskUnlessCancelled(ctx, taskID, runErr.Error())
+		return runErr
 	}
 
+	// 逐表索引已在 OnTableDataReady 中处理；不再写入外层 pending（避免阶段3重复重建）。
+	_ = pending
 	return nil
 }
 

@@ -74,7 +74,7 @@ Sync 不保存任务配置和生命周期状态；这些由 TaskService 维护�
 - **KafkaSink**：基于 `kafka-go`，支持 SASL（PLAIN/SCRAM-SHA-256/SCRAM-SHA-512）、TLS 双向认证、per-table topic 路由
 - **WebhookSink**：基于标准库 `net/http`，支持自定义 Header、失败重试与退避策略
 - **SinkFactory**：`NewSinks(configs, deps)` 按 `sink_configs` 类型创建对应 Sink 实例；空配置默认返回 `[{MYSQL}]`
-- **交付语义**：所有 Sink 写入成功后才 `SavePosition` 推进 checkpoint；任一 Sink 失败则任务 FAILED，位点不推进（At-Least-Once）
+- **交付语义**：同一 binlog 事务内全部事件对所有 Sink 写入并 flush 成功后，才在 `OnTransactionCommit` 统一 `SavePosition`；任一事件/Sink 失败则任务 FAILED，位点不越过该事务（At-Least-Once）
 - **模式限制**：仅 `INCREMENTAL` 模式支持非 `MYSQL` 类型 Sink；`FULL`/`ALL` 含非 MYSQL Sink 时拒绝启动
 
 ### Checkpoint 领域
@@ -186,18 +186,20 @@ TaskService.executeIncrementalSync
   -> SinkFactory.NewSinks(sink_configs)
   -> for each sink: sink.Open() / sink.PrepareTables()
   -> pkg/binlog.Subscriber.Start
-  -> syncEventHandler.OnEvent
-    -> event_normalizer.ToChangeEvent -> ChangeEvent
-    -> for each sink: sink.Write(ChangeEvent)
-    -> 全部成功 -> checkpointMgr.SavePosition
-    -> 任一失败 -> 返回错误，任务 FAILED
+  -> OnRow 缓冲同一事务事件
+  -> OnXID
+    -> 逐条 syncEventHandler.OnEvent（Write + Flush，不推进位点）
+    -> 全部成功后 syncEventHandler.OnTransactionCommit
+      -> 最终 Flush -> checkpointMgr.SavePosition + 任务存档位点回写
+    -> 任一 OnEvent / OnTransactionCommit 失败 -> 返回错误，位点不推进，任务 FAILED
 ```
 
 增量要求：
 
 - MySQL binlog 必须是 ROW 格式。
 - 对无主键表，`binlog_row_image=FULL` 是安全处理 UPDATE/DELETE 的关键前提。
-- 增量 checkpoint 保存 binlog file/pos。
+- 增量 checkpoint 保存 binlog file/pos（XID 提交边界）。
+- **同一事务内所有事件成功写入并 flush 后，才统一推进 checkpoint / 任务存档位点**；中途失败不得越过该事务，否则重启会永久漏数。
 
 事件处理：
 
@@ -207,7 +209,7 @@ TaskService.executeIncrementalSync
 | UPDATE | after image 更新，身份列 WHERE | before image 全列 WHERE |
 | DELETE | 身份列 WHERE | 全列 WHERE |
 
-写入成功后保存 checkpoint。checkpoint 保存失败应视为本次事件处理失败，避免后续恢复丢事件。
+整事务成功后保存 checkpoint。checkpoint 保存失败应视为本次事务提交失败，避免后续恢复丢事件。
 
 ## 6. 无主键表设计
 
@@ -228,7 +230,7 @@ TaskService.executeIncrementalSync
 
 - 如果目标库已有漂移，UPDATE/DELETE 可能匹配 0 行。
 - 如果存在完全重复行，无主键场景无法精确定位逻辑上的"第几行"。
-- ALL 模式下"短锁位点 + 非快照全量 + binlog 回放"无法保证无主键表收敛：全量扫描和 binlog 回放可能写入同一行，`INSERT IGNORE` 无冲突键可去重，产生重复行。
+- ALL 模式下"短锁位点 + 非快照全量 + binlog 回放"无法保证无主键表收敛：全量扫描和 binlog 回放可能写入同一行，`INSERT IGNORE` 无冲突键可去重，产生重复行。该风险对应默认 `full_load_engine=v1` 旧语义；`full_load_engine=v2` 在表级一致性快照窗口内捕获 HWM，增量启动时对无 PK/UK 表 fail-closed 校验并按 HWM 过滤，避免重复 INSERT。V1 ALL 不强校验 HWM，以免默认引擎在 `FULL_COMPLETED` 后永久卡死增量启动。
 - 推荐给业务表补主键或唯一键。
 
 ## 7. 存储与安全

@@ -8,7 +8,12 @@ import (
 	"mysql-to-sync/pkg/binlog"
 )
 
-func ToChangeEvent(binlogEvent *binlog.BinlogEvent, identity *entity.TableIdentity, taskID string) (*sink.ChangeEvent, error) {
+// ChangeEventTraceID 为单行 binlog 变更生成稳定幂等键，供 Webhook Idempotency-Key 与下游去重。
+func ChangeEventTraceID(taskID, binlogFile string, binlogPos uint32, rowIndex int) string {
+	return fmt.Sprintf("%s:%s:%d:%d", taskID, binlogFile, binlogPos, rowIndex)
+}
+
+func ToChangeEvent(binlogEvent *binlog.BinlogEvent, identity *entity.TableIdentity, taskID string, rowIndex int) (*sink.ChangeEvent, error) {
 	if binlogEvent == nil {
 		return nil, fmt.Errorf("binlog event is required")
 	}
@@ -23,6 +28,7 @@ func ToChangeEvent(binlogEvent *binlog.BinlogEvent, identity *entity.TableIdenti
 		EventTime:    binlogEvent.Timestamp,
 		BinlogFile:   binlogEvent.Position.Name,
 		BinlogPos:    binlogEvent.Position.Pos,
+		TraceID:      ChangeEventTraceID(taskID, binlogEvent.Position.Name, binlogEvent.Position.Pos, rowIndex),
 	}
 
 	primaryKeys := make(map[string]interface{})

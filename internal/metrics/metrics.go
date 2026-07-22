@@ -33,19 +33,31 @@ type Metrics struct { // 定义Prometheus指标结构体
 	// 用户选择"无主键表照走"，至少要把无主键事件流量量化出来，方便定位风险表与衡量影响面。
 	IncrementalNoPKTableEventsTotal prometheus.Counter
 
+	// IncrementalSinkTxnBufferLimitTotal 外部 sink（Kafka/Webhook）单事务缓冲硬上限触顶次数。
+	// 与 subscriber spill 独立；触顶后事务无法应用，checkpoint 不推进，需运维介入（调大 limit 或拆分源事务）。
+	IncrementalSinkTxnBufferLimitTotal prometheus.Counter
+
 	// === 全量 V2 引擎观测指标（低基数聚合，不带任务 ID / 表名标签）===
-	FullLoadReadRowsTotal    prometheus.Counter // V2 已读取行数
-	FullLoadReadBytesTotal   prometheus.Counter // V2 已读取字节数
-	FullLoadWriteRowsTotal   prometheus.Counter // V2 已写入（未必已提交）行数
-	FullLoadWriteBytesTotal  prometheus.Counter // V2 已写入字节数
-	FullLoadCommitRowsTotal  prometheus.Counter // V2 已提交行数
-	FullLoadCommitBytesTotal prometheus.Counter // V2 已提交字节数
-	FullLoadCommitsTotal     prometheus.Counter // V2 事务提交次数
-	FullLoadTxReplaysTotal   prometheus.Counter // V2 整事务重放次数
-	FullLoadLockRetriesTotal prometheus.Counter // V2 可重试锁错误次数
-	FullLoadQueueBytes       prometheus.Gauge   // V2 队列当前字节数
-	FullLoadActiveReaders    prometheus.Gauge   // V2 当前活跃读取 worker
-	FullLoadActiveWriters    prometheus.Gauge   // V2 当前活跃写入 worker
+	FullLoadReadRowsTotal      prometheus.Counter // V2 已读取行数
+	FullLoadReadBytesTotal     prometheus.Counter // V2 已读取字节数
+	FullLoadWriteRowsTotal     prometheus.Counter // V2 已写入（未必已提交）行数
+	FullLoadWriteBytesTotal    prometheus.Counter // V2 已写入字节数
+	FullLoadCommitRowsTotal    prometheus.Counter // V2 已提交行数
+	FullLoadCommitBytesTotal   prometheus.Counter // V2 已提交字节数
+	FullLoadCommitsTotal       prometheus.Counter // V2 事务提交次数
+	FullLoadTxReplaysTotal     prometheus.Counter // V2 整事务重放次数
+	FullLoadLockRetriesTotal   prometheus.Counter // V2 可重试锁错误次数
+	FullLoadQueueBytes         prometheus.Gauge   // V2 队列当前字节数
+	FullLoadActiveReaders      prometheus.Gauge   // V2 当前活跃读取 worker
+	FullLoadActiveWriters      prometheus.Gauge   // V2 当前活跃写入 worker
+	FullLoadSnapshotGroups     prometheus.Gauge   // V2 当前活跃表级 snapshot group
+	FullLoadSnapshotTxns       prometheus.Gauge   // V2 当前活跃快照事务/连接
+	FullLoadOldestSnapshotMs   prometheus.Gauge   // V2 最老活跃 snapshot group 存活毫秒
+	FullLoadAlignDegradesTotal prometheus.Counter // V2 对齐取锁失败降级次数
+
+	// oldestSnapshotByTask 进程内各任务当前最老快照年龄；全局 gauge 取其 max，避免并行任务互相覆盖。
+	oldestSnapshotMu     sync.Mutex
+	oldestSnapshotByTask map[string]int64
 }
 
 var ( // 定义包级别变量
@@ -114,6 +126,10 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 				Name: "mysql_sync_incremental_no_pk_table_events_total",
 				Help: "Total number of incremental events targeting tables without primary/unique key (idempotency at risk)",
 			}),
+			IncrementalSinkTxnBufferLimitTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_incremental_sink_txn_buffer_limit_total",
+				Help: "Total times an external sink (Kafka/Webhook) rejected a source transaction due to in-memory buffer hard limit",
+			}),
 			FullLoadReadRowsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 				Name: "mysql_sync_full_load_read_rows_total",
 				Help: "Total rows read by the full-load V2 engine",
@@ -162,6 +178,22 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 				Name: "mysql_sync_full_load_active_writers",
 				Help: "Current active target write workers in the full-load V2 engine",
 			}),
+			FullLoadSnapshotGroups: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "mysql_sync_full_load_snapshot_groups",
+				Help: "Current active table-level snapshot groups in the full-load V2 engine",
+			}),
+			FullLoadSnapshotTxns: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "mysql_sync_full_load_snapshot_txns",
+				Help: "Current active consistent-snapshot transactions/connections in the full-load V2 engine",
+			}),
+			FullLoadOldestSnapshotMs: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "mysql_sync_full_load_oldest_snapshot_age_millis",
+				Help: "Age in milliseconds of the oldest active full-load snapshot group",
+			}),
+			FullLoadAlignDegradesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_full_load_snapshot_align_degrades_total",
+				Help: "Times multi-reader snapshot alignment lock failed and degraded to single-reader",
+			}),
 		}
 
 		// 注册指标
@@ -179,6 +211,7 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 		prometheus.MustRegister(instance.IncrementalZeroRowUpdateTotal)
 		prometheus.MustRegister(instance.IncrementalZeroRowDeleteTotal)
 		prometheus.MustRegister(instance.IncrementalNoPKTableEventsTotal)
+		prometheus.MustRegister(instance.IncrementalSinkTxnBufferLimitTotal)
 		prometheus.MustRegister(instance.FullLoadReadRowsTotal)
 		prometheus.MustRegister(instance.FullLoadReadBytesTotal)
 		prometheus.MustRegister(instance.FullLoadWriteRowsTotal)
@@ -191,6 +224,10 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 		prometheus.MustRegister(instance.FullLoadQueueBytes)
 		prometheus.MustRegister(instance.FullLoadActiveReaders)
 		prometheus.MustRegister(instance.FullLoadActiveWriters)
+		prometheus.MustRegister(instance.FullLoadSnapshotGroups)
+		prometheus.MustRegister(instance.FullLoadSnapshotTxns)
+		prometheus.MustRegister(instance.FullLoadOldestSnapshotMs)
+		prometheus.MustRegister(instance.FullLoadAlignDegradesTotal)
 	})
 
 	return instance // 返回实例
@@ -209,6 +246,11 @@ func (m *Metrics) IncrementIncrementalZeroRowDelete() {
 // IncrementIncrementalNoPKTableEvents 增量事件落到无主键/无唯一键表时调用，按事件计数。
 func (m *Metrics) IncrementIncrementalNoPKTableEvents() {
 	m.IncrementalNoPKTableEventsTotal.Inc()
+}
+
+// IncrementIncrementalSinkTxnBufferLimit 外部 sink 单事务缓冲硬上限触顶时调用。
+func (m *Metrics) IncrementIncrementalSinkTxnBufferLimit() {
+	m.IncrementalSinkTxnBufferLimitTotal.Inc()
 }
 
 // addNonNegative 仅累加非负增量，防止快照差为负时污染 Counter。
@@ -261,6 +303,57 @@ func (m *Metrics) AddFullLoadQueueBytes(delta int64) {
 func (m *Metrics) AddFullLoadActiveWorkers(readersDelta, writersDelta int64) {
 	m.FullLoadActiveReaders.Add(float64(readersDelta))
 	m.FullLoadActiveWriters.Add(float64(writersDelta))
+}
+
+// AddFullLoadSnapshotGroups 按任务快照差值更新活跃 snapshot group 数。
+func (m *Metrics) AddFullLoadSnapshotGroups(delta int64) {
+	m.FullLoadSnapshotGroups.Add(float64(delta))
+}
+
+// AddFullLoadSnapshotTxns 按任务快照差值更新活跃快照事务数。
+func (m *Metrics) AddFullLoadSnapshotTxns(delta int64) {
+	m.FullLoadSnapshotTxns.Add(float64(delta))
+}
+
+// SetFullLoadOldestSnapshotAgeMillis 设置最老活跃 snapshot group 存活毫秒。
+// Deprecated: 使用 SetTaskFullLoadOldestSnapshotAgeMillis，避免并行任务互相覆盖。
+func (m *Metrics) SetFullLoadOldestSnapshotAgeMillis(ms int64) {
+	m.FullLoadOldestSnapshotMs.Set(float64(ms))
+}
+
+// SetTaskFullLoadOldestSnapshotAgeMillis 按任务登记快照年龄，并将全局 gauge 设为所有任务的 max。
+// ms<=0 表示该任务当前无活跃快照，从 registry 移除，避免任务结束写 0 掩盖其他任务。
+func (m *Metrics) SetTaskFullLoadOldestSnapshotAgeMillis(taskID string, ms int64) {
+	if taskID == "" {
+		taskID = "_unknown"
+	}
+	m.oldestSnapshotMu.Lock()
+	defer m.oldestSnapshotMu.Unlock()
+	if m.oldestSnapshotByTask == nil {
+		m.oldestSnapshotByTask = make(map[string]int64)
+	}
+	if ms <= 0 {
+		delete(m.oldestSnapshotByTask, taskID)
+	} else {
+		m.oldestSnapshotByTask[taskID] = ms
+	}
+	var max int64
+	for _, age := range m.oldestSnapshotByTask {
+		if age > max {
+			max = age
+		}
+	}
+	m.FullLoadOldestSnapshotMs.Set(float64(max))
+}
+
+// ClearTaskFullLoadOldestSnapshotAge 清除任务的快照年龄登记并刷新全局 max gauge。
+func (m *Metrics) ClearTaskFullLoadOldestSnapshotAge(taskID string) {
+	m.SetTaskFullLoadOldestSnapshotAgeMillis(taskID, 0)
+}
+
+// AddFullLoadSnapshotAlignDegrades 累加对齐取锁失败降级次数。
+func (m *Metrics) AddFullLoadSnapshotAlignDegrades(n int64) {
+	addNonNegative(m.FullLoadAlignDegradesTotal, n)
 }
 
 // UpdateTaskMetrics 更新任务指标方法

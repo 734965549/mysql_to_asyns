@@ -355,8 +355,16 @@ env:
 同步期间发生的变化不进行追平。如需覆盖同步期间的变化，请使用 ALL 模式。
 
 > 注：历史上提供过 `enable_consistent_snapshot` 任务级开关（用于"严格全局快照
-> + 长事务连接池"模式），现已下线。当前实现统一使用"短锁取位点 + 全量短查询"
-> 模式，避免长事务长期持有源库 `MDL_SHARED_READ`。
+> + 长事务连接池"模式），现已下线。
+>
+> **V1（默认 `full_load_engine=v1`）**：P0 仍用毫秒级 `FLUSH TABLES WITH READ LOCK` 捕获；
+> 全量读取为普通短查询，不长期持有源库 `MDL_SHARED_READ`。
+>
+> **V2（`full_load_engine=v2`）**：全量读取改为表级 `REPEATABLE READ` +
+> `WITH CONSISTENT SNAPSHOT` 长生命周期只读事务（详见下方「全量 V2 引擎」），每张表在读期间
+> 持有表级 `MDL_SHARED_READ`；大表并行读前可能短暂 `FLUSH TABLES t WITH READ LOCK`。
+> ALL 模式无 PK/UK 表还会在快照窗口内捕获**表级 binlog HWM**（`table_binlog_hwms`），增量启动
+> 时对这类表 fail-closed 校验并按 HWM 过滤。运维需关注源库 undo 保留与 MDL 等待。
 
 ### 并行事务提交间隔（tx_commit_every_n_parallel）
 
@@ -391,6 +399,24 @@ env:
 按字节限流的有界队列做背压、事务合并提交、可重试锁错误整事务重放、免 map 的固定
 结构 `RowBatch`，用于消除逐表调度的长尾并降低 GC 压力。
 
+V2 读取侧按**表级一致性快照（snapshot group）**执行：同一张表的所有 chunk 绑定到同一
+（或经短暂表锁对齐的一组）InnoDB `REPEATABLE READ` + `WITH CONSISTENT SNAPSHOT` 只读事务，
+避免全量期间源库“换主键重写 / 唯一列改值”导致目标端重建唯一索引报 1062。中小表走单连接
+快照（无显式写阻塞锁）；估算行数达到约 100 万且 chunk>1 的超大表，短暂
+`FLUSH TABLES t WITH READ LOCK` 对齐多连接 ReadView 后并行读。非 InnoDB 表 fail-closed。
+InnoDB 引擎在打开快照前预检一次，并在持有表锁或首次 `SELECT ... LIMIT 1` 取得表级 MDL 后再权威校验一次，避免 DDL 竞态窗口内被改成 MyISAM 却仍继续一致性快照。
+对齐取锁失败时默认降级为单连接快照；ALL 模式无主键表捕获表级 binlog HWM 时取锁失败
+不降级（fail-closed）。ALL 模式有主键/唯一键表依赖增量幂等收敛；无主键表在快照窗口内
+捕获表级 HWM，增量按事务提交位点过滤并仍推进 checkpoint。
+
+注意：表级 HWM 捕获与增量启动时的 `RequireNoPKTableHWM` fail-closed 校验**仅在
+`full_load_engine=v2` 生效**。默认 `v1` 保持旧语义：不生成表级 HWM，也不强校验；
+因此 V1 的 ALL + 无主键/无唯一键表在增量接管阶段存在重复 INSERT 风险。需要无主键表
+正确去重时请使用 `full_load_engine=v2`。
+
+chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView），改善负载均衡。开启
+`optimize_index` 时，每张表数据全部提交后即异步重建该表索引，不必等到全部表灌数结束。
+
 ```json
 {
   "full_load_engine": "v2",
@@ -423,8 +449,12 @@ env:
 - V2 沿用 V1 的建表 / 删索引 / 索引回放（`optimize_index`、`index_restore_worker_count`）
   与目标库只读保护、`enable_drop_table_before_ddl`、`enable_skip_binlog` 语义。
 - 全量批量写入仍为普通 `INSERT`：请确保目标表为空或开启 `enable_drop_table_before_ddl`。
-- V2 运行期指标（读/写/提交行数与字节、队列水位、活跃 worker、事务重放与锁重试次数）
-  通过 Prometheus `fullload_*` 指标与任务详情接口暴露。
+- V2 运行期指标（读/写/提交行数与字节、队列水位、活跃 worker、事务重放与锁重试次数、
+  活跃 snapshot group / 快照事务数、最老快照存活时长、对齐降级次数）通过 Prometheus
+  `mysql_sync_full_load_*` 指标与任务详情接口暴露。
+- `full_load_read_workers` 同时约束并发表数与单表并行读上限；快照连接信号量会为协调锁
+  连接预留槽位，避免取锁自死锁。源库写入频繁时多个长 ReadView 会放大 undo / history list，
+  请按源库承受能力保守设置 worker 数。
 
 ### 全量并行读取路径（与 channel buffer 的关系）
 
@@ -470,7 +500,11 @@ env:
 
 **默认行为：** 不传 `sink_configs` 时，自动补为 `[{type: "MYSQL"}]`，保持旧任务兼容。
 
-**多 Sink 语义：** 所有 Sink 写入成功后才推进 binlog checkpoint（At-Least-Once）。任一 Sink 写入失败则任务标记 FAILED，位点不推进。
+**多 Sink 语义：** 同一 binlog 事务内全部事件对所有 Sink 写入并 flush 成功后，才统一推进 checkpoint / 任务存档位点（At-Least-Once）。MySQL durable mark 按 **Sink 独立** 判定重放跳过，不会作为全局完成标志；非 durable Sink（Kafka/Webhook）先提交，MySQL durable Sink 最后提交，避免外部 Sink 失败时 MySQL 已持久化 mark 导致事件永久丢失。任一事件或 Sink 失败则任务标记 FAILED，位点不越过该事务。Kafka/Webhook 重放时可能重复投递，接收方应使用 `trace_id`（或 Webhook 的 `Idempotency-Key` 头）去重。
+
+**超大事务缓冲：** 增量订阅在 XID 前会缓冲整事务事件。内存软上限默认为约 `100000` 个 row map（UPDATE 的 before/after 都计入，故约 5 万行 UPDATE 即可能触及）以及约 `256MiB` 估算字节（用于大 BLOB）。超限后溢写到临时目录（默认 `$TMPDIR/mysql-to-sync-txn-spill`），XID 时再回放，避免硬失败形成无法跨越的毒事务。可通过 `SyncConfig.MaxTxnBufferedRows` / `MaxTxnBufferedBytes` / `TxnSpillDir` 调整。
+
+**外部 Sink 事务缓冲硬上限：** Kafka/Webhook 在 `BeginTransaction`/`CommitTransaction` 路径下另有独立内存缓冲（默认 `100000` 事件 / `256MiB`，可通过 `max_txn_buffered_events` / `max_txn_buffered_bytes` 调整）。该缓冲与 subscriber 磁盘 spill **独立**；触顶后事务无法应用、checkpoint 不推进，Prometheus 指标 `mysql_sync_incremental_sink_txn_buffer_limit_total` 会递增。需调大 limit 或缩小源端事务规模。
 
 **密钥回显：** 数据库密码、Kafka `security.sasl_password` 和 Webhook `headers` 在任务 API 响应中显示为 `******`。编辑任务时原样提交占位符会保留已有值；提交新值才会替换。
 
@@ -548,7 +582,7 @@ env:
 | retry_times | int | 否 | 3 | 失败重试次数（非 2xx 状态码触发重试） |
 | retry_backoff_ms | int | 否 | 500 | 重试退避间隔（毫秒） |
 
-> 重试耗尽后任务标记 FAILED，binlog 位点不推进。重启后从上次 checkpoint 重新消费并重试。
+> 每条变更事件会携带稳定 `trace_id`（格式 `{task_id}:{binlog_file}:{binlog_pos}:{row_index}`），Webhook 在未配置自定义 `Idempotency-Key` 头时自动将其写入 HTTP `Idempotency-Key`，供接收方幂等去重。重试耗尽后任务标记 FAILED，binlog 位点不推进。重启后从上次 checkpoint 重新消费并重试。
 
 #### 消息体格式
 
@@ -563,6 +597,7 @@ env:
   "event_time": "2026-07-14T10:00:00+08:00",
   "binlog_file": "mysql-bin.000001",
   "binlog_pos": 12345,
+  "trace_id": "task_001:mysql-bin.000001:12345:0",
   "primary_keys": { "id": 42 },
   "before": { "id": 42, "status": 0 },
   "after": { "id": 42, "status": 1 }

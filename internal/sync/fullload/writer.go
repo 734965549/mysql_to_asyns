@@ -22,7 +22,7 @@ type CommitCallback func(schema, table string, rows, bytes int64)
 // P0 正确性：一个事务内可能已成功写入若干批次，后续批次遇到可重试锁错误时，
 // 回滚整个事务并重放全部未提交批次，而不是只重试当前批次；只有事务提交成功后
 // 才通过 onCommit 推进进度，避免静默缺数。
-func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, isStopped func() bool) error {
+func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, isStopped func() bool) error {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	q.watchContext(workerCtx)
@@ -45,7 +45,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 			defer wg.Done()
 			atomic.AddInt64(&stats.ActiveWriters, 1)
 			defer atomic.AddInt64(&stats.ActiveWriters, -1)
-			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, isStopped); err != nil {
+			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, tracker, isStopped); err != nil {
 				setErr(err)
 			}
 		}(w)
@@ -55,7 +55,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 	return firstErr
 }
 
-func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, isStopped func() bool) error {
+func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, isStopped func() bool) error {
 	conn, err := targetDB.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("writer %d get conn: %w", id, err)
@@ -100,7 +100,12 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 		}
 		dur := time.Since(cs)
 		stats.addCommit(txRows, txBytes, dur)
-		reportCommitted(buf, onCommit)
+		if err := reportCommitted(buf, onCommit, tracker); err != nil {
+			tx = nil
+			buf = nil
+			txRows, txBytes = 0, 0
+			return err
+		}
 		tx = nil
 		buf = nil
 		txRows, txBytes = 0, 0
@@ -187,22 +192,32 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	return nil
 }
 
-func reportCommitted(buf []*RowBatch, onCommit CommitCallback) {
-	if onCommit == nil {
-		return
+func reportCommitted(buf []*RowBatch, onCommit CommitCallback, tracker *tableCompletionTracker) error {
+	if onCommit == nil && tracker == nil {
+		return nil
 	}
 	type key struct{ schema, table string }
 	agg := make(map[key][2]int64)
+	batches := make(map[key]int)
 	for _, b := range buf {
 		k := key{b.Schema, b.Table}
 		v := agg[k]
 		v[0] += int64(len(b.Rows))
 		v[1] += b.ApproxBytes
 		agg[k] = v
+		batches[k]++
 	}
-	for k, v := range agg {
-		onCommit(k.schema, k.table, v[0], v[1])
+	if onCommit != nil {
+		for k, v := range agg {
+			onCommit(k.schema, k.table, v[0], v[1])
+		}
 	}
+	for k, n := range batches {
+		if err := tracker.onBatchesCommitted(k.schema, k.table, n); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func sumBuf(buf []*RowBatch) (rows, bytes int64) {

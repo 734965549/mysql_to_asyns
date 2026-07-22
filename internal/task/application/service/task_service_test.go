@@ -3113,6 +3113,7 @@ func TestSyncPhase_ResetWipesAllPhaseFields(t *testing.T) {
 	task.MarkFullSyncCompleted()
 	task.MarkIncrementalStarted()
 	task.UpdateIncrementalPosition("mysql-bin.000005:888")
+	task.SetTableBinlogHWM("db.nopk", "mysql-bin.000005:100")
 
 	task.ResetSyncPhase()
 	assert.Equal(t, taskEntity.SyncPhaseInit, task.Context.SyncPhase)
@@ -3121,6 +3122,7 @@ func TestSyncPhase_ResetWipesAllPhaseFields(t *testing.T) {
 	assert.Empty(t, task.Context.FullSyncFailedReason)
 	assert.Nil(t, task.Context.FullSyncStartedAt)
 	assert.Nil(t, task.Context.FullSyncCompletedAt)
+	assert.Nil(t, task.Context.TableBinlogHWMs)
 	assert.False(t, task.HasFullSyncEverCompleted())
 	assert.False(t, task.FullSyncIncomplete())
 }
@@ -3334,6 +3336,49 @@ type mysqlPositionLike struct {
 
 func (p mysqlPositionLike) toMysql() mysql.Position {
 	return mysql.Position{Name: p.Name, Pos: p.Pos}
+}
+
+func TestParseTableBinlogHWMs(t *testing.T) {
+	got := parseTableBinlogHWMs(map[string]string{
+		"db.a": "mysql-bin.000001:100",
+		"db.b": "bad",
+		"db.c": "mysql-bin.000002:200",
+	})
+	require.Len(t, got, 2)
+	assert.Equal(t, mysql.Position{Name: "mysql-bin.000001", Pos: 100}, got["db.a"])
+	assert.Equal(t, mysql.Position{Name: "mysql-bin.000002", Pos: 200}, got["db.c"])
+	assert.Nil(t, parseTableBinlogHWMs(map[string]string{"db.z": "mysql-bin.000001:0"}))
+	assert.Nil(t, parseTableBinlogHWMs(nil))
+}
+
+func TestPersistTableBinlogHWM_PersistsBeforeCompleted(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "hwm_persist", Mode: taskEntity.SyncModeAll})
+	ts.tasks[task.Config.ID] = task
+
+	err := ts.persistTableBinlogHWM(task.Config.ID, "src", "nopk", mysql.Position{Name: "mysql-bin.000003", Pos: 456})
+	require.NoError(t, err)
+	assert.Equal(t, "mysql-bin.000003:456", task.Context.TableBinlogHWMs["src.nopk"])
+
+	// clearFullSyncResume 不得清掉已落盘的 HWM（增量仍需用）。
+	ts.clearFullSyncResume(task.Config.ID)
+	assert.Equal(t, "mysql-bin.000003:456", task.Context.TableBinlogHWMs["src.nopk"])
+
+	// 新一轮全量开始时清空。
+	ts.updateSyncPhase(task.Config.ID, func(t *taskEntity.SyncTask) {
+		t.ClearTableBinlogHWMs()
+		t.MarkFullSyncStarted("mysql-bin.000004:1")
+	})
+	assert.Nil(t, task.Context.TableBinlogHWMs)
+}
+
+func TestPersistTableBinlogHWM_FailsClosedOnEmptyPosition(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "hwm_empty"})
+	ts.tasks[task.Config.ID] = task
+	err := ts.persistTableBinlogHWM(task.Config.ID, "s", "t", mysql.Position{})
+	require.Error(t, err)
+	assert.Nil(t, task.Context.TableBinlogHWMs)
 }
 
 // ==================== 节流型位点回写 ====================

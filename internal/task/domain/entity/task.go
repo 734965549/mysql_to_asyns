@@ -5,8 +5,8 @@ import ( // 导入外部包和标准库
 	"strings"
 	"time" // 导入time包，用于时间处理
 
-	"mysql-to-sync/pkg/crypto"
 	sink "mysql-to-sync/internal/sync/domain/sink"
+	"mysql-to-sync/pkg/crypto"
 )
 
 // TaskStatus 任务状态
@@ -93,11 +93,11 @@ type TaskConfig struct { // 定义任务配置结构体
 	OptimizeIndex         bool      `json:"optimize_index"`           // 索引优化：先删除非主键索引，数据迁移完成后再重建
 	// IndexRestoreWorkerCount 阶段3索引回放的表级并发度；0 表示按 min(worker_count,4) 推导。
 	// 单表内多个索引仍串行重建，避免同表 MDL 锁竞争。建议 ≤ target_max_open_conns。
-	IndexRestoreWorkerCount  int             `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
-	EnableReadOnly           bool            `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
-	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后可重建目标端重新全量
-	EnableSkipBinlog         bool            `json:"enable_skip_binlog"`           // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
-	TxCommitEveryNParallel   int             `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐
+	IndexRestoreWorkerCount  int  `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
+	EnableReadOnly           bool `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
+	EnableDropTableBeforeDDL bool `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后可重建目标端重新全量
+	EnableSkipBinlog         bool `json:"enable_skip_binlog"`           // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
+	TxCommitEveryNParallel   int  `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐
 
 	// === 全量 V2 引擎（任务级流水线）配置 ===
 	// full_load_engine=v1 时保持旧行为（内联 syncDatabasePair）；=v2 时使用任务级
@@ -110,9 +110,9 @@ type TaskConfig struct { // 定义任务配置结构体
 	FullLoadCommitRows    int    `json:"full_load_commit_rows,omitempty"`     // 单事务行数上限；0=10000
 	FullLoadCommitBytesMB int    `json:"full_load_commit_bytes_mb,omitempty"` // 单事务字节上限(MiB)；0=32
 
-	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`          // 源数据库配置（可选，覆盖配置文件）
-	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`          // 目标数据库配置（可选，覆盖配置文件）
-	SinkConfigs              []sink.SinkConfig `json:"sink_configs,omitempty"`     // 增量目标端配置（可选，默认 MYSQL）
+	SourceDB    *DatabaseConfig   `json:"source_db,omitempty"`    // 源数据库配置（可选，覆盖配置文件）
+	TargetDB    *DatabaseConfig   `json:"target_db,omitempty"`    // 目标数据库配置（可选，覆盖配置文件）
+	SinkConfigs []sink.SinkConfig `json:"sink_configs,omitempty"` // 增量目标端配置（可选，默认 MYSQL）
 }
 
 // ProcessContext 处理上下文
@@ -158,6 +158,12 @@ type ProcessContext struct { // 定义处理上下文结构体
 	// 当前全量使用普通 INSERT，暂停/失败后不再续传；进入新一轮全量前会清空。
 	FullSyncResume map[string]*TableSyncProgress `json:"full_sync_resume,omitempty"`
 
+	// TableBinlogHWMs 记录 ALL + full_load_engine=v2 下无 PK/UK 表在表级一致性快照窗口内捕获的 binlog 高水位。
+	// key = "schema.table"，value = "file:pos"（与 SHOW MASTER STATUS / canal OnXID 同语义：下一事件起始位置）。
+	// 有 PK/UK 表不写此字段，增量从 FullSyncStartPosition 重放并依赖 upsert 幂等。
+	// V1 全量不写入此字段；V1 ALL 增量不强校验 HWM，无 PK/UK 表存在重复行风险。
+	TableBinlogHWMs map[string]string `json:"table_binlog_hwms,omitempty"`
+
 	// === 行数对比（手动触发，与同步流程解耦）===
 	// 由用户在任务结束/完成后点击"对比行数"触发，后台精确统计源端和目标端 COUNT(*)，
 	// 结果随任务存档持久化。不会因为同步完成自动触发，也不会因不一致而修改原任务终态。
@@ -169,11 +175,11 @@ type ProcessContext struct { // 定义处理上下文结构体
 type RowCountComparisonStatus string
 
 const (
-	RowCountComparisonChecking  RowCountComparisonStatus = "CHECKING"  // 后台核对进行中
-	RowCountComparisonMatched   RowCountComparisonStatus = "MATCHED"   // 全部表查询成功且行数一致
+	RowCountComparisonChecking   RowCountComparisonStatus = "CHECKING"   // 后台核对进行中
+	RowCountComparisonMatched    RowCountComparisonStatus = "MATCHED"    // 全部表查询成功且行数一致
 	RowCountComparisonMismatched RowCountComparisonStatus = "MISMATCHED" // 全部表查询成功，至少一张表不一致
-	RowCountComparisonPartial   RowCountComparisonStatus = "PARTIAL"   // 部分表查询失败，其余结果正常保存
-	RowCountComparisonFailed    RowCountComparisonStatus = "FAILED"    // 连接/表清单获取失败，或所有表均无法完成核对
+	RowCountComparisonPartial    RowCountComparisonStatus = "PARTIAL"    // 部分表查询失败，其余结果正常保存
+	RowCountComparisonFailed     RowCountComparisonStatus = "FAILED"     // 连接/表清单获取失败，或所有表均无法完成核对
 )
 
 // RowCountComparison 行数对比汇总结果。
@@ -182,32 +188,32 @@ const (
 // source_total / target_total 只汇总两端都查询成功的表。
 // 行数使用 *int64 指针区分真实的 0 与查询失败时的未知值（nil）。
 type RowCountComparison struct {
-	Status           RowCountComparisonStatus  `json:"status"`            // 汇总状态
-	StartedAt        *time.Time                `json:"started_at,omitempty"`   // 核对开始时间
-	CompletedAt      *time.Time                `json:"completed_at,omitempty"` // 核对完成时间（CHECKING 时为空）
-	TotalTables      int                       `json:"total_tables"`      // 待核对表总数
-	CheckedTables    int                       `json:"checked_tables"`    // 已完成核对表数（含失败）
-	MatchedTables    int                       `json:"matched_tables"`    // 行数一致表数
-	MismatchedTables int                       `json:"mismatched_tables"` // 行数不一致表数
-	FailedTables     int                       `json:"failed_tables"`     // 查询失败表数
-	SourceTotal      int64                     `json:"source_total"`      // 源端总行数（仅两端均成功）
-	TargetTotal      int64                     `json:"target_total"`      // 目标端总行数（仅两端均成功）
-	Difference       int64                     `json:"difference"`        // 目标总行数 - 源端总行数
+	Status           RowCountComparisonStatus  `json:"status"`                   // 汇总状态
+	StartedAt        *time.Time                `json:"started_at,omitempty"`     // 核对开始时间
+	CompletedAt      *time.Time                `json:"completed_at,omitempty"`   // 核对完成时间（CHECKING 时为空）
+	TotalTables      int                       `json:"total_tables"`             // 待核对表总数
+	CheckedTables    int                       `json:"checked_tables"`           // 已完成核对表数（含失败）
+	MatchedTables    int                       `json:"matched_tables"`           // 行数一致表数
+	MismatchedTables int                       `json:"mismatched_tables"`        // 行数不一致表数
+	FailedTables     int                       `json:"failed_tables"`            // 查询失败表数
+	SourceTotal      int64                     `json:"source_total"`             // 源端总行数（仅两端均成功）
+	TargetTotal      int64                     `json:"target_total"`             // 目标端总行数（仅两端均成功）
+	Difference       int64                     `json:"difference"`               // 目标总行数 - 源端总行数
 	FailureReason    string                    `json:"failure_reason,omitempty"` // FAILED 时的原因（如服务重启中断）
-	Tables           []RowCountComparisonTable `json:"tables,omitempty"`  // 逐表结果
+	Tables           []RowCountComparisonTable `json:"tables,omitempty"`         // 逐表结果
 }
 
 // RowCountComparisonTable 单表行数对比结果。
 type RowCountComparisonTable struct {
-	SourceSchema string `json:"source_schema"`           // 源库
-	SourceTable  string `json:"source_table"`            // 源表
-	TargetSchema string `json:"target_schema"`           // 目标库
-	TargetTable  string `json:"target_table"`            // 目标表
-	SourceRows   *int64 `json:"source_rows,omitempty"`   // 源端行数；nil 表示查询失败
-	TargetRows   *int64 `json:"target_rows,omitempty"`   // 目标端行数；nil 表示查询失败
-	Difference   *int64 `json:"difference,omitempty"`    // 目标端 - 源端；nil 表示至少一端查询失败
-	Matched      bool   `json:"matched"`                 // 两端均成功且行数一致
-	Error        string `json:"error,omitempty"`         // 查询失败时的错误信息（按端区分：source: ... / target: ...）
+	SourceSchema string `json:"source_schema"`         // 源库
+	SourceTable  string `json:"source_table"`          // 源表
+	TargetSchema string `json:"target_schema"`         // 目标库
+	TargetTable  string `json:"target_table"`          // 目标表
+	SourceRows   *int64 `json:"source_rows,omitempty"` // 源端行数；nil 表示查询失败
+	TargetRows   *int64 `json:"target_rows,omitempty"` // 目标端行数；nil 表示查询失败
+	Difference   *int64 `json:"difference,omitempty"`  // 目标端 - 源端；nil 表示至少一端查询失败
+	Matched      bool   `json:"matched"`               // 两端均成功且行数一致
+	Error        string `json:"error,omitempty"`       // 查询失败时的错误信息（按端区分：source: ... / target: ...）
 }
 
 func cloneInt64Ptr(v *int64) *int64 {
@@ -263,6 +269,12 @@ func (ctx ProcessContext) CloneForRead() ProcessContext {
 	}
 	cloned.FullSyncStartedAt = cloneTimePtr(ctx.FullSyncStartedAt)
 	cloned.FullSyncCompletedAt = cloneTimePtr(ctx.FullSyncCompletedAt)
+	if len(ctx.TableBinlogHWMs) > 0 {
+		cloned.TableBinlogHWMs = make(map[string]string, len(ctx.TableBinlogHWMs))
+		for k, v := range ctx.TableBinlogHWMs {
+			cloned.TableBinlogHWMs[k] = v
+		}
+	}
 	cloned.RowCountComparison = CloneRowCountComparison(ctx.RowCountComparison)
 	return cloned
 }
@@ -526,7 +538,25 @@ func (t *SyncTask) ResetSyncPhase() {
 	t.Context.FullSyncStartPosition = ""
 	t.Context.LastIncrementalPosition = ""
 	t.Context.FullSyncFailedReason = ""
+	t.Context.TableBinlogHWMs = nil
 	t.Context.LastUpdateTime = time.Now()
+}
+
+// SetTableBinlogHWM 持久化单表 binlog 高水位（ALL + 无 PK/UK）。pos 形如 "file:pos"。
+func (t *SyncTask) SetTableBinlogHWM(tableKey, pos string) {
+	if tableKey == "" || pos == "" {
+		return
+	}
+	if t.Context.TableBinlogHWMs == nil {
+		t.Context.TableBinlogHWMs = make(map[string]string)
+	}
+	t.Context.TableBinlogHWMs[tableKey] = pos
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// ClearTableBinlogHWMs 清空表级 HWM（新一轮全量开始时调用）。
+func (t *SyncTask) ClearTableBinlogHWMs() {
+	t.Context.TableBinlogHWMs = nil
 }
 
 // HasFullSyncEverCompleted 返回是否曾经完成过一次全量（含 INCREMENTAL_STARTED 阶段）。
@@ -544,6 +574,8 @@ func (t *SyncTask) FullSyncIncomplete() bool {
 }
 
 // ResetFullSyncResume 清空所有表的历史全量断点（全新一轮全量开始时调用）。
+// 不清理 TableBinlogHWMs：全量完成后 clearFullSyncResume 也会调用本方法，
+// 表级 HWM 必须保留到增量阶段；HWM 仅由 ClearTableBinlogHWMs / ResetSyncPhase / 新一轮全量开始时清空。
 func (t *SyncTask) ResetFullSyncResume() {
 	t.Context.FullSyncResume = nil
 }

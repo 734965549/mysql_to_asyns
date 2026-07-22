@@ -16,8 +16,14 @@ import (
 	"github.com/segmentio/kafka-go/sasl/plain"
 	"github.com/segmentio/kafka-go/sasl/scram"
 
+	"mysql-to-sync/internal/metrics"
 	"mysql-to-sync/internal/sync/domain/sink"
 	"mysql-to-sync/pkg/logger"
+)
+
+const (
+	defaultMaxTxnBufferedEvents = 100_000
+	defaultMaxTxnBufferedBytes  = 256 << 20 // 256 MiB
 )
 
 type KafkaSink struct {
@@ -34,6 +40,14 @@ type KafkaSink struct {
 	batchTimeoutMs int
 	requiredAcks   int
 	security       map[string]interface{}
+
+	maxTxnEvents int
+	maxTxnBytes  int64
+
+	txnActive bool
+	txnBytes  int64
+	// txnBuffer 暂存同一源事务内的消息；超 maxTxnEvents/maxTxnBytes 硬上限时拒绝，避免绕过 subscriber spill 后 OOM。
+	txnBuffer []kafka.Message
 }
 
 type messageWriter interface {
@@ -52,6 +66,8 @@ func NewKafkaSink(options map[string]interface{}) *KafkaSink {
 		batchTimeoutMs: getIntWithDefault(options, "batch_timeout_ms", 500),
 		requiredAcks:   getIntWithDefault(options, "required_acks", 1),
 		security:       getMap(options, "security"),
+		maxTxnEvents:   getIntWithDefault(options, "max_txn_buffered_events", defaultMaxTxnBufferedEvents),
+		maxTxnBytes:    getInt64WithDefault(options, "max_txn_buffered_bytes", defaultMaxTxnBufferedBytes),
 	}
 }
 
@@ -91,6 +107,12 @@ func (s *KafkaSink) Validate() error {
 	}
 	if s.requiredAcks != -1 && s.requiredAcks != 0 && s.requiredAcks != 1 {
 		return fmt.Errorf("required_acks must be -1, 0, or 1")
+	}
+	if s.maxTxnEvents <= 0 {
+		return fmt.Errorf("max_txn_buffered_events must be greater than 0")
+	}
+	if s.maxTxnBytes <= 0 {
+		return fmt.Errorf("max_txn_buffered_bytes must be greater than 0")
 	}
 	if s.security == nil {
 		return nil
@@ -156,12 +178,6 @@ func (s *KafkaSink) Open(ctx context.Context) error {
 }
 
 func (s *KafkaSink) Write(ctx context.Context, event *sink.ChangeEvent) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.writer == nil {
-		return fmt.Errorf("kafka sink is not open")
-	}
 	if event == nil {
 		return fmt.Errorf("change event is required")
 	}
@@ -178,11 +194,75 @@ func (s *KafkaSink) Write(ctx context.Context, event *sink.ChangeEvent) error {
 		Key:   []byte(key),
 		Value: value,
 	}
+	msgBytes := int64(len(msg.Key) + len(msg.Value))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.writer == nil {
+		return fmt.Errorf("kafka sink is not open")
+	}
+
+	if s.txnActive {
+		if len(s.txnBuffer)+1 > s.maxTxnEvents || s.txnBytes+msgBytes > s.maxTxnBytes {
+			metrics.GetMetrics().IncrementIncrementalSinkTxnBufferLimit()
+			return fmt.Errorf("kafka sink transaction buffer exceeded hard limit (events=%d+%d bytes=%d+%d max_events=%d max_bytes=%d): "+
+				"raise max_txn_buffered_events/max_txn_buffered_bytes or reduce source transaction size",
+				len(s.txnBuffer), 1, s.txnBytes, msgBytes, s.maxTxnEvents, s.maxTxnBytes)
+		}
+		s.txnBuffer = append(s.txnBuffer, msg)
+		s.txnBytes += msgBytes
+		return nil
+	}
 
 	if err := s.writer.WriteMessages(ctx, msg); err != nil {
 		return fmt.Errorf("write kafka message to topic %s: %w", topic, err)
 	}
 
+	return nil
+}
+
+func (s *KafkaSink) BeginTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.writer == nil {
+		return fmt.Errorf("kafka sink is not open")
+	}
+	if s.txnActive {
+		return fmt.Errorf("kafka sink transaction already active")
+	}
+	s.txnActive = true
+	s.txnBuffer = s.txnBuffer[:0]
+	s.txnBytes = 0
+	return nil
+}
+
+func (s *KafkaSink) CommitTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.txnActive {
+		return nil
+	}
+	if len(s.txnBuffer) > 0 {
+		if err := s.writer.WriteMessages(ctx, s.txnBuffer...); err != nil {
+			s.txnBuffer = s.txnBuffer[:0]
+			s.txnBytes = 0
+			s.txnActive = false
+			return fmt.Errorf("commit kafka sink transaction: %w", err)
+		}
+	}
+	s.txnBuffer = s.txnBuffer[:0]
+	s.txnBytes = 0
+	s.txnActive = false
+	return nil
+}
+
+func (s *KafkaSink) RollbackTransaction(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.txnBuffer = s.txnBuffer[:0]
+	s.txnBytes = 0
+	s.txnActive = false
 	return nil
 }
 
@@ -377,6 +457,28 @@ func getIntWithDefault(m map[string]interface{}, key string, defaultVal int) int
 			return defaultVal
 		}
 		return int(n)
+	}
+	return defaultVal
+}
+
+func getInt64WithDefault(m map[string]interface{}, key string, defaultVal int64) int64 {
+	v, ok := m[key]
+	if !ok {
+		return defaultVal
+	}
+	switch val := v.(type) {
+	case float64:
+		return int64(val)
+	case int:
+		return int64(val)
+	case int64:
+		return val
+	case json.Number:
+		n, err := val.Int64()
+		if err != nil {
+			return defaultVal
+		}
+		return n
 	}
 	return defaultVal
 }

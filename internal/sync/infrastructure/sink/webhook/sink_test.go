@@ -317,6 +317,63 @@ func TestWebhookSink_Write_Timeout(t *testing.T) {
 	assert.Contains(t, err.Error(), "Client.Timeout")
 }
 
+func TestWebhookSink_Write_SetsIdempotencyKeyFromTraceID(t *testing.T) {
+	var receivedKey string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedKey = r.Header.Get("Idempotency-Key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	s := NewWebhookSink(map[string]interface{}{"url": server.URL})
+	require.NoError(t, s.Open(context.Background()))
+
+	event := &sink.ChangeEvent{
+		TaskID:       "task_001",
+		SourceSchema: "db1",
+		SourceTable:  "orders",
+		EventType:    "INSERT",
+		EventTime:    time.Now(),
+		BinlogFile:   "mysql-bin.000001",
+		BinlogPos:    12345,
+		TraceID:      "task_001:mysql-bin.000001:12345:0",
+	}
+
+	require.NoError(t, s.Write(context.Background(), event))
+	assert.Equal(t, "task_001:mysql-bin.000001:12345:0", receivedKey)
+}
+
+func TestWebhookSink_Write_PreservesCustomIdempotencyKey(t *testing.T) {
+	var receivedKey string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedKey = r.Header.Get("Idempotency-Key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	s := NewWebhookSink(map[string]interface{}{
+		"url": server.URL,
+		"headers": map[string]interface{}{
+			"Idempotency-Key": "custom-key",
+		},
+	})
+	require.NoError(t, s.Open(context.Background()))
+
+	event := &sink.ChangeEvent{
+		TaskID:       "task_001",
+		SourceSchema: "db1",
+		SourceTable:  "orders",
+		EventType:    "INSERT",
+		EventTime:    time.Now(),
+		TraceID:      "task_001:mysql-bin.000001:12345:0",
+	}
+
+	require.NoError(t, s.Write(context.Background(), event))
+	assert.Equal(t, "custom-key", receivedKey)
+}
+
 func TestWebhookSink_Flush(t *testing.T) {
 	s := NewWebhookSink(map[string]interface{}{
 		"url": "http://127.0.0.1:9000/cdc/event",
@@ -500,4 +557,44 @@ func TestGetStringMap(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestWebhookSink_TxnBufferHardLimitByEvents(t *testing.T) {
+	s := NewWebhookSink(map[string]interface{}{
+		"url":                     "http://127.0.0.1/hook",
+		"max_txn_buffered_events": 2,
+		"max_txn_buffered_bytes":  float64(1 << 20),
+	})
+	s.client = &http.Client{}
+	require.NoError(t, s.BeginTransaction(context.Background()))
+	require.NoError(t, s.Write(context.Background(), &sink.ChangeEvent{
+		SourceSchema: "db", SourceTable: "t", EventType: "INSERT", After: map[string]interface{}{"id": 1},
+	}))
+	require.NoError(t, s.Write(context.Background(), &sink.ChangeEvent{
+		SourceSchema: "db", SourceTable: "t", EventType: "INSERT", After: map[string]interface{}{"id": 2},
+	}))
+	err := s.Write(context.Background(), &sink.ChangeEvent{
+		SourceSchema: "db", SourceTable: "t", EventType: "INSERT", After: map[string]interface{}{"id": 3},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hard limit")
+	require.NoError(t, s.RollbackTransaction(context.Background()))
+}
+
+func TestWebhookSink_TxnBufferHardLimitByBytes(t *testing.T) {
+	s := NewWebhookSink(map[string]interface{}{
+		"url":                     "http://127.0.0.1/hook",
+		"max_txn_buffered_events": 1000,
+		"max_txn_buffered_bytes":  float64(32),
+	})
+	s.client = &http.Client{}
+	require.NoError(t, s.BeginTransaction(context.Background()))
+	payload := string(make([]byte, 64))
+	err := s.Write(context.Background(), &sink.ChangeEvent{
+		SourceSchema: "db", SourceTable: "t", EventType: "INSERT",
+		After: map[string]interface{}{"payload": payload},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hard limit")
+	require.NoError(t, s.RollbackTransaction(context.Background()))
 }
