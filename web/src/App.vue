@@ -7,8 +7,25 @@ import {
   buildTargetDatabasesPayload as buildDatabaseMappingsPayload,
   getTaskDatabaseMappings,
 } from "./utils/databaseMappings.js";
+import {
+  hasExplicitSinkConfigs,
+  resolveMySQLSinkConnectionDisplay,
+  resolveTaskTargetMySQLDisplay,
+} from "./utils/taskTargetDisplay.js";
 
 const API_BASE = "/api";
+
+function getTaskTargetMySQLDisplay(config) {
+  return resolveTaskTargetMySQLDisplay(config, configForm.value.target);
+}
+
+function getMySQLSinkDisplay(sink, config) {
+  return resolveMySQLSinkConnectionDisplay(
+    sink,
+    config,
+    configForm.value.target,
+  );
+}
 const TASK_SORT_OPTIONS_URL = "/api/tasks/sort-options";
 const TASK_SORT_FALLBACK_OPTIONS = [
   {
@@ -1866,9 +1883,9 @@ function fillTaskFormFromTask(task) {
     };
   }
 
-  // 回填 sink_configs
+  // 回填 sink_configs：默认占位 MYSQL sink 视为隐式目标端，与详情展示逻辑一致
 
-  if (task.config.sink_configs && task.config.sink_configs.length > 0) {
+  if (hasExplicitSinkConfigs(task.config.sink_configs)) {
     if (
       task.config.sink_configs.length === 1 &&
       task.config.sink_configs[0].type !== "MYSQL"
@@ -2524,6 +2541,7 @@ onMounted(async () => {
 
     document.title = "任务详情";
 
+    await fetchDefaultConfig();
     await fetchTaskDetailPage(detailPageTaskId.value);
 
     detailPageRefreshInterval = setInterval(() => {
@@ -3397,16 +3415,16 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
 
               <a-descriptions title="目标数据库配置" :column="2" bordered style="margin-top: 20px">
                 <template
-                  v-if="!detailPageTask.config.sink_configs || detailPageTask.config.sink_configs.length === 0"
+                  v-if="!hasExplicitSinkConfigs(detailPageTask.config.sink_configs)"
                 >
                   <a-descriptions-item label="主机地址">
-                    {{ detailPageTask.config.target_db?.host || '-' }}
+                    {{ getTaskTargetMySQLDisplay(detailPageTask.config).host || '-' }}
                   </a-descriptions-item>
                   <a-descriptions-item label="端口">
-                    {{ detailPageTask.config.target_db?.port || '-' }}
+                    {{ getTaskTargetMySQLDisplay(detailPageTask.config).port || '-' }}
                   </a-descriptions-item>
                   <a-descriptions-item label="用户名">
-                    {{ detailPageTask.config.target_db?.username || '-' }}
+                    {{ getTaskTargetMySQLDisplay(detailPageTask.config).username || '-' }}
                   </a-descriptions-item>
                   <a-descriptions-item label="数据库映射">
                     <a-space wrap>
@@ -3430,9 +3448,10 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                     :span="2"
                   >
                     <div v-if="sink.type === 'MYSQL'">
-                      主机：{{ sink.options?.host || '-' }} 端口：{{ sink.options?.port || '-' }} 用户：{{
-                        sink.options?.username || '-'
+                      主机：{{ getMySQLSinkDisplay(sink, detailPageTask.config).host || '-' }} 端口：{{
+                        getMySQLSinkDisplay(sink, detailPageTask.config).port || '-'
                       }}
+                      用户：{{ getMySQLSinkDisplay(sink, detailPageTask.config).username || '-' }}
                     </div>
                     <div v-else-if="sink.type === 'KAFKA'">
                       Brokers：{{
@@ -6823,10 +6842,7 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
         </a-descriptions>
 
         <template
-          v-if="
-            !selectedTaskForDetail.config.sink_configs ||
-            selectedTaskForDetail.config.sink_configs.length === 0
-          "
+          v-if="!hasExplicitSinkConfigs(selectedTaskForDetail.config.sink_configs)"
         >
           <a-descriptions
             title="目标数据库配置 (MySQL)"
@@ -6835,15 +6851,15 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
             style="margin-top: 20px"
           >
             <a-descriptions-item label="主机地址">
-              {{ selectedTaskForDetail.config.target_db?.host || configForm.target?.host || '-' }}
+              {{ getTaskTargetMySQLDisplay(selectedTaskForDetail.config).host || '-' }}
             </a-descriptions-item>
 
             <a-descriptions-item label="端口">
-              {{ selectedTaskForDetail.config.target_db?.port || configForm.target?.port || '-' }}
+              {{ getTaskTargetMySQLDisplay(selectedTaskForDetail.config).port || '-' }}
             </a-descriptions-item>
 
             <a-descriptions-item label="用户名">
-              {{ selectedTaskForDetail.config.target_db?.username || configForm.target?.username || '-' }}
+              {{ getTaskTargetMySQLDisplay(selectedTaskForDetail.config).username || '-' }}
             </a-descriptions-item>
 
             <a-descriptions-item label="密码">
@@ -6863,9 +6879,15 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
               style="margin-top: 20px"
             >
               <template v-if="sink.type === 'MYSQL'">
-                <a-descriptions-item label="主机地址">{{ sink.options?.host || '-' }}</a-descriptions-item>
-                <a-descriptions-item label="端口">{{ sink.options?.port || '-' }}</a-descriptions-item>
-                <a-descriptions-item label="用户名">{{ sink.options?.username || '-' }}</a-descriptions-item>
+                <a-descriptions-item label="主机地址">{{
+                  getMySQLSinkDisplay(sink, selectedTaskForDetail.config).host || '-'
+                }}</a-descriptions-item>
+                <a-descriptions-item label="端口">{{
+                  getMySQLSinkDisplay(sink, selectedTaskForDetail.config).port || '-'
+                }}</a-descriptions-item>
+                <a-descriptions-item label="用户名">{{
+                  getMySQLSinkDisplay(sink, selectedTaskForDetail.config).username || '-'
+                }}</a-descriptions-item>
                 <a-descriptions-item label="密码">******</a-descriptions-item>
               </template>
 
