@@ -3,16 +3,41 @@ package fullload
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"mysql-to-sync/pkg/logger"
 )
 
 const writeMaxRetries = 5
 
+const writeConnMaxRetries = 5
+
+const writerConnCloseTimeout = 3 * time.Second
+
 const maxPreparedStatementsPerWriter = 128
+
+// forceCloseWriterConn 关闭 writer 持有的连接；若 Close 因残留事务等阻塞，超时后放弃等待，避免拖死整个写入循环。
+func forceCloseWriterConn(conn *sql.Conn) {
+	if conn == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = conn.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(writerConnCloseTimeout):
+		logger.Warn("[FullLoadV2] writer conn close timed out; abandoning connection")
+	}
+}
 
 // CommitCallback 在一个事务成功提交后按表回调，用于推进进度（提交后才计数）。
 type CommitCallback func(schema, table string, rows, bytes int64)
@@ -60,14 +85,62 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	if err != nil {
 		return fmt.Errorf("writer %d get conn: %w", id, err)
 	}
-	defer conn.Close()
+	var stmtCache *preparedStmtCache
+	defer func() {
+		if stmtCache != nil {
+			stmtCache.Close()
+		}
+		if conn != nil {
+			restoreWriteSession(conn, opt.SkipBinlog)
+			forceCloseWriterConn(conn)
+		}
+	}()
 
 	if err := setupWriteSession(ctx, conn, opt.SkipBinlog); err != nil {
 		return fmt.Errorf("writer %d setup session: %w", id, err)
 	}
-	defer restoreWriteSession(conn, opt.SkipBinlog)
-	stmtCache := newPreparedStmtCache(conn, maxPreparedStatementsPerWriter)
-	defer stmtCache.Close()
+	stmtCache = newPreparedStmtCache(conn, maxPreparedStatementsPerWriter)
+
+	// reconnect 在连接失效后换新连接并重建会话/预处理缓存。
+	// 未提交事务会随断连被服务端回滚，因此可安全重放；Commit 失败仍禁止重放。
+	// 调用方须先结束当前 *sql.Tx（Rollback），否则 Conn.Close 会与 awaitDone 死锁。
+	reconnect := func(cause error) error {
+		logger.Warn("[FullLoadV2] writer %d reconnecting after connection error: %v", id, cause)
+		oldCache := stmtCache
+		oldConn := conn
+		stmtCache = nil
+		conn = nil
+		if oldCache != nil {
+			oldCache.Close()
+		}
+		forceCloseWriterConn(oldConn)
+
+		var lastErr error
+		for attempt := 1; attempt <= writeConnMaxRetries; attempt++ {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(25+attempt*25) * time.Millisecond):
+			}
+			c, cErr := targetDB.Conn(ctx)
+			if cErr != nil {
+				lastErr = cErr
+				continue
+			}
+			if sErr := setupWriteSession(ctx, c, opt.SkipBinlog); sErr != nil {
+				forceCloseWriterConn(c)
+				lastErr = sErr
+				continue
+			}
+			conn = c
+			stmtCache = newPreparedStmtCache(conn, maxPreparedStatementsPerWriter)
+			return nil
+		}
+		if lastErr == nil {
+			lastErr = cause
+		}
+		return fmt.Errorf("reconnect exhausted after %d attempts: %w", writeConnMaxRetries, lastErr)
+	}
 
 	var (
 		tx      *sql.Tx
@@ -79,7 +152,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 
 	rollback := func() {
 		if tx != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			tx = nil
 		}
 		buf = nil
@@ -110,6 +183,54 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 		buf = nil
 		txRows, txBytes = 0, 0
 		return nil
+	}
+
+	// beginTx 开启事务；连接失效时换连后重试。
+	beginTx := func() error {
+		var lastErr error
+		for attempt := 0; attempt <= writeConnMaxRetries; attempt++ {
+			if attempt > 0 {
+				if rErr := reconnect(lastErr); rErr != nil {
+					return rErr
+				}
+			}
+			var bErr error
+			tx, bErr = conn.BeginTx(ctx, nil)
+			if bErr == nil {
+				txStart = time.Now()
+				return nil
+			}
+			lastErr = bErr
+			if !isConnRetryable(bErr) {
+				return bErr
+			}
+			tx = nil
+		}
+		return lastErr
+	}
+
+	// replayAfterFailure 在锁冲突或连接失效后重放未提交批次。
+	// 连接失效先换连；重放过程再次断连则继续换连，直到成功或耗尽重试。
+	replayAfterFailure := func(cause error, replayBatches []*RowBatch) (*sql.Tx, error) {
+		needReconnect := isConnRetryable(cause)
+		var lastErr error = cause
+		for attempt := 0; attempt <= writeConnMaxRetries; attempt++ {
+			if needReconnect {
+				if rErr := reconnect(lastErr); rErr != nil {
+					return nil, rErr
+				}
+			}
+			newTx, rErr := replayInFreshTx(ctx, conn, replayBatches, opt, stmtCache, stats)
+			if rErr == nil {
+				return newTx, nil
+			}
+			lastErr = rErr
+			if !isConnRetryable(rErr) {
+				return nil, rErr
+			}
+			needReconnect = true
+		}
+		return nil, fmt.Errorf("replay after connection error exhausted: %w", lastErr)
 	}
 
 	for {
@@ -143,29 +264,32 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 
 		ws := time.Now()
 		if tx == nil {
-			tx, err = conn.BeginTx(ctx, nil)
-			if err != nil {
+			if err := beginTx(); err != nil {
 				return fmt.Errorf("writer %d begin tx: %w", id, err)
 			}
-			txStart = time.Now()
 		}
 
 		wErr := writeBatchInTxCached(ctx, tx, batch, opt, stmtCache)
 		if wErr != nil {
-			if !isRetryableTxConflict(wErr) {
+			if !isRetryableTxConflict(wErr) && !isConnRetryable(wErr) {
 				rollback()
 				return fmt.Errorf("writer %d write batch %s: %w", id, batch.ChunkID, wErr)
 			}
-			stats.incLockRetries()
-			// 回滚整个事务并重放全部未提交批次 + 当前批次。
-			tx.Rollback()
-			tx = nil
+			if isRetryableTxConflict(wErr) {
+				stats.incLockRetries()
+			}
+			// 无论锁冲突还是连接失效，都先 Rollback 释放 *sql.Tx 对 Conn 的占用；
+			// 否则后续 conn.Close()/换连会卡在 awaitDone。断连时 Rollback 可能失败，可忽略。
+			if tx != nil {
+				_ = tx.Rollback()
+				tx = nil
+			}
 			replayBatches := append(append([]*RowBatch{}, buf...), batch)
-			newTx, rErr := replayInFreshTx(ctx, conn, replayBatches, opt, stmtCache, stats)
+			newTx, rErr := replayAfterFailure(wErr, replayBatches)
 			if rErr != nil {
 				buf = nil
 				txRows, txBytes = 0, 0
-				return fmt.Errorf("writer %d replay tx: %w", id, rErr)
+				return fmt.Errorf("writer %d write batch %s: %w", id, batch.ChunkID, rErr)
 			}
 			tx = newTx
 			txStart = time.Now()
@@ -342,7 +466,7 @@ func insertPrefix(batch *RowBatch) string {
 }
 
 // isRetryableTxConflict 仅判断事务内语句可安全重放的锁冲突。
-// 连接错误和 Commit 错误的提交结果可能未知，不能用普通 INSERT 自动重放。
+// Commit 错误的提交结果可能未知，不能用普通 INSERT 自动重放。
 func isRetryableTxConflict(err error) bool {
 	if err == nil {
 		return false
@@ -351,6 +475,24 @@ func isRetryableTxConflict(err error) bool {
 	return strings.Contains(s, "deadlock") ||
 		strings.Contains(s, "lock wait timeout") ||
 		strings.Contains(s, "try restarting transaction")
+}
+
+// isConnRetryable 判断连接失效类错误。未提交事务随断连被服务端回滚，可换连接后重放。
+func isConnRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "invalid connection") ||
+		strings.Contains(s, "bad connection") ||
+		strings.Contains(s, "unexpected packet") ||
+		strings.Contains(s, "connection was bad") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection reset")
 }
 
 type preparedStmtCache struct {

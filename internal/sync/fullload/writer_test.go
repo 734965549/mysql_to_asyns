@@ -2,6 +2,7 @@ package fullload
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"regexp"
 	"strings"
@@ -36,6 +37,31 @@ func TestIsRetryableTxConflict(t *testing.T) {
 		}
 	}
 	if isRetryableTxConflict(nil) {
+		t.Error("nil should be non-retryable")
+	}
+}
+
+func TestIsConnRetryable(t *testing.T) {
+	cases := map[string]bool{
+		"invalid connection":             true,
+		"driver: bad connection":         true,
+		"unexpected packet":              true,
+		"connection was bad":             true,
+		"dial tcp: connection refused":   true,
+		"write: broken pipe":             true,
+		"read: connection reset by peer": true,
+		"Error 1213: Deadlock found":     false,
+		"Error 1062: Duplicate entry":    false,
+	}
+	for msg, want := range cases {
+		if got := isConnRetryable(errors.New(msg)); got != want {
+			t.Errorf("isConnRetryable(%q)=%v want %v", msg, got, want)
+		}
+	}
+	if !isConnRetryable(driver.ErrBadConn) {
+		t.Error("driver.ErrBadConn should be retryable")
+	}
+	if isConnRetryable(nil) {
 		t.Error("nil should be non-retryable")
 	}
 }
@@ -186,6 +212,58 @@ func TestWriterLoopReplaysWholeTransactionOnDeadlock(t *testing.T) {
 		t.Fatalf("writerLoop: %v", err)
 	}
 	if committed != 2 || stats.Snapshot().TxReplays != 2 || stats.Snapshot().LockRetries != 2 || stats.Snapshot().CommittedRows != 2 {
+		t.Fatalf("committed=%d stats=%+v", committed, stats.Snapshot())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriterLoopReconnectsOnInvalidConnection(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	expectWriteSession(mock, false)
+	query := regexp.QuoteMeta("INSERT INTO `db`.`t` (`id`) VALUES (?)")
+	mock.ExpectBegin()
+	mock.ExpectPrepare(query)
+	prepared := mock.ExpectPrepare(query)
+	prepared.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	prepared.ExpectExec().WithArgs(int64(2)).WillReturnError(errors.New("invalid connection"))
+	mock.ExpectRollback()
+
+	// 换连后重建会话并重放未提交批次（含已成功但未提交的 #1）。
+	expectWriteSession(mock, false)
+	mock.ExpectBegin()
+	mock.ExpectPrepare(query)
+	replayPrepared := mock.ExpectPrepare(query)
+	replayPrepared.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	replayPrepared.ExpectExec().WithArgs(int64(2)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	expectRestoreWriteSession(mock, false)
+
+	q := newBatchQueue(1024, &Stats{})
+	for i := int64(1); i <= 2; i++ {
+		if err := q.Put(context.Background(), &RowBatch{
+			Schema: "s", Table: "t", TargetSchema: "db", TargetTable: "t",
+			Columns: []string{"id"}, Rows: [][]any{{i}}, ApproxBytes: 8, ChunkID: "chunk",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q.Close()
+	stats := &Stats{}
+	var committed int64
+	err = writerLoop(context.Background(), 0, db, q,
+		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 10}), stats,
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil)
+	if err != nil {
+		t.Fatalf("writerLoop: %v", err)
+	}
+	if committed != 2 || stats.Snapshot().CommittedRows != 2 || stats.Snapshot().TxReplays != 1 {
 		t.Fatalf("committed=%d stats=%+v", committed, stats.Snapshot())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

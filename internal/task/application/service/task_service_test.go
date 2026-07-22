@@ -553,7 +553,9 @@ func TestRestoreIndexes_BatchesMultipleIndexesIntoOneAlter(t *testing.T) {
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "t", "ft_c").
 		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
-	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a` \\(`a`\\), ADD UNIQUE INDEX `uk_b` \\(`b`\\), ADD FULLTEXT INDEX `ft_c` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a` \\(`a`\\), ADD UNIQUE INDEX `uk_b` \\(`b`\\)").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD FULLTEXT INDEX `ft_c` \\(`c`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{}
@@ -578,6 +580,23 @@ func TestBuildAlterAddIndexesSQL(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE `db`.`t` ADD INDEX `idx_a` (`a`), ADD UNIQUE INDEX `uk_b` (`b`)", sql)
 }
 
+func TestGroupIndexRestoreBatches_SplitsByType(t *testing.T) {
+	items := []indexRestoreItem{
+		{"idx_a", 1, "BTREE", "`a`"},
+		{"uk_b", 0, "BTREE", "`b`"},
+		{"ft_c", 1, "FULLTEXT", "`c`"},
+		{"sp_d", 1, "SPATIAL", "`d`"},
+	}
+	batches := groupIndexRestoreBatches(items)
+	require.Len(t, batches, 3)
+	assert.Equal(t, indexRestoreBatchBTREE, batches[0].kind)
+	assert.Equal(t, []string{"idx_a", "uk_b"}, batches[0].names)
+	assert.Equal(t, indexRestoreBatchFULLTEXT, batches[1].kind)
+	assert.Equal(t, []string{"ft_c"}, batches[1].names)
+	assert.Equal(t, indexRestoreBatchSPATIAL, batches[2].kind)
+	assert.Equal(t, []string{"sp_d"}, batches[2].names)
+}
+
 func TestRestoreIndexes_RetriesInvalidConnection(t *testing.T) {
 	targetDB, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -591,6 +610,37 @@ func TestRestoreIndexes_RetriesInvalidConnection(t *testing.T) {
 		WillReturnError(fmt.Errorf("invalid connection"))
 	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ts := &TaskService{}
+	runtime := &taskRuntime{targetDB: targetDB}
+	indexes := []map[string]interface{}{
+		{"name": "idx_c", "non_unique": 1, "type": "BTREE", "columns": "`c`"},
+	}
+
+	err = ts.restoreIndexes(context.Background(), runtime, "db", "t", indexes)
+
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRestoreIndexes_TreatsAlreadyAppliedBatchAsSuccessAfterRetryError(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_c").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
+		WillReturnError(fmt.Errorf("invalid connection"))
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
+		WillReturnError(fmt.Errorf("Error 1061: Duplicate key name 'idx_c'"))
+
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_c").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
+			AddRow(1, "BTREE", "c", nil, 1))
 
 	ts := &TaskService{}
 	runtime := &taskRuntime{targetDB: targetDB}
