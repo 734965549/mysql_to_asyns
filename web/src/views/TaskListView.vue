@@ -760,11 +760,43 @@ onUnmounted(() => {
 .task-filter-panel :deep(.arco-card-body) {
   padding: 16px 20px 20px;
 }
+.task-filter-panel__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1d2129;
+}
+.task-filter-panel__desc {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #86909c;
+}
 .task-filter-panel__actions {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+.task-filter-summary {
+  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+  border: 1px solid #e5eaf3;
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+.task-filter-summary__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1d2129;
+  margin-bottom: 8px;
+}
+.task-filter-summary__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.task-filter-summary__empty {
+  font-size: 12px;
+  color: var(--app-muted);
 }
 .empty-state {
   padding: 60px 0;

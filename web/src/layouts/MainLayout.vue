@@ -157,24 +157,109 @@ function goCreate() {
 
 .sider-menu {
   flex: 1;
+  background: transparent !important;
+  padding: 12px 8px;
+  width: 100% !important;
+}
+
+.sider-menu:not(.arco-menu-collapsed) {
   width: 100% !important;
 }
 
 .sider-menu :deep(.arco-menu-inner) {
   display: flex !important;
   flex-direction: column !important;
+  opacity: 1 !important;
+  animation: none !important;
+  transition: none !important;
 }
 
 .sider-menu :deep(.arco-menu-item) {
+  color: #fff !important;
+  background: transparent !important;
   margin: 4px 0;
   border-radius: 6px;
+  opacity: 1 !important;
+  visibility: visible !important;
   padding: 0 12px !important;
   height: 40px !important;
   line-height: 40px !important;
+  animation: none !important;
+  transition: none !important;
+  transform: none !important;
+}
+
+.sider-menu :deep(.arco-menu-item),
+.sider-menu :deep(.arco-menu-item.arco-menu-selected),
+.sider-menu :deep(.arco-menu-item:hover),
+.sider-menu :deep(.arco-menu-item:focus),
+.sider-menu :deep(.arco-menu-item:active) {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+.sider-menu :deep(.arco-menu-item .arco-menu-icon) {
+  color: #fff !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  display: inline-flex !important;
+  margin-right: 12px !important;
+  animation: none !important;
+  transition: none !important;
+}
+
+.sider-menu :deep(.arco-menu-item .arco-menu-title) {
+  color: #fff !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  display: inline !important;
+  animation: none !important;
+  transition: none !important;
+  transform: none !important;
+}
+
+.sider-menu :deep(.arco-menu-item *) {
+  color: #fff !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  animation: none !important;
+  transition: none !important;
+}
+
+.sider-menu :deep(.arco-menu-collapse-icon) {
+  display: none !important;
+}
+
+.sider-menu :deep(.arco-menu) {
+  transition: none !important;
+  animation: none !important;
+}
+
+.sider-menu :deep(.arco-menu-item:hover) {
+  background: rgba(255, 255, 255, 0.15) !important;
+  color: #fff !important;
+}
+
+.sider-menu :deep(.arco-menu-item.arco-menu-selected) {
+  background: rgba(255, 255, 255, 0.25) !important;
+  color: #fff !important;
+}
+
+.sider-menu :deep(.arco-menu-item::before),
+.sider-menu :deep(.arco-menu-item::after) {
+  animation: none !important;
+  transition: none !important;
+}
+
+.sider-menu :deep(.arco-menu-item svg) {
+  opacity: 1 !important;
+  visibility: visible !important;
+  color: #fff !important;
 }
 
 .sider-footer {
   padding: 16px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
   margin-top: auto;
 }
 
@@ -183,6 +268,7 @@ function goCreate() {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
   z-index: 10;
 }
 
