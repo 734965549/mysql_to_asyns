@@ -114,7 +114,7 @@ onMounted(() => {
           <a-row :gutter="16" class="config-summary-row">
             <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="HTTP 端口" :value="configForm.http.port" /></a-card></a-col>
             <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="Redis DB" :value="configForm.redis.db" /></a-card></a-col>
-            <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="日志级别" :value="configForm.log.level?.toUpperCase() || '-'" /></a-card></a-col>
+            <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="日志级别"><template #value>{{ configForm.log.level?.toUpperCase() || '-' }}</template></a-statistic></a-card></a-col>
           </a-row>
 
           <a-card class="config-page-card" :bordered="false">
@@ -387,8 +387,11 @@ onMounted(() => {
 .theme-option--dark .theme-option__swatch span:nth-child(1) { background: #111827; }
 .theme-option--dark .theme-option__swatch span:nth-child(2) { background: #1f2937; }
 .theme-option--dark .theme-option__swatch span:nth-child(3) { background: #60a5fa; }
+
+@media (max-width: 920px) {
   .theme-option-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
 
 </style>
