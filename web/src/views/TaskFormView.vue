@@ -1192,31 +1192,29 @@ onUnmounted(() => {
                   v-if="selectedSyncLevel === 'table'"
                   class="table-selector-panel"
                 >
-                  <a-form-item
-                    label="选择要同步的表"
-                    class="table-selector-form-item"
+                  <div class="table-mapping-title">选择要同步的表</div>
+
+                  <a-alert
+                    v-if="selectedDatabases.length === 0"
+                    type="info"
+                    style="margin-bottom: 8px"
+                    show-icon
                   >
-                    <a-alert
-                      v-if="selectedDatabases.length === 0"
-                      type="info"
-                      style="margin-bottom: 8px"
-                      show-icon
-                    >
-                      请先选择至少一个源数据库，再展开库名勾选表
-                    </a-alert>
+                    请先选择至少一个源数据库，再展开库名勾选表
+                  </a-alert>
 
-                    <a-alert
-                      v-if="tableFetchGlobalError"
-                      type="error"
-                      style="margin-bottom: 8px"
-                      show-icon
-                      closable
-                      @close="tableFetchGlobalError = null"
-                    >
-                      {{ tableFetchGlobalError }}
-                    </a-alert>
+                  <a-alert
+                    v-if="tableFetchGlobalError"
+                    type="error"
+                    style="margin-bottom: 8px"
+                    show-icon
+                    closable
+                    @close="tableFetchGlobalError = null"
+                  >
+                    {{ tableFetchGlobalError }}
+                  </a-alert>
 
-                    <div class="table-toolbar">
+                  <div class="table-toolbar">
                       <a-input
                         v-model="tableSearchText"
                         placeholder="搜索表名..."
@@ -1267,7 +1265,7 @@ onUnmounted(() => {
                           <div class="table-db-panel-toolbar">
                             <a-button
                               type="text"
-                              size="mini"
+                              size="small"
                               :loading="loadingTablesByDatabase[db]"
                               @click="fetchTablesForDatabase(db)"
                             >
@@ -1277,7 +1275,7 @@ onUnmounted(() => {
 
                             <a-button
                               type="text"
-                              size="mini"
+                              size="small"
                               @click="toggleAllTablesForDatabase(db)"
                             >
                               {{
@@ -1351,12 +1349,11 @@ onUnmounted(() => {
                       />
                     </div>
 
-                    <div style="margin-top: 8px">
+                    <div class="table-selector-footer">
                       <a-typography-text type="secondary">
                         总计已选 {{ totalSelectedTables }} 个表
                       </a-typography-text>
                     </div>
-                  </a-form-item>
                 </div>
               </a-col>
             </a-row>
@@ -3027,13 +3024,19 @@ onUnmounted(() => {
 }
 .transfer-header {
   min-height: 44px;
+  height: 44px;
   padding: 0 14px;
   border-bottom-color: #edf0f5;
   background: #fbfcff;
+  display: flex;
+  align-items: center;
 }
 .transfer-header .title {
   color: #1d2129;
   font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .transfer-search {
   padding: 12px 14px;
@@ -3057,6 +3060,36 @@ onUnmounted(() => {
 }
 .advanced-config-card :deep(.arco-card-body) {
   padding: 22px 24px;
+}
+.advanced-config-card :deep(.arco-form-item) {
+  margin-bottom: 16px;
+}
+.advanced-config-card :deep(.arco-form-item-label-col) {
+  margin-bottom: 6px;
+}
+.advanced-config-card :deep(.arco-form-item-label-col > label) {
+  color: var(--app-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.advanced-config-card :deep(.arco-form-item-content) {
+  display: flex;
+  flex-direction: column !important;
+  align-items: stretch !important;
+  gap: 4px;
+}
+.advanced-config-card :deep(.arco-form-item-content) .arco-input-wrapper,
+.advanced-config-card :deep(.arco-form-item-content) .arco-select-view,
+.advanced-config-card :deep(.arco-form-item-content) .arco-radio-group,
+.advanced-config-card :deep(.arco-form-item-content) .arco-space {
+  width: 100%;
+}
+.advanced-config-card :deep(.arco-typography-secondary) {
+  line-height: 1.5;
+  width: 100%;
+}
+.advanced-config-card :deep(.arco-row) {
+  align-items: flex-start;
 }
 /* Corrected alignment pass */
 .task-base-config-row :deep(.arco-select),
@@ -3104,24 +3137,32 @@ onUnmounted(() => {
 /* Unified panel styling */
 .table-config-row {
   align-items: stretch;
+  flex-wrap: nowrap;
 }
 .table-config-row > .arco-col {
   display: flex;
+  flex: 0 0 50%;
+  width: 50%;
+  max-width: 50%;
 }
 .table-mapping-panel,
 .table-selector-panel {
   flex: 1;
   display: flex;
   flex-direction: column;
-}
-.table-mapping-panel {
+  height: 520px;
+  min-height: 520px;
+  max-height: 520px;
   background: var(--app-surface);
   border: 1px solid var(--app-border);
   border-radius: 8px;
   padding: 16px;
+  overflow: hidden;
 }
 .table-mapping-title {
   flex-shrink: 0;
+  height: 22px;
+  line-height: 22px;
   margin-bottom: 12px;
   color: var(--app-text);
   font-size: 14px;
@@ -3170,6 +3211,7 @@ onUnmounted(() => {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  min-height: 0;
 }
 .table-list-grid {
   display: grid;
@@ -3198,18 +3240,28 @@ onUnmounted(() => {
   gap: 8px;
   margin-bottom: 8px;
 }
+.table-db-panel-toolbar :deep(.arco-btn-text) {
+  padding-left: 8px;
+  padding-right: 8px;
+}
 .table-checkbox-group {
   width: 100%;
 }
-.table-selector-form-item {
-  margin-bottom: 0;
+.table-selector-footer {
+  flex-shrink: 0;
+  height: 22px;
+  line-height: 22px;
+  margin-top: 8px;
+  text-align: right;
 }
-.table-selector-form-item,
-.table-selector-form-item :deep(.arco-form-item-content-wrapper),
-.table-selector-form-item :deep(.arco-form-item-content) {
-  flex: 1 1 auto;
-  min-height: 0;
+.table-toolbar {
+  flex-shrink: 0;
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.table-search-input {
+  flex: 1;
 }
 </style>

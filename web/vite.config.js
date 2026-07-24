@@ -17,6 +17,6 @@ export default defineConfig({ // 导出默认配置
   },
   build: { // 构建配置
     // 提高 chunk 大小警告限制（单位：kB）
-    chunkSizeWarningLimit: 1000 // 将chunk大小警告限制提高到1000KB
+    chunkSizeWarningLimit: 1500 // 将chunk大小警告限制提高到1500KB
   }
 })
