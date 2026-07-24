@@ -52,6 +52,7 @@ const detailPageMetrics = ref({});
 const detailPageProgress = ref(null);
 const detailPageLoading = ref(false);
 const detailPageActiveTab = ref("runtime");
+const isTablesCollapsed = ref(true);
 
 let detailPageRefreshInterval = null;
 let detailPageProgressInterval = null;
@@ -66,9 +67,11 @@ function getMySQLSinkDisplay(sink, config) {
 const detailPageResumeTables = computed(() => resumeTableList(detailPageTask.value));
 const detailPageRowMeta = computed(() => getRowCountMeta(detailPageTask.value));
 
-async function fetchTaskDetailPage(taskId) {
+async function fetchTaskDetailPage(taskId, silent = false) {
   if (!taskId) return;
-  detailPageLoading.value = true;
+  if (!silent) {
+    detailPageLoading.value = true;
+  }
   try {
     const [taskRes, metricsRes] = await Promise.allSettled([
       fetch(`${API_BASE}/tasks/${taskId}`),
@@ -81,11 +84,16 @@ async function fetchTaskDetailPage(taskId) {
     if (metricsRes.status === "fulfilled" && metricsRes.value.ok) {
       detailPageMetrics.value = await metricsRes.value.json();
     }
-    await fetchTaskDetailProgress(taskId);
+    // Only auto-fetch progress in this call if it's the active tab, to avoid redundant calls
+    if (detailPageActiveTab.value === "runtime") {
+      await fetchTaskDetailProgress(taskId);
+    }
   } catch (e) {
     console.error("加载任务详情失败:", e);
   } finally {
-    detailPageLoading.value = false;
+    if (!silent) {
+      detailPageLoading.value = false;
+    }
   }
 }
 
@@ -141,11 +149,29 @@ onMounted(async () => {
   document.title = "任务详情";
   await ensureDefaultConfig();
   await fetchTaskDetailPage(detailPageTaskId.value);
+  
+  // Set up a single interval loop to handle polling intelligently
   detailPageRefreshInterval = setInterval(() => {
-    fetchTaskDetailPage(detailPageTaskId.value);
+    const status = detailPageTask.value?.context?.status;
+    const isTerminal = ["COMPLETED", "FAILED", "STOPPED", "PAUSED"].includes(status);
+    
+    // If the task is in terminal status, we don't need to poll frequently
+    if (isTerminal) {
+      // Just poll occasionally (e.g. 15s) to check if status changes (like restart)
+      // or we can skip it. For now, let's skip polling in terminal states to save resources
+      return;
+    }
+    
+    // Otherwise, perform silent updates
+    fetchTaskDetailPage(detailPageTaskId.value, true);
   }, 3000);
+
   detailPageProgressInterval = setInterval(() => {
-    fetchTaskDetailProgress(detailPageTaskId.value);
+    const status = detailPageTask.value?.context?.status;
+    // Only poll progress if the task is RUNNING and the active tab is "runtime"
+    if (status === "RUNNING" && detailPageActiveTab.value === "runtime") {
+      fetchTaskDetailProgress(detailPageTaskId.value);
+    }
   }, 2000);
 });
 
@@ -305,7 +331,7 @@ onUnmounted(() => {
             </a-col>
           </a-row>
 
-          <a-tabs v-model:active-key="detailPageActiveTab" class="detail-tabs">
+          <a-tabs v-model:active-key="detailPageActiveTab" class="detail-tabs" lazy-load>
             <!-- 实时进度 -->
             <a-tab-pane key="runtime" title="实时进度">
               <a-empty
@@ -637,22 +663,22 @@ onUnmounted(() => {
                 </a-descriptions-item>
               </a-descriptions>
 
-              <a-descriptions title="源数据库配置" :column="2" bordered style="margin-top: 20px">
-                <a-descriptions-item label="主机地址">
-                  {{ detailPageTask.config.source_db?.host || '-' }}
-                </a-descriptions-item>
-                <a-descriptions-item label="端口">
-                  {{ detailPageTask.config.source_db?.port || '-' }}
+              <a-descriptions title="源数据库配置" :column="1" bordered style="margin-top: 20px" :label-style="{ width: '120px' }">
+                <a-descriptions-item label="连接地址">
+                  <span style="font-weight: 500;">{{ detailPageTask.config.source_db?.host || '-' }}</span>
+                  <span style="margin: 0 8px; color: var(--color-neutral-4)">:</span>
+                  <span style="color: var(--color-text-2)">{{ detailPageTask.config.source_db?.port || '-' }}</span>
                 </a-descriptions-item>
                 <a-descriptions-item label="用户名">
                   {{ detailPageTask.config.source_db?.username || '-' }}
                 </a-descriptions-item>
                 <a-descriptions-item label="数据库">
-                  <a-space wrap>
+                  <a-space wrap class="db-tags-container">
                     <a-tag
                       v-for="db in (detailPageTask.config.source_databases || [])"
                       :key="db"
                       color="arcoblue"
+                      size="small"
                       >{{ db }}</a-tag
                     >
                     <span v-if="!(detailPageTask.config.source_databases || []).length">{{
@@ -662,31 +688,30 @@ onUnmounted(() => {
                 </a-descriptions-item>
               </a-descriptions>
 
-              <a-descriptions title="目标数据库配置" :column="2" bordered style="margin-top: 20px">
+              <a-descriptions title="目标数据库配置" :column="1" bordered style="margin-top: 20px" :label-style="{ width: '120px' }">
                 <template
                   v-if="!hasExplicitSinkConfigs(detailPageTask.config.sink_configs)"
                 >
-                  <a-descriptions-item label="主机地址">
-                    {{ getTaskTargetMySQLDisplay(detailPageTask.config).host || '-' }}
-                  </a-descriptions-item>
-                  <a-descriptions-item label="端口">
-                    {{ getTaskTargetMySQLDisplay(detailPageTask.config).port || '-' }}
+                  <a-descriptions-item label="连接地址">
+                    <span style="font-weight: 500;">{{ getTaskTargetMySQLDisplay(detailPageTask.config).host || '-' }}</span>
+                    <span style="margin: 0 8px; color: var(--color-neutral-4)">:</span>
+                    <span style="color: var(--color-text-2)">{{ getTaskTargetMySQLDisplay(detailPageTask.config).port || '-' }}</span>
                   </a-descriptions-item>
                   <a-descriptions-item label="用户名">
                     {{ getTaskTargetMySQLDisplay(detailPageTask.config).username || '-' }}
                   </a-descriptions-item>
                   <a-descriptions-item label="数据库映射">
-                    <a-space wrap>
-                      <span
+                    <div class="db-mappings-grid">
+                      <div
                         v-for="mapping in getTaskDatabaseMappings(detailPageTask)"
                         :key="mapping.source"
-                        style="display: inline-flex; align-items: center; margin-right: 12px"
+                        class="db-mapping-item"
                       >
-                        <a-tag color="blue">{{ mapping.source }}</a-tag>
-                        <span style="margin: 0 4px">→</span>
-                        <a-tag color="green">{{ mapping.target }}</a-tag>
-                      </span>
-                    </a-space>
+                        <a-tag color="blue" size="small">{{ mapping.source }}</a-tag>
+                        <icon-arrow-right class="mapping-arrow" />
+                        <a-tag color="green" size="small">{{ mapping.target }}</a-tag>
+                      </div>
+                    </div>
                   </a-descriptions-item>
                 </template>
                 <template v-else>
@@ -694,13 +719,13 @@ onUnmounted(() => {
                     v-for="(sink, idx) in detailPageTask.config.sink_configs"
                     :key="idx"
                     :label="`目标端 ${sink.type}`"
-                    :span="2"
                   >
                     <div v-if="sink.type === 'MYSQL'">
-                      主机：{{ getMySQLSinkDisplay(sink, detailPageTask.config).host || '-' }} 端口：{{
-                        getMySQLSinkDisplay(sink, detailPageTask.config).port || '-'
-                      }}
-                      用户：{{ getMySQLSinkDisplay(sink, detailPageTask.config).username || '-' }}
+                      <span style="font-weight: 500;">{{ getMySQLSinkDisplay(sink, detailPageTask.config).host || '-' }}</span>
+                      <span style="margin: 0 8px; color: var(--color-neutral-4)">:</span>
+                      <span>{{ getMySQLSinkDisplay(sink, detailPageTask.config).port || '-' }}</span>
+                      <span style="margin-left: 16px; color: var(--color-text-3)">用户：</span>
+                      <span>{{ getMySQLSinkDisplay(sink, detailPageTask.config).username || '-' }}</span>
                     </div>
                     <div v-else-if="sink.type === 'KAFKA'">
                       Brokers：{{
@@ -733,15 +758,28 @@ onUnmounted(() => {
                 style="margin-top: 20px"
               >
                 <a-descriptions-item label="表列表">
-                  <a-space wrap>
-                    <a-tag v-for="table in (detailPageTask.config.tables || [])" :key="table">{{
-                      table
-                    }}</a-tag>
-                    <span
-                      v-if="!detailPageTask.config.tables || detailPageTask.config.tables.length === 0"
-                      >全库同步</span
-                    >
-                  </a-space>
+                  <div class="sync-tables-wrapper">
+                    <div class="sync-tables-header" style="margin-bottom: 8px;">
+                      <a-button type="outline" size="mini" @click="isTablesCollapsed = !isTablesCollapsed">
+                        <template #icon>
+                          <icon-down v-if="isTablesCollapsed" />
+                          <icon-up v-else />
+                        </template>
+                        {{ isTablesCollapsed ? `展开全部 (${(detailPageTask.config.tables || []).length}张表)` : '收起' }}
+                      </a-button>
+                    </div>
+                    <div v-if="!isTablesCollapsed" class="sync-tables-content">
+                      <a-space wrap>
+                        <a-tag v-for="table in (detailPageTask.config.tables || [])" :key="table">{{
+                          table
+                        }}</a-tag>
+                        <span
+                          v-if="!detailPageTask.config.tables || detailPageTask.config.tables.length === 0"
+                          >全库同步</span
+                        >
+                      </a-space>
+                    </div>
+                  </div>
                 </a-descriptions-item>
               </a-descriptions>
             </a-tab-pane>
@@ -1125,5 +1163,53 @@ onUnmounted(() => {
 
   padding: 16px;
 }
+
+.db-tags-container {
+  max-width: 100%;
+}
+
+.db-mappings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.db-mapping-item {
+  display: flex;
+  align-items: center;
+  background: var(--color-fill-1);
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--color-neutral-3);
+  transition: all 0.2s ease;
+}
+
+.db-mapping-item:hover {
+  background: var(--color-fill-2);
+  border-color: var(--color-neutral-4);
+}
+
+.mapping-arrow {
+  margin: 0 8px;
+  color: var(--color-text-3);
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.sync-tables-wrapper {
+  width: 100%;
+}
+
+.sync-tables-content {
+  background: var(--color-fill-1);
+  padding: 12px;
+  border-radius: 4px;
+  border: 1px solid var(--color-neutral-2);
+  max-height: 250px;
+  overflow-y: auto;
+}
+
 
 </style>
