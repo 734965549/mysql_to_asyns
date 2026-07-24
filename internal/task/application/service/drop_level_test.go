@@ -5,22 +5,24 @@ import (
 	"errors"
 	"regexp"
 	"testing"
+	"time"
 
+	"mysql-to-sync/internal/sync/fullload"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
 )
 
-// expectTargetTableMissingCreateLike 模拟"库级别重建后目标表不存在"的场景：
-// 目标库已存在、目标表不存在，直接 CREATE TABLE ... LIKE 创建，不执行 DROP TABLE。
+// expectTargetTableMissingCreateLike ??"????????????"????
+// ???????????????? CREATE TABLE ... LIKE ?????? DROP TABLE?
 func expectTargetTableMissingCreateLike(mock sqlmock.Sqlmock, targetSchema, table string) {
 	mock.ExpectQuery("SELECT schema_name FROM information_schema.schemata WHERE schema_name = \\?").
 		WithArgs(targetSchema).
 		WillReturnRows(sqlmock.NewRows([]string{"schema_name"}).AddRow(targetSchema))
 	mock.ExpectQuery(regexp.QuoteMeta(
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = '" + targetSchema + "' AND table_name = '" + table + "'",
-	)).WillReturnRows(sqlmock.NewRows([]string{"table_name"})) // 无行 → 表不存在
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+	)).WithArgs(targetSchema, table).WillReturnRows(sqlmock.NewRows([]string{"table_name"})) // ?? ? ????
 	mock.ExpectExec("SET SESSION FOREIGN_KEY_CHECKS=0").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("CREATE TABLE `" + targetSchema + "`.`" + table + "` LIKE `" + fullSyncSrcSchema + "`.`" + table + "`")).
@@ -29,8 +31,8 @@ func expectTargetTableMissingCreateLike(mock sqlmock.Sqlmock, targetSchema, tabl
 		WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
-// TestRebuildTargetDatabases_RebuildsEachUniqueDatabase 验证库级别重建：
-// 对每个目标库执行 DROP DATABASE + CREATE DATABASE，且不执行任何 DROP TABLE。
+// TestRebuildTargetDatabases_RebuildsEachUniqueDatabase ????????
+// ???????? DROP DATABASE + CREATE DATABASE??????? DROP TABLE?
 func TestRebuildTargetDatabases_RebuildsEachUniqueDatabase(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
@@ -48,12 +50,12 @@ func TestRebuildTargetDatabases_RebuildsEachUniqueDatabase(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("CREATE DATABASE IF NOT EXISTS `tgt_a` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	require.NoError(t, ts.rebuildTargetDatabases(runtime, "task-1", []string{"tgt_a"}))
+	require.NoError(t, ts.rebuildTargetDatabases(context.Background(), runtime, "task-1", []string{"tgt_a"}))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestRebuildTargetDatabases_DedupesDuplicateTargets 验证多库映射去重：
-// 两个源库映射到同一目标库时，目标库只重建一次。
+// TestRebuildTargetDatabases_DedupesDuplicateTargets ?????????
+// ???????????????????????
 func TestRebuildTargetDatabases_DedupesDuplicateTargets(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
@@ -66,7 +68,7 @@ func TestRebuildTargetDatabases_DedupesDuplicateTargets(t *testing.T) {
 	}
 	runtime := &taskRuntime{targetDB: db}
 
-	// tgt_shared 出现两次，应只重建一次；tgt_b 重建一次
+	// tgt_shared ????????????tgt_b ????
 	mock.ExpectExec(regexp.QuoteMeta("DROP DATABASE IF EXISTS `tgt_shared`")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("CREATE DATABASE IF NOT EXISTS `tgt_shared` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")).
@@ -76,11 +78,11 @@ func TestRebuildTargetDatabases_DedupesDuplicateTargets(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("CREATE DATABASE IF NOT EXISTS `tgt_b` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	require.NoError(t, ts.rebuildTargetDatabases(runtime, "task-1", []string{"tgt_shared", "tgt_b", "tgt_shared"}))
+	require.NoError(t, ts.rebuildTargetDatabases(context.Background(), runtime, "task-1", []string{"tgt_shared", "tgt_b", "tgt_shared"}))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestRebuildTargetDatabases_DropFailsReturnsError 验证 DROP DATABASE 失败立即终止并返回错误。
+// TestRebuildTargetDatabases_DropFailsReturnsError ?? DROP DATABASE ????????????
 func TestRebuildTargetDatabases_DropFailsReturnsError(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
@@ -96,13 +98,13 @@ func TestRebuildTargetDatabases_DropFailsReturnsError(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("DROP DATABASE IF EXISTS `tgt_a`")).
 		WillReturnError(errors.New("drop database denied"))
 
-	err = ts.rebuildTargetDatabases(runtime, "task-1", []string{"tgt_a"})
+	err = ts.rebuildTargetDatabases(context.Background(), runtime, "task-1", []string{"tgt_a"})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to drop target database tgt_a")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestRebuildTargetDatabases_CreateFailsReturnsError 验证 CREATE DATABASE 失败立即终止并返回错误。
+// TestRebuildTargetDatabases_CreateFailsReturnsError ?? CREATE DATABASE ????????????
 func TestRebuildTargetDatabases_CreateFailsReturnsError(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
@@ -120,13 +122,13 @@ func TestRebuildTargetDatabases_CreateFailsReturnsError(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("CREATE DATABASE IF NOT EXISTS `tgt_a` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")).
 		WillReturnError(errors.New("create database denied"))
 
-	err = ts.rebuildTargetDatabases(runtime, "task-1", []string{"tgt_a"})
+	err = ts.rebuildTargetDatabases(context.Background(), runtime, "task-1", []string{"tgt_a"})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to recreate target database tgt_a")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestRebuildTargetDatabases_EmptySchemasSkipped 验证空库名被跳过、不执行任何语句。
+// TestRebuildTargetDatabases_EmptySchemasSkipped ?????????????????
 func TestRebuildTargetDatabases_EmptySchemasSkipped(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
@@ -139,13 +141,13 @@ func TestRebuildTargetDatabases_EmptySchemasSkipped(t *testing.T) {
 	}
 	runtime := &taskRuntime{targetDB: db}
 
-	// 全部为空，无任何期望
-	require.NoError(t, ts.rebuildTargetDatabases(runtime, "task-1", []string{"", "  ", ""}))
+	// ??????????
+	require.NoError(t, ts.rebuildTargetDatabases(context.Background(), runtime, "task-1", []string{"", "  ", ""}))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestRebuildTargetDatabases_RespectsStopSignal 验证库级别重建过程中收到停止信号时，
-// 不应继续删除后续目标库，并返回 errFullSyncStoppedByUser。
+// TestRebuildTargetDatabases_RespectsStopSignal ??????????????????
+// ??????????????? errFullSyncStoppedByUser?
 func TestRebuildTargetDatabases_RespectsStopSignal(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
@@ -158,19 +160,91 @@ func TestRebuildTargetDatabases_RespectsStopSignal(t *testing.T) {
 	}
 	runtime := &taskRuntime{targetDB: db}
 
-	// 任务已暂停，不应执行任何 DROP/CREATE
-	err = ts.rebuildTargetDatabases(runtime, "task-1", []string{"tgt_a", "tgt_b"})
+	// ???????????? DROP/CREATE
+	err = ts.rebuildTargetDatabases(context.Background(), runtime, "task-1", []string{"tgt_a", "tgt_b"})
 	require.ErrorIs(t, err, errFullSyncStoppedByUser)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestSyncDatabasePair_DatabaseLevelRebuilt_NoDropTable 验证库级别重建后，
-// ensureTargetTable 不再执行 DROP TABLE，直接 CREATE TABLE LIKE；写入仍使用普通 INSERT。
+// TestRebuildTargetDatabases_RespectsSchemaLockLost ???? cause ?????? DDL?
+func TestRebuildTargetDatabases_RespectsSchemaLockLost(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer db.Close()
+
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"task-1": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusRunning}},
+		},
+	}
+	runtime := &taskRuntime{targetDB: db}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(fullload.ErrSchemaLockLost)
+
+	err = ts.rebuildTargetDatabases(ctx, runtime, "task-1", []string{"tgt_a", "tgt_b"})
+	require.ErrorIs(t, err, fullload.ErrSchemaLockLost)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRebuildTargetDatabases_LockLostDuringDropPreservesCause ?? DROP DATABASE
+// ??????????????? ErrSchemaLockLost???? %v ?????????
+func TestRebuildTargetDatabases_LockLostDuringDropPreservesCause(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer db.Close()
+
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"task-1": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusRunning}},
+		},
+	}
+	runtime := &taskRuntime{targetDB: db}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	mock.ExpectExec(regexp.QuoteMeta("DROP DATABASE IF EXISTS `tgt_a`")).
+		WillDelayFor(200 * time.Millisecond).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ts.rebuildTargetDatabases(ctx, runtime, "task-1", []string{"tgt_a"})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel(fullload.ErrSchemaLockLost)
+
+	select {
+	case err = <-errCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rebuildTargetDatabases did not return after lock-lost cancel")
+	}
+	require.ErrorIs(t, err, fullload.ErrSchemaLockLost)
+}
+
+// TestAbortFullSyncIfCancelled_PrefersLockLostOverStop ????????????? cause?
+func TestAbortFullSyncIfCancelled_PrefersLockLostOverStop(t *testing.T) {
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"task-1": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusPaused}},
+		},
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(fullload.ErrSchemaLockLost)
+
+	err := ts.abortFullSyncIfCancelled(ctx, "task-1")
+	require.ErrorIs(t, err, fullload.ErrSchemaLockLost)
+}
+
+// TestSyncDatabasePair_DatabaseLevelRebuilt_NoDropTable ?????????
+// ensureTargetTable ???? DROP TABLE??? CREATE TABLE LIKE???????? INSERT?
 func TestSyncDatabasePair_DatabaseLevelRebuilt_NoDropTable(t *testing.T) {
 	identity := pkUsersIdentity()
 	tableName := "users"
 
-	// 开启删除但库级已重建 → 普通INSERT、无 DROP TABLE
+	// ?????????? ? ??INSERT?? DROP TABLE
 	insertSQL := insertPlainSQL("INSERT IGNORE INTO `" + fullSyncTgtSchema + "`.`" + tableName + "` (`id`, `name`) VALUES (?, ?)")
 
 	sourceDB, sourceMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
@@ -183,13 +257,13 @@ func TestSyncDatabasePair_DatabaseLevelRebuilt_NoDropTable(t *testing.T) {
 	defer targetDB.Close()
 	targetMock.MatchExpectationsInOrder(false)
 
-	// 源：keyset 读取一行后结束
+	// ??keyset ???????
 	sourceMock.ExpectQuery("SELECT `id`, `name` FROM `" + fullSyncSrcSchema + "`.`" + tableName + "` ORDER BY `id` ASC LIMIT \\?").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow(int64(1), "alice"))
 	sourceMock.ExpectQuery("SELECT `id`, `name` FROM `" + fullSyncSrcSchema + "`.`" + tableName + "` WHERE `id` > \\? ORDER BY `id` ASC LIMIT \\?").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}))
 
-	// 目标：库已存在、表不存在（库级重建后的状态），直接建表，无 DROP TABLE
+	// ????????????????????????????? DROP TABLE
 	expectTargetTableMissingCreateLike(targetMock, fullSyncTgtSchema, tableName)
 	expectTargetWriteSession(targetMock, insertSQL)
 
@@ -204,7 +278,7 @@ func TestSyncDatabasePair_DatabaseLevelRebuilt_NoDropTable(t *testing.T) {
 		TargetSchema:             fullSyncTgtSchema,
 		BatchSize:                100,
 		WorkerCount:              1,
-		EnableDropTableBeforeDDL: true, // 开启删除，但库级已重建
+		EnableDropTableBeforeDDL: true, // ???????????
 	}
 	task := taskEntity.NewSyncTask(cfg)
 	task.Start()

@@ -14,7 +14,7 @@ type RowBatch struct {
 	Rows         [][]any  // 行数据，每行长度等于 len(Columns)
 	StartKey     []any    // 本批起始游标值（排查用，可为空）
 	EndKey       []any    // 本批结束游标值（游标推进用）
-	ApproxBytes  int64    // 估算字节数（背压与提交阈值用）
+	ApproxBytes  int64    // 估算字节数（背压与提交频率用）
 	ChunkID      string   // 所属 chunk 标识
 }
 

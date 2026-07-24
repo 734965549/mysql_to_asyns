@@ -3,6 +3,7 @@ package fullload
 import (
 	"context"
 	"errors"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,7 +45,12 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 			AddRow(int64(2), "b"))
 	expectSnapshotCommit(srcMock)
 
-	// 目标：会话优化 + 事务写入 + 提交 + 恢复会话。
+	// 目标：InnoDB 预检 + schema 互斥锁 + marker 表 + 结构校验 + 会话优化 + 事务写入 + marker + 提交 + 按 run_id 清理。
+	expectInnoDBTable(dstMock, "s", "t")
+	expectTxMarkerSchemaLock(dstMock, "s")
+	dstMock.ExpectExec(regexp.QuoteMeta("CREATE TABLE IF NOT EXISTS `s`.`__mts_fl_tx`")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	expectTxMarkerTableOK(dstMock, "s")
 	dstMock.ExpectExec("SET @@SESSION.FOREIGN_KEY_CHECKS=0").WillReturnResult(sqlmock.NewResult(0, 0))
 	dstMock.ExpectExec("SET @@SESSION.UNIQUE_CHECKS=0").WillReturnResult(sqlmock.NewResult(0, 0))
 	dstMock.ExpectQuery("SELECT @@SESSION.FOREIGN_KEY_CHECKS").
@@ -54,10 +60,15 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 	dstMock.ExpectPrepare("INSERT INTO `s`.`t`")
 	dstMock.ExpectPrepare("INSERT INTO `s`.`t`").
 		ExpectExec().WillReturnResult(sqlmock.NewResult(0, 2))
+	dstMock.ExpectExec("INSERT INTO `s`.`__mts_fl_tx`").WillReturnResult(sqlmock.NewResult(0, 1))
 	dstMock.ExpectCommit()
 	dstMock.ExpectExec("SET @@SESSION.FOREIGN_KEY_CHECKS=1").WillReturnResult(sqlmock.NewResult(0, 0))
 	dstMock.ExpectExec("SET @@SESSION.UNIQUE_CHECKS=1").WillReturnResult(sqlmock.NewResult(0, 0))
 	dstMock.ExpectExec("SET SESSION innodb_lock_wait_timeout=50").WillReturnResult(sqlmock.NewResult(0, 0))
+	dstMock.ExpectExec(regexp.QuoteMeta("DELETE FROM `s`.`__mts_fl_tx` WHERE `run_id` = ?")).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectTxMarkerSchemaUnlock(dstMock, "s")
 
 	spec := &TableSpec{
 		SourceSchema: "s", TargetSchema: "s", SourceTable: "t", TargetTable: "t",

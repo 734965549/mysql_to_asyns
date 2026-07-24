@@ -27,7 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// mockAnalyzer 是一个模拟的 IdentityAnalyzer
+// mockAnalyzer ?????? IdentityAnalyzer
 type mockAnalyzer struct{}
 
 type failingTaskStorage struct {
@@ -131,8 +131,8 @@ func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	// sqlmock checks expectations in order by default. Disable ordered matching
 	// because the concurrent implementation may dispatch the two tables in any
 	// order, and each table's ALTER TABLE may overlap with the other table's.
-	// 每个 ExpectQuery 必须使用独立 Rows：并发表会并行消费结果集，共享同一
-	// *sqlmock.Rows 会触发 data race。
+	// ?? ExpectQuery ?????? Rows?????????????????
+	// *sqlmock.Rows ??? data race?
 	mock.MatchExpectationsInOrder(false)
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("target_db", "users", "idx_users_name").
@@ -177,7 +177,7 @@ func TestRestorePendingIndexes_RespectsStopSignal(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	// 不期望任何 ALTER TABLE ADD INDEX 被执行
+	// ????? ALTER TABLE ADD INDEX ???
 	ts := &TaskService{
 		tasks: map[string]*taskEntity.SyncTask{
 			"task-stop": {Context: taskEntity.ProcessContext{Status: taskEntity.TaskStatusPaused}},
@@ -206,7 +206,7 @@ func TestRestorePendingIndexes_FailsFastOnFirstError_Sequential(t *testing.T) {
 
 	emptyStatsRows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
 
-	// workers=1 让派发顺序确定：表 a 报错后主循环 break 出去，保证表 b 的 Exec 永远不会被发出。
+	// workers=1 ????????? a ?????? break ?????? b ? Exec ????????
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "a", "idx_a").
 		WillReturnRows(emptyStatsRows)
@@ -242,8 +242,8 @@ func TestRestorePendingIndexes_FailsFastOnFirstError_Sequential(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// fakeIndexRestoreDriver 用于验证并发索引回放的 fail-fast / context 取消行为。
-// 它通过 started / proceed channel 与测试协同，确保两张表的 DDL 都被派发后再继续。
+// fakeIndexRestoreDriver ??????????? fail-fast / context ?????
+// ??? started / proceed channel ???????????? DDL ?????????
 type fakeIndexRestoreDriver struct {
 	mu      sync.Mutex
 	started chan struct{}
@@ -290,7 +290,7 @@ func (c *fakeIndexRestoreConn) QueryContext(ctx context.Context, query string, a
 	return &fakeIndexRestoreRows{}, nil
 }
 
-// fakeIndexRestoreRows 返回空结果集，用于 fakeIndexRestoreConn 的 QueryContext。
+// fakeIndexRestoreRows ????????? fakeIndexRestoreConn ? QueryContext?
 type fakeIndexRestoreRows struct{}
 
 func (r *fakeIndexRestoreRows) Columns() []string { return nil }
@@ -338,7 +338,7 @@ func TestRestorePendingIndexes_FailsFastOnFirstError_Concurrent(t *testing.T) {
 		errCh <- ts.restorePendingIndexes(context.Background(), runtime, "task-fail-concurrent", pending, 2)
 	}()
 
-	// 等待两张表的 DDL 都被派发，证明是并发执行。
+	// ?????? DDL ?????????????
 	<-drv.started
 	<-drv.started
 	close(drv.proceed)
@@ -448,7 +448,7 @@ func TestDropNonPrimaryKeyIndexes_SkipsFailedDrops(t *testing.T) {
 
 	ts := &TaskService{}
 	runtime := &taskRuntime{targetDB: targetDB}
-	dropped, err := ts.dropNonPrimaryKeyIndexes(runtime, "db", "t")
+	dropped, err := ts.dropNonPrimaryKeyIndexes(context.Background(), runtime, "db", "t")
 
 	require.NoError(t, err)
 	require.Len(t, dropped, 1)
@@ -504,7 +504,7 @@ func TestRestoreIndexes_SkipsExistingMatchingIndex(t *testing.T) {
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "t", "idx_c").
 		WillReturnRows(rows)
-	// 不应再执行 ALTER TABLE ADD INDEX
+	// ????? ALTER TABLE ADD INDEX
 
 	ts := &TaskService{}
 	runtime := &taskRuntime{targetDB: targetDB}
@@ -672,20 +672,20 @@ func TestIsConnRetryable(t *testing.T) {
 
 func TestEffectiveIndexRestoreWorkers(t *testing.T) {
 	cases := []struct{ configured, workerCount, hardMax, want int }{
-		{0, 0, 0, 4},    // 全默认 -> 4
-		{0, 8, 0, 4},    // 回退 min(8,4)=4
+		{0, 0, 0, 4},    // ??? -> 4
+		{0, 8, 0, 4},    // ?? min(8,4)=4
 		{0, 2, 0, 2},    // workerCount<4 -> 2
-		{6, 8, 0, 6},    // 显式 6
-		{32, 8, 16, 16}, // 受 hardMax 封顶
+		{6, 8, 0, 6},    // ?? 6
+		{32, 8, 16, 16}, // ? hardMax ??
 		{0, 0, 2, 2},    // hardMax<defaultCap -> 2
-		{-1, 0, 0, 4},   // 负数当 0
+		{-1, 0, 0, 4},   // ??? 0
 	}
 	for _, c := range cases {
 		require.Equal(t, c.want, taskEntity.EffectiveIndexRestoreWorkers(c.configured, c.workerCount, c.hardMax))
 	}
 }
 
-// newTestTaskService 创建一个使用自定义数据目录的测试任务服务
+// newTestTaskService ????????????????????
 func newTestTaskService(dataDir string) *TaskService {
 	storage := NewFileTaskStorage(dataDir)
 	return &TaskService{
@@ -892,11 +892,11 @@ func TestNewTaskServiceWithDBAndConfig(t *testing.T) {
 func TestSetEnableReadOnly(t *testing.T) {
 	ts := NewTaskService(newDefaultConfig())
 
-	// 测试设置为 false
+	// ????? false
 	ts.SetEnableReadOnly(false)
 	assert.False(t, ts.GetEnableReadOnly())
 
-	// 测试设置为 true
+	// ????? true
 	ts.SetEnableReadOnly(true)
 	assert.True(t, ts.GetEnableReadOnly())
 }
@@ -976,7 +976,7 @@ func TestCreateTask(t *testing.T) {
 	assert.Equal(t, "test_task_1", task.Config.ID)
 	assert.True(t, task.Config.EnableDropTableBeforeDDL)
 
-	// 验证任务已添加到服务中
+	// ???????????
 	retrievedTask, exists := ts.GetTask("test_task_1")
 	assert.True(t, exists)
 	assert.Equal(t, task.Config.ID, retrievedTask.Config.ID)
@@ -988,19 +988,19 @@ func TestGetTask(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 测试获取不存在的任务
+	// ??????????
 	task, exists := ts.GetTask("non_existent")
 	assert.False(t, exists)
 	assert.Nil(t, task)
 
-	// 创建任务
+	// ????
 	taskConfig := taskEntity.TaskConfig{
 		ID:   "test_task_2",
 		Name: "Test Task",
 	}
 	ts.CreateTask(taskConfig)
 
-	// 测试获取存在的任务
+	// ?????????
 	task, exists = ts.GetTask("test_task_2")
 	assert.True(t, exists)
 	assert.NotNil(t, task)
@@ -1012,16 +1012,16 @@ func TestGetAllTasks(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 初始应该为空
+	// ??????
 	tasks := ts.GetAllTasks()
 	assert.Empty(t, tasks)
 
-	// 创建多个任务
+	// ??????
 	ts.CreateTask(taskEntity.TaskConfig{ID: "task_1_unique", Name: "Task 1"})
 	ts.CreateTask(taskEntity.TaskConfig{ID: "task_2_unique", Name: "Task 2"})
 	ts.CreateTask(taskEntity.TaskConfig{ID: "task_3_unique", Name: "Task 3"})
 
-	// 获取所有任务
+	// ??????
 	tasks = ts.GetAllTasks()
 	assert.Len(t, tasks, 3)
 
@@ -1034,7 +1034,7 @@ func TestGetAllTasks(t *testing.T) {
 	assert.True(t, taskIDs["task_2_unique"])
 	assert.True(t, taskIDs["task_3_unique"])
 
-	// 返回快照而非 live 指针：改快照不影响服务内任务
+	// ?????? live ??????????????
 	live, ok := ts.GetTask("task_1_unique")
 	require.True(t, ok)
 	var snap *taskEntity.SyncTask
@@ -1055,21 +1055,21 @@ func TestUpdateTask(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 创建任务
+	// ????
 	taskConfig := taskEntity.TaskConfig{
 		ID:   "test_task_update",
 		Name: "Original Name",
 	}
 	task, _ := ts.CreateTask(taskConfig)
 
-	// 修改任务（非运行态可编辑）
+	// ?????????????
 	task.Config.Name = "Updated Name"
 
-	// 更新任务
+	// ????
 	err := ts.UpdateTask(task)
 	assert.NoError(t, err)
 
-	// 验证更新：Config 已合并，Context 仍为原 live 状态
+	// ?????Config ????Context ??? live ??
 	retrievedTask, _ := ts.GetTask("test_task_update")
 	assert.Equal(t, "Updated Name", retrievedTask.Config.Name)
 	assert.Equal(t, taskEntity.TaskStatusPending, retrievedTask.Context.Status)
@@ -1108,7 +1108,7 @@ func TestUpdateTask_PreservesLiveContextFromSnapshot(t *testing.T) {
 	snap, ok := ts.GetTaskSnapshot("upd_ctx")
 	require.True(t, ok)
 	snap.Config.Name = "renamed"
-	snap.Context.TotalRows = 0 // 故意污染快照 Context，写路径应忽略
+	snap.Context.TotalRows = 0 // ?????? Context???????
 
 	require.NoError(t, ts.UpdateTask(snap))
 
@@ -1154,22 +1154,22 @@ func TestDeleteTask(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 创建任务
+	// ????
 	taskConfig := taskEntity.TaskConfig{
 		ID:   "test_task_delete",
 		Name: "Test Task",
 	}
 	ts.CreateTask(taskConfig)
 
-	// 验证任务存在
+	// ??????
 	_, exists := ts.GetTask("test_task_delete")
 	assert.True(t, exists)
 
-	// 删除任务
+	// ????
 	err := ts.DeleteTask("test_task_delete")
 	assert.NoError(t, err)
 
-	// 验证任务已删除
+	// ???????
 	_, exists = ts.GetTask("test_task_delete")
 	assert.False(t, exists)
 }
@@ -1197,7 +1197,7 @@ func TestStartTask(t *testing.T) {
 
 	ts := NewTaskServiceWithDB(sourceDB, targetDB, analyzer)
 
-	// 创建任务
+	// ????
 	taskConfig := taskEntity.TaskConfig{
 		ID:           "test_task_start",
 		Name:         "Test Task",
@@ -1222,13 +1222,13 @@ func TestStartTask(t *testing.T) {
 	}
 	ts.CreateTask(taskConfig)
 
-	// 启动任务（当前实现会在启动时重建真实数据库连接，单元测试环境下预期失败）
+	// ????????????????????????????????????
 	ctx := context.Background()
 	err = ts.StartTask(ctx, "test_task_start")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to initialize database connections")
 
-	// 验证任务状态保持未启动
+	// ???????????
 	task, _ := ts.GetTask("test_task_start")
 	assert.Equal(t, taskEntity.TaskStatusPending, task.Context.Status)
 }
@@ -1245,7 +1245,7 @@ func TestStartTask_NotFound(t *testing.T) {
 func TestStartTask_AlreadyRunning(t *testing.T) {
 	ts := NewTaskService(newDefaultConfig())
 
-	// 创建并启动任务
+	// ???????
 	taskConfig := taskEntity.TaskConfig{
 		ID:   "test_task_running",
 		Name: "Test Task",
@@ -1419,7 +1419,7 @@ func TestStartTask_SuccessPath_ExecuteSyncGetsIndependentContext(t *testing.T) {
 	err = ts.StartTask(httpCtx, "task_ctx")
 	require.NoError(t, err)
 
-	// Cancel the HTTP context — executeSync's context should remain alive
+	// Cancel the HTTP context ? executeSync's context should remain alive
 	httpCancel()
 
 	select {
@@ -1529,7 +1529,7 @@ func TestStartTask_SuccessPath_StorageSaveCalled(t *testing.T) {
 func TestPauseTask(t *testing.T) {
 	ts := NewTaskService(newDefaultConfig())
 
-	// 创建并启动任务
+	// ???????
 	taskConfig := taskEntity.TaskConfig{
 		ID:   "test_task_pause",
 		Name: "Test Task",
@@ -1537,11 +1537,11 @@ func TestPauseTask(t *testing.T) {
 	task, _ := ts.CreateTask(taskConfig)
 	task.Start()
 
-	// 暂停任务
+	// ????
 	err := ts.PauseTask("test_task_pause")
 	assert.NoError(t, err)
 
-	// 验证任务状态
+	// ??????
 	retrievedTask, _ := ts.GetTask("test_task_pause")
 	assert.Equal(t, taskEntity.TaskStatusPaused, retrievedTask.Context.Status)
 }
@@ -1557,7 +1557,7 @@ func TestPauseTask_NotFound(t *testing.T) {
 func TestSkipError(t *testing.T) {
 	ts := NewTaskService(newDefaultConfig())
 
-	// 创建任务并设置错误状态
+	// ???????????
 	taskConfig := taskEntity.TaskConfig{
 		ID:   "test_task_skip",
 		Name: "Test Task",
@@ -1566,11 +1566,11 @@ func TestSkipError(t *testing.T) {
 	task.Context.Status = taskEntity.TaskStatusFailed
 	task.Context.ErrorStack = "some error"
 
-	// 跳过错误
+	// ????
 	err := ts.SkipError("test_task_skip")
 	assert.NoError(t, err)
 
-	// 验证错误已清除
+	// ???????
 	retrievedTask, _ := ts.GetTask("test_task_skip")
 	assert.Equal(t, taskEntity.TaskStatusPaused, retrievedTask.Context.Status)
 	assert.Empty(t, retrievedTask.Context.ErrorStack)
@@ -1589,7 +1589,7 @@ func TestGetTaskMetrics(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 创建任务
+	// ????
 	taskConfig := taskEntity.TaskConfig{
 		ID:     "test_task_metrics_unique",
 		Name:   "Test Task",
@@ -1599,10 +1599,10 @@ func TestGetTaskMetrics(t *testing.T) {
 	task.Context.ProcessedRows = 1000
 	task.Context.TotalRows = 2000
 	task.Context.CurrentPosition = "position_1"
-	// 手动计算进度百分比
+	// ?????????
 	task.Context.ProgressPercent = 50.0
 
-	// 获取指标
+	// ????
 	metrics, err := ts.GetTaskMetrics("test_task_metrics_unique")
 	assert.NoError(t, err)
 	assert.NotNil(t, metrics)
@@ -1629,11 +1629,11 @@ func TestGetRunningTaskCount(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 初始应该为 0
+	// ????? 0
 	count := ts.GetRunningTaskCount()
 	assert.Equal(t, 0, count)
 
-	// 创建并启动一些任务
+	// ?????????
 	task1, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1_unique", Name: "Task 1"})
 	task1.Start()
 
@@ -1641,7 +1641,7 @@ func TestGetRunningTaskCount(t *testing.T) {
 	task2.Start()
 
 	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: "task_3_unique", Name: "Task 3"})
-	// task3 保持暂停状态
+	// task3 ??????
 
 	count = ts.GetRunningTaskCount()
 	assert.Equal(t, 2, count)
@@ -1660,18 +1660,18 @@ func TestClose(t *testing.T) {
 
 	ts := NewTaskServiceWithDB(sourceDB, targetDB, analyzer)
 
-	// 创建一些任务
+	// ??????
 	task1, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 	task1.Start()
 
 	task2, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_2", Name: "Task 2"})
 	task2.Start()
 
-	// 关闭服务
+	// ????
 	err = ts.Close()
 	assert.NoError(t, err)
 
-	// 验证运行中的任务已暂停
+	// ???????????
 	retrievedTask1, _ := ts.GetTask("task_1")
 	assert.Equal(t, taskEntity.TaskStatusPaused, retrievedTask1.Context.Status)
 
@@ -1706,19 +1706,19 @@ func TestIsTaskStopped(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 测试不存在的任务
+	// ????????
 	assert.True(t, ts.isTaskStopped("non_existent"))
 
-	// 创建任务
+	// ????
 	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 
-	// 测试未运行的任务
+	// ????????
 	assert.True(t, ts.isTaskStopped("task_1"))
 
-	// 启动任务
+	// ????
 	task.Start()
 
-	// 测试运行中的任务
+	// ????????
 	assert.False(t, ts.isTaskStopped("task_1"))
 }
 
@@ -1727,13 +1727,13 @@ func TestUpdateTaskProgress(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 创建任务
+	// ????
 	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 
-	// 更新进度
+	// ????
 	ts.updateTaskProgress("task_1", 100, "position_1")
 
-	// 验证更新
+	// ????
 	retrievedTask, _ := ts.GetTask("task_1")
 	assert.Equal(t, int64(100), retrievedTask.Context.ProcessedRows)
 	assert.Equal(t, "position_1", retrievedTask.Context.CurrentPosition)
@@ -1744,30 +1744,30 @@ func TestIncrementTaskProgress(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 创建任务
+	// ????
 	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 	task.Context.TotalRows = 1000
 
-	// 增加进度
+	// ????
 	ts.incrementTaskProgress("task_1", 100, "position_1")
 	ts.incrementTaskProgress("task_1", 200, "position_2")
 
-	// 验证更新
+	// ????
 	retrievedTask, _ := ts.GetTask("task_1")
 	assert.Equal(t, int64(300), retrievedTask.Context.ProcessedRows)
 	assert.Equal(t, "position_2", retrievedTask.Context.CurrentPosition)
 	assert.Equal(t, 30.0, retrievedTask.Context.ProgressPercent)
 }
 
-// TestIncrementTaskProgress_ReturnsEstimatedTotal 验证精确 TotalRows 未到位时，
-// incrementTaskProgress 返回 EstimatedTotalRows 供运行时 ETA 使用。
+// TestIncrementTaskProgress_ReturnsEstimatedTotal ???? TotalRows ?????
+// incrementTaskProgress ?? EstimatedTotalRows ???? ETA ???
 func TestIncrementTaskProgress_ReturnsEstimatedTotal(t *testing.T) {
 	dataDir := t.TempDir()
 
 	ts := newTestTaskService(dataDir)
 
 	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_eta", Name: "Task ETA"})
-	// 精确 COUNT(*) 尚未完成，只有估算值
+	// ?? COUNT(*) ??????????
 	task.Context.TotalRows = 0
 	task.Context.EstimatedTotalRows = 5000
 
@@ -1775,13 +1775,13 @@ func TestIncrementTaskProgress_ReturnsEstimatedTotal(t *testing.T) {
 
 	assert.Equal(t, int64(5000), total, "should return EstimatedTotalRows when TotalRows is 0")
 
-	// 精确 COUNT(*) 完成后应返回精确值
+	// ?? COUNT(*) ?????????
 	task.Context.TotalRows = 6000
 	total = ts.incrementTaskProgress("task_eta", 200, "pos_2")
 	assert.Equal(t, int64(6000), total, "should return TotalRows when it is set")
 }
 
-// spyTaskStorage 包装真实 FileTaskStorage，统计 Save 调用次数，用于测试持久化节流行为。
+// spyTaskStorage ???? FileTaskStorage??? Save ?????????????????
 type spyTaskStorage struct {
 	*FileTaskStorage
 	saveCount int
@@ -1807,7 +1807,7 @@ func (s *spyTaskStorage) ResetCount() {
 	s.saveCount = 0
 }
 
-// newTestTaskServiceWithSpy 创建带 spy storage 的测试服务，用于观测 Save 调用次数。
+// newTestTaskServiceWithSpy ??? spy storage ?????????? Save ?????
 func newTestTaskServiceWithSpy(dataDir string) (*TaskService, *spyTaskStorage) {
 	real := NewFileTaskStorage(dataDir)
 	spy := &spyTaskStorage{FileTaskStorage: real}
@@ -1820,87 +1820,87 @@ func newTestTaskServiceWithSpy(dataDir string) (*TaskService, *spyTaskStorage) {
 	}, spy
 }
 
-// TestIncrementTaskProgress_Throttle 验证进度持久化节流：
-// 1. 同一秒内多次 incrementTaskProgress 只触发一次 Save
-// 2. 超过 1 秒后再次调用会触发新的 Save
+// TestIncrementTaskProgress_Throttle ??????????
+// 1. ?????? incrementTaskProgress ????? Save
+// 2. ?? 1 ??????????? Save
 func TestIncrementTaskProgress_Throttle(t *testing.T) {
 	dataDir := t.TempDir()
 
 	ts, spy := newTestTaskServiceWithSpy(dataDir)
 
-	// 创建任务（CreateTask 内部会调用一次 Save，重置计数器）
+	// ?????CreateTask ??????? Save???????
 	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 	task.Context.TotalRows = 1000
 	spy.ResetCount()
 
-	// 第 1 次调用：首次，应触发 Save
+	// ? 1 ?????????? Save
 	ts.incrementTaskProgress("task_1", 100, "pos_1")
-	assert.Equal(t, 1, spy.SaveCount(), "首次调用应触发 Save")
+	assert.Equal(t, 1, spy.SaveCount(), "??????? Save")
 
-	// 第 2 次调用：同一秒内，不应再触发 Save
+	// ? 2 ?????????????? Save
 	ts.incrementTaskProgress("task_1", 200, "pos_2")
-	assert.Equal(t, 1, spy.SaveCount(), "1 秒内第二次调用不应触发 Save")
+	assert.Equal(t, 1, spy.SaveCount(), "1 ??????????? Save")
 
-	// 第 3 次调用：同一秒内，仍不应触发 Save
+	// ? 3 ?????????????? Save
 	ts.incrementTaskProgress("task_1", 50, "pos_3")
-	assert.Equal(t, 1, spy.SaveCount(), "1 秒内第三次调用不应触发 Save")
+	assert.Equal(t, 1, spy.SaveCount(), "1 ??????????? Save")
 
-	// 验证内存值已正确累加（不受节流影响）
+	// ??????????????????
 	retrievedTask, _ := ts.GetTask("task_1")
 	assert.Equal(t, int64(350), retrievedTask.Context.ProcessedRows)
 	assert.Equal(t, "pos_3", retrievedTask.Context.CurrentPosition)
 	assert.Equal(t, 35.0, retrievedTask.Context.ProgressPercent)
 
-	// 等待超过 1 秒，再次调用应触发新的 Save
+	// ???? 1 ??????????? Save
 	time.Sleep(1100 * time.Millisecond)
 	ts.incrementTaskProgress("task_1", 150, "pos_4")
-	assert.Equal(t, 2, spy.SaveCount(), "超过 1 秒后应触发新的 Save")
+	assert.Equal(t, 2, spy.SaveCount(), "?? 1 ??????? Save")
 
-	// 验证内存值继续累加
+	// ?????????
 	retrievedTask, _ = ts.GetTask("task_1")
 	assert.Equal(t, int64(500), retrievedTask.Context.ProcessedRows)
 	assert.Equal(t, "pos_4", retrievedTask.Context.CurrentPosition)
 	assert.Equal(t, 50.0, retrievedTask.Context.ProgressPercent)
 }
 
-// TestIncrementTaskProgress_ThrottleReset 验证任务完成时会清理节流记录，
-// 确保同一 taskID 快速重复运行时首秒能正常落盘。
+// TestIncrementTaskProgress_ThrottleReset ???????????????
+// ???? taskID ???????????????
 func TestIncrementTaskProgress_ThrottleReset(t *testing.T) {
 	dataDir := t.TempDir()
 
 	ts, spy := newTestTaskServiceWithSpy(dataDir)
 
-	// 创建任务
+	// ????
 	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 	task.Context.TotalRows = 1000
 	spy.ResetCount()
 
-	// 第一次运行：调用一次 progress
+	// ?????????? progress
 	ts.incrementTaskProgress("task_1", 100, "pos_1")
 	assert.Equal(t, 1, spy.SaveCount())
 
-	// 模拟任务完成时的清理路径（s.mu 下清理节流记录，progressMu 下清理运行时进度）
+	// ?????????????s.mu ????????progressMu ?????????
 	ts.mu.Lock()
 	ts.clearLastProgressPersistLocked("task_1")
 	ts.mu.Unlock()
 	ts.clearRunningProgress("task_1")
 
-	// 验证 lastProgressPersist 已清理
+	// ?? lastProgressPersist ???
 	_, exists := ts.lastProgressPersist["task_1"]
-	assert.False(t, exists, "任务完成时应清理 lastProgressPersist 记录")
+	assert.False(t, exists, "???????? lastProgressPersist ??")
 
-	// 重新创建任务（模拟同一 taskID 快速重复运行）
+	// ??????????? taskID ???????
 	task2, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 	task2.Context.TotalRows = 1000
 	spy.ResetCount()
 
-	// 新运行首次调用应触发 Save（因为节流记录已被清理）
+	// ?????????? Save????????????
 	ts.incrementTaskProgress("task_1", 200, "pos_2")
-	assert.Equal(t, 1, spy.SaveCount(), "清理节流记录后，新运行首次调用应触发 Save")
+	assert.Equal(t, 1, spy.SaveCount(), "?????????????????? Save")
 }
 
-// TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave 验证 Pause 等锁内同步存档后，
-// 滞后的 RUNNING 进度快照不会在锁外落盘，避免把 PAUSED/STOPPED 覆盖回 RUNNING。
+// TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave ?? Pause ?????????
+// ??? RUNNING ??????????????? PAUSED/STOPPED ??? RUNNING?
 func TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave(t *testing.T) {
 	dataDir := t.TempDir()
 
@@ -1912,7 +1912,7 @@ func TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave(t *testing.T
 	task.Context.TotalRows = 1000
 	spy.ResetCount()
 
-	// 模拟 incrementTaskProgress 已出锁、尚未 Save 的陈旧 RUNNING 快照。
+	// ?? incrementTaskProgress ?????? Save ??? RUNNING ???
 	ts.mu.Lock()
 	task.Context.ProcessedRows = 100
 	task.Context.CurrentPosition = "pos_stale"
@@ -1942,31 +1942,31 @@ func TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave(t *testing.T
 	assert.Equal(t, int64(100), loaded.Context.ProcessedRows)
 }
 
-// TestDeleteTask_CleansThrottleRecord 验证 DeleteTask 会清理 lastProgressPersist。
+// TestDeleteTask_CleansThrottleRecord ?? DeleteTask ??? lastProgressPersist?
 func TestDeleteTask_CleansThrottleRecord(t *testing.T) {
 	dataDir := t.TempDir()
 
 	ts, spy := newTestTaskServiceWithSpy(dataDir)
 
-	// 创建任务
+	// ????
 	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 	spy.ResetCount()
 
-	// 调用一次 progress 以在 lastProgressPersist 中留下记录
+	// ???? progress ?? lastProgressPersist ?????
 	ts.incrementTaskProgress("task_1", 100, "pos_1")
 	assert.Equal(t, 1, spy.SaveCount())
 
-	// 验证记录存在
+	// ??????
 	_, exists := ts.lastProgressPersist["task_1"]
-	assert.True(t, exists, "调用 incrementTaskProgress 后应存在节流记录")
+	assert.True(t, exists, "?? incrementTaskProgress ????????")
 
-	// 删除任务
+	// ????
 	err := ts.DeleteTask("task_1")
 	assert.NoError(t, err)
 
-	// 验证节流记录已被清理
+	// ??????????
 	_, exists = ts.lastProgressPersist["task_1"]
-	assert.False(t, exists, "DeleteTask 应清理 lastProgressPersist 记录")
+	assert.False(t, exists, "DeleteTask ??? lastProgressPersist ??")
 }
 
 func TestUpdateTaskTotalRows(t *testing.T) {
@@ -1974,13 +1974,13 @@ func TestUpdateTaskTotalRows(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 创建任务
+	// ????
 	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 
-	// 更新估算行数
+	// ??????
 	ts.updateTaskEstimatedRows("task_1", 5000)
 
-	// 验证估算行数更新
+	// ????????
 	retrievedTask, _ := ts.GetTask("task_1")
 	assert.Equal(t, int64(5000), retrievedTask.Context.EstimatedTotalRows)
 }
@@ -1990,13 +1990,13 @@ func TestUpdateTaskStatus(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 创建任务
+	// ????
 	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 
-	// 更新状态
+	// ????
 	ts.updateTaskStatus("task_1", taskEntity.TaskStatusFailed, "test error")
 
-	// 验证更新
+	// ????
 	retrievedTask, _ := ts.GetTask("task_1")
 	assert.Equal(t, taskEntity.TaskStatusFailed, retrievedTask.Context.Status)
 	assert.Equal(t, "test error", retrievedTask.Context.ErrorStack)
@@ -2008,21 +2008,21 @@ func TestCompleteTask(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 创建并启动任务
+	// ???????
 	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
 	task.Start()
 
-	// 完成任务
+	// ????
 	ts.completeTask("task_1")
 
-	// 验证完成
+	// ????
 	retrievedTask, _ := ts.GetTask("task_1")
 	assert.Equal(t, taskEntity.TaskStatusCompleted, retrievedTask.Context.Status)
 	assert.NotNil(t, retrievedTask.Context.EndTime)
 }
 
 func TestTaskStorage_Save_Error(t *testing.T) {
-	// 创建一个无效的目录路径（使用保留字符）
+	// ???????????????????
 	storage := NewFileTaskStorage("invalid:dir")
 
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
@@ -2039,12 +2039,12 @@ func TestTaskStorage_LoadAll_InvalidJSON(t *testing.T) {
 
 	storage := NewFileTaskStorage(dataDir)
 
-	// 创建一个无效的 JSON 文件
+	// ??????? JSON ??
 	invalidJSON := `{"invalid": json}`
 	filePath := dataDir + "/invalid.json"
 	os.WriteFile(filePath, []byte(invalidJSON), 0644)
 
-	// 加载应该跳过无效文件
+	// ??????????
 	tasks, err := storage.LoadAll()
 	assert.NoError(t, err)
 	assert.Empty(t, tasks)
@@ -2055,19 +2055,19 @@ func TestTaskStorage_LoadAll_ReadError(t *testing.T) {
 
 	storage := NewFileTaskStorage(dataDir)
 
-	// 创建一个目录而不是文件
+	// ???????????
 	dirPath := dataDir + "/subdir"
 	os.MkdirAll(dirPath, 0755)
 
-	// 加载应该跳过目录
+	// ????????
 	tasks, err := storage.LoadAll()
 	assert.NoError(t, err)
 	assert.Empty(t, tasks)
 }
 
 func TestTaskStorage_NewTaskStorage_Error(t *testing.T) {
-	// 测试创建目录失败的情况
-	// 由于 os.MkdirAll 在大多数情况下不会失败，这里只是测试函数不会 panic
+	// ???????????
+	// ?? os.MkdirAll ?????????????????????? panic
 	storage := NewFileTaskStorage("data")
 	assert.NotNil(t, storage)
 }
@@ -2077,7 +2077,7 @@ func TestTaskService_ConcurrentOperations(t *testing.T) {
 
 	ts := newTestTaskService(dataDir)
 
-	// 并发创建任务
+	// ??????
 	done := make(chan bool, 10)
 	for i := 0; i < 10; i++ {
 		go func(id int) {
@@ -2090,12 +2090,12 @@ func TestTaskService_ConcurrentOperations(t *testing.T) {
 		}(i)
 	}
 
-	// 等待所有操作完成
+	// ????????
 	for i := 0; i < 10; i++ {
 		<-done
 	}
 
-	// 验证所有任务都已创建
+	// ??????????
 	tasks := ts.GetAllTasks()
 	assert.Equal(t, 10, len(tasks))
 }
@@ -2388,8 +2388,8 @@ func TestBoundaryToString(t *testing.T) {
 	assert.Equal(t, "a\x00b\x00c", result)
 }
 
-// TestSamplePKBoundariesImproved_KeysetStepsForAllWorkers 验证 keyset 步进算法：
-// 取代串行深 OFFSET，预期发出 (n-1) 条 WHERE pk > ? ... LIMIT ? 查询，产出的边界单调递增。
+// TestSamplePKBoundariesImproved_KeysetStepsForAllWorkers ?? keyset ?????
+// ????? OFFSET????? (n-1) ? WHERE pk > ? ... LIMIT ? ?????????????
 func TestSamplePKBoundariesImproved_KeysetStepsForAllWorkers(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
@@ -2399,7 +2399,7 @@ func TestSamplePKBoundariesImproved_KeysetStepsForAllWorkers(t *testing.T) {
 	const estimatedRows int64 = 40 // step = 40/4 = 10
 	const step int64 = 10
 
-	// Batch 1：从表头开始
+	// Batch 1??????
 	firstQuery := "SELECT `id` FROM `src`.`events` ORDER BY `id` ASC LIMIT ?"
 	rows1 := sqlmock.NewRows([]string{"id"})
 	for i := int64(1); i <= step; i++ {
@@ -2407,7 +2407,7 @@ func TestSamplePKBoundariesImproved_KeysetStepsForAllWorkers(t *testing.T) {
 	}
 	mock.ExpectQuery(firstQuery).WithArgs(step).WillReturnRows(rows1)
 
-	// Batch 2..n-1：每批用上批的末位作为下界，算法共 n-1 轮，故除首轮外再 mock n-2 批
+	// Batch 2..n-1????????????????? n-1 ???????? mock n-2 ?
 	for b := 1; b < workers-1; b++ {
 		lastID := fmt.Sprintf("%03d", int64(b)*step)
 		query := "SELECT `id` FROM `src`.`events` WHERE `id` > ? ORDER BY `id` ASC LIMIT ?"
@@ -2425,38 +2425,38 @@ func TestSamplePKBoundariesImproved_KeysetStepsForAllWorkers(t *testing.T) {
 	for i := 1; i < len(boundaries); i++ {
 		assert.Less(t, compareBoundaryValues(boundaries[i-1], boundaries[i]), 0)
 	}
-	// 校验末位为 "030"（第三批的 step*3 处）
+	// ????? "030"????? step*3 ??
 	assert.Equal(t, "030", boundaries[workers-2])
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestSamplePKBoundariesImproved_EstimatedRowsTooSmall 估算行数小于 n*2 时直接返回错误，
-// 表明不值得并行，调用方应回退到单线程 keyset 读取。
+// TestSamplePKBoundariesImproved_EstimatedRowsTooSmall ?????? n*2 ????????
+// ?????????????????? keyset ???
 func TestSamplePKBoundariesImproved_EstimatedRowsTooSmall(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
 	defer db.Close()
 
 	var ts TaskService
-	// estimatedRows=5, n=4，要求 >= n*2=8，期望失败且不发任何查询
+	// estimatedRows=5, n=4??? >= n*2=8????????????
 	_, err = ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, 5, 4)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "insufficient rows")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestSamplePKBoundariesImproved_EstimatedTooLargeConvergesAtTableEnd 估算行数偏大：
-// 最后一批 rowsRead < step 即收敛，有效 worker 自动减少，调用方据此下调 intraWorkers。
+// TestSamplePKBoundariesImproved_EstimatedTooLargeConvergesAtTableEnd ???????
+// ???? rowsRead < step ?????? worker ???????????? intraWorkers?
 func TestSamplePKBoundariesImproved_EstimatedTooLargeConvergesAtTableEnd(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
 	defer db.Close()
 
 	const workers = 4
-	const estimatedRows int64 = 400 // step = 100，估算远大于实际
+	const estimatedRows int64 = 400 // step = 100????????
 	const step int64 = 100
 
-	// Batch 1: 满 batch
+	// Batch 1: ? batch
 	rows1 := sqlmock.NewRows([]string{"id"})
 	for i := int64(1); i <= step; i++ {
 		rows1.AddRow(fmt.Sprintf("%03d", i))
@@ -2465,7 +2465,7 @@ func TestSamplePKBoundariesImproved_EstimatedTooLargeConvergesAtTableEnd(t *test
 		WithArgs(step).
 		WillReturnRows(rows1)
 
-	// Batch 2: 满 batch
+	// Batch 2: ? batch
 	rows2 := sqlmock.NewRows([]string{"id"})
 	for i := int64(1); i <= step; i++ {
 		rows2.AddRow(fmt.Sprintf("%03d", step+i))
@@ -2474,7 +2474,7 @@ func TestSamplePKBoundariesImproved_EstimatedTooLargeConvergesAtTableEnd(t *test
 		WithArgs("100", step).
 		WillReturnRows(rows2)
 
-	// Batch 3: 只剩 30 行，rowsRead < step，触发收敛
+	// Batch 3: ?? 30 ??rowsRead < step?????
 	rows3 := sqlmock.NewRows([]string{"id"})
 	for i := int64(1); i <= 30; i++ {
 		rows3.AddRow(fmt.Sprintf("%03d", 2*step+i))
@@ -2483,21 +2483,21 @@ func TestSamplePKBoundariesImproved_EstimatedTooLargeConvergesAtTableEnd(t *test
 		WithArgs("200", step).
 		WillReturnRows(rows3)
 
-	// Batch 4 不应发出（循环已收敛）
+	// Batch 4 ???????????
 
 	var ts TaskService
 	boundaries, err := ts.samplePKBoundariesImproved(context.Background(), db, "src", "events", []string{"id"}, estimatedRows, workers)
 	require.NoError(t, err)
-	// 实际行数 = 230, step=100，应产出 2 个边界（100, 200），有效 worker=3
+	// ???? = 230, step=100???? 2 ????100, 200???? worker=3
 	require.Len(t, boundaries, 2)
 	assert.Equal(t, "100", boundaries[0])
 	assert.Equal(t, "200", boundaries[1])
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestSamplePKBoundariesImproved_CompositeKeysetSteps 复合主键 keyset 步进：
-// 验证 buildKeysetCompositeWhere 正确展开 (pk1,pk2) > (v1,v2) 为 OR 表达式，
-// 边界产出 []interface{} 类型，与 comparePKWithBoundary 续传逻辑兼容。
+// TestSamplePKBoundariesImproved_CompositeKeysetSteps ???? keyset ???
+// ?? buildKeysetCompositeWhere ???? (pk1,pk2) > (v1,v2) ? OR ????
+// ???? []interface{} ???? comparePKWithBoundary ???????
 func TestSamplePKBoundariesImproved_CompositeKeysetSteps(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
@@ -2507,7 +2507,7 @@ func TestSamplePKBoundariesImproved_CompositeKeysetSteps(t *testing.T) {
 	const estimatedRows int64 = 30
 	const step int64 = 10
 
-	// Batch 1：从表头开始，末位 = ["002", "b"]
+	// Batch 1????????? = ["002", "b"]
 	batch1 := [][]driver.Value{
 		{"001", "a"}, {"001", "b"}, {"001", "c"}, {"001", "d"}, {"001", "e"},
 		{"001", "f"}, {"001", "g"}, {"001", "h"}, {"001", "i"}, {"002", "b"},
@@ -2539,7 +2539,7 @@ func TestSamplePKBoundariesImproved_CompositeKeysetSteps(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, boundaries, workers-1)
 
-	// 末位为 ["002","b"] 和 ["003","b"]，均为 []interface{} 类型
+	// ??? ["002","b"] ? ["003","b"]??? []interface{} ??
 	expected := []interface{}{
 		[]interface{}{"002", "b"},
 		[]interface{}{"003", "b"},
@@ -2816,7 +2816,7 @@ func TestWithDDL(t *testing.T) {
 
 func TestDropTargetTableIfNeeded(t *testing.T) {
 	ts := &TaskService{}
-	err := ts.dropTargetTableIfNeeded(nil, "test", "users", true)
+	err := ts.dropTargetTableIfNeeded(context.Background(), nil, "test", "users", true)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "target connection is nil")
 
@@ -2829,13 +2829,13 @@ func TestDropTargetTableIfNeeded(t *testing.T) {
 	defer conn.Close()
 
 	t.Run("disabled returns nil", func(t *testing.T) {
-		err := ts.dropTargetTableIfNeeded(conn, "test", "users", false)
+		err := ts.dropTargetTableIfNeeded(context.Background(), conn, "test", "users", false)
 		assert.NoError(t, err)
 	})
 
 	t.Run("drops target table when enabled", func(t *testing.T) {
 		mock.ExpectExec("DROP TABLE IF EXISTS `test`.`users`").WillReturnResult(sqlmock.NewResult(0, 0))
-		err := ts.dropTargetTableIfNeeded(conn, "test", "users", true)
+		err := ts.dropTargetTableIfNeeded(context.Background(), conn, "test", "users", true)
 		require.NoError(t, err)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
@@ -2850,7 +2850,7 @@ func TestDropTargetTableIfNeeded(t *testing.T) {
 		defer customConn.Close()
 
 		customMock.ExpectExec("DROP TABLE IF EXISTS `prod_backup`.`users_archive`").WillReturnResult(sqlmock.NewResult(0, 0))
-		err = ts.dropTargetTableIfNeeded(customConn, "prod_backup", "users_archive", true)
+		err = ts.dropTargetTableIfNeeded(context.Background(), customConn, "prod_backup", "users_archive", true)
 		require.NoError(t, err)
 		require.NoError(t, customMock.ExpectationsWereMet())
 	})
@@ -2870,9 +2870,13 @@ func TestEnsureTargetTable_DropBeforeDDLRecreatesExistingTable(t *testing.T) {
 
 	targetMock.ExpectQuery("SELECT schema_name FROM information_schema.schemata WHERE schema_name = ?").WithArgs("target_db").WillReturnError(sql.ErrNoRows)
 	targetMock.ExpectExec("CREATE DATABASE IF NOT EXISTS `target_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci").WillReturnResult(sqlmock.NewResult(0, 0))
-	targetMock.ExpectQuery("SELECT table_name FROM information_schema.tables WHERE table_schema = 'target_db' AND table_name = 'users'").WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("users"))
+	targetMock.ExpectQuery("SELECT table_name FROM information_schema.tables WHERE table_schema = \\? AND table_name = \\?").
+		WithArgs("target_db", "users").
+		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("users"))
+	targetMock.ExpectExec("SET SESSION FOREIGN_KEY_CHECKS=0").WillReturnResult(sqlmock.NewResult(0, 0))
 	targetMock.ExpectExec("DROP TABLE IF EXISTS `target_db`.`users`").WillReturnResult(sqlmock.NewResult(0, 0))
 	targetMock.ExpectExec("CREATE TABLE `target_db`.`users` LIKE `source_db`.`users`").WillReturnResult(sqlmock.NewResult(0, 0))
+	targetMock.ExpectExec("SET SESSION FOREIGN_KEY_CHECKS=1").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	t.Run("existing table is recreated when enabled", func(t *testing.T) {
 		targetConn, err := targetDB.Conn(context.Background())
@@ -2885,8 +2889,8 @@ func TestEnsureTargetTable_DropBeforeDDLRecreatesExistingTable(t *testing.T) {
 		runtime.sourceDB = sourceDB
 		runtime.targetDB = targetDB
 
-		// ensureTargetTable 只会在 CREATE TABLE LIKE 前走目标库连接的 DROP，因此这里仅验证执行路径
-		_, err = ts.ensureTargetTable(runtime, "source_db", "target_db", "users", "users", false, true)
+		// ensureTargetTable ??? CREATE TABLE LIKE ???????? DROP????????????
+		_, err = ts.ensureTargetTable(context.Background(), runtime, "source_db", "target_db", "users", "users", false, true)
 		require.NoError(t, err)
 	})
 
@@ -2903,10 +2907,10 @@ func TestMin(t *testing.T) {
 	assert.Equal(t, -1, min(-1, 0))
 }
 
-// ==================== captureFullSyncStartPosition（短锁取位点） ====================
+// ==================== captureFullSyncStartPosition??????? ====================
 
-// captureFullSyncStartPosition 已固定为"短锁取位点"模式：
-// 永远先 FTWRL，SHOW MASTER STATUS 拿到位点后立即 UNLOCK。
+// captureFullSyncStartPosition ????"?????"???
+// ??? FTWRL?SHOW MASTER STATUS ??????? UNLOCK?
 func TestCaptureFullSyncStartPosition_ShortReadLock(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -3127,9 +3131,9 @@ func TestCompleteTaskWithRepeatReschedulesUntilExhausted(t *testing.T) {
 	assert.NoError(t, ts.Close())
 }
 
-// TestScheduleCronTaskPreservesCronConfig 验证 ScheduleCronTask 设置后 cron 字段保留，
-// 这是回归测试：此前 ResetRepeat 误清了 ConfigureCronSchedule 刚写入的 cron 字段，
-// 导致 nextCronRun 因 CronExpression 为空而失败。
+// TestScheduleCronTaskPreservesCronConfig ?? ScheduleCronTask ??? cron ?????
+// ????????? ResetRepeat ??? ConfigureCronSchedule ???? cron ???
+// ?? nextCronRun ? CronExpression ??????
 func TestScheduleCronTaskPreservesCronConfig(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
 	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "cron_set", Name: "Cron Set"})
@@ -3145,8 +3149,8 @@ func TestScheduleCronTaskPreservesCronConfig(t *testing.T) {
 	assert.NoError(t, ts.Close())
 }
 
-// TestCompleteTaskCronReschedules 验证 cron 任务完成后会重新调度到下一次触发时间，
-// 且 cron 配置不会被 ClearScheduleConfig 误清。
+// TestCompleteTaskCronReschedules ?? cron ???????????????????
+// ? cron ????? ClearScheduleConfig ???
 func TestCompleteTaskCronReschedules(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
 	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "cron_reschedule", Name: "Cron Reschedule"})
@@ -3163,14 +3167,14 @@ func TestCompleteTaskCronReschedules(t *testing.T) {
 	assert.NoError(t, ts.Close())
 }
 
-// TestCompleteTaskClearsStaleScheduleConfig 验证非 cron / repeat 已耗尽的任务完成时，
-// 残留的调度字段被 ClearScheduleConfig 清空，避免前端在 COMPLETED 状态下误展示定时调度。
+// TestCompleteTaskClearsStaleScheduleConfig ??? cron / repeat ??????????
+// ???????? ClearScheduleConfig ???????? COMPLETED ???????????
 func TestCompleteTaskClearsStaleScheduleConfig(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
 	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "complete_clear", Name: "Complete Clear"})
 	require.NoError(t, err)
 
-	// 模拟残留的调度配置：repeat 模式但剩余次数为 0
+	// ??????????repeat ???????? 0
 	task.Context.ScheduleMode = "repeat"
 	task.Context.RepeatRemaining = 0
 	task.Context.CronExpression = "0 9 * * 1-5"
@@ -3186,8 +3190,8 @@ func TestCompleteTaskClearsStaleScheduleConfig(t *testing.T) {
 	assert.NoError(t, ts.Close())
 }
 
-// TestStartTaskImmediatelyClearsStaleCronFields 验证立即启动任务时清除残留的 cron 调度配置，
-// 避免 RUNNING 期间残留调度字段造成状态不一致。
+// TestStartTaskImmediatelyClearsStaleCronFields ?????????????? cron ?????
+// ?? RUNNING ????????????????
 func TestStartTaskImmediatelyClearsStaleCronFields(t *testing.T) {
 	ts := newScheduledTestTaskService(t.TempDir())
 	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "start_clear_cron", Name: "Start Clear Cron"})
@@ -3206,8 +3210,8 @@ func TestStartTaskImmediatelyClearsStaleCronFields(t *testing.T) {
 	assert.NoError(t, ts.Close())
 }
 
-// TestCancelScheduleAfterCronRestoresStatus 验证对 cron 定时任务取消后能恢复到原始状态，
-// 而非因 ScheduledFromStatus 被误清而退化为 PENDING。
+// TestCancelScheduleAfterCronRestoresStatus ??? cron ????????????????
+// ??? ScheduledFromStatus ??????? PENDING?
 func TestCancelScheduleAfterCronRestoresStatus(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
 	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "cron_cancel_restore", Name: "Cron Cancel Restore"})
@@ -3253,7 +3257,7 @@ func TestScheduleOperationsReturnStorageErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to save cancelled schedule state")
 }
 
-// ==================== 阶段状态机：entity 助手方法 ====================
+// ==================== ??????entity ???? ====================
 
 func TestSyncPhase_HelpersOnFreshTask(t *testing.T) {
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "phase_fresh"})
@@ -3332,7 +3336,7 @@ func TestSyncPhase_ResetWipesAllPhaseFields(t *testing.T) {
 	assert.False(t, task.FullSyncIncomplete())
 }
 
-// ==================== 阶段状态机：service 持久化 helper ====================
+// ==================== ??????service ??? helper ====================
 
 func TestUpdateSyncPhase_PersistsAndIsNoopForUnknownTask(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
@@ -3353,10 +3357,10 @@ func TestUpdateSyncPhase_PersistsAndIsNoopForUnknownTask(t *testing.T) {
 	})
 }
 
-// ==================== executeSync 入口门禁 + 暂停 bug ====================
+// ==================== executeSync ???? + ?? bug ====================
 
-// TestExecuteSync_IncrementalRequiresFullSync 覆盖修复 5：
-// 纯 INCREMENTAL 模式下，若任务从未完成过全量，必须直接标 FAILED 而不是订阅 binlog。
+// TestExecuteSync_IncrementalRequiresFullSync ???? 5?
+// ? INCREMENTAL ???????????????????? FAILED ????? binlog?
 func TestExecuteSync_IncrementalRequiresFullSync(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
@@ -3364,7 +3368,7 @@ func TestExecuteSync_IncrementalRequiresFullSync(t *testing.T) {
 		Name: "Incremental Without Full",
 		Mode: taskEntity.SyncModeIncremental,
 	})
-	task.Start() // 状态 RUNNING，否则 failTaskUnlessCancelled 会忽略
+	task.Start() // ?? RUNNING??? failTaskUnlessCancelled ???
 	ts.tasks[task.Config.ID] = task
 
 	ts.executeSync(context.Background(), task.Config.ID, &taskRuntime{})
@@ -3374,9 +3378,9 @@ func TestExecuteSync_IncrementalRequiresFullSync(t *testing.T) {
 	assert.Contains(t, task.Context.ErrorStack, "requires a previously completed full sync")
 }
 
-// TestExecuteSync_IncrementalAllowedAfterFullCompleted 覆盖修复 5 的肯定路径：
-// 一旦阶段为 FULL_COMPLETED，INCREMENTAL 必须放行进入 executeIncrementalSync。
-// 这里用 nil runtime 触发 executeIncrementalSync 内部的早退保护，确认门禁本身已通过。
+// TestExecuteSync_IncrementalAllowedAfterFullCompleted ???? 5 ??????
+// ????? FULL_COMPLETED?INCREMENTAL ?????? executeIncrementalSync?
+// ??? nil runtime ?? executeIncrementalSync ??????????????????
 func TestExecuteSync_IncrementalAllowedAfterFullCompleted(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
 	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
@@ -3391,20 +3395,20 @@ func TestExecuteSync_IncrementalAllowedAfterFullCompleted(t *testing.T) {
 
 	ts.executeSync(context.Background(), task.Config.ID, nil)
 
-	// 门禁通过后进入 executeIncrementalSync，由于 runtime 为 nil 会把任务标 FAILED，
-	// 但错误信息应来自"task runtime is nil"，证明门禁本身已放行。
+	// ??????? executeIncrementalSync??? runtime ? nil ????? FAILED?
+	// ????????"task runtime is nil"???????????
 	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
 	assert.Contains(t, task.Context.ErrorStack, "runtime")
 	assert.NotContains(t, task.Context.ErrorStack, "requires a previously completed full sync")
 }
 
-// TestExecuteSync_FullPauseDoesNotCompleteTask 覆盖暂停被错标 COMPLETED 的 P0 bug：
-// 全量过程中用户暂停 → executeFullSync 入口的"早期停止检查"返回 errFullSyncStoppedByUser
-// → executeSync 识别 sentinel 后既不能调用 completeTask 也不能把任务标 FAILED，
-// 阶段也不能被推进到 FULL_COMPLETED。
+// TestExecuteSync_FullPauseDoesNotCompleteTask ??????? COMPLETED ? P0 bug?
+// ????????? ? executeFullSync ???"??????"?? errFullSyncStoppedByUser
+// ? executeSync ?? sentinel ?????? completeTask ??????? FAILED?
+// ????????? FULL_COMPLETED?
 //
-// 这里复用 executeFullSync 入口的早停短路：不需要 mock SQL，只要 runtime 三件套非 nil
-// 即可，校验通过后就会撞到 isTaskStopped 检查。
+// ???? executeFullSync ??????????? mock SQL??? runtime ???? nil
+// ???????????? isTaskStopped ???
 func TestExecuteSync_FullPauseDoesNotCompleteTask(t *testing.T) {
 	db, _, err := sqlmock.New()
 	require.NoError(t, err)
@@ -3421,7 +3425,7 @@ func TestExecuteSync_FullPauseDoesNotCompleteTask(t *testing.T) {
 	task.Start()
 	ts.tasks[task.Config.ID] = task
 
-	// 模拟"用户在全量过程中按了暂停"（走 TaskService 入口，与生产路径一致）
+	// ??"????????????"?? TaskService ???????????
 	require.NoError(t, ts.PauseTask(task.Config.ID))
 
 	ts.executeSync(context.Background(), task.Config.ID, &taskRuntime{
@@ -3438,9 +3442,9 @@ func TestExecuteSync_FullPauseDoesNotCompleteTask(t *testing.T) {
 		"paused full sync must NOT be flipped to FULL_FAILED either")
 }
 
-// TestExecuteSync_DatabaseRebuildPauseKeepsPhase 覆盖库级别重建被暂停时，
-// executeFullSync 必须把 errFullSyncStoppedByUser 原样返回，不能调用 MarkFullSyncFailed，
-// 因此 SyncPhase 保持 FULL_STARTED 而不被翻转为 FULL_FAILED。
+// TestExecuteSync_DatabaseRebuildPauseKeepsPhase ????????????
+// executeFullSync ??? errFullSyncStoppedByUser ????????? MarkFullSyncFailed?
+// ?? SyncPhase ?? FULL_STARTED ?????? FULL_FAILED?
 func TestExecuteSync_DatabaseRebuildPauseKeepsPhase(t *testing.T) {
 	sourceDB, sourceMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
@@ -3452,10 +3456,10 @@ func TestExecuteSync_DatabaseRebuildPauseKeepsPhase(t *testing.T) {
 	sourceMock.MatchExpectationsInOrder(false)
 	targetMock.MatchExpectationsInOrder(false)
 
-	// FULL 模式不再捕获 binlog 位点，无需 mock FTWRL/SHOW MASTER STATUS/UNLOCK。
+	// FULL ?????? binlog ????? mock FTWRL/SHOW MASTER STATUS/UNLOCK?
 
-	// 目标库：库级别重建。第一个 DROP 故意延迟，让测试有机会在重建过程中暂停任务；
-	// 暂停后第二个库的迭代应被 isTaskStopped 拦截，不会执行 DROP/CREATE。
+	// ????????????? DROP ??????????????????????
+	// ???????????? isTaskStopped ??????? DROP/CREATE?
 	targetMock.ExpectExec(regexp.QuoteMeta("DROP DATABASE IF EXISTS `tgt_a`")).
 		WillDelayFor(500 * time.Millisecond).
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -3487,7 +3491,7 @@ func TestExecuteSync_DatabaseRebuildPauseKeepsPhase(t *testing.T) {
 	}
 	ts.runtimes[task.Config.ID] = runtime
 
-	// 在重建过程中暂停任务：延迟 100ms 确保 executeFullSync 已通过早停检查并进入 rebuild。
+	// ????????????? 100ms ?? executeFullSync ?????????? rebuild?
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		_ = ts.PauseTask(task.Config.ID)
@@ -3504,8 +3508,8 @@ func TestExecuteSync_DatabaseRebuildPauseKeepsPhase(t *testing.T) {
 	require.NoError(t, targetMock.ExpectationsWereMet())
 }
 
-// TestErrFullSyncStoppedByUser_IsSentinel 守住 sentinel 的可识别性：
-// errors.Is 必须对包装后的错误仍为 true，否则上层 switch 会把暂停误判为失败。
+// TestErrFullSyncStoppedByUser_IsSentinel ?? sentinel ??????
+// errors.Is ??????????? true????? switch ??????????
 func TestErrFullSyncStoppedByUser_IsSentinel(t *testing.T) {
 	wrapped := fmt.Errorf("syncDatabasePair: %w", errFullSyncStoppedByUser)
 	assert.True(t, errors.Is(wrapped, errFullSyncStoppedByUser))
@@ -3514,7 +3518,7 @@ func TestErrFullSyncStoppedByUser_IsSentinel(t *testing.T) {
 	assert.False(t, errors.Is(other, errFullSyncStoppedByUser))
 }
 
-// TestFormatBinlogPosition 覆盖小工具，避免空位点污染任务存档。
+// TestFormatBinlogPosition ??????????????????
 func TestFormatBinlogPosition(t *testing.T) {
 	cases := []struct {
 		name string
@@ -3533,7 +3537,7 @@ func TestFormatBinlogPosition(t *testing.T) {
 	}
 }
 
-// mysqlPositionLike 单测内联辅助：把测试参数转成 mysql.Position，避免在每个 case 内手写转换。
+// mysqlPositionLike ?????????????? mysql.Position?????? case ??????
 type mysqlPositionLike struct {
 	Name string
 	Pos  uint32
@@ -3565,11 +3569,11 @@ func TestPersistTableBinlogHWM_PersistsBeforeCompleted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "mysql-bin.000003:456", task.Context.TableBinlogHWMs["src.nopk"])
 
-	// clearFullSyncResume 不得清掉已落盘的 HWM（增量仍需用）。
+	// clearFullSyncResume ???????? HWM????????
 	ts.clearFullSyncResume(task.Config.ID)
 	assert.Equal(t, "mysql-bin.000003:456", task.Context.TableBinlogHWMs["src.nopk"])
 
-	// 新一轮全量开始时清空。
+	// ???????????
 	ts.updateSyncPhase(task.Config.ID, func(t *taskEntity.SyncTask) {
 		t.ClearTableBinlogHWMs()
 		t.MarkFullSyncStarted("mysql-bin.000004:1")
@@ -3586,7 +3590,7 @@ func TestPersistTableBinlogHWM_FailsClosedOnEmptyPosition(t *testing.T) {
 	assert.Nil(t, task.Context.TableBinlogHWMs)
 }
 
-// ==================== 节流型位点回写 ====================
+// ==================== ??????? ====================
 
 func TestThrottledPositionPersister_OnlyWritesAfterMinInterval(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
@@ -3598,12 +3602,12 @@ func TestThrottledPositionPersister_OnlyWritesAfterMinInterval(t *testing.T) {
 	persist("throttle", mysqlPositionLike{Name: "mysql-bin.000100", Pos: 1}.toMysql())
 	assert.Equal(t, "mysql-bin.000100:1", task.Context.LastIncrementalPosition)
 
-	// 立即再写一次（在 throttle 窗口内）应被丢弃，不更新存档
+	// ???????? throttle ??????????????
 	persist("throttle", mysqlPositionLike{Name: "mysql-bin.000100", Pos: 2}.toMysql())
 	assert.Equal(t, "mysql-bin.000100:1", task.Context.LastIncrementalPosition,
 		"second call within throttle window must be dropped")
 
-	// 等过节流窗口后再写应放行
+	// ????????????
 	time.Sleep(80 * time.Millisecond)
 	persist("throttle", mysqlPositionLike{Name: "mysql-bin.000100", Pos: 3}.toMysql())
 	assert.Equal(t, "mysql-bin.000100:3", task.Context.LastIncrementalPosition)
@@ -3629,7 +3633,7 @@ func TestStopSchedulerIsIdempotent(t *testing.T) {
 }
 
 // ============================================================
-// 运行时进度追踪单元测试
+// ???????????
 // ============================================================
 
 func TestInitRunningProgress(t *testing.T) {
@@ -3650,7 +3654,7 @@ func TestInitRunningProgress(t *testing.T) {
 	assert.Equal(t, "full", rp.Phase)
 	assert.Len(t, rp.Tables, 3)
 
-	// 验证所有表初始状态为 pending
+	// ?????????? pending
 	for _, ti := range rp.Tables {
 		assert.Equal(t, "pending", ti.Status)
 		assert.Equal(t, int64(0), ti.ProcessedRows)
@@ -3696,7 +3700,7 @@ func TestStartTableProgress_NonExistentTable(t *testing.T) {
 	}
 	ts.initRunningProgress(taskID, entries, "full")
 
-	// 启动一个不存在的表，不应 panic
+	// ???????????? panic
 	assert.NotPanics(t, func() {
 		ts.startTableProgress(taskID, "db1", "nonexistent", 0)
 	})
@@ -3713,7 +3717,7 @@ func TestUpdateTableProgress(t *testing.T) {
 	ts.initRunningProgress(taskID, entries, "full")
 	ts.startTableProgress(taskID, "db1", "users", 10000)
 
-	// 模拟处理了 2000 行，耗时 2 秒
+	// ????? 2000 ???? 2 ?
 	ts.updateTableProgress(taskID, "db1", "users", 2000, 2.0, time.Now().Add(-2*time.Second), 10000)
 
 	rp, err := ts.GetTaskProgress(taskID)
@@ -3739,7 +3743,7 @@ func TestUpdateTableProgress_ProgressCappedAt100(t *testing.T) {
 	ts.initRunningProgress(taskID, entries, "full")
 	ts.startTableProgress(taskID, "db1", "users", 100)
 
-	// 处理超过总行数
+	// ???????
 	ts.updateTableProgress(taskID, "db1", "users", 150, 1.0, time.Now().Add(-time.Second), 100)
 
 	rp, err := ts.GetTaskProgress(taskID)
@@ -3748,7 +3752,7 @@ func TestUpdateTableProgress_ProgressCappedAt100(t *testing.T) {
 	for _, ti := range rp.Tables {
 		if ti.Schema == "db1" && ti.Table == "users" {
 			assert.Equal(t, int64(150), ti.ProcessedRows)
-			assert.Equal(t, 100.0, ti.ProgressPct) // 封顶 100
+			assert.Equal(t, 100.0, ti.ProgressPct) // ?? 100
 		}
 	}
 }
@@ -3764,7 +3768,7 @@ func TestUpdateTableProgress_ZeroElapsed(t *testing.T) {
 	ts.initRunningProgress(taskID, entries, "full")
 	ts.startTableProgress(taskID, "db1", "users", 10000)
 
-	// elapsed=0 时不应计算速度（避免除零）
+	// elapsed=0 ?????????????
 	assert.NotPanics(t, func() {
 		ts.updateTableProgress(taskID, "db1", "users", 100, 0, time.Now().Add(-time.Second), 10000)
 	})
@@ -3834,12 +3838,12 @@ func TestRefreshOverallProgress(t *testing.T) {
 	}
 	ts.initRunningProgress(taskID, entries, "full")
 
-	// 第一张表完成
+	// ??????
 	ts.startTableProgress(taskID, "db1", "users", 1000)
 	ts.updateTableProgress(taskID, "db1", "users", 1000, 1.0, time.Now().Add(-10*time.Second), 3000)
 	ts.completeTableProgress(taskID, "db1", "users")
 
-	// 第二张表进行中
+	// ???????
 	ts.startTableProgress(taskID, "db1", "orders", 2000)
 	ts.updateTableProgress(taskID, "db1", "orders", 500, 2.0, time.Now().Add(-10*time.Second), 3000)
 
@@ -3894,7 +3898,7 @@ func TestRefreshOverallProgress_NoRemaining(t *testing.T) {
 
 	rp, err := ts.GetTaskProgress(taskID)
 	assert.NoError(t, err)
-	// 全部完成时，预估剩余应为 -1
+	// ???????????? -1
 	assert.Equal(t, float64(-1), rp.EstimatedRemain)
 }
 
@@ -3917,14 +3921,14 @@ func TestClearRunningProgress(t *testing.T) {
 	}
 	ts.initRunningProgress(taskID, entries, "full")
 
-	// 确认存在
+	// ????
 	_, err := ts.GetTaskProgress(taskID)
 	assert.NoError(t, err)
 
-	// 清除
+	// ??
 	ts.clearRunningProgress(taskID)
 
-	// 确认已清除
+	// ?????
 	_, err = ts.GetTaskProgress(taskID)
 	assert.Error(t, err)
 }
@@ -3935,7 +3939,7 @@ func TestProgressMethods_NoRunningProgress(t *testing.T) {
 
 	taskID := "test_no_rp"
 
-	// 所有方法在无 RunningProgress 时不应 panic
+	// ?????? RunningProgress ??? panic
 	assert.NotPanics(t, func() {
 		ts.startTableProgress(taskID, "db1", "users", 100)
 		ts.updateTableProgress(taskID, "db1", "users", 100, 1.0, time.Now().Add(-time.Second), 100)
@@ -3958,10 +3962,10 @@ func TestCompleteTask_ClearsRunningProgress(t *testing.T) {
 	}
 	ts.initRunningProgress(taskID, entries, "full")
 
-	// 完成任务
+	// ????
 	ts.completeTask(taskID)
 
-	// 进度应被清除
+	// ??????
 	_, err := ts.GetTaskProgress(taskID)
 	assert.Error(t, err)
 }
@@ -3978,10 +3982,10 @@ func TestPauseTask_ClearsRunningProgress(t *testing.T) {
 	}
 	ts.initRunningProgress(taskID, entries, "full")
 
-	// 暂停任务
+	// ????
 	_ = ts.PauseTask(taskID)
 
-	// 进度应被清除
+	// ??????
 	_, err := ts.GetTaskProgress(taskID)
 	assert.Error(t, err)
 }

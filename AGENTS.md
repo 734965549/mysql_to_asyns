@@ -9,18 +9,94 @@ These instructions apply to the entire repository. Read this file before making 
 - Read the smallest relevant source files before editing. Do not rely only on documentation.
 - Preserve user changes. Do not revert unrelated modified files.
 
-### Codebase-memory indexing (Windows)
+### Codebase-memory knowledge graph (Windows)
 
-Do **not** rely on the MCP `index_repository` tool while Cursor is connected — the MCP server holds the SQLite graph open and the worker exits immediately. Paths containing non-ASCII characters (e.g. `E盘`) also crash the worker.
+Workspace roots:
 
-Use the project script instead, then restart Cursor (or reload MCP):
+- `D:\Epan\BaiduNetdiskDownload\go\` — mysql_to_asyns, lianghua, aiops, bindip
+- `D:\E\BaiduNetdiskDownload\go\` — goInception, archery
+
+MCP server id in Cursor: `user-codebase-memory-mcp` (global) or `project-0-<workspace>-codebase-memory-mcp` (project-level). Add `.cursor/mcp.json` with `CBM_ALLOWED_ROOT` = `C:/temp/<folder>` (ASCII junction) when indexing from this machine.
+
+#### Indexed projects (use `"project"` in every MCP call)
+
+| Folder | MCP `project` | Local path | Index status | Junction |
+|--------|---------------|------------|--------------|----------|
+| `mysql_to_asyns` | **`mysql_to_asyns`** | `D:\Epan\BaiduNetdiskDownload\go\mysql_to_asyns` | ✅ indexed (3489 nodes) | `C:\temp\mysql_to_asyns` |
+| `lianghua` | **`lianghua`** | `D:\Epan\BaiduNetdiskDownload\go\lianghua` | ✅ indexed (2410 nodes) | `C:\temp\lianghua` |
+| `aiops` | **`aiops`** | `D:\Epan\BaiduNetdiskDownload\go\aiops` | ✅ indexed (7282 nodes) | `C:\temp\aiops` |
+| `bindip` | **`bindip`** | `D:\Epan\BaiduNetdiskDownload\go\bindip` | ✅ indexed (407 nodes) | `C:\temp\bindip` |
+| `goInception` | **`goInception`** | `D:\E\BaiduNetdiskDownload\go\goInception` | ✅ indexed (16908 nodes) | `C:\temp\goInception` |
+| `archery` | **`archery`** | `D:\E\BaiduNetdiskDownload\go\archery` | ✅ indexed (8012 nodes) | `C:\temp\archery` |
+
+**This repo:** always pass `"project": "mysql_to_asyns"`.
+
+**Sibling repo in Cursor:** pass the matching `project` from the table (same as folder name).
+
+#### Query tools (use via MCP)
+
+| Question | Tool |
+|----------|------|
+| Find functions/classes by keyword | `search_graph` with `query` or `name_pattern` |
+| Text search enriched with graph context | `search_code` |
+| Who calls X / what does X call | `trace_path` (`direction`: inbound/outbound/both) |
+| Complex graph patterns | `query_graph` (Cypher) |
+| Read source for a symbol | `get_code_snippet` (get `qualified_name` from `search_graph` first) |
+| Package/module overview | `get_architecture` |
+| Node/edge types | `get_graph_schema` |
+
+Examples:
+
+```json
+{"project": "mysql_to_asyns", "query": "full load engine", "limit": 20}
+{"project": "aiops", "query": "runbook execution", "limit": 20}
+{"project": "lianghua", "name_pattern": ".*Order.*", "label": "Function"}
+{"project": "bindip", "query": "binding state", "limit": 10}
+{"project": "goInception", "query": "sql audit execute", "limit": 20}
+{"project": "archery", "query": "sql workflow review", "limit": 20}
+```
+
+Prefer these graph tools over `rg`/Grep when exploring structure, callers, or architecture.
+
+#### Tools not exposed in Cursor (MCP pagination — use CLI instead)
+
+Cursor only loads the first page of MCP tools. These require the standalone CLI:
+
+```powershell
+& "$env:USERPROFILE\.local\bin\codebase-memory-mcp.exe" cli list_projects
+& "$env:USERPROFILE\.local\bin\codebase-memory-mcp.exe" cli detect_changes --project mysql_to_asyns
+& "$env:USERPROFILE\.local\bin\codebase-memory-mcp.exe" cli index_status --project mysql_to_asyns
+```
+
+Replace `mysql_to_asyns` with any project name from the table as needed.
+
+#### Indexing (do not use MCP `index_repository` while Cursor is connected)
+
+The MCP server holds the SQLite graph open and the worker exits immediately. Paths containing non-ASCII characters (e.g. `E盘`) also crash the worker. Always index through an ASCII junction: `C:\temp\<folder>`.
+
+**This repo (`mysql_to_asyns`):**
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/index-codebase.ps1
 # or: make index-codebase
 ```
 
-The script creates an ASCII junction at `C:\temp\mysql_to_asyns`, runs the standalone CLI, and writes `.codebase-memory/graph.db.zst`. Exclusions live in `.cbmignore`.
+**Sibling repos — generic recipe:**
+
+```powershell
+$cbm = "$env:USERPROFILE\.local\bin\codebase-memory-mcp.exe"
+$name = "goInception"   # or aiops / lianghua / bindip / archery
+$repo = "D:\E\BaiduNetdiskDownload\go\$name"   # use D:\Epan\... for Epan-path repos
+$junction = "C:\temp\$name"
+
+if (-not (Test-Path $junction)) {
+  New-Item -ItemType Junction -Path $junction -Target $repo | Out-Null
+}
+
+& $cbm cli index_repository --repo-path $junction --name $name --mode full --persistence true
+```
+
+Then reload MCP servers (or restart Cursor). Artifact: `<repo>/.codebase-memory/graph.db.zst` (gitignored).
 
 Useful context files:
 

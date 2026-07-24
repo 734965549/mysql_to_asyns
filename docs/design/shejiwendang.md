@@ -156,6 +156,10 @@ StartTask
 
 全量写统一使用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE）。目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 后由程序在全量前重建为空；如果目标表已有数据，属于不支持场景，可能失败或污染目标数据。全量不是增量回放，不使用 upsert 作为默认语义。开启 `enable_skip_binlog=true` 时，全量写入前在目标端写入连接上执行 `SET SESSION sql_log_bin=0`，写入完成后恢复为 1；需目标库账号具备 SUPER 权限。
 
+#### V2 写事务提交与 `__mts_fl_tx`
+
+`full_load_engine=v2` 时，写入侧在每个目标 schema 维护系统表 `__mts_fl_tx`（InnoDB，带表/列注释，含 `run_id`）。每个写事务提交前插入唯一 UUID marker，与业务行同事务提交。客户端遇到连接类 Commit 错误时，**不得**用业务行存在性推断结果（无主键跨事务相同行会误判；非锁定读可能与仍在处理的 COMMIT 竞态），而是对该 marker 做 `SELECT ... FOR UPDATE`：命中则只推进进度，无行则整事务重放；无法判定则 fail-closed。启动前还会：在首次目标端 DDL 前对目标 schema 获取 `GET_LOCK` 强制互斥（禁止同 schema 并发 V2；持有至任务级收尾；要求 MySQL ≥ 5.7.5 以支持同连接多锁；`target_max_open_conns` ≥ 2）；拒绝业务目标表占用保留名 `__mts_fl_tx`（大小写不敏感）；校验所有目标业务表为 InnoDB；并对已存在的 marker 表 fail-closed 校验 `BASE TABLE`/InnoDB/`id` 完整唯一键（`SUB_PART` NULL 或 ≥ 36）与 `run_id` 列。数据流水线成功后按本趟 `run_id` 删除本任务行（**不** `DROP` 共享表；清理独立短超时；失败/暂停保留行）。目标账号除 `CREATE TABLE` 外，还需对 marker 表具备 `INSERT`、`SELECT ... FOR UPDATE`、`DELETE`，以及 `GET_LOCK`/`RELEASE_LOCK`。详见 `docs/CONFIGURATION.md`「写事务提交标记表」。
+
 ## 4. 全量中断处理
 
 历史断点字段保存在：

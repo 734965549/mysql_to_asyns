@@ -176,6 +176,7 @@ type RowBatch struct {
 - 无主键表、空表、小表、超宽表、JSON、TEXT、BLOB、NULL 和大字段。
 - 分片边界无重复、无遗漏，目标行数与源端一致。
 - 锁超时、死锁、连接断开和提交失败时重放完整未提交事务。
+- Commit 连接错误（结果未知）时用目标库 `__mts_fl_tx` 事务标记 + 锁定当前读判定，禁止业务行存在性猜测；无主键跨事务相同行、目标非 InnoDB、已有 marker 表非 InnoDB/缺完整唯一键（含 `SUB_PART`）/缺 `run_id`、业务表占用保留名 `__mts_fl_tx`、同 schema 并发 V2（`GET_LOCK`）须有对应 fail-closed / 恢复测试；目标账号需 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DELETE`/`GET_LOCK`；数据流水线成功后按 `run_id` 短超时清理本任务行（不 DROP 共享表），失败路径保留。
 - 暂停和取消时所有未提交事务回滚，任务不能错误进入 FULL_COMPLETED。
 - 进度持久化锁外落盘与 Pause/End/Fail 并发时，陈旧 RUNNING 快照不得覆盖
   `PAUSED` / `STOPPED` / `FAILED` 存档（`TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave`）。

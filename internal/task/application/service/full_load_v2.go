@@ -60,7 +60,10 @@ type tableReadyV2 struct {
 // 阶段1 串行准备表结构；阶段2 表级一致性快照 + 任务级读写流水线；
 // 索引恢复写入 pending，由最外层在全部表数据完成后统一阶段3执行。
 // 禁止与灌数并行建索引：两者共用 runtime.targetDB 连接池，重叠会打满连接并拖垮目标库。
-func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, pending *[]pendingIndexRestore, dbLevelRebuilt bool) error {
+//
+// schemaLocks 由调用层预先获取并传入，覆盖完整任务生命周期（含 DDL 与索引恢复），
+// Engine 内部不再自行获取/释放锁。
+func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, pending *[]pendingIndexRestore, dbLevelRebuilt bool, schemaLocks *fullload.SchemaLocks) error {
 	taskID := task.Config.ID
 
 	tables := append([]string{}, specifiedTables...)
@@ -80,8 +83,8 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	logger.Info("[Task %s] FullLoadV2 阶段1: 准备 %d 个表结构...", taskID, len(tables))
 	ready := make([]tableReadyV2, 0, len(tables))
 	for i, tableName := range tables {
-		if s.isTaskStopped(taskID) {
-			return errFullSyncStoppedByUser
+		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
+			return err
 		}
 		targetTableName := s.resolveTableTargetName(task, sourceSchema, tableName, i)
 		identity, err := runtime.analyzer.AnalyzeTable(sourceSchema, tableName)
@@ -92,14 +95,14 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		}
 
 		effectiveDropBeforeDDL := task.Config.EnableDropTableBeforeDDL && !dbLevelRebuilt
-		savedIndexes, err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL)
+		savedIndexes, err := s.ensureTargetTable(ctx, runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL)
 		if err != nil {
 			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s -> %s.%s: %v", sourceSchema, tableName, targetSchema, targetTableName, err)
 			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 			return fmt.Errorf("%s", errMsg)
 		}
 		if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
-			indexes, dropErr := s.dropNonPrimaryKeyIndexes(runtime, targetSchema, targetTableName)
+			indexes, dropErr := s.dropNonPrimaryKeyIndexes(ctx, runtime, targetSchema, targetTableName)
 			if dropErr != nil {
 				logger.Warn("[Task %s] FullLoadV2: drop indexes for %s.%s failed: %v", taskID, targetSchema, targetTableName, dropErr)
 			} else {
@@ -159,6 +162,7 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		Options:         opt,
 		Stats:           stats,
 		TaskID:          taskID,
+		SchemaLocks:     schemaLocks,
 		IsStopped:       func() bool { return s.isTaskStopped(taskID) },
 		CaptureTableHWM: task.Config.Mode == taskEntity.SyncModeAll,
 		OnTableSnapshotReady: func(schema, table string, pos mysql.Position) error {
@@ -185,9 +189,9 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	}
 
 	runErr := engine.Run(ctx, specs)
-	if s.isTaskStopped(taskID) {
+	if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
 		logger.Info("[Task %s] FullLoadV2 stopped during pair %s->%s: %v", taskID, sourceSchema, targetSchema, runErr)
-		return errFullSyncStoppedByUser
+		return err
 	}
 	if runErr != nil {
 		s.failTaskUnlessCancelled(ctx, taskID, runErr.Error())

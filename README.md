@@ -107,7 +107,7 @@ MySQL-to-Async 是一个高性能的 MySQL 数据同步工具，支持全量同�
 
 - Go 1.24+
 
-- MySQL 5.7+ / 8.0+ (需开启Binlog)
+- MySQL 5.7.5+ / 8.0+ (需开启Binlog；V2 多 schema `GET_LOCK` 要求 ≥ 5.7.5)
 
 - Redis 6.0+ (推荐)
 
@@ -483,7 +483,7 @@ Content-Type: application/json
 
 - **V1 全量（默认 `full_load_engine=v1`）**：P0 之外不生成表级 HWM；全量读取为普通短查询，不长期持有源库 MDL。ALL + 无主键/无唯一键表在增量接管阶段存在重复 INSERT 风险。
 
-- **V2 全量（`full_load_engine=v2`）**：除 P0 外，ALL 模式下无 PK/UK 表在表级一致性快照窗口内额外捕获**表级 binlog HWM**（持久化到 `table_binlog_hwms`）；增量启动时对这类表 fail-closed 校验，并按 HWM 过滤已覆盖行。V2 全量读取使用表级长生命周期 `REPEATABLE READ` 快照事务，读期间持有表级 `MDL_SHARED_READ`，大表并行读前可能短暂表锁；运维需关注源库 undo 保留与 MDL 等待。
+- **V2 全量（`full_load_engine=v2`）**：除 P0 外，ALL 模式下无 PK/UK 表在表级一致性快照窗口内额外捕获**表级 binlog HWM**（持久化到 `table_binlog_hwms`）；增量启动时对这类表 fail-closed 校验，并按 HWM 过滤已覆盖行。V2 全量读取使用表级长生命周期 `REPEATABLE READ` 快照事务，读期间持有表级 `MDL_SHARED_READ`，大表并行读前可能短暂表锁；运维需关注源库 undo 保留与 MDL 等待。写入侧在每个目标 schema 自动创建 `__mts_fl_tx` 事务标记表（与业务 INSERT 同事务提交，含 `run_id`），用于 Commit 结果未知时的锁定探测，避免业务行存在性误判；启动前以 `GET_LOCK` 强制同 schema 单任务，并 fail-closed 校验目标业务表 InnoDB、marker 表结构（含完整唯一索引），拒绝业务表占用保留名 `__mts_fl_tx`；数据流水线成功后按 `run_id` 删除本任务 marker 行（不 `DROP` 共享表）；目标账号需对 marker 表具备 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DELETE`，以及 `GET_LOCK`/`RELEASE_LOCK`。
 
 - 历史版本曾提供 `enable_consistent_snapshot` 任务级字段，现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
 
@@ -1349,7 +1349,7 @@ FULL 模式执行一次无缝全表遍历，保证分片边界与读取流程本
 ALL 模式先捕获全局 binlog 位点（P0），再执行全量扫描，全量结束后从 P0 回放 binlog 追平变化，最终进入持续同步。
 
 - 第一次读取前获取并持久化 P0（`FLUSH TABLES WITH READ LOCK` → `SHOW MASTER STATUS` → `UNLOCK TABLES`，毫秒级），失败必须终止
-- 全量引擎：`full_load_engine=v1`（默认）使用普通短查询；`v2` 使用表级一致性快照（长生命周期 RR 事务，读期间持有表级 MDL，详见配置文档）
+- 全量引擎：`full_load_engine=v1`（默认）使用普通短查询；`v2` 使用表级一致性快照（长生命周期 RR 事务，读期间持有表级 MDL，详见配置文档）；V2 写入侧使用目标库 `__mts_fl_tx` 事务标记表做 Commit 未知恢复
 - V2 + ALL：无 PK/UK 表在快照窗口内额外捕获表级 binlog HWM（`table_binlog_hwms`），增量启动 fail-closed 校验并按 HWM 过滤
 - 全量结束后从 P0 回放 binlog：PK/UK INSERT 使用 upsert，UPDATE 正确处理 before/after key
 - 追平后进入实时同步

@@ -22,6 +22,10 @@ type Engine struct {
 	IsStopped func() bool    // 返回 true 时引擎尽快停止（用户暂停/取消）
 	TaskID    string
 
+	// SchemaLocks 由调用层预先获取的 schema 级互斥锁。
+	// 非 nil 时 Engine 不再内部获取/释放锁，由调用层负责生命周期管理。
+	SchemaLocks *SchemaLocks
+
 	// CaptureTableHWM 为 true 时，无 PK/UK 表在打开快照时短锁表并捕获 binlog HWM（ALL 模式）。
 	CaptureTableHWM bool
 	// OnTableSnapshotReady 在表级快照就绪且 HWM 捕获完成后调用；由集成层持久化 table_binlog_hwms。
@@ -55,6 +59,50 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	if poolMax > 0 && opt.MaxSnapshotConns != beforeConns {
 		logger.Info("[Task %s] FullLoadV2: capped MaxSnapshotConns %d -> %d by source pool max_open=%d",
 			e.TaskID, beforeConns, opt.MaxSnapshotConns, poolMax)
+	}
+
+	// [P2] 目标连接池容量校验：锁连接占用 1 个池槽，写路径至少需要 1 个额外连接。
+	targetPoolMax := e.TargetDB.Stats().MaxOpenConnections
+	if targetPoolMax > 0 {
+		if targetPoolMax < 2 {
+			return fmt.Errorf("full-load V2 requires target_max_open_conns >= 2 (current=%d); lock connection reserves 1 slot", targetPoolMax)
+		}
+		usable := targetPoolMax - 1
+		if opt.WriteWorkers > usable {
+			logger.Info("[Task %s] FullLoadV2: capping WriteWorkers %d -> %d (target pool %d minus 1 lock conn)",
+				e.TaskID, opt.WriteWorkers, usable, targetPoolMax)
+			opt.WriteWorkers = usable
+			e.Options = opt
+		}
+	}
+
+	// 目标端必须为 InnoDB：写事务原子性与 Commit 未知时的 marker 探测都依赖事务引擎。
+	if err := assertTargetTablesInnoDB(ctx, e.TargetDB, specs); err != nil {
+		return err
+	}
+	// 同一目标 schema 禁止并发 V2：由调用层预持有锁则跳过内部获取。
+	var schemaLocks *SchemaLocks
+	if e.SchemaLocks != nil {
+		schemaLocks = e.SchemaLocks
+	} else {
+		var err error
+		schemaLocks, err = acquireTxMarkerSchemaLocks(ctx, e.TargetDB, specs)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if rErr := schemaLocks.Release(context.Background()); rErr != nil {
+				logger.Warn("[Task %s] FullLoadV2: release tx marker schema locks: %v", e.TaskID, rErr)
+			}
+		}()
+	}
+	_ = schemaLocks // used implicitly via connection-level lock
+	if err := ensureTxMarkerTables(ctx, e.TargetDB, specs); err != nil {
+		return err
+	}
+	runID, err := newTxMarkerID()
+	if err != nil {
+		return fmt.Errorf("allocate full-load run_id: %w", err)
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
@@ -115,7 +163,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		writerErr = runWriters(cctx, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.IsStopped)
+		writerErr = runWriters(cctx, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.IsStopped, runID)
 		if writerErr != nil {
 			cancel()
 		}
@@ -152,6 +200,11 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	}
 	if cctx.Err() != nil {
 		return context.Canceled
+	}
+	// 数据流水线成功后按 run_id 删除本任务 marker 行（不 DROP 共享表）。
+	// 注意：此处早于可能存在的索引恢复等任务级收尾；清理失败只告警。
+	if err := cleanupTxMarkerRows(ctx, e.TargetDB, specs, runID); err != nil {
+		logger.Warn("[Task %s] FullLoadV2: cleanup tx marker rows after pipeline success failed (sync already committed): %v", e.TaskID, err)
 	}
 	return nil
 }

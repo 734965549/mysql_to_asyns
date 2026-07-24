@@ -190,6 +190,9 @@ func TestWriterLoopReplaysWholeTransactionOnDeadlock(t *testing.T) {
 	secondReplay := mock.ExpectPrepare(query)
 	secondReplay.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
 	secondReplay.ExpectExec().WithArgs(int64(2)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO `db`.`__mts_fl_tx` (`id`, `run_id`) VALUES (?, ?)")).
+		WithArgs(sqlmock.AnyArg(), "run-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	expectRestoreWriteSession(mock, false)
 
@@ -207,7 +210,7 @@ func TestWriterLoopReplaysWholeTransactionOnDeadlock(t *testing.T) {
 	var committed int64
 	err = writerLoop(context.Background(), 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 10}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil)
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, "run-1")
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -242,6 +245,9 @@ func TestWriterLoopReconnectsOnInvalidConnection(t *testing.T) {
 	replayPrepared := mock.ExpectPrepare(query)
 	replayPrepared.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
 	replayPrepared.ExpectExec().WithArgs(int64(2)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO `db`.`__mts_fl_tx` (`id`, `run_id`) VALUES (?, ?)")).
+		WithArgs(sqlmock.AnyArg(), "run-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	expectRestoreWriteSession(mock, false)
 
@@ -259,7 +265,7 @@ func TestWriterLoopReconnectsOnInvalidConnection(t *testing.T) {
 	var committed int64
 	err = writerLoop(context.Background(), 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 10}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil)
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, "run-1")
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -271,7 +277,7 @@ func TestWriterLoopReconnectsOnInvalidConnection(t *testing.T) {
 	}
 }
 
-func TestWriterLoopDoesNotReplayUnknownCommitOutcome(t *testing.T) {
+func TestWriterLoopRecoversUnknownCommitWhenRolledBack(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -283,22 +289,248 @@ func TestWriterLoopDoesNotReplayUnknownCommitOutcome(t *testing.T) {
 	mock.ExpectPrepare(query)
 	prepared := mock.ExpectPrepare(query)
 	prepared.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit().WillReturnError(errors.New("bad connection"))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO `db`.`__mts_fl_tx` (`id`, `run_id`) VALUES (?, ?)")).
+		WithArgs(sqlmock.AnyArg(), "run-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit().WillReturnError(errors.New("invalid connection"))
+
+	// 换连后锁定读探测 marker：不存在 → 已回滚，重放后再提交。
+	expectWriteSession(mock, false)
+	mock.ExpectBegin()
+	verifyQ := regexp.QuoteMeta("SELECT 1 FROM `db`.`__mts_fl_tx` WHERE `id` = ? FOR UPDATE")
+	mock.ExpectQuery(verifyQ).WithArgs(sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"1"}))
+	mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectPrepare(query)
+	replayPrepared := mock.ExpectPrepare(query)
+	replayPrepared.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO `db`.`__mts_fl_tx` (`id`, `run_id`) VALUES (?, ?)")).
+		WithArgs(sqlmock.AnyArg(), "run-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 	expectRestoreWriteSession(mock, false)
 
 	q := newBatchQueue(1024, &Stats{})
 	_ = q.Put(context.Background(), &RowBatch{
 		Schema: "s", Table: "t", TargetSchema: "db", TargetTable: "t",
-		Columns: []string{"id"}, Rows: [][]any{{int64(1)}}, ApproxBytes: 8,
+		Columns: []string{"id"},
+		Rows:    [][]any{{int64(1)}}, ApproxBytes: 8,
 	})
 	q.Close()
 	stats := &Stats{}
-	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats, nil, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "outcome unknown") {
-		t.Fatalf("expected unknown commit outcome error, got %v", err)
+	var committed int64
+	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats,
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, "run-1")
+	if err != nil {
+		t.Fatalf("writerLoop: %v", err)
 	}
-	if snap := stats.Snapshot(); snap.CommittedRows != 0 || snap.TxReplays != 0 {
-		t.Fatalf("commit failure must not count/replay: %+v", snap)
+	if committed != 1 || stats.Snapshot().CommittedRows != 1 || stats.Snapshot().TxReplays != 1 {
+		t.Fatalf("committed=%d stats=%+v", committed, stats.Snapshot())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriterLoopRecoversUnknownCommitWhenApplied(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	expectWriteSession(mock, false)
+	mock.ExpectBegin()
+	query := regexp.QuoteMeta("INSERT INTO `db`.`t` (`id`) VALUES (?)")
+	mock.ExpectPrepare(query)
+	prepared := mock.ExpectPrepare(query)
+	prepared.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO `db`.`__mts_fl_tx` (`id`, `run_id`) VALUES (?, ?)")).
+		WithArgs(sqlmock.AnyArg(), "run-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit().WillReturnError(errors.New("bad connection"))
+
+	// 换连后锁定读探测 marker：已存在 → 视为提交成功，不重放。
+	expectWriteSession(mock, false)
+	mock.ExpectBegin()
+	verifyQ := regexp.QuoteMeta("SELECT 1 FROM `db`.`__mts_fl_tx` WHERE `id` = ? FOR UPDATE")
+	mock.ExpectQuery(verifyQ).WithArgs(sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+	mock.ExpectCommit()
+	expectRestoreWriteSession(mock, false)
+
+	q := newBatchQueue(1024, &Stats{})
+	_ = q.Put(context.Background(), &RowBatch{
+		Schema: "s", Table: "t", TargetSchema: "db", TargetTable: "t",
+		Columns: []string{"id"},
+		Rows:    [][]any{{int64(1)}}, ApproxBytes: 8,
+	})
+	q.Close()
+	stats := &Stats{}
+	var committed int64
+	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats,
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, "run-1")
+	if err != nil {
+		t.Fatalf("writerLoop: %v", err)
+	}
+	if committed != 1 || stats.Snapshot().CommittedRows != 1 || stats.Snapshot().TxReplays != 0 {
+		t.Fatalf("committed=%d stats=%+v", committed, stats.Snapshot())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriterLoopCommitNonConnErrorStillFails(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	expectWriteSession(mock, false)
+	mock.ExpectBegin()
+	query := regexp.QuoteMeta("INSERT INTO `db`.`t` (`id`) VALUES (?)")
+	mock.ExpectPrepare(query)
+	prepared := mock.ExpectPrepare(query)
+	prepared.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO `db`.`__mts_fl_tx` (`id`, `run_id`) VALUES (?, ?)")).
+		WithArgs(sqlmock.AnyArg(), "run-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit().WillReturnError(errors.New("disk full"))
+	expectRestoreWriteSession(mock, false)
+
+	q := newBatchQueue(1024, &Stats{})
+	_ = q.Put(context.Background(), &RowBatch{
+		Schema: "s", Table: "t", TargetSchema: "db", TargetTable: "t",
+		Columns: []string{"id"},
+		Rows:    [][]any{{int64(1)}}, ApproxBytes: 8,
+	})
+	q.Close()
+	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), &Stats{}, nil, nil, nil, "run-1")
+	if err == nil || !strings.Contains(err.Error(), "disk full") || strings.Contains(err.Error(), "outcome unknown") {
+		t.Fatalf("expected plain commit error, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWriterLoopFullColumnsIdenticalRowsAcrossTxUsesDistinctMarkers 证明：即使业务行完全相同，
+// 各写事务仍使用独立 marker；Commit 未知时不会因前一事务已提交的相同行而误判。
+func TestWriterLoopFullColumnsIdenticalRowsAcrossTxUsesDistinctMarkers(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	expectWriteSession(mock, false)
+
+	query := regexp.QuoteMeta("INSERT INTO `db`.`t` (`a`, `b`) VALUES (?, ?)")
+	markerQ := regexp.QuoteMeta("INSERT INTO `db`.`__mts_fl_tx` (`id`, `run_id`) VALUES (?, ?)")
+	verifyQ := regexp.QuoteMeta("SELECT 1 FROM `db`.`__mts_fl_tx` WHERE `id` = ? FOR UPDATE")
+
+	// 事务 1：提交成功（含相同业务行 R）。
+	mock.ExpectBegin()
+	mock.ExpectPrepare(query)
+	p1 := mock.ExpectPrepare(query)
+	p1.ExpectExec().WithArgs("R", 1).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(markerQ).WithArgs(sqlmock.AnyArg(), "run-1").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	// 事务 2：写入相同行 R，Commit 连接错误；marker 不存在 → 判定回滚并重放。
+	mock.ExpectBegin()
+	p2 := mock.ExpectPrepare(query)
+	p2.ExpectExec().WithArgs("R", 1).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(markerQ).WithArgs(sqlmock.AnyArg(), "run-1").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit().WillReturnError(errors.New("invalid connection"))
+
+	expectWriteSession(mock, false)
+	mock.ExpectBegin()
+	mock.ExpectQuery(verifyQ).WithArgs(sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"1"}))
+	mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectPrepare(query)
+	replay := mock.ExpectPrepare(query)
+	replay.ExpectExec().WithArgs("R", 1).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(markerQ).WithArgs(sqlmock.AnyArg(), "run-1").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	expectRestoreWriteSession(mock, false)
+
+	q := newBatchQueue(1024, &Stats{})
+	for i := 0; i < 2; i++ {
+		if err := q.Put(context.Background(), &RowBatch{
+			Schema: "s", Table: "t", TargetSchema: "db", TargetTable: "t",
+			Columns: []string{"a", "b"},
+			Rows:    [][]any{{"R", 1}}, ApproxBytes: 8,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q.Close()
+	stats := &Stats{}
+	var committed int64
+	err = writerLoop(context.Background(), 0, db, q,
+		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 1}), stats,
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, "run-1")
+	if err != nil {
+		t.Fatalf("writerLoop: %v", err)
+	}
+	if committed != 2 || stats.Snapshot().TxReplays != 1 {
+		t.Fatalf("committed=%d stats=%+v", committed, stats.Snapshot())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTxMarkerAppliedLockingRead(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM `db`.`__mts_fl_tx` WHERE `id` = ? FOR UPDATE")).
+		WithArgs("m1").
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+	mock.ExpectCommit()
+	ok, err := txMarkerApplied(context.Background(), conn, "db", "m1")
+	if err != nil || !ok {
+		t.Fatalf("applied=%v err=%v", ok, err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT 1 FROM `db`.`__mts_fl_tx` WHERE `id` = ? FOR UPDATE")).
+		WithArgs("m2").
+		WillReturnRows(sqlmock.NewRows([]string{"1"}))
+	mock.ExpectRollback()
+	ok, err = txMarkerApplied(context.Background(), conn, "db", "m2")
+	if err != nil || ok {
+		t.Fatalf("applied=%v err=%v want false", ok, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAssertTargetTablesInnoDBRejectsMyISAM(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?")).
+		WithArgs("db", "t").
+		WillReturnRows(sqlmock.NewRows([]string{"ENGINE"}).AddRow("MyISAM"))
+	err = assertTargetTablesInnoDB(context.Background(), db, []*TableSpec{{
+		TargetSchema: "db", TargetTable: "t",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "not InnoDB") {
+		t.Fatalf("expected non-InnoDB error, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -317,6 +549,9 @@ func TestWriterLoopCommitsOnIntervalWithoutNextBatch(t *testing.T) {
 	mock.ExpectPrepare(query)
 	prepared := mock.ExpectPrepare(query)
 	prepared.ExpectExec().WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO `db`.`__mts_fl_tx` (`id`, `run_id`) VALUES (?, ?)")).
+		WithArgs(sqlmock.AnyArg(), "run-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	expectRestoreWriteSession(mock, false)
 
@@ -329,7 +564,7 @@ func TestWriterLoopCommitsOnIntervalWithoutNextBatch(t *testing.T) {
 	opt.CommitInterval = 20 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err = writerLoop(ctx, 0, db, q, opt, &Stats{}, func(_, _ string, _, _ int64) { q.Close() }, nil, nil)
+	err = writerLoop(ctx, 0, db, q, opt, &Stats{}, func(_, _ string, _, _ int64) { q.Close() }, nil, nil, "run-1")
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}

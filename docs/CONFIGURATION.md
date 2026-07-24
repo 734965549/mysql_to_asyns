@@ -267,6 +267,9 @@ env:
   - 测试环境：`false`
 - 注意：需要MySQL 5.7+，且有足够权限
 
+**target_max_open_conns（目标连接池，见 `[sync]` / 连接池调优）**
+- V2 全量持有 schema 顾问锁时会占用 1 个目标连接槽，因此开启 `full_load_engine=v2` 时 **`target_max_open_conns` 必须 ≥ 2**（`AcquireSchemaLocks` 前 fail-fast）
+
 **optimize_index（索引优化）**
 - 含义：同步前删除非主键索引，所有数据库、所有表的数据同步完成后，再按表顺序统一重建
 - 作用：大幅提升写入性能（特别是有大量索引的表）
@@ -408,6 +411,47 @@ InnoDB 引擎在打开快照前预检一次，并在持有表锁或首次 `SELEC
 对齐取锁失败时默认降级为单连接快照；ALL 模式无主键表捕获表级 binlog HWM 时取锁失败
 不降级（fail-closed）。ALL 模式有主键/唯一键表依赖增量幂等收敛；无主键表在快照窗口内
 捕获表级 HWM，增量按事务提交位点过滤并仍推进 checkpoint。
+
+#### 写事务提交标记表（`__mts_fl_tx`）
+
+V2 在每个目标 schema 自动创建系统表 `` `{schema}.__mts_fl_tx` ``（`CREATE TABLE IF NOT EXISTS`，InnoDB）。
+每个写入事务在 `Commit` 前插入一行唯一 UUID，与业务 `INSERT` **同事务**提交；当客户端收到连接类
+Commit 错误、服务端结果未知时，writer 换连后对该 UUID 做 `SELECT ... FOR UPDATE` 锁定当前读：
+
+| 探测结果 | 含义 | 处理 |
+|---|---|---|
+| 锁定读命中 marker | 原事务已提交 | 只推进进度，**禁止**重放 |
+| 锁定读无行（等锁结束后） | 原事务已回滚 | 整事务重放后再提交 |
+| 缺少 marker / 探测失败 | 无法判定 | **fail-closed**，任务失败 |
+
+禁止根据业务行是否存在猜测 Commit 结果：无主键/全列策略下，前一事务已提交的完全相同行会误判；
+普通一致性读也可能在原 `COMMIT` 仍在服务端处理时先看到“无行”，随后重放造成重复。
+
+**表结构与注释**（新建时写入；已存在的同名表不会被 `IF NOT EXISTS` 改注释或改结构）：
+
+| 列/对象 | 说明 |
+|---|---|
+| 表注释 | `mysql-to-sync 全量V2写事务提交标记表；与业务INSERT同事务提交，用于Commit结果未知时的锁定探测，请勿手工删除或改名` |
+| `id` | 写事务唯一标记 UUID（`PRIMARY KEY`） |
+| `run_id` | 本趟全量数据流水线运行 ID；成功收尾时按此删除本任务行 |
+| `created_at` | 标记行写入时间（服务端时钟） |
+| `idx_run_id` | 非唯一索引，加速按 `run_id` 清理 |
+
+建表后会 **fail-closed** 校验已有 marker 表：必须是 `BASE TABLE`、`ENGINE=InnoDB`；`id` 为可保存 UUID 的 `NOT NULL` 列，并具备 `PRIMARY KEY(id)` 或等价单列唯一索引，且索引须覆盖完整列（`STATISTICS.SUB_PART` 为 `NULL`）或前缀长度 ≥ 36（拒绝 `UNIQUE(id(1))` 等短前缀）；`run_id` 为可保存至少 64 字符的 `NOT NULL` 列。若同名表是 MyISAM 等非事务引擎，marker 会在业务事务 `Commit` 前永久落库，回滚后探测仍会误判已提交并造成静默少数据。早期版本若缺少 `run_id` 列，需手工 `ALTER` 补齐或删表后由下次 V2 重建。
+
+**上线检查清单（目标库账号 / 表映射）**：
+
+- 目标账号对每个目标 schema 具备 `CREATE TABLE`（首次自动建 `__mts_fl_tx`）。
+- 目标账号对 `__mts_fl_tx` 具备 `INSERT`（写事务提交前插入 marker）与 `SELECT`（含 `SELECT ... FOR UPDATE` 锁定探测）。
+- 目标账号对 `__mts_fl_tx` 具备 `DELETE`：数据流水线成功后会按本趟 `run_id` 删除本任务 marker 行（**不** `DROP` 共享表）；清理使用独立短超时，失败只打告警，不回滚已成功的同步结果。失败/暂停/取消**不**清理本趟行，便于排查。
+- 目标账号需能执行 `GET_LOCK`/`RELEASE_LOCK`：任务进入全量 V2 后、**首次目标端 DDL 之前**即对每个目标 schema 获取名为 `mts_fl_v2:{schema}` 的顾问锁，并持有至索引恢复与任务级收尾完成；同一 schema 上并发 V2 会 **fail-closed**。
+- 锁连接会占用目标连接池 1 个槽位，因此 **`target_max_open_conns` 必须 ≥ 2**（在 `AcquireSchemaLocks` 前 fail-fast）；写路径与 DDL 另需可用连接。
+- 锁会话会读取并必要时抬高 `@@SESSION.wait_timeout`（至少 60s），心跳间隔严格小于该值（默认 15s，取 `wait_timeout/3` 的较小者），避免 MySQL 先关闭空闲会话并隐式释放 `GET_LOCK`。心跳失败以 `ErrSchemaLockLost` 取消派生 context，库重建/建表/删索引等破坏性 DDL 与 `MarkFullSyncCompleted` 前都会检查该 cause。
+- 多 schema 任务在同一锁连接上连续 `GET_LOCK`，要求 **MySQL ≥ 5.7.5**（更早版本第二次 `GET_LOCK` 会释放旧锁）。
+- 业务 `TargetTable` **不得**占用保留名 `__mts_fl_tx`（大小写不敏感比较，兼容 `lower_case_table_names`）；否则启动 fail-closed。
+- 启动 writers 前会 **fail-closed** 校验所有目标业务表为 InnoDB（复用既有表且为 MyISAM 等非事务引擎时直接失败）。
+- 请勿手工删除、改名或清空**正在运行**任务使用的 `__mts_fl_tx`。同一目标 schema 上不得并发跑多个 V2 全量（代码以 `GET_LOCK` 强制互斥）。
+- 若早期版本已创建无注释或不兼容结构的同名表，应手工修正（`ALTER`/`ENGINE=InnoDB`/`PRIMARY KEY`/补 `run_id`）或删表后由下次 V2 全量重建；不符合结构时任务会直接失败。
 
 注意：表级 HWM 捕获与增量启动时的 `RequireNoPKTableHWM` fail-closed 校验**仅在
 `full_load_engine=v2` 生效**。默认 `v1` 保持旧语义：不生成表级 HWM，也不强校验；

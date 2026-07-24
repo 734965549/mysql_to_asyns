@@ -47,7 +47,10 @@ type CommitCallback func(schema, table string, rows, bytes int64)
 // P0 正确性：一个事务内可能已成功写入若干批次，后续批次遇到可重试锁错误时，
 // 回滚整个事务并重放全部未提交批次，而不是只重试当前批次；只有事务提交成功后
 // 才通过 onCommit 推进进度，避免静默缺数。
-func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, isStopped func() bool) error {
+func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, isStopped func() bool, runID string) error {
+	if runID == "" {
+		return fmt.Errorf("runWriters: run_id is required")
+	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	q.watchContext(workerCtx)
@@ -70,7 +73,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 			defer wg.Done()
 			atomic.AddInt64(&stats.ActiveWriters, 1)
 			defer atomic.AddInt64(&stats.ActiveWriters, -1)
-			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, tracker, isStopped); err != nil {
+			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, tracker, isStopped, runID); err != nil {
 				setErr(err)
 			}
 		}(w)
@@ -80,7 +83,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 	return firstErr
 }
 
-func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, isStopped func() bool) error {
+func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, isStopped func() bool, runID string) error {
 	conn, err := targetDB.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("writer %d get conn: %w", id, err)
@@ -143,12 +146,20 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	}
 
 	var (
-		tx      *sql.Tx
-		buf     []*RowBatch
-		txRows  int64
-		txBytes int64
-		txStart time.Time
+		tx               *sql.Tx
+		buf              []*RowBatch
+		txRows           int64
+		txBytes          int64
+		txStart          time.Time
+		commitRecoveries int
+		txMarkerID       string
+		txMarkerSchema   string
 	)
+
+	clearTxMarker := func() {
+		txMarkerID = ""
+		txMarkerSchema = ""
+	}
 
 	rollback := func() {
 		if tx != nil {
@@ -157,35 +168,116 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 		}
 		buf = nil
 		txRows, txBytes = 0, 0
+		clearTxMarker()
 	}
 
-	commit := func() error {
+	var replayAfterFailure func(cause error, replayBatches []*RowBatch) (*sql.Tx, error)
+
+	// commit 提交当前事务。连接类 Commit 错误时结果未知：先换连，再用事务 marker
+	// 的锁定当前读判定是否已落库。禁止根据业务行存在性猜测（无主键会误判）。
+	var commit func() error
+	commit = func() error {
 		if tx == nil {
 			return nil
 		}
 		cs := time.Now()
-		cErr := tx.Commit()
-		if cErr != nil {
-			tx = nil
-			// Commit 返回连接类错误时，服务端是否已经提交不可判定。普通 INSERT 不是幂等写，
-			// 此处禁止重放，否则可能把已提交事务再插入一次，尤其会静默复制无主键行。
-			return fmt.Errorf("writer %d commit (outcome unknown; transaction not replayed): %w", id, cErr)
-		}
-		dur := time.Since(cs)
-		stats.addCommit(txRows, txBytes, dur)
-		if err := reportCommitted(buf, onCommit, tracker); err != nil {
+		pending := buf
+		markerID := txMarkerID
+		markerSchema := txMarkerSchema
+		if markerID == "" || markerSchema == "" {
+			_ = tx.Rollback()
 			tx = nil
 			buf = nil
 			txRows, txBytes = 0, 0
+			clearTxMarker()
+			return fmt.Errorf("writer %d commit: missing tx marker (fail-closed)", id)
+		}
+		if err := insertTxMarker(ctx, tx, markerSchema, markerID, runID); err != nil {
+			_ = tx.Rollback()
+			tx = nil
+			buf = nil
+			txRows, txBytes = 0, 0
+			clearTxMarker()
+			return fmt.Errorf("writer %d commit marker: %w", id, err)
+		}
+		cErr := tx.Commit()
+		tx = nil
+		if cErr != nil {
+			if !isConnRetryable(cErr) {
+				buf = nil
+				txRows, txBytes = 0, 0
+				clearTxMarker()
+				return fmt.Errorf("writer %d commit: %w", id, cErr)
+			}
+			if commitRecoveries >= writeConnMaxRetries {
+				buf = nil
+				txRows, txBytes = 0, 0
+				clearTxMarker()
+				return fmt.Errorf("writer %d commit (outcome unknown; recover exhausted): %w", id, cErr)
+			}
+			commitRecoveries++
+			logger.Warn("[FullLoadV2] writer %d commit connection error (outcome unknown), verifying marker: %v", id, cErr)
+			buf = nil
+			txRows, txBytes = 0, 0
+			if rErr := reconnect(cErr); rErr != nil {
+				clearTxMarker()
+				return fmt.Errorf("writer %d commit (outcome unknown; reconnect failed): %w", id, rErr)
+			}
+			applied, vErr := txMarkerApplied(ctx, conn, markerSchema, markerID)
+			if vErr != nil {
+				clearTxMarker()
+				return fmt.Errorf("writer %d commit (outcome unknown; verify failed): %w", id, vErr)
+			}
+			if applied {
+				logger.Warn("[FullLoadV2] writer %d commit verified applied via tx marker after connection error", id)
+				rows, bytes := sumBuf(pending)
+				stats.addCommit(rows, bytes, time.Since(cs))
+				commitRecoveries = 0
+				clearTxMarker()
+				return reportCommitted(pending, onCommit, tracker)
+			}
+			logger.Warn("[FullLoadV2] writer %d commit verified rolled back via tx marker; replaying %d batches", id, len(pending))
+			clearTxMarker()
+			newTx, rErr := replayInFreshTx(ctx, conn, pending, opt, stmtCache, stats)
+			if rErr != nil {
+				if isConnRetryable(rErr) {
+					newTx, rErr = replayAfterFailure(rErr, pending)
+				}
+				if rErr != nil {
+					return fmt.Errorf("writer %d commit (outcome unknown; replay failed): %w", id, rErr)
+				}
+			}
+			tx = newTx
+			txStart = time.Now()
+			buf = pending
+			txRows, txBytes = sumBuf(buf)
+			if len(buf) > 0 && buf[0] != nil {
+				txMarkerSchema = buf[0].TargetSchema
+			}
+			var mErr error
+			txMarkerID, mErr = newTxMarkerID()
+			if mErr != nil {
+				rollback()
+				return fmt.Errorf("writer %d allocate tx marker after replay: %w", id, mErr)
+			}
+			return commit()
+		}
+		dur := time.Since(cs)
+		stats.addCommit(txRows, txBytes, dur)
+		if err := reportCommitted(pending, onCommit, tracker); err != nil {
+			buf = nil
+			txRows, txBytes = 0, 0
+			clearTxMarker()
 			return err
 		}
-		tx = nil
 		buf = nil
 		txRows, txBytes = 0, 0
+		commitRecoveries = 0
+		clearTxMarker()
 		return nil
 	}
 
-	// beginTx 开启事务；连接失效时换连后重试。
+	// beginTx 开启事务；连接失效时换连后重试。同时分配本事务唯一 marker。
 	beginTx := func() error {
 		var lastErr error
 		for attempt := 0; attempt <= writeConnMaxRetries; attempt++ {
@@ -194,10 +286,16 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 					return rErr
 				}
 			}
+			markerID, mErr := newTxMarkerID()
+			if mErr != nil {
+				return fmt.Errorf("allocate tx marker: %w", mErr)
+			}
 			var bErr error
 			tx, bErr = conn.BeginTx(ctx, nil)
 			if bErr == nil {
 				txStart = time.Now()
+				txMarkerID = markerID
+				txMarkerSchema = ""
 				return nil
 			}
 			lastErr = bErr
@@ -205,13 +303,14 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 				return bErr
 			}
 			tx = nil
+			clearTxMarker()
 		}
 		return lastErr
 	}
 
 	// replayAfterFailure 在锁冲突或连接失效后重放未提交批次。
 	// 连接失效先换连；重放过程再次断连则继续换连，直到成功或耗尽重试。
-	replayAfterFailure := func(cause error, replayBatches []*RowBatch) (*sql.Tx, error) {
+	replayAfterFailure = func(cause error, replayBatches []*RowBatch) (*sql.Tx, error) {
 		needReconnect := isConnRetryable(cause)
 		var lastErr error = cause
 		for attempt := 0; attempt <= writeConnMaxRetries; attempt++ {
@@ -295,8 +394,22 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			txStart = time.Now()
 			buf = replayBatches
 			txRows, txBytes = sumBuf(buf)
+			if txMarkerID == "" {
+				mid, mErr := newTxMarkerID()
+				if mErr != nil {
+					rollback()
+					return fmt.Errorf("writer %d allocate tx marker after write replay: %w", id, mErr)
+				}
+				txMarkerID = mid
+			}
+			if txMarkerSchema == "" && len(buf) > 0 && buf[0] != nil {
+				txMarkerSchema = buf[0].TargetSchema
+			}
 		} else {
 			buf = append(buf, batch)
+			if txMarkerSchema == "" {
+				txMarkerSchema = batch.TargetSchema
+			}
 			txRows += rows
 			txBytes += bytes
 		}
@@ -466,7 +579,6 @@ func insertPrefix(batch *RowBatch) string {
 }
 
 // isRetryableTxConflict 仅判断事务内语句可安全重放的锁冲突。
-// Commit 错误的提交结果可能未知，不能用普通 INSERT 自动重放。
 func isRetryableTxConflict(err error) bool {
 	if err == nil {
 		return false

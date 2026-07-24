@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "codebase-memory-mcp": {
+      "command": "C:/Users/73496/.local/bin/codebase-memory-mcp.exe",
       "env": {
         "CBM_ALLOWED_ROOT": "C:/temp/mysql_to_asyns",
         "CBM_LOG_LEVEL": "info"

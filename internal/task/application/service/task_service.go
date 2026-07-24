@@ -51,6 +51,8 @@ import (
 
 	syncApp "mysql-to-sync/internal/sync/application" // 同步应用包
 
+	"mysql-to-sync/internal/sync/fullload"
+
 	"mysql-to-sync/internal/sync/infrastructure/reader" // 同步读取器包
 
 	"mysql-to-sync/internal/sync/infrastructure/readonly" // 只读管理包
@@ -1928,6 +1930,19 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 // 上层 executeSync 据此区分"应当标 FAILED"还是"应当保留当前阶段并退出"。
 var errFullSyncStoppedByUser = errors.New("full sync stopped by user")
 
+// abortFullSyncIfCancelled 在阶段边界检查丢锁 cause 与用户停止信号。
+// 丢锁优先于用户停止：必须 fail-closed，不能误标 FULL_COMPLETED。
+func (s *TaskService) abortFullSyncIfCancelled(ctx context.Context, taskID string) error {
+	if err := fullload.SchemaLockLostError(ctx); err != nil {
+		logger.Error("[Task %s] Full sync aborted after schema lock lost", taskID)
+		return err
+	}
+	if s.isTaskStopped(taskID) {
+		logger.Info("[Task %s] Full sync detected stop signal; aborting without marking completed", taskID)
+		return errFullSyncStoppedByUser
+	}
+	return nil
+}
 // updateSyncPhase 持有写锁修改任务阶段相关字段并持久化。mutator 必须是无副作用的纯字段写入。
 // 若任务不存在则静默返回，不抛错，与 updateTaskStatus 行为一致。
 func (s *TaskService) updateSyncPhase(taskID string, mutator func(*taskEntity.SyncTask)) {
@@ -2462,16 +2477,57 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		t.MarkFullSyncStarted(startPosStr)
 	})
 
+	// [P1] 在首次目标端 DDL 前获取所有目标 schema 锁，覆盖完整生命周期
+	// （库级重建 → 表结构准备 → 数据写入 → 索引恢复），直到任务级收尾完成才释放。
+	var targetSchemas []string
+	seen := make(map[string]struct{}, len(pairs))
+	for _, p := range pairs {
+		if _, ok := seen[p.dst]; ok {
+			continue
+		}
+		seen[p.dst] = struct{}{}
+		targetSchemas = append(targetSchemas, p.dst)
+	}
+
+	var schemaLocks *fullload.SchemaLocks
+	if task.Config.UsesFullLoadV2() && len(targetSchemas) > 0 {
+		sort.Strings(targetSchemas)
+		var lockErr error
+		schemaLocks, lockErr = fullload.AcquireSchemaLocks(ctx, runtime.targetDB, targetSchemas)
+		if lockErr != nil {
+			errMsg := fmt.Sprintf("Failed to acquire target schema locks: %v", lockErr)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		// 启动心跳：锁连接失活时以明确 cause 取消派生 ctx，覆盖后续 DDL / 完成标记。
+		lockCtx, lockCancel := context.WithCancelCause(ctx)
+		schemaLocks.StartHeartbeat(lockCtx, func() {
+			logger.Error("[Task %s] Schema lock heartbeat lost; cancelling full sync (fail-closed)", taskID)
+			lockCancel(fullload.ErrSchemaLockLost)
+		})
+		defer lockCancel(nil)
+		defer func() {
+			if rErr := schemaLocks.Release(context.Background()); rErr != nil {
+				logger.Warn("[Task %s] Release target schema locks: %v", taskID, rErr)
+			}
+		}()
+		// 使用 lockCtx 替换后续操作的 ctx，确保锁失活可传播取消。
+		ctx = lockCtx
+	}
+
 	// 库级别同步且开启"DDL 前删除"时，在任何目标表 DDL/数据写入前统一重建目标库。
 	// 表级别同步保持原有逐表 DROP TABLE 行为（在 ensureTargetTable 内执行）。
 	// 增量阶段不会进入 executeFullSync，故此处天然不会在增量阶段执行删除。
 	dbLevelRebuilt := false
 	if task.Config.EnableDropTableBeforeDDL && task.Config.SyncLevel == taskEntity.SyncLevelDatabase {
-		var targetSchemas []string
+		rebuildSchemas := make([]string, 0, len(pairs))
 		for _, p := range pairs {
-			targetSchemas = append(targetSchemas, p.dst)
+			rebuildSchemas = append(rebuildSchemas, p.dst)
 		}
-		if err := s.rebuildTargetDatabases(runtime, taskID, targetSchemas); err != nil {
+		if err := s.rebuildTargetDatabases(ctx, runtime, taskID, rebuildSchemas); err != nil {
 
 			if errors.Is(err, errFullSyncStoppedByUser) {
 
@@ -2494,7 +2550,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		}
 		dbLevelRebuilt = true
 		logger.Info("[Task %s] Database-level rebuild completed for %d target database(s); per-table DROP TABLE disabled",
-			taskID, len(targetSchemas))
+			taskID, len(rebuildSchemas))
 	}
 
 	// 依次同步每个库（库间串行，库内表间并行）。索引恢复任务跨库累计，
@@ -2503,12 +2559,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 	for _, p := range pairs {
 
-		if s.isTaskStopped(taskID) {
-
-			// === 修复 1d：用 sentinel 代替 nil，避免上层把"用户暂停"误标为成功 ===
-			logger.Info("[Task %s] Full sync detected stop signal between database pairs; aborting without marking completed", taskID)
-			return errFullSyncStoppedByUser
-
+		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
+			return err
 		}
 
 		if task.Config.SyncLevel == taskEntity.SyncLevelTable && len(task.Config.Tables) > 0 && len(tablesBySource[p.src]) == 0 {
@@ -2520,16 +2572,16 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		// full_load_engine=v2 时使用任务级流水线引擎；否则保持 V1 内联逐表调度。
 		var pairErr error
 		if task.Config.UsesFullLoadV2() {
-			pairErr = s.syncDatabasePairV2(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt)
+			pairErr = s.syncDatabasePairV2(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt, schemaLocks)
 		} else {
 			pairErr = s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt)
 		}
 		if pairErr != nil {
 
 			// 一并区分"被停止"和"真实失败"：库级 err 时再核查一次任务状态。
-			if s.isTaskStopped(taskID) {
+			if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
 				logger.Info("[Task %s] Full sync stopped during pair %s->%s: %v", taskID, p.src, p.dst, pairErr)
-				return errFullSyncStoppedByUser
+				return err
 			}
 			return pairErr
 
@@ -2538,9 +2590,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	}
 
 	if task.Config.OptimizeIndex && len(pendingIndexRestores) > 0 {
-		if s.isTaskStopped(taskID) {
-			logger.Info("[Task %s] Full sync detected stop signal before restoring indexes", taskID)
-			return errFullSyncStoppedByUser
+		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
+			return err
 		}
 		workers := taskEntity.EffectiveIndexRestoreWorkers(
 			task.Config.IndexRestoreWorkerCount,
@@ -2554,10 +2605,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		logger.Info("[Task %s] 阶段3完成：所有待恢复索引已并发处理", taskID)
 	}
 
-	// 完成前最后一次停止检查：避免末尾刚好用户按了暂停就被误标完成。
-	if s.isTaskStopped(taskID) {
-		logger.Info("[Task %s] Full sync stopped right before completion; not marking completed", taskID)
-		return errFullSyncStoppedByUser
+	// 完成前最后一次停止/丢锁检查：避免末尾竞态下误标 FULL_COMPLETED。
+	if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
+		return err
 	}
 
 	// === 修复 4：标记"全量已完成"，是后续 INCREMENTAL/ALL 模式跳过全量的唯一依据 ===
@@ -2740,9 +2790,9 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 	for i, tableName := range tables {
 
-		if s.isTaskStopped(taskID) {
+		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
 
-			return fmt.Errorf("task stopped")
+			return err
 
 		}
 
@@ -2764,7 +2814,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		// 库级别重建已清空整个目标库，逐表 DROP TABLE 不再需要；表级别保持原有删除行为。
 		effectiveDropBeforeDDL := task.Config.EnableDropTableBeforeDDL && !dbLevelRebuilt
-		savedIndexes, err := s.ensureTargetTable(runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL)
+		savedIndexes, err := s.ensureTargetTable(ctx, runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL)
 
 		if err != nil {
 
@@ -2781,7 +2831,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 		// 并发执行 ALTER TABLE，也确保后续能集中恢复。
 		if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
 			logger.Info("[Task %s] Dropping non-primary indexes for target table %s.%s...", taskID, targetSchema, targetTableName)
-			indexes, dropErr := s.dropNonPrimaryKeyIndexes(runtime, targetSchema, targetTableName)
+			indexes, dropErr := s.dropNonPrimaryKeyIndexes(ctx, runtime, targetSchema, targetTableName)
 			if dropErr != nil {
 				logger.Warn("[Task %s] Warning: Failed to drop indexes for %s.%s: %v", taskID, targetSchema, targetTableName, dropErr)
 			} else {
@@ -4354,7 +4404,22 @@ func (s *TaskService) withDDL(runtime *taskRuntime, fn func() error) error {
 
 }
 
-func (s *TaskService) dropTargetTableIfNeeded(conn *sql.Conn, schema, tableName string, enabled bool) error {
+// preferSchemaLockLost 在 ctx 因丢锁取消时优先返回类型化 cause，否则用 %w 包装原错误。
+// DDL 执行中心跳取消时 ExecContext 常返回 context.Canceled，直接 %v 包装会丢失 ErrSchemaLockLost。
+func preferSchemaLockLost(ctx context.Context, err error, format string, args ...any) error {
+	if err == nil {
+		return nil
+	}
+	if lost := fullload.SchemaLockLostError(ctx); lost != nil {
+		return lost
+	}
+	all := make([]any, 0, len(args)+1)
+	all = append(all, args...)
+	all = append(all, err)
+	return fmt.Errorf(format+": %w", all...)
+}
+
+func (s *TaskService) dropTargetTableIfNeeded(ctx context.Context, conn *sql.Conn, schema, tableName string, enabled bool) error {
 	if !enabled {
 		return nil
 	}
@@ -4364,23 +4429,26 @@ func (s *TaskService) dropTargetTableIfNeeded(conn *sql.Conn, schema, tableName 
 	if strings.TrimSpace(schema) == "" || strings.TrimSpace(tableName) == "" {
 		return nil
 	}
-	_, err := conn.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`", schema, tableName))
+	if err := fullload.SchemaLockLostError(ctx); err != nil {
+		return err
+	}
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`", schema, tableName))
 	if err != nil {
-		return fmt.Errorf("failed to drop target table %s.%s: %v", schema, tableName, err)
+		return preferSchemaLockLost(ctx, err, "failed to drop target table %s.%s", schema, tableName)
 	}
 	logger.Info("[Task] Dropped target table %s.%s before DDL", schema, tableName)
 	return nil
 }
 
-func (s *TaskService) applyDropBeforeDDL(conn *sql.Conn, schema, tableName string, enabled bool) error {
-	return s.dropTargetTableIfNeeded(conn, schema, tableName, enabled)
+func (s *TaskService) applyDropBeforeDDL(ctx context.Context, conn *sql.Conn, schema, tableName string, enabled bool) error {
+	return s.dropTargetTableIfNeeded(ctx, conn, schema, tableName, enabled)
 }
 
 // rebuildTargetDatabases 在库级别同步且开启"DDL 前删除"时统一重建目标库：
 // 对每个唯一目标库依次执行 DROP DATABASE IF EXISTS 与 CREATE DATABASE IF NOT EXISTS
 // （utf8mb4 / utf8mb4_unicode_ci）。任一步失败立即返回错误，调用方应据此终止全量同步。
 // 仅在全量阶段、任何目标表 DDL/数据写入前调用一次；增量阶段不调用。
-func (s *TaskService) rebuildTargetDatabases(runtime *taskRuntime, taskID string, targetSchemas []string) error {
+func (s *TaskService) rebuildTargetDatabases(ctx context.Context, runtime *taskRuntime, taskID string, targetSchemas []string) error {
 
 	if runtime == nil || runtime.targetDB == nil {
 
@@ -4388,11 +4456,15 @@ func (s *TaskService) rebuildTargetDatabases(runtime *taskRuntime, taskID string
 
 	}
 
-	conn, err := runtime.targetDB.Conn(context.Background())
+	if err := fullload.SchemaLockLostError(ctx); err != nil {
+		return err
+	}
+
+	conn, err := runtime.targetDB.Conn(ctx)
 
 	if err != nil {
 
-		return fmt.Errorf("failed to get target connection for database rebuild: %v", err)
+		return preferSchemaLockLost(ctx, err, "failed to get target connection for database rebuild")
 
 	}
 
@@ -4405,12 +4477,8 @@ func (s *TaskService) rebuildTargetDatabases(runtime *taskRuntime, taskID string
 
 		for _, schema := range targetSchemas {
 
-			if s.isTaskStopped(taskID) {
-
-				logger.Info("[Task %s] Full sync stopped during database rebuild", taskID)
-
-				return errFullSyncStoppedByUser
-
+			if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
+				return err
 			}
 
 			if strings.TrimSpace(schema) == "" {
@@ -4427,21 +4495,21 @@ func (s *TaskService) rebuildTargetDatabases(runtime *taskRuntime, taskID string
 
 			seen[schema] = struct{}{}
 
-			if _, e := conn.ExecContext(context.Background(),
+			if _, e := conn.ExecContext(ctx,
 
 				fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", schema)); e != nil {
 
-				return fmt.Errorf("failed to drop target database %s: %v", schema, e)
+				return preferSchemaLockLost(ctx, e, "failed to drop target database %s", schema)
 
 			}
 
 			logger.Info("[Task %s] Dropped target database %s before full sync (database-level rebuild)", taskID, schema)
 
-			if _, e := conn.ExecContext(context.Background(),
+			if _, e := conn.ExecContext(ctx,
 
 				fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", schema)); e != nil {
 
-				return fmt.Errorf("failed to recreate target database %s: %v", schema, e)
+				return preferSchemaLockLost(ctx, e, "failed to recreate target database %s", schema)
 
 			}
 
@@ -4457,12 +4525,16 @@ func (s *TaskService) rebuildTargetDatabases(runtime *taskRuntime, taskID string
 
 // ensureTargetTable 确保目标表存在
 
-func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targetSchema, sourceTableName, targetTableName string, optimizeIndex bool, dropBeforeDDL bool) ([]map[string]interface{}, error) {
+func (s *TaskService) ensureTargetTable(ctx context.Context, runtime *taskRuntime, sourceSchema, targetSchema, sourceTableName, targetTableName string, optimizeIndex bool, dropBeforeDDL bool) ([]map[string]interface{}, error) {
 
 	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil {
 
 		return nil, fmt.Errorf("task runtime is not initialized")
 
+	}
+
+	if err := fullload.SchemaLockLostError(ctx); err != nil {
+		return nil, err
 	}
 
 	targetDB := runtime.targetDB
@@ -4473,7 +4545,7 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	var dbExists string
 
-	err := targetDB.QueryRow(
+	err := targetDB.QueryRowContext(ctx,
 
 		"SELECT schema_name FROM information_schema.schemata WHERE schema_name = ?", targetSchema,
 	).Scan(&dbExists)
@@ -4484,13 +4556,13 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		if err = s.withDDL(runtime, func() error {
 
-			_, e := targetDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetSchema))
+			_, e := targetDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetSchema))
 
 			return e
 
 		}); err != nil {
 
-			return nil, fmt.Errorf("failed to create target database %s: %v", targetSchema, err)
+			return nil, preferSchemaLockLost(ctx, err, "failed to create target database %s", targetSchema)
 
 		}
 
@@ -4508,9 +4580,9 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	var tableNameCheck string
 
-	err = targetDB.QueryRow(
+	err = targetDB.QueryRowContext(ctx,
 
-		fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name = '%s'", targetSchema, targetTableName),
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name = ?", targetSchema, targetTableName,
 	).Scan(&tableNameCheck)
 
 	tableExists := err == nil
@@ -4534,15 +4606,19 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 	}
 
 	// 获取一个专用目标连接，临时关闭外键检查，避免因父表尚未创建而导致 DDL 失败
-	tgtDDLConn, tgtConnErr := targetDB.Conn(context.Background())
+	tgtDDLConn, tgtConnErr := targetDB.Conn(ctx)
 	if tgtConnErr != nil {
-		return nil, fmt.Errorf("failed to get target connection for DDL: %v", tgtConnErr)
+		return nil, preferSchemaLockLost(ctx, tgtConnErr, "failed to get target connection for DDL")
 	}
 	defer func() {
-		tgtDDLConn.ExecContext(context.Background(), "SET SESSION FOREIGN_KEY_CHECKS=1")
+		// 会话收尾不受父 ctx 取消影响，避免丢锁取消后无法恢复 FOREIGN_KEY_CHECKS。
+		cleanupCtx := context.WithoutCancel(ctx)
+		tgtDDLConn.ExecContext(cleanupCtx, "SET SESSION FOREIGN_KEY_CHECKS=1")
 		tgtDDLConn.Close()
 	}()
-	tgtDDLConn.ExecContext(context.Background(), "SET SESSION FOREIGN_KEY_CHECKS=0")
+	if _, err := tgtDDLConn.ExecContext(ctx, "SET SESSION FOREIGN_KEY_CHECKS=0"); err != nil {
+		return nil, preferSchemaLockLost(ctx, err, "failed to disable FOREIGN_KEY_CHECKS for DDL")
+	}
 
 	// 方法1：尝试在已禁用外键检查的目标连接上用 CREATE TABLE ... LIKE 创建表（源和目标在同一服务器时有效）
 
@@ -4550,15 +4626,18 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		tryErr := s.withDDL(runtime, func() error {
 
-			if err := s.dropTargetTableIfNeeded(tgtDDLConn, targetSchema, targetTableName, dropBeforeDDL); err != nil {
+			if err := s.dropTargetTableIfNeeded(ctx, tgtDDLConn, targetSchema, targetTableName, dropBeforeDDL); err != nil {
 				return err
 			}
 
-			_, e := tgtDDLConn.ExecContext(context.Background(), fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
+			_, e := tgtDDLConn.ExecContext(ctx, fmt.Sprintf("CREATE TABLE `%s`.`%s` LIKE `%s`.`%s`",
 
 				targetSchema, targetTableName, sourceSchema, sourceTableName))
 
-			return e
+			if e != nil {
+				return preferSchemaLockLost(ctx, e, "CREATE TABLE LIKE `%s`.`%s`", targetSchema, targetTableName)
+			}
+			return nil
 
 		})
 
@@ -4570,6 +4649,14 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 		}
 
+		// 丢锁属于 fail-closed，不得回退到 SHOW CREATE 路径。
+		if errors.Is(tryErr, fullload.ErrSchemaLockLost) {
+			return nil, tryErr
+		}
+		if lost := fullload.SchemaLockLostError(ctx); lost != nil {
+			return nil, lost
+		}
+
 		logger.Error("[Task] Failed to create table using CREATE TABLE LIKE: %v", tryErr)
 
 	}
@@ -4579,18 +4666,18 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 
 	var createSQL string
 
-	ddlConn, connErr := sourceDB.Conn(context.Background())
+	ddlConn, connErr := sourceDB.Conn(ctx)
 	if connErr != nil {
 		return nil, fmt.Errorf("failed to get source connection for DDL: %v", connErr)
 	}
 	defer ddlConn.Close()
 
 	// 去掉 ANSI_QUOTES，避免 SHOW CREATE TABLE 输出双引号列名导致目标库执行失败
-	_, _ = ddlConn.ExecContext(context.Background(),
+	_, _ = ddlConn.ExecContext(ctx,
 		"SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'ANSI_QUOTES', '')")
 
 	var showCreateTableName string
-	err = ddlConn.QueryRowContext(context.Background(),
+	err = ddlConn.QueryRowContext(ctx,
 
 		fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", sourceSchema, sourceTableName),
 	).Scan(&showCreateTableName, &createSQL)
@@ -4634,17 +4721,19 @@ func (s *TaskService) ensureTargetTable(runtime *taskRuntime, sourceSchema, targ
 	// 在已关闭外键检查的专用连接上执行 DDL
 	if err = s.withDDL(runtime, func() error {
 
-		if err := s.dropTargetTableIfNeeded(tgtDDLConn, targetSchema, targetTableName, dropBeforeDDL); err != nil {
+		if err := s.dropTargetTableIfNeeded(ctx, tgtDDLConn, targetSchema, targetTableName, dropBeforeDDL); err != nil {
 			return err
 		}
 
-		_, e := tgtDDLConn.ExecContext(context.Background(), createSQL)
-
-		return e
+		_, e := tgtDDLConn.ExecContext(ctx, createSQL)
+		if e != nil {
+			return preferSchemaLockLost(ctx, e, "CREATE TABLE `%s`.`%s`", targetSchema, targetTableName)
+		}
+		return nil
 
 	}); err != nil {
 
-		return nil, fmt.Errorf("failed to create target table %s.%s: %v", targetSchema, targetTableName, err)
+		return nil, preferSchemaLockLost(ctx, err, "failed to create target table %s.%s", targetSchema, targetTableName)
 
 	}
 
@@ -7049,12 +7138,16 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 
 // dropNonPrimaryKeyIndexes 删除非主键索引
 
-func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tableName string) ([]map[string]interface{}, error) {
+func (s *TaskService) dropNonPrimaryKeyIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string) ([]map[string]interface{}, error) {
 
 	if runtime == nil || runtime.targetDB == nil {
 
 		return nil, fmt.Errorf("task runtime target db is not initialized")
 
+	}
+
+	if err := fullload.SchemaLockLostError(ctx); err != nil {
+		return nil, err
 	}
 
 	targetDB := runtime.targetDB
@@ -7079,6 +7172,10 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 	for _, indexInfo := range savedIndexes {
 
+		if err := fullload.SchemaLockLostError(ctx); err != nil {
+			return dropped, err
+		}
+
 		name, ok := indexInfo["name"].(string)
 
 		if !ok || name == "" {
@@ -7089,7 +7186,7 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(runtime *taskRuntime, schema, tab
 
 		dropQuery := fmt.Sprintf("ALTER TABLE `%s`.`%s` DROP INDEX `%s`", schema, tableName, name)
 
-		_, err := targetDB.Exec(dropQuery)
+		_, err := targetDB.ExecContext(ctx, dropQuery)
 
 		if err != nil {
 
@@ -7394,6 +7491,9 @@ func execAlterAddIndexes(ctx context.Context, targetDB *sql.DB, schema, tableNam
 			schema, tableName, attempt+1, err)
 	}
 	if err != nil {
+		if lost := fullload.SchemaLockLostError(ctx); lost != nil {
+			return lost
+		}
 		if applied, checkErr := isAlterBatchAlreadyApplied(ctx, targetDB, schema, tableName, batch); checkErr == nil && applied {
 			logger.Warn("ALTER TABLE on `%s`.`%s` returned error but all target indexes already match; treating as success (error: %v)",
 				schema, tableName, err)

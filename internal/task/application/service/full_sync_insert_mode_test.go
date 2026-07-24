@@ -83,8 +83,8 @@ func expectTargetTableAlreadyExists(mock sqlmock.Sqlmock, targetSchema, table st
 		WithArgs(targetSchema).
 		WillReturnRows(sqlmock.NewRows([]string{"schema_name"}).AddRow(targetSchema))
 	mock.ExpectQuery(regexp.QuoteMeta(
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = '" + targetSchema + "' AND table_name = '" + table + "'",
-	)).WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow(table))
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+	)).WithArgs(targetSchema, table).WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow(table))
 }
 
 func expectTargetTableRecreateOnDrop(mock sqlmock.Sqlmock, targetSchema, table string) {
