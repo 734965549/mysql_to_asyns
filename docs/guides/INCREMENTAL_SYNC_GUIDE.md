@@ -55,6 +55,8 @@ expire_logs_days=7
 ```sql
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 GRANT SELECT ON *.* TO 'username'@'%';
+-- ALL 必须具备 RELOAD；FULL 默认可在缺权限时降级单连接，但超大表多连接对齐或 degrade=false 同样需要
+GRANT RELOAD ON *.* TO 'username'@'%';
 FLUSH PRIVILEGES;
 ```
 

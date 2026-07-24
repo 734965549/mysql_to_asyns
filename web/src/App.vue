@@ -390,6 +390,8 @@ const taskForm = ref({
   full_load_batch_bytes_mb: 0,
   full_load_commit_rows: 0,
   full_load_commit_bytes_mb: 0,
+  full_load_lock_wait_timeout_sec: 0,
+  full_load_degrade_on_align_lock_fail: true,
 });
 
 // 全量 V2 预设：仅调整性能参数，绝不改动删除目标/跳过 binlog 等破坏性开关。
@@ -404,6 +406,8 @@ function applyFullLoadPreset(name) {
       f.full_load_batch_bytes_mb = 4;
       f.full_load_commit_rows = 10000;
       f.full_load_commit_bytes_mb = 32;
+      f.full_load_lock_wait_timeout_sec = 10;
+      f.full_load_degrade_on_align_lock_fail = true;
       break;
     case "speed": // 速度优先
       f.full_load_read_workers = 8;
@@ -412,6 +416,8 @@ function applyFullLoadPreset(name) {
       f.full_load_batch_bytes_mb = 8;
       f.full_load_commit_rows = 20000;
       f.full_load_commit_bytes_mb = 64;
+      f.full_load_lock_wait_timeout_sec = 10;
+      f.full_load_degrade_on_align_lock_fail = true;
       break;
     case "low": // 低目标负载
       f.full_load_read_workers = 2;
@@ -420,6 +426,8 @@ function applyFullLoadPreset(name) {
       f.full_load_batch_bytes_mb = 2;
       f.full_load_commit_rows = 5000;
       f.full_load_commit_bytes_mb = 16;
+      f.full_load_lock_wait_timeout_sec = 10;
+      f.full_load_degrade_on_align_lock_fail = true;
       break;
     case "auto": // 全部自动（0=使用后端默认）
     default:
@@ -429,6 +437,8 @@ function applyFullLoadPreset(name) {
       f.full_load_batch_bytes_mb = 0;
       f.full_load_commit_rows = 0;
       f.full_load_commit_bytes_mb = 0;
+      f.full_load_lock_wait_timeout_sec = 0;
+      f.full_load_degrade_on_align_lock_fail = true;
       break;
   }
 }
@@ -908,6 +918,8 @@ function resetForm() {
     full_load_batch_bytes_mb: 0,
     full_load_commit_rows: 0,
     full_load_commit_bytes_mb: 0,
+    full_load_lock_wait_timeout_sec: 0,
+    full_load_degrade_on_align_lock_fail: true,
   };
 
   selectedSyncLevel.value = "database";
@@ -1790,6 +1802,9 @@ function fillTaskFormFromTask(task) {
     full_load_batch_bytes_mb: task.config.full_load_batch_bytes_mb ?? 0,
     full_load_commit_rows: task.config.full_load_commit_rows ?? 0,
     full_load_commit_bytes_mb: task.config.full_load_commit_bytes_mb ?? 0,
+    full_load_lock_wait_timeout_sec: task.config.full_load_lock_wait_timeout_sec ?? 0,
+    full_load_degrade_on_align_lock_fail:
+      task.config.full_load_degrade_on_align_lock_fail !== false,
   };
 
   if (task.config.sync_level === "DATABASE") {
@@ -4811,6 +4826,38 @@ watch(uiTheme, (theme) => syncUiThemeToDocument(theme), { immediate: true });
                             style="width: 100%"
                             placeholder="0=自动(32)"
                           />
+                        </a-form-item>
+                      </a-col>
+                    </a-row>
+
+                    <a-row :gutter="16">
+                      <a-col :span="12">
+                        <a-form-item label="对齐取锁等待 (秒)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_lock_wait_timeout_sec"
+                            @change="(v) => (taskForm.full_load_lock_wait_timeout_sec = v ?? 0)"
+                            :min="0"
+                            :max="3600"
+                            style="width: 100%"
+                            placeholder="0=自动(10)"
+                          />
+                        </a-form-item>
+                      </a-col>
+                      <a-col :span="12">
+                        <a-form-item label="对齐取锁失败策略">
+                          <a-switch
+                            v-model="taskForm.full_load_degrade_on_align_lock_fail"
+                          />
+                          <a-typography-text
+                            type="secondary"
+                            style="margin-left: 8px; font-size: 12px"
+                          >
+                            {{
+                              taskForm.full_load_degrade_on_align_lock_fail
+                                ? "降级为单连接快照"
+                                : "fail-closed（任务失败）"
+                            }}
+                          </a-typography-text>
                         </a-form-item>
                       </a-col>
                     </a-row>

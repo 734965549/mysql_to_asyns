@@ -109,6 +109,11 @@ type TaskConfig struct { // 定义任务配置结构体
 	FullLoadBatchBytesMB  int    `json:"full_load_batch_bytes_mb,omitempty"`  // 单条 INSERT 字节上限(MiB)；0=4
 	FullLoadCommitRows    int    `json:"full_load_commit_rows,omitempty"`     // 单事务行数上限；0=10000
 	FullLoadCommitBytesMB int    `json:"full_load_commit_bytes_mb,omitempty"` // 单事务字节上限(MiB)；0=32
+	// FullLoadLockWaitTimeoutSec 超大表对齐取锁等待超时（秒）；0=默认 10。
+	FullLoadLockWaitTimeoutSec int `json:"full_load_lock_wait_timeout_sec,omitempty"`
+	// FullLoadDegradeOnAlignLockFail nil/省略=对齐取锁失败时降级单连接；显式 false=fail-closed。
+	// ALL+无PK 捕获表级 HWM 时仍强制 fail-closed，不受该字段影响。
+	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
 
 	SourceDB    *DatabaseConfig   `json:"source_db,omitempty"`    // 源数据库配置（可选，覆盖配置文件）
 	TargetDB    *DatabaseConfig   `json:"target_db,omitempty"`    // 目标数据库配置（可选，覆盖配置文件）
@@ -279,7 +284,8 @@ func (ctx ProcessContext) CloneForRead() ProcessContext {
 	return cloned
 }
 
-// CloneForRead 返回任务只读快照；GetTask 仍返回 live 指针供服务内部修改，API 读取应优先使用 TaskService.GetTaskSnapshot。
+// CloneForRead 返回任务只读快照；GetTask 仍返回 live 指针供服务内部修改，
+// API/路由读取应优先使用 TaskService.GetTaskSnapshot / GetAllTasks（已克隆）。
 func (t *SyncTask) CloneForRead() *SyncTask {
 	if t == nil {
 		return nil
@@ -291,6 +297,10 @@ func (t *SyncTask) CloneForRead() *SyncTask {
 	cloned.Config.TargetDatabases = append([]string(nil), t.Config.TargetDatabases...)
 	cloned.Config.Tables = append([]string(nil), t.Config.Tables...)
 	cloned.Config.TargetTables = append([]string(nil), t.Config.TargetTables...)
+	if t.Config.FullLoadDegradeOnAlignLockFail != nil {
+		degrade := *t.Config.FullLoadDegradeOnAlignLockFail
+		cloned.Config.FullLoadDegradeOnAlignLockFail = &degrade
+	}
 	if t.Config.SourceDB != nil {
 		sourceDB := *t.Config.SourceDB
 		cloned.Config.SourceDB = &sourceDB

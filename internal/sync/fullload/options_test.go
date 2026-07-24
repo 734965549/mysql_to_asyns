@@ -47,6 +47,28 @@ func TestResolveOptions_Defaults(t *testing.T) {
 	if !opt.DegradeOnAlignLockFail {
 		t.Error("DegradeOnAlignLockFail should default true")
 	}
+	if opt.LockWaitTimeoutSec != defaultLockWaitTimeoutSec {
+		t.Errorf("LockWaitTimeoutSec=%d want %d", opt.LockWaitTimeoutSec, defaultLockWaitTimeoutSec)
+	}
+}
+
+func TestResolveOptions_LockPolicyFromRaw(t *testing.T) {
+	failClosed := false
+	opt := ResolveOptions(RawOptions{
+		LockWaitTimeoutSec:     30,
+		DegradeOnAlignLockFail: &failClosed,
+	})
+	if opt.LockWaitTimeoutSec != 30 {
+		t.Errorf("LockWaitTimeoutSec=%d want 30", opt.LockWaitTimeoutSec)
+	}
+	if opt.DegradeOnAlignLockFail {
+		t.Error("DegradeOnAlignLockFail should be false when explicitly disabled")
+	}
+
+	opt2 := ResolveOptions(RawOptions{LockWaitTimeoutSec: 99999})
+	if opt2.LockWaitTimeoutSec != hardMaxLockWaitTimeoutSec {
+		t.Errorf("LockWaitTimeoutSec=%d want clamp %d", opt2.LockWaitTimeoutSec, hardMaxLockWaitTimeoutSec)
+	}
 }
 
 func TestResolveOptions_ExplicitMB(t *testing.T) {

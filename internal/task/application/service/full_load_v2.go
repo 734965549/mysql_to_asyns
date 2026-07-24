@@ -141,6 +141,8 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		BatchSize:                    task.Config.BatchSize,
 		LegacyTxCommitEveryNParallel: task.Config.TxCommitEveryNParallel,
 		SkipBinlog:                   task.Config.EnableSkipBinlog,
+		LockWaitTimeoutSec:           task.Config.FullLoadLockWaitTimeoutSec,
+		DegradeOnAlignLockFail:       task.Config.FullLoadDegradeOnAlignLockFail,
 	})
 
 	stats := &fullload.Stats{}

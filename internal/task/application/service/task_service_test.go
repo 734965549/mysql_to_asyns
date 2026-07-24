@@ -124,18 +124,22 @@ func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	emptyStatsRows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+	emptyIndexStatsRows := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+	}
 
 	// sqlmock checks expectations in order by default. Disable ordered matching
 	// because the concurrent implementation may dispatch the two tables in any
 	// order, and each table's ALTER TABLE may overlap with the other table's.
+	// 每个 ExpectQuery 必须使用独立 Rows：并发表会并行消费结果集，共享同一
+	// *sqlmock.Rows 会触发 data race。
 	mock.MatchExpectationsInOrder(false)
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("target_db", "users", "idx_users_name").
-		WillReturnRows(emptyStatsRows)
+		WillReturnRows(emptyIndexStatsRows())
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("target_db", "orders", "uk_orders_no").
-		WillReturnRows(emptyStatsRows)
+		WillReturnRows(emptyIndexStatsRows())
 	mock.ExpectExec("ALTER TABLE `target_db`.`users` ADD INDEX `idx_users_name` \\(`name`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `target_db`.`orders` ADD UNIQUE INDEX `uk_orders_no` \\(`order_no`\\)").
@@ -543,16 +547,18 @@ func TestRestoreIndexes_BatchesMultipleIndexesIntoOneAlter(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	empty := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+	empty := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+	}
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "t", "idx_a").
-		WillReturnRows(empty)
+		WillReturnRows(empty())
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "t", "uk_b").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(empty())
 	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
 		WithArgs("db", "t", "ft_c").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(empty())
 	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a` \\(`a`\\), ADD UNIQUE INDEX `uk_b` \\(`b`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `db`.`t` ADD FULLTEXT INDEX `ft_c` \\(`c`\\)").
@@ -1027,6 +1033,21 @@ func TestGetAllTasks(t *testing.T) {
 	assert.True(t, taskIDs["task_1_unique"])
 	assert.True(t, taskIDs["task_2_unique"])
 	assert.True(t, taskIDs["task_3_unique"])
+
+	// 返回快照而非 live 指针：改快照不影响服务内任务
+	live, ok := ts.GetTask("task_1_unique")
+	require.True(t, ok)
+	var snap *taskEntity.SyncTask
+	for _, task := range tasks {
+		if task.Config.ID == "task_1_unique" {
+			snap = task
+			break
+		}
+	}
+	require.NotNil(t, snap)
+	assert.NotSame(t, live, snap)
+	snap.Context.Status = taskEntity.TaskStatusFailed
+	assert.NotEqual(t, taskEntity.TaskStatusFailed, live.Context.Status)
 }
 
 func TestUpdateTask(t *testing.T) {
@@ -1041,18 +1062,76 @@ func TestUpdateTask(t *testing.T) {
 	}
 	task, _ := ts.CreateTask(taskConfig)
 
-	// 修改任务
+	// 修改任务（非运行态可编辑）
 	task.Config.Name = "Updated Name"
-	task.Start()
 
 	// 更新任务
 	err := ts.UpdateTask(task)
 	assert.NoError(t, err)
 
-	// 验证更新
+	// 验证更新：Config 已合并，Context 仍为原 live 状态
 	retrievedTask, _ := ts.GetTask("test_task_update")
 	assert.Equal(t, "Updated Name", retrievedTask.Config.Name)
-	assert.Equal(t, taskEntity.TaskStatusRunning, retrievedTask.Context.Status)
+	assert.Equal(t, taskEntity.TaskStatusPending, retrievedTask.Context.Status)
+}
+
+func TestUpdateTask_RejectsRunning(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newTestTaskService(dataDir)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "upd_running", Name: "run"})
+	require.NoError(t, err)
+	task.Start()
+
+	snap, ok := ts.GetTaskSnapshot("upd_running")
+	require.True(t, ok)
+	snap.Config.Name = "should-not-apply"
+
+	err = ts.UpdateTask(snap)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot update running")
+
+	live, _ := ts.GetTask("upd_running")
+	assert.Equal(t, "run", live.Config.Name)
+	assert.Equal(t, taskEntity.TaskStatusRunning, live.Context.Status)
+}
+
+func TestUpdateTask_PreservesLiveContextFromSnapshot(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newTestTaskService(dataDir)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "upd_ctx", Name: "orig"})
+	require.NoError(t, err)
+	task.Context.TotalRows = 42
+	task.Context.ProgressPercent = 12.5
+
+	snap, ok := ts.GetTaskSnapshot("upd_ctx")
+	require.True(t, ok)
+	snap.Config.Name = "renamed"
+	snap.Context.TotalRows = 0 // 故意污染快照 Context，写路径应忽略
+
+	require.NoError(t, ts.UpdateTask(snap))
+
+	live, _ := ts.GetTask("upd_ctx")
+	assert.Equal(t, "renamed", live.Config.Name)
+	assert.Equal(t, int64(42), live.Context.TotalRows)
+	assert.InDelta(t, 12.5, live.Context.ProgressPercent, 0.01)
+}
+
+func TestDeleteTask_RejectsRunning(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newTestTaskService(dataDir)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "del_running", Name: "run"})
+	require.NoError(t, err)
+	task.Start()
+
+	err = ts.DeleteTask("del_running")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot delete running")
+
+	_, exists := ts.GetTask("del_running")
+	assert.True(t, exists)
 }
 
 func TestUpdateTask_NotFound(t *testing.T) {

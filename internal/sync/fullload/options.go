@@ -30,12 +30,13 @@ const (
 	// mysqlMaxPlaceholders 单条预处理语句占位符上限（留余量），与 writer 包保持一致。
 	mysqlMaxPlaceholders = 62000
 
-	hardMaxWorkers    = 64
-	hardMaxBatchRow   = 100000
-	hardMaxBufferMB   = 4096
-	hardMaxBatchMB    = 64
-	hardMaxCommitMB   = 4096
-	hardMaxCommitRows = 10000000
+	hardMaxWorkers            = 64
+	hardMaxBatchRow           = 100000
+	hardMaxBufferMB           = 4096
+	hardMaxBatchMB            = 64
+	hardMaxCommitMB           = 4096
+	hardMaxCommitRows         = 10000000
+	hardMaxLockWaitTimeoutSec = 3600
 )
 
 // RawOptions 是从任务配置直接读取的原始参数（未经默认值推导）。
@@ -54,6 +55,11 @@ type RawOptions struct {
 	LegacyTxCommitEveryNParallel int
 
 	SkipBinlog bool // enable_skip_binlog
+
+	// LockWaitTimeoutSec 取表锁等待超时（秒）；<=0 时使用默认 10。
+	LockWaitTimeoutSec int
+	// DegradeOnAlignLockFail nil 时默认 true（降级单连接）；显式 false 为 fail-closed。
+	DegradeOnAlignLockFail *bool
 }
 
 // Options 是经过默认值推导后引擎实际使用的运行参数。
@@ -85,6 +91,11 @@ type Options struct {
 
 // ResolveOptions 将原始配置推导为生效运行参数，应用 4C8G 平衡预设。
 func ResolveOptions(raw RawOptions) Options {
+	degrade := true
+	if raw.DegradeOnAlignLockFail != nil {
+		degrade = *raw.DegradeOnAlignLockFail
+	}
+
 	opt := Options{
 		ReadWorkers:            clampInt(raw.ReadWorkers, defaultReadWorkers, 1, hardMaxWorkers),
 		WriteWorkers:           clampInt(raw.WriteWorkers, defaultWriteWorkers, 1, hardMaxWorkers),
@@ -93,8 +104,8 @@ func ResolveOptions(raw RawOptions) Options {
 		ChunkOvershoot:         defaultChunkOvershoot,
 		SkipBinlog:             raw.SkipBinlog,
 		LargeTableRows:         defaultLargeTableRows,
-		LockWaitTimeoutSec:     defaultLockWaitTimeoutSec,
-		DegradeOnAlignLockFail: true,
+		LockWaitTimeoutSec:     clampInt(raw.LockWaitTimeoutSec, defaultLockWaitTimeoutSec, 1, hardMaxLockWaitTimeoutSec),
+		DegradeOnAlignLockFail: degrade,
 	}
 
 	opt.BufferBytes = mebibytes(raw.BufferMB, defaultBufferBytes, hardMaxBufferMB)

@@ -177,9 +177,9 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 
 GRANT SELECT ON *.* TO 'username'@'%';
 
-# ALL 模式全量开始前采用"短锁取位点"模式，会短暂执行 FLUSH TABLES WITH READ LOCK，
+# ALL 必须具备 RELOAD；FULL 默认可在缺权限时降级单连接，
 
-# 因此 ALL 模式需要 RELOAD 权限（FULL 模式不需要）
+# 但超大表多连接对齐或 degrade=false 同样需要
 
 GRANT RELOAD ON *.* TO 'username'@'%';
 

@@ -255,16 +255,16 @@ func TestStartRowCountComparison_Validation(t *testing.T) {
 
 		// 等待后台 goroutine 进入 CHECKING 并最终 FAILED（无真实数据库连接）
 		require.Eventually(t, func() bool {
-			t, ok := ts.GetTask("cmp_stopped_ok")
-			if !ok || t.Context.RowCountComparison == nil {
+			snap, ok := ts.GetTaskSnapshot("cmp_stopped_ok")
+			if !ok || snap.Context.RowCountComparison == nil {
 				return false
 			}
-			return t.Context.RowCountComparison.Status == taskEntity.RowCountComparisonFailed
+			return snap.Context.RowCountComparison.Status == taskEntity.RowCountComparisonFailed
 		}, 5*time.Second, 50*time.Millisecond, "comparison should fail due to no real DB")
 
 		// 重复启动应被拦截（409 already in progress）——但此时已 FAILED，所以重新启动允许。
 		// 这里验证 FAILED 后任务终态不被修改为非 STOPPED。
-		task2, ok := ts.GetTask("cmp_stopped_ok")
+		task2, ok := ts.GetTaskSnapshot("cmp_stopped_ok")
 		require.True(t, ok)
 		assert.Equal(t, taskEntity.TaskStatusStopped, task2.Context.Status, "comparison failure must not change task terminal status")
 	})
@@ -762,6 +762,58 @@ func TestGetTaskSnapshot_ConcurrentRowCountComparison(t *testing.T) {
 					if tbl.TargetRows != nil {
 						_ = *tbl.TargetRows
 					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestGetAllTasks_ConcurrentRowCountComparison 验证列表快照与后台进度写入无 data race。
+func TestGetAllTasks_ConcurrentRowCountComparison(t *testing.T) {
+	ts := NewTaskService(&config.Config{Storage: config.StorageConfig{Mode: "file", DataDir: t.TempDir()}})
+	defer ts.Close()
+
+	taskID := "all_tasks_cmp"
+	makeAllTaskAtIncremental(t, ts, taskID)
+	require.NoError(t, ts.EndTask(taskID))
+
+	startedAt := time.Now()
+	tables := []comparisonTableTask{{sourceSchema: "src_db", sourceTable: "users", targetSchema: "tgt_db", targetTable: "users"}}
+	srcRows := int64(1)
+	tgtRows := int64(2)
+	diff := int64(1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			done := []taskEntity.RowCountComparisonTable{{
+				SourceSchema: "src_db", SourceTable: "users", TargetSchema: "tgt_db", TargetTable: "users",
+				SourceRows: &srcRows, TargetRows: &tgtRows, Difference: &diff, Matched: false,
+			}}
+			ts.persistRowCountComparisonProgress(taskID, startedAt, tables, done)
+		}
+	}()
+
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				for _, snap := range ts.GetAllTasks() {
+					if snap == nil || snap.Config.ID != taskID {
+						continue
+					}
+					_ = snap.Context.Status
+					rc := snap.Context.RowCountComparison
+					if rc == nil {
+						continue
+					}
+					_ = rc.Status
+					_ = rc.CheckedTables
 				}
 			}
 		}()

@@ -341,6 +341,8 @@ func TestCreateTask_FullLoadV2Fields(t *testing.T) {
 		"full_load_batch_bytes_mb":8,
 		"full_load_commit_rows":20000,
 		"full_load_commit_bytes_mb":64,
+		"full_load_lock_wait_timeout_sec":25,
+		"full_load_degrade_on_align_lock_fail":false,
 		"index_restore_worker_count":3
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/tasks", body)
@@ -367,6 +369,12 @@ func TestCreateTask_FullLoadV2Fields(t *testing.T) {
 	}
 	if cfg.FullLoadCommitRows != 20000 || cfg.FullLoadCommitBytesMB != 64 {
 		t.Fatalf("commit fields not mapped: %d/%d", cfg.FullLoadCommitRows, cfg.FullLoadCommitBytesMB)
+	}
+	if cfg.FullLoadLockWaitTimeoutSec != 25 {
+		t.Fatalf("lock wait timeout not mapped: %d", cfg.FullLoadLockWaitTimeoutSec)
+	}
+	if cfg.FullLoadDegradeOnAlignLockFail == nil || *cfg.FullLoadDegradeOnAlignLockFail {
+		t.Fatalf("degrade_on_align_lock_fail not mapped: %v", cfg.FullLoadDegradeOnAlignLockFail)
 	}
 	if cfg.IndexRestoreWorkerCount != 3 {
 		t.Fatalf("index_restore_worker_count not mapped: %d", cfg.IndexRestoreWorkerCount)
@@ -957,10 +965,7 @@ func stageAllTaskAtIncremental(t *testing.T, taskSvc *taskService.TaskService, t
 	}
 	task.Start()
 	task.MarkIncrementalStarted()
-	// 通过 UpdateTask 把运行中状态写回服务映射
-	if err := taskSvc.UpdateTask(task); err != nil {
-		t.Fatalf("stage task: %v", err)
-	}
+	// CreateTask 返回的即是 map 中的 live 指针，Start/Mark 已直接写入内存状态。
 }
 
 // TestUpdateTaskHandler_RejectsStopped STOPPED 任务更新返回 409，且不改脏内存配置。

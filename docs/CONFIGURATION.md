@@ -425,7 +425,9 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
   "full_load_buffer_mb": 128,
   "full_load_batch_bytes_mb": 4,
   "full_load_commit_rows": 10000,
-  "full_load_commit_bytes_mb": 32
+  "full_load_commit_bytes_mb": 32,
+  "full_load_lock_wait_timeout_sec": 10,
+  "full_load_degrade_on_align_lock_fail": true
 }
 ```
 
@@ -438,6 +440,8 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
 | `full_load_batch_bytes_mb` | 单批目标字节数（MiB），达到即入队 | 4（范围 1–64） |
 | `full_load_commit_rows` | 单事务累计提交行数阈值 | 10000（不小于 `batch_size`，上限 10000000） |
 | `full_load_commit_bytes_mb` | 单事务累计提交字节阈值（MiB） | 32（不小于单批字节，上限 4096） |
+| `full_load_lock_wait_timeout_sec` | 超大表对齐取锁等待超时（秒，双保险：客户端 context + `SESSION lock_wait_timeout`） | 10（范围 1–3600） |
+| `full_load_degrade_on_align_lock_fail` | 对齐多连接取锁失败时是否降级为单连接快照；`false` 为 fail-closed | `true`（省略时同样按 true） |
 
 说明：
 
@@ -455,6 +459,9 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
 - `full_load_read_workers` 同时约束并发表数与单表并行读上限；快照连接信号量会为协调锁
   连接预留槽位，避免取锁自死锁。源库写入频繁时多个长 ReadView 会放大 undo / history list，
   请按源库承受能力保守设置 worker 数。
+- `full_load_degrade_on_align_lock_fail=false` 时，超大表对齐取锁失败会直接让该表/任务失败；
+  默认 `true` 则降级为单连接一致性快照继续。无论该开关如何，ALL 模式无主键表在捕获表级
+  binlog HWM 时取锁失败始终 fail-closed。
 
 ### 全量并行读取路径（与 channel buffer 的关系）
 

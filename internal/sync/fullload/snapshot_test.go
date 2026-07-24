@@ -508,6 +508,50 @@ func TestOpenTableSnapshotsWithLimiter_DegradeOnAlignLockFail(t *testing.T) {
 	}
 }
 
+func TestOpenTableSnapshotsWithLimiter_FailClosedWhenDegradeDisabled(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.MatchExpectationsInOrder(false)
+
+	lockErr := errors.New("Access denied; you need (at least one of) the RELOAD privilege(s)")
+	expectInnoDBTable(mock, "s", "t")
+	expectLockWaitTimeout(mock)
+	mock.ExpectExec("FLUSH TABLES `s`.`t` WITH READ LOCK").WillReturnError(lockErr)
+	expectRestoreLockWaitTimeout(mock)
+
+	lim := newSnapshotLimiter(2, 8)
+	stats := &Stats{}
+	failClosed := false
+	opt := ResolveOptions(RawOptions{
+		ReadWorkers:            2,
+		DegradeOnAlignLockFail: &failClosed,
+	})
+
+	snaps, reserved, err := openTableSnapshotsWithLimiter(
+		context.Background(), db, "s", "t", "id", 2,
+		SnapshotOptions{LockWaitTimeoutSec: 5},
+		lim, opt, stats,
+	)
+	if err == nil {
+		t.Fatal("expected align lock failure when degrade disabled")
+	}
+	if !errors.Is(err, lockErr) && !strings.Contains(err.Error(), lockErr.Error()) {
+		t.Fatalf("want original lock error, got: %v", err)
+	}
+	if snaps != nil || reserved != 0 {
+		t.Fatalf("snaps=%v reserved=%d want nil/0 (no single-reader snapshot)", snaps, reserved)
+	}
+	if atomic.LoadInt64(&stats.SnapshotAlignDegrades) != 0 {
+		t.Fatalf("degrades=%d want 0", stats.SnapshotAlignDegrades)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSetLockWaitTimeout_RestoresPreviousValue(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(false))
 	if err != nil {

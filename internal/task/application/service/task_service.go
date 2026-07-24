@@ -994,24 +994,20 @@ func (s *TaskService) GetTaskSnapshot(taskID string) (*taskEntity.SyncTask, bool
 	return task.CloneForRead(), true
 }
 
-// GetAllTasks 获取所有任务
-
+// GetAllTasks 返回所有任务的只读快照，供路由指标等在释放锁后安全读取 Status，
+// 避免与后台进度更新共享 live 指针产生数据竞争。内部修改请继续用 GetTask。
 func (s *TaskService) GetAllTasks() []*taskEntity.SyncTask {
-
 	s.mu.RLock()
-
 	defer s.mu.RUnlock()
 
 	tasks := make([]*taskEntity.SyncTask, 0, len(s.tasks))
-
 	for _, task := range s.tasks {
-
-		tasks = append(tasks, task)
-
+		if task == nil {
+			continue
+		}
+		tasks = append(tasks, task.CloneForRead())
 	}
-
 	return tasks
-
 }
 
 // GetTasksPage 获取分页任务列表
@@ -1207,13 +1203,18 @@ func (s *TaskService) getTasksPageFromMemory(page, pageSize int, status, keyword
 	return tasks[start:end], total, page, pageSize
 }
 
-// UpdateTask 更新任务
+// UpdateTask 更新任务配置。写锁内复核 RUNNING/STOPPED，并将传入对象的 Config 合并到
+// 内存中的 live 任务，保留 Context（进度、行数核对等），避免 API 侧快照覆盖并发写入。
 
 func (s *TaskService) UpdateTask(task *taskEntity.SyncTask) error {
 
 	s.mu.Lock()
 
 	defer s.mu.Unlock()
+
+	if task == nil {
+		return fmt.Errorf("task is nil")
+	}
 
 	existing, exists := s.tasks[task.Config.ID]
 	if !exists {
@@ -1222,21 +1223,21 @@ func (s *TaskService) UpdateTask(task *taskEntity.SyncTask) error {
 
 	}
 
+	// 写锁内复核：拒绝运行中编辑，避免 handler 先读快照后的 TOCTOU。
+	if existing.Context.Status == taskEntity.TaskStatusRunning {
+		return fmt.Errorf("cannot update running task: %s", task.Config.ID)
+	}
+
 	// STOPPED 为终态，不允许编辑原任务（可复制新建或删除）。
 	if existing.Context.Status == taskEntity.TaskStatusStopped {
 		return fmt.Errorf("task is stopped and cannot be edited: %s", task.Config.ID)
 	}
 
-	// 编辑不应清空已归档的行数对比结果（请求体一般不携带该字段）。
-	if task.Context.RowCountComparison == nil && existing.Context.RowCountComparison != nil {
-		task.Context.RowCountComparison = existing.Context.RowCountComparison
-	}
-
-	s.tasks[task.Config.ID] = task
+	existing.Config = task.Config
 
 	// 保存到存储
 
-	if err := s.storage.Save(task); err != nil {
+	if err := s.storage.Save(existing); err != nil {
 
 		fmt.Printf("保存任务失败: %v\n", err)
 
@@ -1254,10 +1255,16 @@ func (s *TaskService) DeleteTask(taskID string) error {
 
 	defer s.mu.Unlock()
 
-	if _, exists := s.tasks[taskID]; !exists {
+	existing, exists := s.tasks[taskID]
+	if !exists {
 
 		return fmt.Errorf("task not found: %s", taskID)
 
+	}
+
+	// 写锁内复核：拒绝删除运行中任务，避免 handler 先读后删的 TOCTOU。
+	if existing.Context.Status == taskEntity.TaskStatusRunning {
+		return fmt.Errorf("cannot delete running task: %s", taskID)
 	}
 
 	// 停止增量同步服务（如果存在）
