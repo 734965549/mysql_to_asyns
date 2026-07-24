@@ -708,8 +708,83 @@ onUnmounted(() => {
   <StartTaskModal ref="startModalRef" @success="onStartSuccess" />
 </template>
 
-<style>
+<style scoped>
 /* TaskListView 组件特定的样式，主题相关的样式在 themes.css 中 */
+.stat-cards {
+  margin-bottom: 24px;
+}
+.stat-card {
+  border-radius: 8px;
+}
+.stat-icon {
+  font-size: 20px;
+  margin-right: 8px;
+}
+.stat-icon.blue {
+  color: #165dff;
+}
+.stat-icon.green {
+  color: #00b42a;
+}
+.stat-icon.red {
+  color: #f53f3f;
+}
+.task-list-card {
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+  border: 1px solid var(--app-border-soft);
+  overflow: hidden;
+}
+.task-list-card :deep(.arco-card-header) {
+  border-bottom: 1px solid var(--app-border-soft);
+  padding: 20px 24px 18px;
+  height: auto;
+  min-height: 72px;
+  overflow: visible;
+  align-items: center;
+}
+.task-list-card :deep(.arco-card-body) {
+  padding: 20px 24px 24px;
+}
+.task-filter-panel {
+  margin-bottom: 18px;
+  border: 1px solid #e5eaf3;
+  border-radius: 16px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+}
+.task-filter-panel :deep(.arco-card-header) {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid #edf2f7;
+}
+.task-filter-panel :deep(.arco-card-body) {
+  padding: 16px 20px 20px;
+}
+.task-filter-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.empty-state {
+  padding: 60px 0;
+  text-align: center;
+}
+.empty-state--card {
+  background: var(--app-surface-soft);
+  border: 1px dashed var(--app-border);
+  border-radius: 14px;
+  margin: 4px 0 18px;
+}
+.task-card-inner {
+  border-radius: 14px;
+  border: 1px solid #edf2f7;
+  width: 100%;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+}
+.task-card-inner :deep(.arco-card-body) {
+  padding: 20px;
+}
 .task-list-header {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

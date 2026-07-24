@@ -119,10 +119,76 @@ function goCreate() {
   </a-layout>
 </template>
 
-<style>
+<style scoped>
 /* MainLayout 基础样式，其他样式在 themes.css 中 */
 .layout-container {
   height: 100vh;
+}
+
+.sider {
+  display: flex;
+  flex-direction: column;
+}
+
+.logo {
+  height: 64px;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  color: #fff;
+}
+
+.logo-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 12px;
+  font-size: 18px;
+}
+
+.logo-text {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.sider-menu {
+  flex: 1;
+  width: 100% !important;
+}
+
+.sider-menu :deep(.arco-menu-inner) {
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+.sider-menu :deep(.arco-menu-item) {
+  margin: 4px 0;
+  border-radius: 6px;
+  padding: 0 12px !important;
+  height: 40px !important;
+  line-height: 40px !important;
+}
+
+.sider-footer {
+  padding: 16px 20px;
+  margin-top: auto;
+}
+
+.header {
+  padding: 0 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  z-index: 10;
+}
+
+.content {
+  padding: 24px;
+  overflow-y: auto;
 }
 
 .header-left,

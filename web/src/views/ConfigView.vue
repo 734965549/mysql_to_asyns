@@ -266,7 +266,7 @@ onMounted(() => {
         </div>
 </template>
 
-<style>
+<style scoped>
 /* ConfigView 组件特定的样式，主题相关的样式在 themes.css 中 */
 .config-page-shell {
   display: flex;
@@ -288,6 +288,34 @@ onMounted(() => {
 }
 .config-summary-row {
   margin-bottom: 4px;
+}
+.config-page-card :deep(.arco-card-body) {
+  padding: 20px 24px 24px;
+}
+.config-section-card :deep(.arco-card-header) {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--app-border-soft, #edf2f7);
+}
+.config-section-card :deep(.arco-card-header-title) {
+  color: var(--app-text, #1d2129);
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 22px;
+}
+.config-section-card :deep(.arco-card-body) {
+  padding: 16px 20px 20px;
+}
+.config-section-divider {
+  margin: 22px 0 16px !important;
+  border-color: var(--app-border-soft, #e5e8ef) !important;
+}
+.config-section-divider :deep(.arco-divider-text) {
+  padding: 0 12px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 20px;
+  color: var(--app-text, #1d2129);
+  background: var(--app-surface-soft, #fbfcff);
 }
 .config-actions-bar {
   display: flex;
