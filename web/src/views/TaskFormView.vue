@@ -41,6 +41,8 @@ const activeTableSourceDatabase = ref("");
 const tableSelectionsByDatabase = ref({});
 const tablesByDatabase = ref({});
 const loadingTablesByDatabase = ref({});
+const tableFetchErrors = ref({});
+const tableFetchGlobalError = ref(null);
 const expandedTableDatabaseKeys = ref([]);
 const expandedTargetTableDatabaseKeys = ref([]);
 
@@ -181,10 +183,10 @@ async function fetchDatabases() {
       dbConfig = { host: configForm.value.datasource.host, port: configForm.value.datasource.port, username: configForm.value.datasource.username, password: configForm.value.datasource.password, database: configForm.value.datasource.database || "mysql" };
     }
     const defaultRes = await fetch(`${API_BASE}/metadata/databases`);
-    if (defaultRes.ok) { databases.value = await defaultRes.json(); return; }
+    if (defaultRes.ok) { databases.value = await defaultRes.json(); tableFetchGlobalError.value = null; return; }
     if (dbConfig?.host) {
       const res = await fetch(`${API_BASE}/metadata/databases-with-config`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(dbConfig) });
-      if (res.ok) { databases.value = await res.json(); return; }
+      if (res.ok) { databases.value = await res.json(); tableFetchGlobalError.value = null; return; }
       const errData = await res.json();
       Message.warning("获取数据库列表失败: " + errData.error);
     } else {
@@ -217,6 +219,8 @@ async function saveSourceConfig() {
   if (!customSourceDB.value.host) { Message.warning("请先填写源数据库配置"); return; }
   Object.assign(configForm.value.datasource, { host: customSourceDB.value.host, port: customSourceDB.value.port, database: customSourceDB.value.database, username: customSourceDB.value.username, password: customSourceDB.value.password });
   await saveConfig();
+  tableFetchGlobalError.value = null;
+  tableFetchErrors.value = {};
   fetchDatabases();
 }
 
@@ -226,9 +230,20 @@ async function saveTargetConfig() {
   await saveConfig();
 }
 
-async function fetchTablesForDatabase(database) {
+function isTableFetchConfigError(message) {
+  if (!message) return false;
+  const lower = String(message).toLowerCase();
+  return lower.includes("database not connected") || lower.includes("please create a task with database configuration") || lower.includes("configure datasource");
+}
+
+async function fetchTablesForDatabase(database, { silent = false } = {}) {
   if (!database) return;
+  if (loadingTablesByDatabase.value[database]) return;
+  const cachedError = tableFetchErrors.value[database];
+  if (cachedError && isTableFetchConfigError(cachedError)) return;
+  if (tableFetchGlobalError.value && isTableFetchConfigError(tableFetchGlobalError.value)) return;
   loadingTablesByDatabase.value = { ...loadingTablesByDatabase.value, [database]: true };
+  tableFetchErrors.value = { ...tableFetchErrors.value, [database]: null };
   try {
     let dbConfig = null;
     if (useCustomSourceDB.value && customSourceDB.value.host) {
@@ -246,12 +261,26 @@ async function fetchTablesForDatabase(database) {
       const tableList = await res.json();
       tablesByDatabase.value = { ...tablesByDatabase.value, [database]: tableList };
       if (activeTableSourceDatabase.value === database) tables.value = tableList;
+      if (!silent) tableFetchGlobalError.value = null;
     } else {
       const errText = await res.text();
-      try { const errData = JSON.parse(errText); Message.error(`获取表列表失败: ${errData.error || errText}`); } catch { Message.error(`获取表列表失败: ${errText}`); }
+      let errMessage = errText;
+      try { const errData = JSON.parse(errText); errMessage = errData.error || errText; } catch { /* keep raw text */ }
+      const prettyMessage = `获取表列表失败: ${errMessage}`;
+      if (isTableFetchConfigError(errMessage)) {
+        tableFetchGlobalError.value = prettyMessage;
+      } else {
+        tableFetchErrors.value = { ...tableFetchErrors.value, [database]: prettyMessage };
+        if (!silent) Message.error(prettyMessage);
+      }
     }
-  } catch (e) { Message.error(`获取表列表失败: ${e.message}`); }
-  finally { loadingTablesByDatabase.value = { ...loadingTablesByDatabase.value, [database]: false }; }
+  } catch (e) {
+    const prettyMessage = `获取表列表失败: ${e.message}`;
+    tableFetchErrors.value = { ...tableFetchErrors.value, [database]: prettyMessage };
+    if (!silent) Message.error(prettyMessage);
+  } finally {
+    loadingTablesByDatabase.value = { ...loadingTablesByDatabase.value, [database]: false };
+  }
 }
 
 async function refreshTables() {
@@ -287,6 +316,8 @@ function resetForm() {
   tableSelectionsByDatabase.value = {};
   tablesByDatabase.value = {};
   loadingTablesByDatabase.value = {};
+  tableFetchErrors.value = {};
+  tableFetchGlobalError.value = null;
   expandedTableDatabaseKeys.value = [];
   expandedTargetTableDatabaseKeys.value = [];
   editingTaskId.value = null;
@@ -361,7 +392,9 @@ function onSyncLevelChange() {
   selectedDatabases.value = []; targetDatabaseMappings.value = [];
   selectedTables.value = []; activeTableSourceDatabase.value = "";
   tableSelectionsByDatabase.value = {}; tablesByDatabase.value = {};
-  loadingTablesByDatabase.value = {}; expandedTableDatabaseKeys.value = [];
+  loadingTablesByDatabase.value = {}; tableFetchErrors.value = {};
+  tableFetchGlobalError.value = null;
+  expandedTableDatabaseKeys.value = [];
   expandedTargetTableDatabaseKeys.value = []; tableSearchText.value = "";
   taskForm.value.source_schema = ""; taskForm.value.target_schema = "";
 }
@@ -592,7 +625,11 @@ async function createTask() {
   }
 }
 
-watch(useCustomSourceDB, () => fetchDatabases());
+watch(useCustomSourceDB, () => {
+  tableFetchGlobalError.value = null;
+  tableFetchErrors.value = {};
+  fetchDatabases();
+});
 
 watch(selectedDatabases, (newDbs) => {
   if (selectedSyncLevel.value === "table") {
@@ -1168,6 +1205,17 @@ onUnmounted(() => {
                       请先选择至少一个源数据库，再展开库名勾选表
                     </a-alert>
 
+                    <a-alert
+                      v-if="tableFetchGlobalError"
+                      type="error"
+                      style="margin-bottom: 8px"
+                      show-icon
+                      closable
+                      @close="tableFetchGlobalError = null"
+                    >
+                      {{ tableFetchGlobalError }}
+                    </a-alert>
+
                     <div class="table-toolbar">
                       <a-input
                         v-model="tableSearchText"
@@ -1246,6 +1294,16 @@ onUnmounted(() => {
                             :loading="loadingTablesByDatabase[db]"
                             style="width: 100%"
                           >
+                            <a-alert
+                              v-if="tableFetchErrors[db]"
+                              type="error"
+                              style="margin-bottom: 8px"
+                              show-icon
+                              size="small"
+                            >
+                              {{ tableFetchErrors[db] }}
+                            </a-alert>
+
                             <a-checkbox-group
                               v-if="getFilteredTablesForDatabase(db).length > 0"
                               :model-value="tableSelectionsByDatabase[db] || []"
@@ -1274,7 +1332,7 @@ onUnmounted(() => {
                             </a-checkbox-group>
 
                             <a-empty
-                              v-else
+                              v-else-if="!tableFetchErrors[db]"
                               :description="
                                 loadingTablesByDatabase[db]
                                   ? '加载中...'
@@ -2763,30 +2821,6 @@ onUnmounted(() => {
 
   border-bottom: 1px solid var(--app-border-soft);
 }
-.table-selector-panel {
-  height: 100%;
-
-  min-height: 460px;
-
-  border: 1px solid #e5e6eb;
-
-  border-radius: 8px;
-
-  background: #fff;
-
-  padding: 12px;
-}
-.table-selector-form-item {
-  margin-bottom: 0;
-}
-.table-selector-form-item :deep(.arco-form-item-content-wrapper) {
-  width: 100%;
-}
-.table-selector-form-item :deep(.arco-form-item-content) {
-  width: 100%;
-
-  display: block;
-}
 .advanced-config-row {
   margin-top: 16px;
 }
@@ -2794,47 +2828,6 @@ onUnmounted(() => {
   background: #fff;
 
   border-radius: 8px;
-}
-.table-mapping-panel {
-  margin-bottom: 12px;
-
-  border: 1px solid #e5e6eb;
-
-  border-radius: 4px;
-
-  padding: 10px 12px;
-
-  background: #fafbfc;
-}
-.table-mapping-title {
-  margin-bottom: 8px;
-
-  color: #4e5969;
-
-  font-size: 13px;
-
-  font-weight: 500;
-}
-.table-mapping-list {
-  display: flex;
-
-  flex-direction: column;
-
-  gap: 8px;
-}
-.table-mapping-item {
-  display: flex;
-
-  align-items: center;
-
-  gap: 8px;
-}
-.table-mapping-source {
-  min-width: 120px;
-
-  color: #1d2129;
-
-  font-size: 13px;
 }
 .transfer-content {
   flex: 1;
@@ -2934,43 +2927,6 @@ onUnmounted(() => {
 /* Layout refinements for task list filters and table-level sync configuration */
 .task-base-config-row {
   align-items: flex-start;
-}
-.table-selector-panel {
-  width: 100%;
-  height: 560px;
-  min-height: 560px;
-  max-height: 560px;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-.table-target-mapping-panel .table-mapping-title,
-.table-mapping-list {
-  min-width: 0;
-}
-.table-mapping-item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 16px minmax(160px, 220px);
-  width: 100%;
-  align-items: center;
-}
-.table-mapping-source {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.table-mapping-item :deep(.arco-input-wrapper) {
-  width: 100% !important;
-  min-width: 0;
-}
-.table-selector-form-item,
-.table-selector-form-item :deep(.arco-form-item-content-wrapper),
-.table-selector-form-item :deep(.arco-form-item-content) {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
 }
 /* Polished create task layout */
 .task-form-full-page {
@@ -3075,8 +3031,7 @@ onUnmounted(() => {
   border-bottom-color: #edf0f5;
   background: #fbfcff;
 }
-.transfer-header .title,
-.table-mapping-title {
+.transfer-header .title {
   color: #1d2129;
   font-weight: 600;
 }
@@ -3095,31 +3050,6 @@ onUnmounted(() => {
   padding-top: 52px;
   color: var(--app-accent);
 }
-.table-mapping-panel {
-  margin: 16px 0 22px;
-  padding: 16px;
-  border: 1px solid var(--app-border);
-  border-radius: 8px;
-  background: var(--app-surface);
-}
-.table-mapping-title {
-  margin-bottom: 12px;
-  font-size: 14px;
-}
-.table-mapping-item {
-  min-height: 42px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--app-surface-soft);
-}
-.table-mapping-source {
-  min-width: 160px;
-  overflow: hidden;
-  color: var(--app-text);
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .advanced-config-card {
   border: 1px solid var(--app-border);
   border-radius: 8px;
@@ -3129,18 +3059,9 @@ onUnmounted(() => {
   padding: 22px 24px;
 }
 /* Corrected alignment pass */
-.task-base-config-row :deep(.arco-col) {
-  flex: 0 0 100%;
-  max-width: 100%;
-}
 .task-base-config-row :deep(.arco-select),
 .task-base-config-row :deep(.arco-input-wrapper) {
   max-width: 100%;
-}
-.table-selector-panel {
-  height: 520px;
-  min-height: 520px;
-  max-height: 520px;
 }
 .task-form-full-page {
   max-width: 1180px;
@@ -3152,11 +3073,18 @@ onUnmounted(() => {
 .advanced-config-card,
 .table-mapping-panel,
 .table-selector-panel,
-.transfer-pane,
-.task-base-config-row {
+.transfer-pane {
   position: relative;
   overflow: hidden;
+}
+.task-base-config-row {
   padding: 28px 30px 10px;
+}
+.advanced-config-card,
+.table-mapping-panel,
+.table-selector-panel,
+.transfer-pane {
+  padding: 20px;
 }
 .task-base-config-row::before {
   content: "";
@@ -3168,8 +3096,120 @@ onUnmounted(() => {
     linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent 18%);
   opacity: 0.85;
 }
-.task-base-config-row :deep(.arco-col) {
+.task-base-config-row > .arco-col {
   position: relative;
   z-index: 1;
+}
+
+/* Unified panel styling */
+.table-config-row {
+  align-items: stretch;
+}
+.table-config-row > .arco-col {
+  display: flex;
+}
+.table-mapping-panel,
+.table-selector-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.table-mapping-panel {
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.table-mapping-title {
+  flex-shrink: 0;
+  margin-bottom: 12px;
+  color: var(--app-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.table-mapping-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.table-mapping-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px minmax(160px, 220px);
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--app-surface-soft);
+  min-height: 42px;
+}
+.table-mapping-source {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--app-text);
+  font-weight: 500;
+}
+.table-mapping-item :deep(.arco-input-wrapper) {
+  width: 100% !important;
+  min-width: 0;
+}
+.table-db-collapse {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+.table-db-collapse :deep(.arco-collapse-item-content) {
+  padding: 8px 0;
+}
+.table-list-panel {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.table-list-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+}
+.table-list-item {
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--app-surface-soft);
+}
+.table-list-item:hover {
+  background: var(--app-surface-hover);
+}
+.table-name-text {
+  display: inline-block;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.table-db-panel-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.table-checkbox-group {
+  width: 100%;
+}
+.table-selector-form-item {
+  margin-bottom: 0;
+}
+.table-selector-form-item,
+.table-selector-form-item :deep(.arco-form-item-content-wrapper),
+.table-selector-form-item :deep(.arco-form-item-content) {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 </style>
