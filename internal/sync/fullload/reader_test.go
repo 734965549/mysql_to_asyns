@@ -2,6 +2,7 @@ package fullload
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -206,6 +207,104 @@ func TestChunkReaderStreamQueryTimeoutReturnsStructuredError(t *testing.T) {
 	}
 	if te := err.(*ReadQueryTimeoutError); te.Phase != "stream" {
 		t.Fatalf("expected phase=stream, got %+v", te)
+	}
+}
+
+// TestChunkReaderStreamMaxDurationDuringOpenReportsActualLimit 验证打开阶段被
+// StreamMaxDuration 取消时，错误中的 Timeout 为 max duration 而非 openTimeout。
+func TestChunkReaderStreamMaxDurationDuringOpenReportsActualLimit(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	spec := &TableSpec{SourceSchema: "s", SourceTable: "t", Identity: &entity.TableIdentity{
+		Strategy: entity.FullColumnsStrategy,
+		Columns:  []entity.ColumnMeta{{Name: "payload"}},
+	}}
+	mock.ExpectQuery("SELECT `payload` FROM `s`.`t`").
+		WillDelayFor(300 * time.Millisecond).
+		WillReturnRows(sqlmock.NewRows([]string{"payload"}).AddRow("x"))
+
+	maxDur := 40 * time.Millisecond
+	opt := Options{
+		QueryTimeout:           5 * time.Second, // 远大于 max duration
+		StreamIdleTimeout:      time.Hour,
+		StreamMaxDuration:      maxDur,
+		SlowQueryWarnThreshold: time.Hour,
+	}
+	cr, err := newChunkReader(db, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 10, defaultBatchBytes, opt, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cr.close()
+
+	_, err = cr.nextBatch(context.Background())
+	if !IsReadQueryTimeout(err) {
+		t.Fatalf("expected ReadQueryTimeoutError, got %T: %v", err, err)
+	}
+	te := err.(*ReadQueryTimeoutError)
+	if te.Timeout != maxDur {
+		t.Fatalf("expected Timeout=%v (max duration), got %v (elapsed=%v)", maxDur, te.Timeout, te.Elapsed)
+	}
+}
+
+// TestChunkReaderEnqueueObservesStreamWatchCancel 验证写队列背压期间 watch 触发会
+// 唤醒 Put，并转为 ReadQueryTimeoutError（而不是当成功退出）。
+func TestChunkReaderEnqueueObservesStreamWatchCancel(t *testing.T) {
+	spec := &TableSpec{SourceSchema: "s", SourceTable: "t", Identity: &entity.TableIdentity{
+		Strategy: entity.FullColumnsStrategy,
+		Columns:  []entity.ColumnMeta{{Name: "payload"}},
+	}}
+	cr, err := newChunkReader(nil, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 10, defaultBatchBytes, Options{}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cr.close()
+
+	queryCtx, queryCancel := context.WithCancel(context.Background())
+	maxDur := 40 * time.Millisecond
+	cr.queryCtx = queryCtx
+	cr.queryCancel = queryCancel
+	cr.queryPhase = "stream"
+	cr.queryStart = time.Now()
+	cr.queryTimeout = time.Hour
+	cr.streamWatch = newStreamWatch(queryCancel, time.Hour, maxDur)
+
+	q := newBatchQueue(10, &Stats{})
+	parent := context.Background()
+	cr.ensureStreamEnqueueWatch(q)
+	_ = q.Put(parent, &RowBatch{ApproxBytes: 10}) // 填满
+
+	blocked := make(chan error, 1)
+	go func() {
+		enqCtx := cr.enqueueContext(parent)
+		err := q.Put(enqCtx, &RowBatch{ApproxBytes: 10})
+		if err != nil {
+			if to := cr.watchTimeoutError(); to != nil {
+				blocked <- to
+				return
+			}
+			if parent.Err() != nil {
+				blocked <- parent.Err()
+				return
+			}
+			blocked <- nil // 错误地当成功——测试应捕获
+			return
+		}
+		blocked <- fmt.Errorf("put unexpectedly succeeded")
+	}()
+
+	select {
+	case err := <-blocked:
+		if !IsReadQueryTimeout(err) {
+			t.Fatalf("expected ReadQueryTimeoutError, got %T: %v", err, err)
+		}
+		if te := err.(*ReadQueryTimeoutError); te.Timeout != maxDur {
+			t.Fatalf("expected Timeout=%v, got %v", maxDur, te.Timeout)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Put should unblock when stream max duration fires")
 	}
 }
 

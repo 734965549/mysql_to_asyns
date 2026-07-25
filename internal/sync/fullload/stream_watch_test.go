@@ -23,12 +23,13 @@ func TestStreamWatch_IdleFiresWithoutProgress(t *testing.T) {
 
 func TestStreamWatch_ProgressResetsIdle(t *testing.T) {
 	var fired atomic.Bool
-	w := newStreamWatch(func() { fired.Store(true) }, 40*time.Millisecond, 0)
+	// 用宽裕比例（约 50x），避免 Windows/繁忙 CI 上 sleep 抖动导致偶发失败。
+	w := newStreamWatch(func() { fired.Store(true) }, 500*time.Millisecond, 0)
 	defer w.stop()
 	w.armIdle()
 
 	for i := 0; i < 5; i++ {
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 		w.noteProgress()
 	}
 	if fired.Load() {

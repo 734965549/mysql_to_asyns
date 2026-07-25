@@ -41,6 +41,8 @@ type chunkReader struct {
 	queryTimeout time.Duration
 	queryStart   time.Time
 	streamWatch  *streamWatch // 仅 stream：无进展/最长时长看门狗
+	// streamEnqueueWatched 表示已为当前 queryCtx 注册队列唤醒，避免每批重复起 goroutine。
+	streamEnqueueWatched bool
 }
 
 // effectiveBatchRows 根据表列类型动态计算实际批次行数，对含大字段表降低单批量，
@@ -134,6 +136,7 @@ func (r *chunkReader) finishQuery() {
 		r.streamWatch.stop()
 		r.streamWatch = nil
 	}
+	r.streamEnqueueWatched = false
 	if r.slowCancel != nil {
 		r.slowCancel()
 		r.slowCancel = nil
@@ -150,6 +153,60 @@ func (r *chunkReader) finishQuery() {
 
 // classifyScanError 将结果集消费阶段的查询超时包装为可重试的 ReadQueryTimeoutError。
 // 须在 finishQuery/closeRows 取消 queryCtx 之前调用；父 ctx 已取消/超时时不包装，避免误重试。
+// enqueueContext 返回投递写队列时应监听的 context。
+// stream 查询存活期间改用 queryCtx，使 max_duration/空闲超时能唤醒阻塞的 Put。
+func (r *chunkReader) enqueueContext(parent context.Context) context.Context {
+	if r != nil && r.streamWatch != nil && r.queryCtx != nil {
+		return r.queryCtx
+	}
+	return parent
+}
+
+// ensureStreamEnqueueWatch 为当前 stream queryCtx 注册队列唤醒（每查询一次）。
+func (r *chunkReader) ensureStreamEnqueueWatch(q *batchQueue) {
+	if r == nil || q == nil || r.streamWatch == nil || r.queryCtx == nil || r.streamEnqueueWatched {
+		return
+	}
+	q.watchContext(r.queryCtx)
+	r.streamEnqueueWatched = true
+}
+
+// watchTimeoutError 在 stream 看门狗已触发时构造 ReadQueryTimeoutError；未触发返回 nil。
+func (r *chunkReader) watchTimeoutError() error {
+	if r == nil || r.streamWatch == nil || !r.streamWatch.wasFired() {
+		return nil
+	}
+	elapsed := time.Duration(0)
+	if !r.queryStart.IsZero() {
+		elapsed = time.Since(r.queryStart)
+	}
+	timeout := r.queryTimeout
+	if lim := r.streamWatch.limitOnFire(); lim > 0 {
+		timeout = lim
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	phase := r.queryPhase
+	if phase == "" {
+		phase = "stream"
+	}
+	if r.stats != nil {
+		atomic.AddInt64(&r.stats.QueryTimeouts, 1)
+	}
+	return &ReadQueryTimeoutError{
+		Schema:  r.chunk.Spec.SourceSchema,
+		Table:   r.chunk.Spec.SourceTable,
+		ChunkID: r.chunk.ID,
+		Phase:   phase,
+		Cursor:  r.cursor,
+		Start:   r.chunk.Start,
+		End:     r.chunk.End,
+		Timeout: timeout,
+		Elapsed: elapsed,
+	}
+}
+
 func (r *chunkReader) classifyScanError(parentCtx context.Context, err error) error {
 	if err == nil || r == nil {
 		return err
@@ -278,7 +335,8 @@ func (r *chunkReader) runStreamQuery(ctx context.Context, query string, args ...
 	slowCtx, slowCancel := context.WithCancel(ctx)
 	queryStart := time.Now()
 	watch := newStreamWatch(queryCancel, idleTimeout, r.opt.StreamMaxDuration)
-	openTimer := time.AfterFunc(openTimeout, watch.fire)
+	// 打开阶段超时必须上报 openTimeout，不能走 fire() 默认的 idleTimeout。
+	openTimer := time.AfterFunc(openTimeout, func() { watch.fireWith(openTimeout) })
 	r.startSlowQueryWarn(slowCtx, slowWarn, queryStart, "stream")
 
 	rows, err := r.queryer.QueryContext(queryCtx, query, args...)
@@ -288,6 +346,12 @@ func (r *chunkReader) runStreamQuery(ctx context.Context, query string, args ...
 	failOpenTimeout := func() (*sql.Rows, time.Duration, error) {
 		if rows != nil {
 			_ = rows.Close()
+		}
+		limit := openTimeout
+		if watch.wasFired() {
+			if lim := watch.limitOnFire(); lim > 0 {
+				limit = lim
+			}
 		}
 		watch.stop()
 		slowCancel()
@@ -303,7 +367,7 @@ func (r *chunkReader) runStreamQuery(ctx context.Context, query string, args ...
 			Cursor:  r.cursor,
 			Start:   r.chunk.Start,
 			End:     r.chunk.End,
-			Timeout: openTimeout,
+			Timeout: limit,
 			Elapsed: elapsed,
 		}
 	}
@@ -1033,8 +1097,10 @@ func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *ba
 				return eErr
 			}
 		}
+		cr.ensureStreamEnqueueWatch(q)
+		enqCtx := cr.enqueueContext(ctx)
 		enq := time.Now()
-		if err := q.Put(ctx, batch); err != nil {
+		if err := q.Put(enqCtx, batch); err != nil {
 			if tracker != nil {
 				if decErr := tracker.onBatchEnqueueAborted(batch.Schema, batch.Table); decErr != nil {
 					return decErr
@@ -1042,6 +1108,10 @@ func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *ba
 			}
 			if stateTracker != nil && batch.AttemptID > 0 {
 				stateTracker.onBatchReleased(batch.Schema, batch.Table, batch.AttemptID)
+			}
+			// stream 看门狗（含 max_duration）在队列背压期间触发：必须返回超时错误，不能当成功退出。
+			if to := cr.watchTimeoutError(); to != nil {
+				return fmt.Errorf("read chunk %s: %w", chunk.ID, to)
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
