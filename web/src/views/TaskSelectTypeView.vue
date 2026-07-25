@@ -180,20 +180,19 @@ function proceedToCreateTask(type) {
   text-align: center;
 }
 .select-type-header :deep(.arco-typography) {
-  color: var(--app-text) !important;
+  color: var(--color-text-1);
 }
 .select-type-header :deep(h1.arco-typography),
 .select-type-header :deep(h2.arco-typography),
 .select-type-header :deep(h3.arco-typography) {
   margin: 0 0 10px !important;
-  color: #f3fbff !important;
+  color: var(--color-text-1);
   font-size: 30px;
   font-weight: 700;
   line-height: 1.25;
-  text-shadow: 0 0 18px rgba(32, 199, 232, 0.18);
 }
 .select-type-header :deep(.arco-typography-secondary) {
-  color: #b9cbe0 !important;
+  color: var(--color-text-3);
   font-size: 14px;
 }
 .type-cards-container {
@@ -201,31 +200,29 @@ function proceedToCreateTask(type) {
 }
 .type-card {
   min-height: 126px;
-  border: 1px solid var(--app-border) !important;
-  background:
-    linear-gradient(180deg, var(--app-surface), var(--app-surface-soft)) !important;
-  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.22);
-  color: var(--app-text);
+  border: 1px solid var(--color-border-2) !important;
+  background: var(--color-bg-2) !important;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
+  color: var(--color-text-1);
   overflow: hidden;
 }
 .type-card:hover {
   transform: translateY(-3px);
-  border-color: var(--app-accent) !important;
-  background:
-    linear-gradient(180deg, var(--app-surface-soft), var(--app-surface-strong)) !important;
-  box-shadow: 0 18px 38px var(--app-glow);
+  border-color: rgb(var(--primary-6)) !important;
+  background: var(--color-bg-2) !important;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
 }
 .type-card :deep(.arco-card-body) {
   align-items: center;
   padding: 24px;
-  color: var(--app-text);
+  color: var(--color-text-1);
 }
 .type-content {
   min-width: 0;
 }
 .type-content :deep(.arco-typography),
 .type-content :deep(h5.arco-typography) {
-  color: #f3fbff !important;
+  color: var(--color-text-1);
 }
 .type-content :deep(h5.arco-typography) {
   margin-bottom: 8px !important;
@@ -233,23 +230,76 @@ function proceedToCreateTask(type) {
   line-height: 1.35;
 }
 .type-content :deep(.arco-typography-secondary) {
-  color: var(--app-muted) !important;
+  color: var(--color-text-3);
   font-size: 13px;
   line-height: 1.65;
 }
 .type-icon {
+  border: 1px solid transparent;
+  background: #e8f3ff !important;
+  color: rgb(var(--primary-6)) !important;
+}
+.kafka-icon {
+  background: #fff3e8 !important;
+  color: rgb(var(--orange-6)) !important;
+}
+.webhook-icon {
+  background: #e8fffb !important;
+  color: rgb(var(--green-6)) !important;
+}
+.multi-icon {
+  background: #f2f3f5 !important;
+  color: var(--color-text-1) !important;
+}
+
+/* Sci-fi / Dark Theme overrides when layout is not default */
+.layout-container:not(.theme-default) .select-type-header :deep(.arco-typography) {
+  color: var(--app-text) !important;
+}
+.layout-container:not(.theme-default) .select-type-header :deep(h1.arco-typography),
+.layout-container:not(.theme-default) .select-type-header :deep(h2.arco-typography),
+.layout-container:not(.theme-default) .select-type-header :deep(h3.arco-typography) {
+  color: #f3fbff !important;
+  text-shadow: 0 0 18px rgba(32, 199, 232, 0.18);
+}
+.layout-container:not(.theme-default) .select-type-header :deep(.arco-typography-secondary) {
+  color: #b9cbe0 !important;
+}
+.layout-container:not(.theme-default) .type-card {
+  border: 1px solid var(--app-border) !important;
+  background: linear-gradient(180deg, var(--app-surface), var(--app-surface-soft)) !important;
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.22);
+  color: var(--app-text);
+}
+.layout-container:not(.theme-default) .type-card:hover {
+  border-color: var(--app-accent) !important;
+  background: linear-gradient(180deg, var(--app-surface-soft), var(--app-surface-strong)) !important;
+  box-shadow: 0 18px 38px var(--app-glow);
+}
+.layout-container:not(.theme-default) .type-card :deep(.arco-card-body) {
+  color: var(--app-text);
+}
+.layout-container:not(.theme-default) .type-content :deep(.arco-typography),
+.layout-container:not(.theme-default) .type-content :deep(h5.arco-typography) {
+  color: #f3fbff !important;
+}
+.layout-container:not(.theme-default) .type-content :deep(.arco-typography-secondary) {
+  color: var(--app-muted) !important;
+}
+.layout-container:not(.theme-default) .type-icon {
   border: 1px solid var(--app-border-soft);
   background: color-mix(in srgb, var(--app-accent) 12%, transparent) !important;
   color: var(--app-accent) !important;
 }
-.kafka-icon {
+.layout-container:not(.theme-default) .kafka-icon {
   background: color-mix(in srgb, var(--app-accent-2) 12%, transparent) !important;
   color: var(--app-accent-2) !important;
 }
-.multi-icon {
+.layout-container:not(.theme-default) .multi-icon {
   background: color-mix(in srgb, var(--app-muted) 12%, transparent) !important;
   color: var(--app-muted) !important;
 }
+
 .theme-blue .type-card,
 .theme-gray .type-card,
 .theme-black .type-card,

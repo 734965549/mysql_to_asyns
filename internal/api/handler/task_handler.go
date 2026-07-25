@@ -154,8 +154,10 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	FullLoadLockWaitTimeoutSec int      `json:"full_load_lock_wait_timeout_sec,omitempty"` // V2 取表锁等待秒数；0=10
 	// FullLoadDegradeOnAlignLockFail nil=默认降级单连接；false=对齐取锁失败 fail-closed
 	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
-	FullLoadQueryTimeoutSec        int   `json:"full_load_query_timeout_sec,omitempty"`     // V2 单次查询超时秒数；0=300
-	FullLoadSlowQueryWarnSec       int   `json:"full_load_slow_query_warn_sec,omitempty"`   // V2 慢查询告警秒数；0=30
+	FullLoadQueryTimeoutSec        int   `json:"full_load_query_timeout_sec,omitempty"`      // V2 查询超时秒数；keyset绝对/stream打开；0=300
+	FullLoadStreamIdleTimeoutSec   int   `json:"full_load_stream_idle_timeout_sec,omitempty"` // V2 无主键流式无进展超时；0=300
+	FullLoadStreamMaxDurationSec   int   `json:"full_load_stream_max_duration_sec,omitempty"` // V2 无主键流式绝对最长时长；0=不限制
+	FullLoadSlowQueryWarnSec       int   `json:"full_load_slow_query_warn_sec,omitempty"`    // V2 慢查询告警秒数；0=30
 	FullLoadTableNoProgressSec     int   `json:"full_load_table_no_progress_sec,omitempty"` // V2 表无进展告警秒数；0=关闭
 	FullLoadReadRetryTimes         int   `json:"full_load_read_retry_times,omitempty"`      // V2 表级读取重试次数；0=不重试
 	FullLoadTwoPhaseRead           bool  `json:"full_load_two_phase_read,omitempty"`        // V2 单列PK两阶段读取；默认关
@@ -269,8 +271,10 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		FullLoadCommitBytesMB:          req.FullLoadCommitBytesMB,          // 设置V2单事务字节上限
 		FullLoadLockWaitTimeoutSec:     req.FullLoadLockWaitTimeoutSec,     // 设置V2取表锁等待秒数
 		FullLoadDegradeOnAlignLockFail: req.FullLoadDegradeOnAlignLockFail, // 设置对齐取锁失败策略
-		FullLoadQueryTimeoutSec:        req.FullLoadQueryTimeoutSec,        // 设置V2单次查询超时秒数
-		FullLoadSlowQueryWarnSec:       req.FullLoadSlowQueryWarnSec,       // 设置V2慢查询告警秒数
+		FullLoadQueryTimeoutSec:      req.FullLoadQueryTimeoutSec,      // 设置V2查询超时秒数
+		FullLoadStreamIdleTimeoutSec: req.FullLoadStreamIdleTimeoutSec, // 设置V2流式无进展超时
+		FullLoadStreamMaxDurationSec: req.FullLoadStreamMaxDurationSec, // 设置V2流式最长时长
+		FullLoadSlowQueryWarnSec:     req.FullLoadSlowQueryWarnSec,     // 设置V2慢查询告警秒数
 		FullLoadTableNoProgressSec:     req.FullLoadTableNoProgressSec,     // 设置V2表无进展告警秒数
 		FullLoadReadRetryTimes:         req.FullLoadReadRetryTimes,         // 设置V2表级读取重试次数
 		FullLoadTwoPhaseRead:           req.FullLoadTwoPhaseRead,           // 设置V2单列PK两阶段读取
@@ -937,6 +941,12 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.FullLoadQueryTimeoutSec != nil {
 		task.Config.FullLoadQueryTimeoutSec = *req.FullLoadQueryTimeoutSec
 	}
+	if req.FullLoadStreamIdleTimeoutSec != nil {
+		task.Config.FullLoadStreamIdleTimeoutSec = *req.FullLoadStreamIdleTimeoutSec
+	}
+	if req.FullLoadStreamMaxDurationSec != nil {
+		task.Config.FullLoadStreamMaxDurationSec = *req.FullLoadStreamMaxDurationSec
+	}
 	if req.FullLoadSlowQueryWarnSec != nil {
 		task.Config.FullLoadSlowQueryWarnSec = *req.FullLoadSlowQueryWarnSec
 	}
@@ -1056,8 +1066,10 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	FullLoadCommitBytesMB          *int                   `json:"full_load_commit_bytes_mb,omitempty"`            // V2 单事务字节上限MiB（可选）
 	FullLoadLockWaitTimeoutSec     *int                   `json:"full_load_lock_wait_timeout_sec,omitempty"`      // V2 取表锁等待秒数（可选）
 	FullLoadDegradeOnAlignLockFail *bool                  `json:"full_load_degrade_on_align_lock_fail,omitempty"` // 对齐取锁失败是否降级（可选）
-	FullLoadQueryTimeoutSec        *int                   `json:"full_load_query_timeout_sec,omitempty"`          // V2 单次查询超时秒数（可选）
-	FullLoadSlowQueryWarnSec       *int                   `json:"full_load_slow_query_warn_sec,omitempty"`        // V2 慢查询告警秒数（可选）
+	FullLoadQueryTimeoutSec        *int                   `json:"full_load_query_timeout_sec,omitempty"`           // V2 查询超时秒数（可选）
+	FullLoadStreamIdleTimeoutSec   *int                   `json:"full_load_stream_idle_timeout_sec,omitempty"`  // V2 流式无进展超时（可选）
+	FullLoadStreamMaxDurationSec   *int                   `json:"full_load_stream_max_duration_sec,omitempty"`  // V2 流式最长时长（可选）
+	FullLoadSlowQueryWarnSec       *int                   `json:"full_load_slow_query_warn_sec,omitempty"`         // V2 慢查询告警秒数（可选）
 	FullLoadTableNoProgressSec     *int                   `json:"full_load_table_no_progress_sec,omitempty"`      // V2 表无进展告警秒数（可选）
 	FullLoadReadRetryTimes         *int                   `json:"full_load_read_retry_times,omitempty"`           // V2 表级重试次数（可选）
 	FullLoadTwoPhaseRead           *bool                  `json:"full_load_two_phase_read,omitempty"`             // V2 单列PK两阶段读取（可选）

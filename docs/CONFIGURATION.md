@@ -471,7 +471,10 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
   "full_load_commit_rows": 10000,
   "full_load_commit_bytes_mb": 32,
   "full_load_lock_wait_timeout_sec": 10,
-  "full_load_degrade_on_align_lock_fail": true
+  "full_load_degrade_on_align_lock_fail": true,
+  "full_load_query_timeout_sec": 300,
+  "full_load_stream_idle_timeout_sec": 300,
+  "full_load_stream_max_duration_sec": 0
 }
 ```
 
@@ -486,6 +489,9 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
 | `full_load_commit_bytes_mb` | 单事务累计提交字节阈值（MiB） | 32（不小于单批字节，上限 4096） |
 | `full_load_lock_wait_timeout_sec` | 超大表对齐取锁等待超时（秒，双保险：客户端 context + `SESSION lock_wait_timeout`） | 10（范围 1–3600） |
 | `full_load_degrade_on_align_lock_fail` | 对齐多连接取锁失败时是否降级为单连接快照；`false` 为 fail-closed | `true`（省略时同样按 true） |
+| `full_load_query_timeout_sec` | 源端查询超时（秒）。keyset：整次查询绝对超时；stream：仅打开查询等待上限 | 300（范围 1–7200） |
+| `full_load_stream_idle_timeout_sec` | 无主键流式查询无进展超时（秒）。每次 `Rows.Next` 成功后重置；等待写队列时暂停 | 300（范围 1–7200） |
+| `full_load_stream_max_duration_sec` | 无主键流式查询绝对最长时长（秒）；`0` 表示不限制整表复制总时长 | 0（不限制；显式值范围 1–86400） |
 
 说明：
 
@@ -506,6 +512,11 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
 - `full_load_degrade_on_align_lock_fail=false` 时，超大表对齐取锁失败会直接让该表/任务失败；
   默认 `true` 则降级为单连接一致性快照继续。无论该开关如何，ALL 模式无主键表在捕获表级
   binlog HWM 时取锁失败始终 fail-closed。
+- 无主键表（`FULL_COLUMNS_STRATEGY`）在 V2 中走单条全表流式 `SELECT`。不要把
+  `full_load_query_timeout_sec` 当成整表复制总时长：stream 打开后改用
+  `full_load_stream_idle_timeout_sec` 无进展超时；只要持续读到行就不会因总时长超时。
+  写端背压导致的队列等待会暂停空闲计时。若需要硬性总时长上限，再设
+  `full_load_stream_max_duration_sec`；`0`（默认）表示不限制。
 
 ### 全量并行读取路径（与 channel buffer 的关系）
 

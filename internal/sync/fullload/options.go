@@ -30,12 +30,16 @@ const (
 	// 取表锁等待超时（秒），同时用于客户端 context 与 SESSION lock_wait_timeout。
 	defaultLockWaitTimeoutSec = 10
 
-	// 单次源端查询超时（秒），防止单条 SQL 无限执行拖死读端。
+	// 单次源端查询超时（秒）：keyset 为整次查询绝对超时；stream 仅覆盖打开查询。
 	defaultQueryTimeoutSec = 300
+	// 无主键流式查询无进展超时（秒）：每次 Rows.Next 成功后重置；等待写队列时暂停。
+	defaultStreamIdleTimeoutSec = 300
 	// 慢查询告警阈值（秒），超过后输出一次告警。
 	defaultSlowQueryWarnSec = 30
-	// 查询超时/慢查询阈值上限（秒）。
+	// 查询超时/慢查询/流式无进展阈值上限（秒）。
 	hardMaxQueryTimeoutSec = 7200
+	// 流式查询绝对最长时长上限（秒）；0 表示不限制总时长。
+	hardMaxStreamMaxDurationSec = 86400
 
 	// mysqlMaxPlaceholders 单条预处理语句占位符上限（留余量），与 writer 包保持一致。
 	mysqlMaxPlaceholders = 62000
@@ -72,7 +76,12 @@ type RawOptions struct {
 	DegradeOnAlignLockFail *bool
 
 	// QueryTimeoutSec 单次源端查询超时（秒）；<=0 时使用默认 300。
+	// keyset：整次查询绝对超时；stream：仅打开查询等待上限。
 	QueryTimeoutSec int
+	// StreamIdleTimeoutSec 无主键流式查询无进展超时（秒）；<=0 时使用默认 300。
+	StreamIdleTimeoutSec int
+	// StreamMaxDurationSec 无主键流式查询绝对最长时长（秒）；0=不限制总时长。
+	StreamMaxDurationSec int
 	// SlowQueryWarnSec 慢查询告警阈值（秒）；<=0 时使用默认 30。
 	SlowQueryWarnSec int
 	// TableNoProgressSec 表无进展告警阈值（秒）；<=0 时关闭。P0 阶段预留，未实现。
@@ -111,8 +120,12 @@ type Options struct {
 	// DegradeOnAlignLockFail 对齐多连接取锁失败时是否降级为单连接快照（ALL+无PK 捕获 HWM 时仍 fail-closed）。
 	DegradeOnAlignLockFail bool
 
-	// QueryTimeout 单次源端查询超时。
+	// QueryTimeout 单次源端查询超时（keyset 绝对超时；stream 仅打开查询）。
 	QueryTimeout time.Duration
+	// StreamIdleTimeout 无主键流式查询无进展超时。
+	StreamIdleTimeout time.Duration
+	// StreamMaxDuration 无主键流式查询绝对最长时长；0=不限制。
+	StreamMaxDuration time.Duration
 	// SlowQueryWarnThreshold 慢查询告警阈值。
 	SlowQueryWarnThreshold time.Duration
 	// TableNoProgressSec 表无进展告警阈值（秒）；0=关闭。P0 未使用。
@@ -154,8 +167,13 @@ func ResolveOptions(raw RawOptions) Options {
 		DegradeOnAlignLockFail: degrade,
 	}
 
-	// 单次查询超时与慢查询告警阈值。
+	// 单次查询超时、流式无进展超时与慢查询告警阈值。
 	opt.QueryTimeout = time.Duration(clampInt(raw.QueryTimeoutSec, defaultQueryTimeoutSec, 1, hardMaxQueryTimeoutSec)) * time.Second
+	opt.StreamIdleTimeout = time.Duration(clampInt(raw.StreamIdleTimeoutSec, defaultStreamIdleTimeoutSec, 1, hardMaxQueryTimeoutSec)) * time.Second
+	// StreamMaxDuration：0 表示不限制；显式正值夹到 [1, hardMax]。
+	if raw.StreamMaxDurationSec > 0 {
+		opt.StreamMaxDuration = time.Duration(clampInt(raw.StreamMaxDurationSec, 0, 1, hardMaxStreamMaxDurationSec)) * time.Second
+	}
 	opt.SlowQueryWarnThreshold = time.Duration(clampInt(raw.SlowQueryWarnSec, defaultSlowQueryWarnSec, 1, hardMaxQueryTimeoutSec)) * time.Second
 	opt.TableNoProgressSec = raw.TableNoProgressSec             // P0 阶段暂不使用，直接透传
 	opt.ReadRetryTimes = clampInt(raw.ReadRetryTimes, 0, 0, 10) // P2：表级重试次数，上限 10

@@ -116,7 +116,13 @@ type TaskConfig struct { // 定义任务配置结构体
 	// ALL+无PK 捕获表级 HWM 时仍强制 fail-closed，不受该字段影响。
 	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
 	// FullLoadQueryTimeoutSec 单次源端查询超时（秒）；0=默认 300（5 分钟）。
+	// keyset：整次查询绝对超时；stream：仅打开查询等待上限。
 	FullLoadQueryTimeoutSec int `json:"full_load_query_timeout_sec,omitempty"`
+	// FullLoadStreamIdleTimeoutSec 无主键流式查询无进展超时（秒）；0=默认 300。
+	// 每次 Rows.Next 成功后重置；等待写队列时暂停，不计入空闲。
+	FullLoadStreamIdleTimeoutSec int `json:"full_load_stream_idle_timeout_sec,omitempty"`
+	// FullLoadStreamMaxDurationSec 无主键流式查询绝对最长时长（秒）；0=不限制总时长。
+	FullLoadStreamMaxDurationSec int `json:"full_load_stream_max_duration_sec,omitempty"`
 	// FullLoadSlowQueryWarnSec 慢查询告警阈值（秒）；0=默认 30。
 	FullLoadSlowQueryWarnSec int `json:"full_load_slow_query_warn_sec,omitempty"`
 	// FullLoadTableNoProgressSec 表无进展告警阈值（秒）；0=关闭。P0 阶段预留，未实现。
@@ -337,6 +343,8 @@ func (t *SyncTask) CloneForRead() *SyncTask {
 		cloned.Config.FullLoadDegradeOnAlignLockFail = &degrade
 	}
 	cloned.Config.FullLoadQueryTimeoutSec = t.Config.FullLoadQueryTimeoutSec
+	cloned.Config.FullLoadStreamIdleTimeoutSec = t.Config.FullLoadStreamIdleTimeoutSec
+	cloned.Config.FullLoadStreamMaxDurationSec = t.Config.FullLoadStreamMaxDurationSec
 	cloned.Config.FullLoadSlowQueryWarnSec = t.Config.FullLoadSlowQueryWarnSec
 	cloned.Config.FullLoadTableNoProgressSec = t.Config.FullLoadTableNoProgressSec
 	cloned.Config.FullLoadReadRetryTimes = t.Config.FullLoadReadRetryTimes

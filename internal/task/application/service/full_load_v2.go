@@ -163,6 +163,8 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		LockWaitTimeoutSec:           task.Config.FullLoadLockWaitTimeoutSec,
 		DegradeOnAlignLockFail:       task.Config.FullLoadDegradeOnAlignLockFail,
 		QueryTimeoutSec:              task.Config.FullLoadQueryTimeoutSec,
+		StreamIdleTimeoutSec:         task.Config.FullLoadStreamIdleTimeoutSec,
+		StreamMaxDurationSec:         task.Config.FullLoadStreamMaxDurationSec,
 		SlowQueryWarnSec:             task.Config.FullLoadSlowQueryWarnSec,
 		TableNoProgressSec:           task.Config.FullLoadTableNoProgressSec,
 		ReadRetryTimes:               task.Config.FullLoadReadRetryTimes,

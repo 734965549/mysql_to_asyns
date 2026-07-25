@@ -188,7 +188,12 @@ func TestChunkReaderStreamQueryTimeoutReturnsStructuredError(t *testing.T) {
 		WillDelayFor(200 * time.Millisecond).
 		WillReturnRows(sqlmock.NewRows([]string{"payload"}).AddRow("x"))
 
-	opt := Options{QueryTimeout: 20 * time.Millisecond, SlowQueryWarnThreshold: time.Hour}
+	// stream 打开阶段仍受 QueryTimeout 约束（非整表绝对超时）。
+	opt := Options{
+		QueryTimeout:           20 * time.Millisecond,
+		StreamIdleTimeout:      time.Hour,
+		SlowQueryWarnThreshold: time.Hour,
+	}
 	cr, err := newChunkReader(db, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 10, defaultBatchBytes, opt, 1, nil)
 	if err != nil {
 		t.Fatal(err)

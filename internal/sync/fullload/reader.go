@@ -40,6 +40,7 @@ type chunkReader struct {
 	queryPhase   string
 	queryTimeout time.Duration
 	queryStart   time.Time
+	streamWatch  *streamWatch // 仅 stream：无进展/最长时长看门狗
 }
 
 // effectiveBatchRows 根据表列类型动态计算实际批次行数，对含大字段表降低单批量，
@@ -129,6 +130,10 @@ func (r *chunkReader) finishQuery() {
 	if r == nil {
 		return
 	}
+	if r.streamWatch != nil {
+		r.streamWatch.stop()
+		r.streamWatch = nil
+	}
 	if r.slowCancel != nil {
 		r.slowCancel()
 		r.slowCancel = nil
@@ -149,7 +154,8 @@ func (r *chunkReader) classifyScanError(parentCtx context.Context, err error) er
 	if err == nil || r == nil {
 		return err
 	}
-	queryTimedOut := r.queryCtx != nil && r.queryCtx.Err() == context.DeadlineExceeded
+	watchFired := r.streamWatch != nil && r.streamWatch.wasFired()
+	queryTimedOut := watchFired || (r.queryCtx != nil && r.queryCtx.Err() == context.DeadlineExceeded)
 	if !queryTimedOut && !errorsIsDeadline(err) {
 		return err
 	}
@@ -161,6 +167,11 @@ func (r *chunkReader) classifyScanError(parentCtx context.Context, err error) er
 		elapsed = time.Since(r.queryStart)
 	}
 	timeout := r.queryTimeout
+	if watchFired {
+		if lim := r.streamWatch.limitOnFire(); lim > 0 {
+			timeout = lim
+		}
+	}
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
@@ -184,10 +195,14 @@ func (r *chunkReader) classifyScanError(parentCtx context.Context, err error) er
 	}
 }
 
-// runQuery 执行源端查询，带超时控制和慢查询监控。phase 为 "stream" 或 "keyset"。
+// runQuery 执行源端查询，带超时控制和慢查询监控。
+// keyset/pk_probe/payload_fetch 使用绝对超时；stream 请走 runStreamQuery。
 // 成功返回的 *sql.Rows 对应的超时 context 会挂在 chunkReader 上，直到 closeRows/close 才取消。
 // 零值 QueryTimeout/SlowQueryWarnThreshold 会被防护。
 func (r *chunkReader) runQuery(ctx context.Context, phase string, query string, args ...any) (*sql.Rows, time.Duration, error) {
+	if phase == "stream" {
+		return r.runStreamQuery(ctx, query, args...)
+	}
 	timeout := r.opt.QueryTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
@@ -203,28 +218,7 @@ func (r *chunkReader) runQuery(ctx context.Context, phase string, query string, 
 	queryCtx, queryCancel := context.WithTimeout(ctx, timeout)
 	slowCtx, slowCancel := context.WithCancel(ctx)
 	queryStart := time.Now()
-	go func() {
-		select {
-		case <-time.After(slowWarn):
-			if !r.slowWarnOnce {
-				r.slowWarnOnce = true
-				if r.stats != nil {
-					atomic.AddInt64(&r.stats.SlowQueries, 1)
-				}
-				if phase == "keyset" {
-					logger.Warn("[FullLoadV2] slow source query: table=%s.%s chunk=%s phase=%s cursor=%v end=%v elapsed=%s batch_rows=%d",
-						r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, phase,
-						r.cursor, r.chunk.End, time.Since(queryStart), r.batchRows)
-				} else {
-					logger.Warn("[FullLoadV2] slow source query: table=%s.%s chunk=%s phase=%s elapsed=%s batch_rows=%d",
-						r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, phase,
-						time.Since(queryStart), r.batchRows)
-				}
-			}
-		case <-slowCtx.Done():
-			return
-		}
-	}()
+	r.startSlowQueryWarn(slowCtx, slowWarn, queryStart, phase)
 
 	rows, err := r.queryer.QueryContext(queryCtx, query, args...)
 	elapsed := time.Since(queryStart)
@@ -259,6 +253,116 @@ func (r *chunkReader) runQuery(ctx context.Context, phase string, query string, 
 	r.queryTimeout = timeout
 	r.queryStart = queryStart
 	return rows, elapsed, nil
+}
+
+// runStreamQuery 打开无主键全表流式查询。
+// 打开阶段使用 QueryTimeout；打开成功后改为 StreamIdleTimeout 无进展超时，
+// 可选 StreamMaxDuration 作为绝对最长时长（0=不限制）。
+func (r *chunkReader) runStreamQuery(ctx context.Context, query string, args ...any) (*sql.Rows, time.Duration, error) {
+	openTimeout := r.opt.QueryTimeout
+	if openTimeout <= 0 {
+		openTimeout = 5 * time.Minute
+	}
+	idleTimeout := r.opt.StreamIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = openTimeout
+	}
+	slowWarn := r.opt.SlowQueryWarnThreshold
+	if slowWarn <= 0 {
+		slowWarn = 30 * time.Second
+	}
+
+	r.finishQuery()
+
+	queryCtx, queryCancel := context.WithCancel(ctx)
+	slowCtx, slowCancel := context.WithCancel(ctx)
+	queryStart := time.Now()
+	watch := newStreamWatch(queryCancel, idleTimeout, r.opt.StreamMaxDuration)
+	openTimer := time.AfterFunc(openTimeout, watch.fire)
+	r.startSlowQueryWarn(slowCtx, slowWarn, queryStart, "stream")
+
+	rows, err := r.queryer.QueryContext(queryCtx, query, args...)
+	openTimer.Stop()
+	elapsed := time.Since(queryStart)
+
+	failOpenTimeout := func() (*sql.Rows, time.Duration, error) {
+		if rows != nil {
+			_ = rows.Close()
+		}
+		watch.stop()
+		slowCancel()
+		queryCancel()
+		if r.stats != nil {
+			atomic.AddInt64(&r.stats.QueryTimeouts, 1)
+		}
+		return nil, elapsed, &ReadQueryTimeoutError{
+			Schema:  r.chunk.Spec.SourceSchema,
+			Table:   r.chunk.Spec.SourceTable,
+			ChunkID: r.chunk.ID,
+			Phase:   "stream",
+			Cursor:  r.cursor,
+			Start:   r.chunk.Start,
+			End:     r.chunk.End,
+			Timeout: openTimeout,
+			Elapsed: elapsed,
+		}
+	}
+
+	if err != nil {
+		if watch.wasFired() || errorsIsDeadline(err) || queryCtx.Err() != nil {
+			if ctx.Err() != nil {
+				watch.stop()
+				slowCancel()
+				queryCancel()
+				return nil, elapsed, err
+			}
+			return failOpenTimeout()
+		}
+		watch.stop()
+		slowCancel()
+		queryCancel()
+		return nil, elapsed, err
+	}
+	if watch.wasFired() {
+		// 打开刚成功但 open 超时已触发：不要带着已取消 ctx 继续消费。
+		return failOpenTimeout()
+	}
+
+	// 打开成功：挂上可重置无进展看门狗，覆盖后续 Rows.Next/Scan。
+	r.queryCancel = queryCancel
+	r.slowCancel = slowCancel
+	r.queryCtx = queryCtx
+	r.queryPhase = "stream"
+	r.queryTimeout = idleTimeout
+	r.queryStart = queryStart
+	r.streamWatch = watch
+	watch.armIdle()
+	return rows, elapsed, nil
+}
+
+func (r *chunkReader) startSlowQueryWarn(slowCtx context.Context, slowWarn time.Duration, queryStart time.Time, phase string) {
+	go func() {
+		select {
+		case <-time.After(slowWarn):
+			if !r.slowWarnOnce {
+				r.slowWarnOnce = true
+				if r.stats != nil {
+					atomic.AddInt64(&r.stats.SlowQueries, 1)
+				}
+				if phase == "keyset" || phase == "pk_probe" || phase == "payload_fetch" {
+					logger.Warn("[FullLoadV2] slow source query: table=%s.%s chunk=%s phase=%s cursor=%v end=%v elapsed=%s batch_rows=%d",
+						r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, phase,
+						r.cursor, r.chunk.End, time.Since(queryStart), r.batchRows)
+				} else {
+					logger.Warn("[FullLoadV2] slow source query: table=%s.%s chunk=%s phase=%s elapsed=%s batch_rows=%d",
+						r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, phase,
+						time.Since(queryStart), r.batchRows)
+				}
+			}
+		case <-slowCtx.Done():
+			return
+		}
+	}()
 }
 
 func errorsIsDeadline(err error) bool {
@@ -300,7 +404,7 @@ func (r *chunkReader) nextStreamBatch(ctx context.Context) (*RowBatch, error) {
 		q := fmt.Sprintf("SELECT %s FROM %s.%s", r.selectSQL,
 			quoteIdentifier(r.chunk.Spec.SourceSchema), quoteIdentifier(r.chunk.Spec.SourceTable))
 
-		rows, elapsed, err := r.runQuery(ctx, "stream", q)
+		rows, elapsed, err := r.runStreamQuery(ctx, q)
 		if err != nil {
 			return nil, err
 		}
@@ -308,8 +412,11 @@ func (r *chunkReader) nextStreamBatch(ctx context.Context) (*RowBatch, error) {
 
 		logger.Debug("[FullLoadV2] source query started: table=%s.%s chunk=%s phase=stream elapsed=%s",
 			r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
+	} else if r.streamWatch != nil {
+		// 上一批返回后曾 pause（覆盖写队列等待）；继续读取前恢复无进展计时。
+		r.streamWatch.resume()
 	}
-	rowsData, bytes, exhausted, err := scanUpTo(r.stream, len(r.cols), r.batchRows, r.batchBytes)
+	rowsData, bytes, exhausted, err := scanUpTo(r.stream, len(r.cols), r.batchRows, r.batchBytes, r.streamWatch.noteProgress)
 	if err != nil {
 		err = r.classifyScanError(ctx, err)
 		r.closeRows(r.stream)
@@ -327,6 +434,9 @@ func (r *chunkReader) nextStreamBatch(ctx context.Context) (*RowBatch, error) {
 		r.closeRows(r.stream)
 		r.stream = nil
 		r.done = true
+	} else if r.streamWatch != nil {
+		// 批次未读完：暂停无进展计时，避免写队列背压被算进源端空闲超时。
+		r.streamWatch.pause()
 	}
 	return r.makeBatch(rowsData, bytes), nil
 }
@@ -349,7 +459,7 @@ func (r *chunkReader) nextKeysetBatch(ctx context.Context) (*RowBatch, error) {
 	logger.Debug("[FullLoadV2] source query completed: table=%s.%s chunk=%s phase=keyset elapsed=%s",
 		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
 
-	rowsData, bytes, exhausted, err := scanUpTo(rows, len(r.cols), r.batchRows, r.batchBytes)
+	rowsData, bytes, exhausted, err := scanUpTo(rows, len(r.cols), r.batchRows, r.batchBytes, nil)
 	if err != nil {
 		err = r.classifyScanError(ctx, err)
 	}
@@ -397,7 +507,7 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
 
 	// pk_probe 只取主键列，PK 值极小（远低于 batchBytes），maxBytes 传 0 确保取满 batchRows。
-	pkValues, _, pkExhausted, err := scanUpTo(pkRows, 1, r.batchRows, 0)
+	pkValues, _, pkExhausted, err := scanUpTo(pkRows, 1, r.batchRows, 0, nil)
 	if err != nil {
 		err = r.classifyScanError(ctx, err)
 	}
@@ -431,7 +541,7 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, len(pkValues), elapsed2)
 
 	// payload 可能被 batchBytes 截断（大 JSON）；未截断时 payloadExhausted=true。
-	rowsData, bytes, payloadExhausted, err := scanUpTo(payloadRows, len(r.cols), r.batchRows, r.batchBytes)
+	rowsData, bytes, payloadExhausted, err := scanUpTo(payloadRows, len(r.cols), r.batchRows, r.batchBytes, nil)
 	if err != nil {
 		err = r.classifyScanError(ctx, err)
 	}
@@ -568,7 +678,7 @@ func buildKeysetUpperInclusive(cols []string, vals []any) (string, []any) {
 }
 
 // scanUpTo 从结果集中扫描至多 maxRows 行到 [][]any，并估算字节数。
-func scanUpTo(rows *sql.Rows, nCols, maxRows int, maxBytes int64) ([][]any, int64, bool, error) {
+func scanUpTo(rows *sql.Rows, nCols, maxRows int, maxBytes int64, onProgress func()) ([][]any, int64, bool, error) {
 	var out [][]any
 	var bytes int64
 	for i := 0; i < maxRows; i++ {
@@ -577,6 +687,9 @@ func scanUpTo(rows *sql.Rows, nCols, maxRows int, maxBytes int64) ([][]any, int6
 				return out, bytes, false, err
 			}
 			return out, bytes, true, nil
+		}
+		if onProgress != nil {
+			onProgress()
 		}
 		vals := make([]any, nCols)
 		ptrs := make([]any, nCols)
