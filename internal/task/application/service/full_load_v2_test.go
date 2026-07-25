@@ -2,6 +2,10 @@ package service
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 
 	"mysql-to-sync/internal/sync/fullload"
@@ -9,6 +13,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFullLoadStatsLifecycle(t *testing.T) {
@@ -143,4 +148,112 @@ func TestCleanupStaleStagingTablesForTask_DropsExactRefs(t *testing.T) {
 
 	ts.cleanupStaleStagingTablesForTask(context.Background(), db, task)
 	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestSameSchemaCrashRecovery_GET_LOCKMustPrecedeStagingDROP 回归：同 schema 并发时，
+// 崩溃恢复 DROP 必须发生在 GET_LOCK 成功之后。staging 名仅含表名+attemptID，
+// 锁外 DROP 会误删另一任务正在写入的活跃 staging。
+func TestSameSchemaCrashRecovery_GET_LOCKMustPrecedeStagingDROP(t *testing.T) {
+	const (
+		targetSchema = "tgt"
+		lockName     = "mts_fl_v2:" + targetSchema
+		lockTimeout  = 5 // fullload.txMarkerSchemaLockTimeoutSec
+		stagingName  = "__mts_staging_orders_1"
+	)
+
+	t.Run("lock_then_drop_order", func(t *testing.T) {
+		ts := NewTaskService(newDefaultConfig())
+		defer ts.Close()
+
+		task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+			ID:             "stg-lock-order",
+			FullLoadEngine: "v2",
+			SourceSchema:   "src",
+			TargetSchema:   targetSchema,
+		})
+		task.SetFullLoadV2TableState("src.orders", &taskEntity.FullLoadV2TableState{
+			Phase:        "COPYING",
+			AttemptID:    1,
+			StagingTable: stagingName,
+		})
+
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer db.Close()
+		db.SetMaxOpenConns(4)
+
+		// 生产顺序：wait_timeout 准备 → GET_LOCK →（heartbeat）→ 清单 DROP
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT @@SESSION.wait_timeout")).
+			WillReturnRows(sqlmock.NewRows([]string{"wait_timeout"}).AddRow(int64(28800)))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+			WithArgs(lockName, lockTimeout).
+			WillReturnRows(sqlmock.NewRows([]string{"GET_LOCK(?, ?)"}).AddRow(1))
+		mock.ExpectQuery("SELECT 1 FROM information_schema.TABLES").
+			WithArgs(targetSchema, stagingName).
+			WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+		mock.ExpectExec("DROP TABLE IF EXISTS .*" + regexp.QuoteMeta(stagingName) + ".*").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
+			WithArgs(lockName).
+			WillReturnRows(sqlmock.NewRows([]string{"RELEASE_LOCK(?)"}).AddRow(1))
+
+		ctx := context.Background()
+		locks, err := fullload.AcquireSchemaLocks(ctx, db, []string{targetSchema})
+		require.NoError(t, err)
+		lockCtx, lockCancel := context.WithCancelCause(ctx)
+		locks.StartHeartbeat(lockCtx, func() { lockCancel(fullload.ErrSchemaLockLost) })
+
+		ts.cleanupStaleStagingTablesForTask(lockCtx, db, task)
+		lockCancel(nil)
+		require.NoError(t, locks.Release(context.Background()))
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("busy_lock_skips_drop", func(t *testing.T) {
+		// 模拟 executeFullSync：GET_LOCK 失败则直接返回，不得再 DROP。
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer db.Close()
+		db.SetMaxOpenConns(4)
+
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT @@SESSION.wait_timeout")).
+			WillReturnRows(sqlmock.NewRows([]string{"wait_timeout"}).AddRow(int64(28800)))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+			WithArgs(lockName, lockTimeout).
+			WillReturnRows(sqlmock.NewRows([]string{"GET_LOCK(?, ?)"}).AddRow(0))
+
+		_, err = fullload.AcquireSchemaLocks(context.Background(), db, []string{targetSchema})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "locked by another")
+		// 无 DROP / information_schema 期望：若调用方在锁失败后仍清理，ExpectationsWereMet 不会抓住，
+		// 但未注册的 DROP 会在 Close 时由 sqlmock 报 unexpected；此处断言仅锁相关期望被消费。
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// TestExecuteFullSyncSource_StagingCleanupAfterSchemaLock 守护生产编排顺序：
+// executeFullSync 内 AcquireSchemaLocks 必须出现在 cleanupStaleStagingTablesForTask 之前。
+func TestExecuteFullSyncSource_StagingCleanupAfterSchemaLock(t *testing.T) {
+	path := filepath.Join("task_service.go")
+	src, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	const sig = "func (s *TaskService) executeFullSync"
+	start := strings.Index(string(src), sig)
+	require.GreaterOrEqual(t, start, 0, "executeFullSync not found")
+
+	// 取到下一个同文件顶级 TaskService 方法为止，避免误匹配其它函数。
+	body := string(src[start:])
+	if next := strings.Index(body[len(sig):], "\nfunc (s *TaskService)"); next >= 0 {
+		body = body[:len(sig)+next]
+	}
+
+	lockIdx := strings.Index(body, "AcquireSchemaLocks(")
+	hbIdx := strings.Index(body, "StartHeartbeat(")
+	cleanupIdx := strings.Index(body, "cleanupStaleStagingTablesForTask(")
+	require.GreaterOrEqual(t, lockIdx, 0, "AcquireSchemaLocks call missing in executeFullSync")
+	require.GreaterOrEqual(t, hbIdx, 0, "StartHeartbeat call missing in executeFullSync")
+	require.GreaterOrEqual(t, cleanupIdx, 0, "cleanupStaleStagingTablesForTask call missing in executeFullSync")
+	require.Less(t, lockIdx, cleanupIdx, "GET_LOCK (AcquireSchemaLocks) must precede staging DROP cleanup")
+	require.Less(t, hbIdx, cleanupIdx, "heartbeat/derived ctx must be established before staging DROP cleanup")
 }

@@ -2717,12 +2717,6 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		targetSchemas = append(targetSchemas, p.dst)
 	}
 
-	// 崩溃恢复：在任何 CREATE TABLE IF NOT EXISTS staging 之前，按持久化精确表名清理遗留 staging。
-	// 否则引擎 attempt 从 1 重启会复用半成品 staging（有主键重复键 / 无主键重复发布）。
-	if task.Config.UsesFullLoadV2() && runtime != nil && runtime.targetDB != nil {
-		s.cleanupStaleStagingTablesForTask(ctx, runtime.targetDB, task)
-	}
-
 	var schemaLocks *fullload.SchemaLocks
 	if task.Config.UsesFullLoadV2() && len(targetSchemas) > 0 {
 		sort.Strings(targetSchemas)
@@ -2750,6 +2744,14 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		}()
 		// 使用 lockCtx 替换后续操作的 ctx，确保锁失活可传播取消。
 		ctx = lockCtx
+	}
+
+	// 崩溃恢复：必须在 GET_LOCK 成功且 heartbeat/派生 ctx 建立之后，再按持久化精确表名 DROP 遗留 staging。
+	// staging 名仅由目标表名+attemptID 组成，不含 taskID；若在锁外清理，同 schema 并发任务 B
+	// 持锁写入的活跃 staging 可能被崩溃恢复任务 A 误 DROP，绕过 schema 隔离。
+	// 同时也避免引擎 attempt 从 1 重启复用半成品 staging（有主键重复键 / 无主键重复发布）。
+	if task.Config.UsesFullLoadV2() && runtime != nil && runtime.targetDB != nil {
+		s.cleanupStaleStagingTablesForTask(ctx, runtime.targetDB, task)
 	}
 
 	// V2 恢复模式：已有未完成的 FullLoadV2States 时，禁止库级重建，避免已 PUBLISHED 表被删后跳过复制导致丢数。
