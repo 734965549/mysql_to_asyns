@@ -378,3 +378,55 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestClassifyScanError_QueryTimeoutRetryable 验证 Scan 阶段查询超时包装为 ReadQueryTimeoutError。
+func TestClassifyScanError_QueryTimeoutRetryable(t *testing.T) {
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id"}},
+		},
+	}
+	cr := &chunkReader{
+		chunk:        &Chunk{ID: "c1", Spec: spec, Start: []any{1}, End: []any{100}},
+		queryPhase:   "keyset",
+		queryTimeout: 50 * time.Millisecond,
+		queryStart:   time.Now().Add(-80 * time.Millisecond),
+	}
+	qctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(2 * time.Millisecond)
+	cr.queryCtx = qctx
+
+	got := cr.classifyScanError(context.Background(), context.DeadlineExceeded)
+	if !IsReadQueryTimeout(got) {
+		t.Fatalf("expected ReadQueryTimeoutError, got %T: %v", got, got)
+	}
+	if !isRetryableReadError(got) {
+		t.Fatalf("scan-phase query timeout must be retryable: %v", got)
+	}
+	te := got.(*ReadQueryTimeoutError)
+	if te.Phase != "keyset" || te.ChunkID != "c1" {
+		t.Fatalf("missing context: %+v", te)
+	}
+}
+
+// TestClassifyScanError_ParentCancelNotTimeout 验证父 ctx 取消时不误判为查询超时。
+func TestClassifyScanError_ParentCancelNotTimeout(t *testing.T) {
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t",
+		Identity: &entity.TableIdentity{Columns: []entity.ColumnMeta{{Name: "id"}}},
+	}
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	cr := &chunkReader{
+		chunk:      &Chunk{ID: "c1", Spec: spec},
+		queryPhase: "stream",
+		queryCtx:   parent,
+	}
+	got := cr.classifyScanError(parent, context.Canceled)
+	if IsReadQueryTimeout(got) {
+		t.Fatalf("parent cancel must not become query timeout: %v", got)
+	}
+}

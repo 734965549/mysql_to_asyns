@@ -146,13 +146,8 @@ func readTableWithRetry(
 			return context.Canceled
 		}
 
-		attemptID, aErr := stateTracker.startAttempt(schema, table, maxRetries)
-		if aErr != nil {
-			return fmt.Errorf("table %s.%s retry exhausted: %w", schema, table, aErr)
-		}
-		job.AttemptID = attemptID
-
-		// 新 attempt 前：等旧 attempt 排空，再清理旧 staging
+		// 必须先按旧 attempt 等待 inflight 排空并 DROP staging，再 startAttempt。
+		// startAttempt 会把 Inflight 重置为 0 并切换 AttemptID；若先切换，barrier 会空转通过。
 		if opt.StagingEnabled && prevAttemptID > 0 {
 			if err := stateTracker.waitInflightZero(schema, table, 5*time.Minute); err != nil {
 				return fmt.Errorf("inflight barrier before retry for %s.%s: %w", schema, table, err)
@@ -162,6 +157,12 @@ func readTableWithRetry(
 				atomic.AddInt64(&stats.ActiveStagingTables, -1)
 			}
 		}
+
+		attemptID, aErr := stateTracker.startAttempt(schema, table, maxRetries)
+		if aErr != nil {
+			return fmt.Errorf("table %s.%s retry exhausted: %w", schema, table, aErr)
+		}
+		job.AttemptID = attemptID
 
 		if opt.StagingEnabled {
 			if err := createStagingTable(ctx, eng.TargetDB, targetSchema, targetTable, attemptID); err != nil {
@@ -216,7 +217,10 @@ func readTableWithRetry(
 		}
 
 		prevAttemptID = attemptID
-		_ = stateTracker.recordError(schema, table, readErr)
+		if err := stateTracker.recordError(schema, table, readErr); err != nil {
+			// 状态落盘失败必须 fail-closed：不可在未知 FAILED 持久化结果下继续重试。
+			return fmt.Errorf("persist FAILED state for %s.%s: %w (read error: %v)", schema, table, err, readErr)
+		}
 
 		if !isRetryableReadError(readErr) {
 			if opt.StagingEnabled {

@@ -35,6 +35,7 @@ func oldBackupTableName(baseTable string, ts string) string {
 }
 
 // createStagingTable 在目标库中创建空的 staging 表,结构与目标表完全一致。
+// CREATE IF NOT EXISTS 后强制 TRUNCATE，避免崩溃复用半成品 staging 残留行。
 func createStagingTable(ctx context.Context, db *sql.DB, targetSchema, targetTable string, attemptID int) error {
 	stagingTable := stagingTableName(targetTable, attemptID)
 	ddl := fmt.Sprintf(
@@ -45,6 +46,9 @@ func createStagingTable(ctx context.Context, db *sql.DB, targetSchema, targetTab
 	_, err := db.ExecContext(ctx, ddl)
 	if err != nil {
 		return fmt.Errorf("create staging table %s.%s: %w", targetSchema, stagingTable, err)
+	}
+	if err := truncateStagingTable(ctx, db, targetSchema, targetTable, attemptID); err != nil {
+		return err
 	}
 	return nil
 }

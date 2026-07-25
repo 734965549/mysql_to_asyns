@@ -700,6 +700,8 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 	// P3.5: 生产入口也必须执行 V2 状态恢复（此前仅挂在 NewTaskServiceWithDBAndConfig）。
 	ts.recoverFullLoadV2States()
+	// 崩溃遗留 staging 的精确清理挂在 executeFullSync：此时才有任务级 targetDB。
+	// NewTaskService 构造期无全局目标连接，不能在此 DROP。
 
 	// 启动定时调度器
 	ts.StartScheduler()
@@ -847,20 +849,10 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 	// 不自动启动恢复;只修正状态:已全量完成的标记为可接增量,未完成的保持 Paused 等待手动启动。
 	ts.recoverFullLoadV2States()
 
-	// P3.1: 按持久化精确 staging 表名清理（禁止全库前缀扫描）。
+	// P3.1: 测试/注入入口在构造期已有共享 targetDB，可立即按清单清理。
+	// 生产 NewTaskService 路径无全局 targetDB，改在 executeFullSync 任务建连后清理。
 	if ts.targetDB != nil {
-		staleRefs := ts.collectStaleStagingTableRefs()
-		if len(staleRefs) > 0 {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 60*time.Second)
-			dropped, err := fullload.CleanupStaleStagingTables(cleanupCtx, ts.targetDB, staleRefs)
-			cleanupCancel()
-			if err != nil {
-				logger.Warn("[TaskService] startup staging cleanup failed (partial): %v", err)
-			}
-			if dropped > 0 {
-				logger.Info("[TaskService] startup staging cleanup: dropped %d stale staging tables from manifest", dropped)
-			}
-		}
+		ts.cleanupAllStaleStagingTables(context.Background(), ts.targetDB)
 	}
 
 	// 启动定时调度器
@@ -2118,50 +2110,104 @@ func (s *TaskService) persistFullLoadV2TableState(taskID, schema, table, phase s
 	return nil
 }
 
-// collectStaleStagingTableRefs 从持久化 V2 状态收集需清理的精确 staging 表（目标 schema + staging 名）。
-// StagingTable 由引擎写入；目标 schema 从任务映射的源 schema 推导（同名映射场景）。
+// collectStaleStagingTableRefsFromTask 从单个任务的持久化 V2 状态收集需清理的精确 staging 表。
+// StagingTable 由引擎写入；目标 schema 从任务映射的源 schema 推导。不持有 TaskService 锁。
+func collectStaleStagingTableRefsFromTask(task *taskEntity.SyncTask) []fullload.StagingTableRef {
+	if task == nil || !task.Config.UsesFullLoadV2() {
+		return nil
+	}
+	var refs []fullload.StagingTableRef
+	seen := make(map[string]struct{})
+	for tableKey, st := range task.Context.FullLoadV2States {
+		if st == nil || st.Phase == "PUBLISHED" || st.StagingTable == "" {
+			continue
+		}
+		schema, _, ok := splitSourceTableKey(tableKey)
+		if !ok {
+			continue
+		}
+		targetSchema := schema
+		if task.Config.TargetSchema != "" && schema == task.Config.SourceSchema {
+			targetSchema = task.Config.TargetSchema
+		}
+		for i, src := range task.Config.SourceDatabases {
+			if src != schema {
+				continue
+			}
+			if i < len(task.Config.TargetDatabases) && task.Config.TargetDatabases[i] != "" {
+				targetSchema = task.Config.TargetDatabases[i]
+			} else if task.Config.TargetDatabase != "" {
+				targetSchema = task.Config.TargetDatabase
+			}
+			break
+		}
+		refKey := targetSchema + "." + st.StagingTable
+		if _, ok := seen[refKey]; ok {
+			continue
+		}
+		seen[refKey] = struct{}{}
+		refs = append(refs, fullload.StagingTableRef{Schema: targetSchema, Table: st.StagingTable})
+	}
+	return refs
+}
+
+// collectStaleStagingTableRefs 汇总所有任务的残留 staging 引用（测试/共享 targetDB 构造路径）。
 func (s *TaskService) collectStaleStagingTableRefs() []fullload.StagingTableRef {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var refs []fullload.StagingTableRef
 	seen := make(map[string]struct{})
 	for _, task := range s.tasks {
-		if task == nil || !task.Config.UsesFullLoadV2() {
-			continue
-		}
-		for tableKey, st := range task.Context.FullLoadV2States {
-			if st == nil || st.Phase == "PUBLISHED" || st.StagingTable == "" {
-				continue
-			}
-			schema, _, ok := splitSourceTableKey(tableKey)
-			if !ok {
-				continue
-			}
-			// 目标 schema：优先任务级库映射，否则与源同名。
-			targetSchema := schema
-			if task.Config.TargetSchema != "" && schema == task.Config.SourceSchema {
-				targetSchema = task.Config.TargetSchema
-			}
-			for i, src := range task.Config.SourceDatabases {
-				if src != schema {
-					continue
-				}
-				if i < len(task.Config.TargetDatabases) && task.Config.TargetDatabases[i] != "" {
-					targetSchema = task.Config.TargetDatabases[i]
-				} else if task.Config.TargetDatabase != "" {
-					targetSchema = task.Config.TargetDatabase
-				}
-				break
-			}
-			refKey := targetSchema + "." + st.StagingTable
+		for _, ref := range collectStaleStagingTableRefsFromTask(task) {
+			refKey := ref.Schema + "." + ref.Table
 			if _, ok := seen[refKey]; ok {
 				continue
 			}
 			seen[refKey] = struct{}{}
-			refs = append(refs, fullload.StagingTableRef{Schema: targetSchema, Table: st.StagingTable})
+			refs = append(refs, ref)
 		}
 	}
 	return refs
+}
+
+// cleanupStaleStagingTablesForTask 按单个任务的持久化清单清理崩溃遗留 staging。
+func (s *TaskService) cleanupStaleStagingTablesForTask(ctx context.Context, db *sql.DB, task *taskEntity.SyncTask) {
+	if db == nil || task == nil {
+		return
+	}
+	refs := collectStaleStagingTableRefsFromTask(task)
+	if len(refs) == 0 {
+		return
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 60*time.Second)
+	dropped, err := fullload.CleanupStaleStagingTables(cleanupCtx, db, refs)
+	cleanupCancel()
+	if err != nil {
+		logger.Warn("[Task %s] staging cleanup failed (partial): %v", task.Config.ID, err)
+	}
+	if dropped > 0 {
+		logger.Info("[Task %s] staging cleanup: dropped %d stale staging tables from manifest", task.Config.ID, dropped)
+	}
+}
+
+// cleanupAllStaleStagingTables 清理所有已加载任务的残留 staging（共享 targetDB 构造路径）。
+func (s *TaskService) cleanupAllStaleStagingTables(ctx context.Context, db *sql.DB) {
+	if db == nil {
+		return
+	}
+	refs := s.collectStaleStagingTableRefs()
+	if len(refs) == 0 {
+		return
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 60*time.Second)
+	dropped, err := fullload.CleanupStaleStagingTables(cleanupCtx, db, refs)
+	cleanupCancel()
+	if err != nil {
+		logger.Warn("[TaskService] startup staging cleanup failed (partial): %v", err)
+	}
+	if dropped > 0 {
+		logger.Info("[TaskService] startup staging cleanup: dropped %d stale staging tables from manifest", dropped)
+	}
 }
 
 func splitSourceTableKey(key string) (schema, table string, ok bool) {
@@ -2669,6 +2715,12 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		}
 		seen[p.dst] = struct{}{}
 		targetSchemas = append(targetSchemas, p.dst)
+	}
+
+	// 崩溃恢复：在任何 CREATE TABLE IF NOT EXISTS staging 之前，按持久化精确表名清理遗留 staging。
+	// 否则引擎 attempt 从 1 重启会复用半成品 staging（有主键重复键 / 无主键重复发布）。
+	if task.Config.UsesFullLoadV2() && runtime != nil && runtime.targetDB != nil {
+		s.cleanupStaleStagingTablesForTask(ctx, runtime.targetDB, task)
 	}
 
 	var schemaLocks *fullload.SchemaLocks

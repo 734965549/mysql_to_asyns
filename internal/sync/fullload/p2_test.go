@@ -266,13 +266,14 @@ func TestStagingTableLifecycle(t *testing.T) {
 	table := "orders"
 	attemptID := 1
 
-	// 1. createStagingTable
+	// 1. createStagingTable：CREATE IF NOT EXISTS 后强制 TRUNCATE，避免复用半成品
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS .* LIKE .*").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("TRUNCATE TABLE .*").WillReturnResult(sqlmock.NewResult(0, 0))
 	if err := createStagingTable(ctx, db, schema, table, attemptID); err != nil {
 		t.Fatalf("createStagingTable: %v", err)
 	}
 
-	// 2. truncateStagingTable
+	// 2. truncateStagingTable（独立路径仍可用）
 	mock.ExpectExec("TRUNCATE TABLE .*").WillReturnResult(sqlmock.NewResult(0, 0))
 	if err := truncateStagingTable(ctx, db, schema, table, attemptID); err != nil {
 		t.Fatalf("truncateStagingTable: %v", err)
@@ -575,5 +576,84 @@ func TestCaptureHWMConditionWithRetry(t *testing.T) {
 	capturePKWithRetry := true && (false || optWithRetry.ReadRetryTimes > 0)
 	if !capturePKWithRetry {
 		t.Fatal("PK table with retry enabled should capture HWM")
+	}
+}
+
+// TestRecordError_PersistFailurePropagates 验证 recordError 持久化失败时返回错误（fail-closed 契约）。
+func TestRecordError_PersistFailurePropagates(t *testing.T) {
+	tracker := newTableStateTracker([]*TableSpec{{SourceSchema: "s", SourceTable: "t1"}})
+	tracker.onChange = func(schema, table, phase string, attemptID int, stagingTable, errMsg string, committedRows int64) error {
+		if phase == string(PhaseFailed) {
+			return fmt.Errorf("disk full")
+		}
+		return nil
+	}
+	if _, err := tracker.startAttempt("s", "t1", 3); err != nil {
+		t.Fatalf("startAttempt: %v", err)
+	}
+	err := tracker.recordError("s", "t1", boomErr{})
+	if err == nil {
+		t.Fatal("expected persist failure to propagate")
+	}
+	if !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestInflightBarrierMustRunBeforeStartAttempt 验证重试契约：必须先 waitInflightZero 再 startAttempt。
+// startAttempt 会清零 Inflight；若顺序反了，barrier 会空转通过。
+func TestInflightBarrierMustRunBeforeStartAttempt(t *testing.T) {
+	tracker := newTableStateTracker([]*TableSpec{{SourceSchema: "s", SourceTable: "t1"}})
+	id1, _ := tracker.startAttempt("s", "t1", 3)
+	if err := tracker.onBatchEnqueued("s", "t1", id1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 错误顺序：先 startAttempt 再 wait → barrier 立即通过（回归保护）
+	id2, err := tracker.startAttempt("s", "t1", 3)
+	if err != nil {
+		t.Fatalf("startAttempt: %v", err)
+	}
+	if id2 != 2 {
+		t.Fatalf("expected attempt 2, got %d", id2)
+	}
+	if err := tracker.waitInflightZero("s", "t1", 50*time.Millisecond); err != nil {
+		t.Fatalf("buggy order makes barrier pass instantly; unexpected err: %v", err)
+	}
+
+	// 正确顺序：旧 attempt 仍有 inflight 时 wait 会阻塞，释放后才返回
+	tracker2 := newTableStateTracker([]*TableSpec{{SourceSchema: "s", SourceTable: "t1"}})
+	oldID, _ := tracker2.startAttempt("s", "t1", 3)
+	_ = tracker2.onBatchEnqueued("s", "t1", oldID)
+
+	done := make(chan error, 1)
+	go func() {
+		if err := tracker2.waitInflightZero("s", "t1", 2*time.Second); err != nil {
+			done <- err
+			return
+		}
+		_, err := tracker2.startAttempt("s", "t1", 3)
+		done <- err
+	}()
+
+	time.Sleep(80 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("barrier should still be waiting on old inflight, got early result: %v", err)
+	default:
+	}
+
+	tracker2.onBatchReleased("s", "t1", oldID)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("correct order should succeed after drain: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for correct-order retry prep")
+	}
+	st := tracker2.getState("s", "t1")
+	if st.AttemptID != 2 {
+		t.Fatalf("expected new attempt 2 after barrier, got %d", st.AttemptID)
 	}
 }

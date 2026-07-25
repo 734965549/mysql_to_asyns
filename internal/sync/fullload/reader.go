@@ -34,8 +34,12 @@ type chunkReader struct {
 	slowWarnOnce bool // 标记是否已输出慢查询告警，避免重复刷屏
 
 	// queryCancel/slowCancel 必须存活到 Rows.Close，覆盖整个结果集消费周期。
-	queryCancel context.CancelFunc
-	slowCancel  context.CancelFunc
+	queryCancel  context.CancelFunc
+	slowCancel   context.CancelFunc
+	queryCtx     context.Context // 当前查询超时 ctx；Scan 超时分类前勿取消
+	queryPhase   string
+	queryTimeout time.Duration
+	queryStart   time.Time
 }
 
 // effectiveBatchRows 根据表列类型动态计算实际批次行数，对含大字段表降低单批量，
@@ -133,6 +137,51 @@ func (r *chunkReader) finishQuery() {
 		r.queryCancel()
 		r.queryCancel = nil
 	}
+	r.queryCtx = nil
+	r.queryPhase = ""
+	r.queryTimeout = 0
+	r.queryStart = time.Time{}
+}
+
+// classifyScanError 将结果集消费阶段的查询超时包装为可重试的 ReadQueryTimeoutError。
+// 须在 finishQuery/closeRows 取消 queryCtx 之前调用；父 ctx 已取消/超时时不包装，避免误重试。
+func (r *chunkReader) classifyScanError(parentCtx context.Context, err error) error {
+	if err == nil || r == nil {
+		return err
+	}
+	queryTimedOut := r.queryCtx != nil && r.queryCtx.Err() == context.DeadlineExceeded
+	if !queryTimedOut && !errorsIsDeadline(err) {
+		return err
+	}
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return err
+	}
+	elapsed := time.Duration(0)
+	if !r.queryStart.IsZero() {
+		elapsed = time.Since(r.queryStart)
+	}
+	timeout := r.queryTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	phase := r.queryPhase
+	if phase == "" {
+		phase = "scan"
+	}
+	if r.stats != nil {
+		atomic.AddInt64(&r.stats.QueryTimeouts, 1)
+	}
+	return &ReadQueryTimeoutError{
+		Schema:  r.chunk.Spec.SourceSchema,
+		Table:   r.chunk.Spec.SourceTable,
+		ChunkID: r.chunk.ID,
+		Phase:   phase,
+		Cursor:  r.cursor,
+		Start:   r.chunk.Start,
+		End:     r.chunk.End,
+		Timeout: timeout,
+		Elapsed: elapsed,
+	}
 }
 
 // runQuery 执行源端查询，带超时控制和慢查询监控。phase 为 "stream" 或 "keyset"。
@@ -205,6 +254,10 @@ func (r *chunkReader) runQuery(ctx context.Context, phase string, query string, 
 	// 成功：超时 context 必须覆盖 Rows.Next/Scan 直至 Close。
 	r.queryCancel = queryCancel
 	r.slowCancel = slowCancel
+	r.queryCtx = queryCtx
+	r.queryPhase = phase
+	r.queryTimeout = timeout
+	r.queryStart = queryStart
 	return rows, elapsed, nil
 }
 
@@ -258,6 +311,7 @@ func (r *chunkReader) nextStreamBatch(ctx context.Context) (*RowBatch, error) {
 	}
 	rowsData, bytes, exhausted, err := scanUpTo(r.stream, len(r.cols), r.batchRows, r.batchBytes)
 	if err != nil {
+		err = r.classifyScanError(ctx, err)
 		r.closeRows(r.stream)
 		r.stream = nil
 		r.done = true
@@ -296,6 +350,9 @@ func (r *chunkReader) nextKeysetBatch(ctx context.Context) (*RowBatch, error) {
 		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
 
 	rowsData, bytes, exhausted, err := scanUpTo(rows, len(r.cols), r.batchRows, r.batchBytes)
+	if err != nil {
+		err = r.classifyScanError(ctx, err)
+	}
 	r.closeRows(rows)
 	if err != nil {
 		return nil, err
@@ -341,6 +398,9 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 
 	// pk_probe 只取主键列，PK 值极小（远低于 batchBytes），maxBytes 传 0 确保取满 batchRows。
 	pkValues, _, pkExhausted, err := scanUpTo(pkRows, 1, r.batchRows, 0)
+	if err != nil {
+		err = r.classifyScanError(ctx, err)
+	}
 	r.closeRows(pkRows)
 	if err != nil {
 		return nil, err
@@ -372,6 +432,9 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 
 	// payload 可能被 batchBytes 截断（大 JSON）；未截断时 payloadExhausted=true。
 	rowsData, bytes, payloadExhausted, err := scanUpTo(payloadRows, len(r.cols), r.batchRows, r.batchBytes)
+	if err != nil {
+		err = r.classifyScanError(ctx, err)
+	}
 	r.closeRows(payloadRows)
 	if err != nil {
 		return nil, err
