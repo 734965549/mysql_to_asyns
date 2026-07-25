@@ -2,7 +2,7 @@
 
 ## 摘要
 
-为增量同步链路增加 Kafka 目标端能力。沿用 [plans/incremental-multi-sink-design.md](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/plans/incremental-multi-sink-design.md) 的 Sink 抽象思路，落地 `ChangeEvent` + `Sink` 接口 + `SinkFactory`，先把现有 MySQL 增量写入重构为 `MySQLSink`，再实现 `KafkaSink`（使用已引入的 `segmentio/kafka-go`）。配置契约对齐前端已预埋的 `sink_configs`（复数数组，支持多 Sink）。本阶段不实现 Webhook Sink，保留扩展点。
+为增量同步链路增加 Kafka 目标端能力。沿用 [plans/incremental-multi-sink-design.md](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/plans/incremental-multi-sink-design.md) 的 Sink 抽象思路，落地 `ChangeEvent` + `Sink` 接口 + `SinkFactory`，先把现有 MySQL 增量写入重构为 `MySQLSink`，再实现 `KafkaSink`（使用已引入的 `segmentio/kafka-go`）。配置契约对齐前端已预埋的 `sink_configs`（复数数组，支持多 Sink）。本阶段不实现 Webhook Sink，保留扩展点。
 
 **交付语义**：At-Least-Once（Sink 写入成功后才推进 binlog checkpoint）。
 **适用范围**：仅增量同步（INCREMENTAL）。FULL/ALL 模式当 sink 非 MYSQL 时拒绝启动。
@@ -33,14 +33,14 @@
 - 设计文档 `plans/incremental-multi-sink-design.md` 已定义 ChangeEvent/Sink/SinkFactory 蓝图
 
 ### 缺失
-- 后端 `TaskConfig`（[task.go:74](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74)）无 sink 字段
-- `task_handler.go` 的 `CreateTaskRequest`（[task_handler.go:117](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go#L117)）不接收 `sink_configs`
+- 后端 `TaskConfig`（[task.go:74](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74)）无 sink 字段
+- `task_handler.go` 的 `CreateTaskRequest`（[task_handler.go:117](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go#L117)）不接收 `sink_configs`
 - 无 `Sink` 接口、`ChangeEvent`、`SinkFactory`、`KafkaSink`
-- `IncrementalSyncService`（[sync_service.go:43](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L43)）直接持有 `writers map[string]*writer.BufferedWriter`，与 MySQL 强耦合
-- `executeIncrementalSync`（[task_service.go:3943](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L3943)）未传递 sink 配置
+- `IncrementalSyncService`（[sync_service.go:43](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L43)）直接持有 `writers map[string]*writer.BufferedWriter`，与 MySQL 强耦合
+- `executeIncrementalSync`（[task_service.go:3943](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L3943)）未传递 sink 配置
 
 ### 关键耦合点
-`IncrementalSyncService.Start`（[sync_service.go:140-262](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L140)）在 232-258 行直接为每张表创建 `BufferedWriter` 并 `EnableUpsert()`；`syncEventHandler`（[sync_service.go:481](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L481)）按 EventType 分发到 `handleInsert/handleUpdate/handleDelete` 直接操作 `s.writers[key]`。这是重构主切入点。
+`IncrementalSyncService.Start`（[sync_service.go:140-262](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L140)）在 232-258 行直接为每张表创建 `BufferedWriter` 并 `EnableUpsert()`；`syncEventHandler`（[sync_service.go:481](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L481)）按 EventType 分发到 `handleInsert/handleUpdate/handleDelete` 直接操作 `s.writers[key]`。这是重构主切入点。
 
 ---
 
@@ -106,7 +106,7 @@ type TablePreparer interface {
 **内容**：封装现有 `writer.BufferedWriter`。
 - `Open`：获取 writeConn，`SET SESSION FOREIGN_KEY_CHECKS=0`
 - `PrepareTables`：遍历 dbMapping/tables，`analyzer.AnalyzeTable` 后创建 BufferedWriter + `EnableUpsert()`，缓存到内部 `map[string]*writer.BufferedWriter`（key=`srcDB.table`）
-- `Write`：按 EventType 调用 BufferedWriter 的 WriteBatch/UpdateWithBeforeImage/Delete；UPDATE 时检测 identity 变化走 `deleteAndUpsert`（迁移自现有 [sync_service.go:640](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L640)）
+- `Write`：按 EventType 调用 BufferedWriter 的 WriteBatch/UpdateWithBeforeImage/Delete；UPDATE 时检测 identity 变化走 `deleteAndUpsert`（迁移自现有 [sync_service.go:640](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L640)）
 - `Flush`/`Close`：委托 BufferedWriter
 **为什么**：保持现有 MySQL 增量行为完全不变（兼容性基准）。
 
@@ -132,12 +132,12 @@ type TablePreparer interface {
 **为什么**：解耦事件订阅与目标写入，支撑多 Sink。
 
 ### 7. TaskConfig 增加 SinkConfigs
-**文件**：`internal/task/domain/entity/task.go`（修改，[task.go:74-100](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74)）
+**文件**：`internal/task/domain/entity/task.go`（修改，[task.go:74-100](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74)）
 **变更**：`TaskConfig` 末尾增加 `SinkConfigs []sink.SinkConfig`（json `sink_configs,omitempty`）。为避免循环依赖，`SinkConfig` 定义在 `internal/sync/domain/sink`，task 实体 import 它（task 已依赖 sync 包语义；若循环，则在 task 包内定义等价结构并转换）。
 **兼容**：老任务 `sink_configs` 为空，启动时默认填充 `[{type:MYSQL}]`。
 
 ### 8. API 请求/响应扩展
-**文件**：`internal/api/handler/task_handler.go`（修改，[task_handler.go:117-138](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go#L117)）
+**文件**：`internal/api/handler/task_handler.go`（修改，[task_handler.go:117-138](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go#L117)）
 **变更**：
 - `CreateTaskRequest` / `UpdateTaskRequest` 增加 `SinkConfigs []SinkConfigRequest`（json `sink_configs,omitempty`）
 - `SinkConfigRequest{ Type string; Options map[string]interface{} }`
@@ -147,7 +147,7 @@ type TablePreparer interface {
 **为什么**：对齐前端契约，不破坏老 API。
 
 ### 9. executeIncrementalSync 传递 sink 配置 + FULL 模式拦截
-**文件**：`internal/task/application/service/task_service.go`（修改，[task_service.go:3943](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L3943)）
+**文件**：`internal/task/application/service/task_service.go`（修改，[task_service.go:3943](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L3943)）
 **变更**：
 - `executeIncrementalSync`：把 `task.Config.SinkConfigs` 填入 `syncApp.SyncConfig`
 - `StartTask`（1259 行）或 `executeFullSync`：增加校验——若 `SinkConfigs` 含非 MYSQL 类型且 Mode 为 FULL 或 ALL，返回错误拒绝启动（"Kafka sink 仅支持 INCREMENTAL 模式"）

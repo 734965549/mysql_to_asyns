@@ -1,0 +1,11 @@
+# Backend map
+- `internal/api`: Gin handlers/routing; request-response translation only.
+- `internal/task`: task aggregate/lifecycle/scheduling/storage/runtime isolation/full-load state.
+- `internal/metadata`: schema inspection and PK/UK/no-PK identity selection.
+- `internal/sync`: orchestration plus reader/writer/readonly/matching; `internal/sync/fullload` contains V2 pipeline, retry, staging, publishing.
+- `internal/checkpoint`: incremental binlog positions only.
+- `internal/config`: TOML/env loading, validation, pool tuning.
+- `internal/audit`, `internal/metrics`: cross-cutting audit and Prometheus.
+- `pkg/binlog`, `pkg/crypto`, `pkg/logger`, `pkg/storage`: shared technical packages.
+- Full sync bulk write uses plain INSERT; target must be empty or explicit drop-before-DDL. Incremental PK/UK insert uses upsert; no-PK does not.
+- ALL mode captures a short-FTWRL binlog position before full scan; do not restore long global snapshots or `enable_consistent_snapshot`.

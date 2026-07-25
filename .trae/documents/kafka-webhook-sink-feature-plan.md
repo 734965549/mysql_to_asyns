@@ -37,25 +37,25 @@
 ## 当前状态分析
 
 ### 已具备
-- `go.mod` 已引入 `github.com/segmentio/kafka-go v0.4.50`（未使用）— [go.mod:13](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/go.mod#L13)
-- 前端 `web/src/App.vue` 已预埋 Kafka UI：`SINK_TYPES`、`singleKafkaConfig`、`sinkConfigsPayload`，发送 `sink_configs: [{type, options}]`（含 brokers/topic/key_mode/batch_size/required_acks），并支持回填 — [App.vue:226](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/web/src/App.vue#L226)
-- `pkg/binlog.BinlogEvent` 已是统一事件模型（含 BeforeImage/Rows/Position）— [subscriber.go:26](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/pkg/binlog/subscriber.go#L26)
-- `checkpoint.Manager` 可复用（SavePosition/GetPosition）— [redis_checkpoint.go:33](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/checkpoint/redis_checkpoint.go#L33)
-- `DataWriter` 接口与 `BufferedWriter`/`BatchWriter` 已封装良好 — [data_writer.go:24](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/infrastructure/writer/data_writer.go#L24)
-- 存储加密 `pkg/crypto`（AES-GCM，`ENC~` 前缀）+ `SyncTask.EncryptPasswords/DecryptPasswords` — [task.go:519](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L519)、[aes.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/pkg/crypto/aes.go)
+- `go.mod` 已引入 `github.com/segmentio/kafka-go v0.4.50`（未使用）— [go.mod:13](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/go.mod#L13)
+- 前端 `web/src/App.vue` 已预埋 Kafka UI：`SINK_TYPES`、`singleKafkaConfig`、`sinkConfigsPayload`，发送 `sink_configs: [{type, options}]`（含 brokers/topic/key_mode/batch_size/required_acks），并支持回填 — [App.vue:226](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/web/src/App.vue#L226)
+- `pkg/binlog.BinlogEvent` 已是统一事件模型（含 BeforeImage/Rows/Position）— [subscriber.go:26](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/pkg/binlog/subscriber.go#L26)
+- `checkpoint.Manager` 可复用（SavePosition/GetPosition）— [redis_checkpoint.go:33](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/checkpoint/redis_checkpoint.go#L33)
+- `DataWriter` 接口与 `BufferedWriter`/`BatchWriter` 已封装良好 — [data_writer.go:24](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/infrastructure/writer/data_writer.go#L24)
+- 存储加密 `pkg/crypto`（AES-GCM，`ENC~` 前缀）+ `SyncTask.EncryptPasswords/DecryptPasswords` — [task.go:519](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L519)、[aes.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/pkg/crypto/aes.go)
 - 设计文档 `plans/incremental-multi-sink-design.md` 已定义 ChangeEvent/Sink/SinkFactory 蓝图
 
 ### 缺失
-- `TaskConfig`（[task.go:74](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74)）无 sink 字段
-- `task_handler.go` 的 `CreateTaskRequest`（[task_handler.go:117](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go#L117)）不接收 `sink_configs`
+- `TaskConfig`（[task.go:74](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74)）无 sink 字段
+- `task_handler.go` 的 `CreateTaskRequest`（[task_handler.go:117](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go#L117)）不接收 `sink_configs`
 - 无 `Sink` 接口、`ChangeEvent`、`SinkFactory`、`KafkaSink`、`WebhookSink`
-- `IncrementalSyncService`（[sync_service.go:43](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L43)）直接持有 `writers map[string]*writer.BufferedWriter`，与 MySQL 强耦合
-- `executeIncrementalSync`（[task_service.go:3943](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L3943)）未传递 sink 配置
+- `IncrementalSyncService`（[sync_service.go:43](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L43)）直接持有 `writers map[string]*writer.BufferedWriter`，与 MySQL 强耦合
+- `executeIncrementalSync`（[task_service.go:3943](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L3943)）未传递 sink 配置
 - 加密逻辑只覆盖 DB 密码，未覆盖 sink option 中的密钥（SASL 密码、Webhook auth）
 - 前端缺少 SASL/SSL 字段与 per-table topic_prefix 字段
 
 ### 关键耦合点（重构主切入点）
-`IncrementalSyncService.Start`（[sync_service.go:140-262](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L140)）在 232-258 行直接为每张表创建 `BufferedWriter` 并 `EnableUpsert()`；`syncEventHandler`（[sync_service.go:481](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L481)）按 EventType 分发到 `handleInsert/handleUpdate/handleDelete` 直接操作 `s.writers[key]`。
+`IncrementalSyncService.Start`（[sync_service.go:140-262](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L140)）在 232-258 行直接为每张表创建 `BufferedWriter` 并 `EnableUpsert()`；`syncEventHandler`（[sync_service.go:481](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L481)）按 EventType 分发到 `handleInsert/handleUpdate/handleDelete` 直接操作 `s.writers[key]`。
 
 ---
 
@@ -93,7 +93,7 @@
 **内容**：封装现有 `writer.BufferedWriter`。
 - `Open`：获取 writeConn，`SET SESSION FOREIGN_KEY_CHECKS=0`
 - `PrepareTables`：遍历 dbMapping/tables，`analyzer.AnalyzeTable` 后创建 `BufferedWriter` + `EnableUpsert()`，缓存到 `map[string]*writer.BufferedWriter`（key=`srcDB.table`）
-- `Write`：按 EventType 调用 `BufferedWriter` 的 WriteBatch/UpdateWithBeforeImage/Delete；UPDATE 检测主键变化走 `deleteAndUpsert`（迁移自 [sync_service.go:640](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L640)）
+- `Write`：按 EventType 调用 `BufferedWriter` 的 WriteBatch/UpdateWithBeforeImage/Delete；UPDATE 检测主键变化走 `deleteAndUpsert`（迁移自 [sync_service.go:640](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go#L640)）
 - `Flush`/`Close`：委托 BufferedWriter（Close 幂等）
 **为什么**：保持现有 MySQL 增量行为完全不变（兼容性基准）。
 
@@ -122,13 +122,13 @@
 ### 阶段 C — TaskConfig / API / 存储加密扩展
 
 #### C1. TaskConfig 增加 SinkConfigs
-**文件**：`internal/task/domain/entity/task.go`（修改，[task.go:74-100](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74)）
+**文件**：`internal/task/domain/entity/task.go`（修改，[task.go:74-100](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74)）
 **变更**：`TaskConfig` 末尾增加 `SinkConfigs []sink.SinkConfig`（json `sink_configs,omitempty`）。
 - 依赖方向：`task` 实体 import `internal/sync/domain/sink`（若循环依赖，则在 task 包内定义镜像结构并转换）
 - 兼容：老任务 `sink_configs` 为空，启动时默认填充 `[{type:MYSQL}]`
 
 #### C2. 存储加密扩展（覆盖 sink option 密钥）
-**文件**：`internal/task/domain/entity/task.go`（修改，[task.go:519](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L519)）
+**文件**：`internal/task/domain/entity/task.go`（修改，[task.go:519](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L519)）
 **变更**：扩展 `EncryptPasswords`/`DecryptPasswords`，在处理 DB 密码后追加遍历 `SinkConfigs` 调用 `sink.EncryptSinkSecrets(options, key)` / `DecryptSinkSecrets(options, key)`。
 - 密钥路径声明（由各 sink 实现注册到 factory）：
   - KAFKA：`security.sasl_password`（string）
@@ -137,7 +137,7 @@
 **为什么**：AGENTS.md 明确禁止泄露任务密码；SASL 密码与 Webhook auth token 同属敏感凭据，必须落盘加密。
 
 #### C3. API 请求/响应扩展
-**文件**：`internal/api/handler/task_handler.go`（修改，[task_handler.go:117](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go#L117)）
+**文件**：`internal/api/handler/task_handler.go`（修改，[task_handler.go:117](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go#L117)）
 **变更**：
 - `CreateTaskRequest`/`UpdateTaskRequest` 增加 `SinkConfigs []SinkConfigRequest`（json `sink_configs,omitempty`）
 - `SinkConfigRequest{ Type string; Options map[string]interface{} }`
@@ -147,7 +147,7 @@
 **为什么**：对齐前端契约，不破坏老 API。
 
 #### C4. executeIncrementalSync 传递 sink 配置 + FULL 模式拦截
-**文件**：`internal/task/application/service/task_service.go`（修改，[task_service.go:3943](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L3943)、[task_service.go:1259](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L1259)）
+**文件**：`internal/task/application/service/task_service.go`（修改，[task_service.go:3943](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L3943)、[task_service.go:1259](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go#L1259)）
 **变更**：
 - `executeIncrementalSync`：把 `task.Config.SinkConfigs` 填入 `syncApp.SyncConfig`
 - `StartTask`：增加校验——若 `SinkConfigs` 含非 MYSQL 类型且 Mode 为 `FULL`/`ALL`，返回错误拒绝启动（"Kafka/Webhook sink 仅支持 INCREMENTAL 模式"）
@@ -197,7 +197,7 @@
 ### 阶段 F — 前端扩展
 
 #### F1. Kafka 配置表单增强
-**文件**：`web/src/App.vue`（修改，[App.vue:4421](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/web/src/App.vue#L4421)）
+**文件**：`web/src/App.vue`（修改，[App.vue:4421](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/web/src/App.vue#L4421)）
 **变更**：
 - `singleKafkaConfig` 增加：`routing_mode`（下拉 single_topic/per_table）、`topic_prefix`（per_table 时显示）、`security` 折叠区（sasl_mechanism/sasl_username/sasl_password/tls_enabled/ca_cert_path/client_cert_path/client_key_path/insecure_skip_verify）
 - payload 构建保持 `sink_configs: [{type, options}]` 结构，options 嵌套 `security`
@@ -308,7 +308,7 @@ MySQL Binlog
 ## 安全与加密
 
 - sink option 中的密钥（Kafka `security.sasl_password`、Webhook `headers`）必须落盘加密，复用 `pkg/crypto` AES-GCM + `ENC~` 前缀。
-- 加密入口：扩展 `SyncTask.EncryptPasswords/DecryptPasswords`（[task.go:519](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L519)），遍历 `SinkConfigs` 调用各 sink 声明的密钥路径加密/解密。
+- 加密入口：扩展 `SyncTask.EncryptPasswords/DecryptPasswords`（[task.go:519](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L519)），遍历 `SinkConfigs` 调用各 sink 声明的密钥路径加密/解密。
 - 存储（MySQL/File）层现有「存储前 `EncryptPasswords`、defer 还原明文、加载后 `DecryptPasswords`」流程不变，自动覆盖新字段。
 - 响应回显时不应返回密钥明文（前端展示掩码或留空，由 handler 决定；本期先回填占位，避免泄露）。
 

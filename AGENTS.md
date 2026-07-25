@@ -9,168 +9,156 @@ These instructions apply to the entire repository. Read this file before making 
 - Read the smallest relevant source files before editing. Do not rely only on documentation.
 - Preserve user changes. Do not revert unrelated modified files.
 
-### Serena (LSP semantic analysis) — use FIRST
+## Semantic Code Discovery and MCP Safety
 
-Serena provides IDE-level semantic analysis via LSP (gopls). Always use it for **precise symbol-level queries** before falling back to the knowledge graph or grep.
+These rules are client-independent. They apply to Codex, Cursor, Trae, VS Code
+agents, CLI agents, and any other host that can read `AGENTS.md`.
 
-**MCP server:** `mcp_serena`
-**Always start with:** `run_mcp` → `server_name: "mcp_serena"`, `tool_name: "activate_project"`, `args: {"project": "mysql_to_asyns"}`
+Do not depend on a client-specific MCP server id, wrapper function, or UI label.
+Discover the available server/tool names in the current client, then map them by
+capability:
 
-#### Core tools
+- **Serena**: LSP-backed symbol lookup, references, diagnostics, and file
+  structure.
+- **Codebase Memory**: knowledge-graph search, architecture, call chains, and
+  cross-module impact analysis.
 
-All Serena tools are called via `run_mcp` with `server_name: "mcp_serena"` and the tool_name below:
+If an MCP server is not exposed as a native tool, its standalone CLI may be
+used only after the workspace safety gate below succeeds. Do not report a
+server as unavailable merely because one client uses a different tool prefix.
 
-| Question | tool_name | Key args |
-|----------|-----------|----------|
-| What's in this file? (symbols) | `get_symbols_overview` | `relative_path` |
-| Where is symbol X defined? | `find_symbol` | `name_path_pattern`, `include_info: true` |
-| Who references symbol X? | `find_referencing_symbols` | `name_path`, `relative_path` |
-| Are there compilation errors? | `get_diagnostics_for_file` | `relative_path` |
-| Regex search across project | `search_for_pattern` | `substring_pattern`, `restrict_search_to_code_files: true` |
-| Read a file (LSP-aware) | `read_file` | `relative_path` |
+### Mandatory Workspace Safety Gate
 
-#### Tool selection priority (MUST follow this order)
-
-1. **Serena** (`mcp_serena`) — precise symbol lookup, references, diagnostics, file overview
-2. **Codebase-memory graph** (`mcp_codebase-memory-mcp`) — architecture-level call chains, cross-module impact analysis, `trace_path`
-3. **Grep** — raw text search (last resort, only when Serena and graph can't answer)
-
-#### Examples
-
-All examples use `run_mcp(server_name: "mcp_serena", tool_name: "...", args: {...})`:
-
-```
-// Activate project (always first)
-run_mcp(server_name: "mcp_serena", tool_name: "activate_project", args: {"project": "mysql_to_asyns"})
-
-// Get file structure
-run_mcp(server_name: "mcp_serena", tool_name: "get_symbols_overview", args: {"relative_path": "internal/sync/fullload/engine.go"})
-
-// Find symbol with signature
-run_mcp(server_name: "mcp_serena", tool_name: "find_symbol", args: {"name_path_pattern": "executeFullSync", "include_info": true, "max_matches": 1})
-
-// Find all references to a symbol
-run_mcp(server_name: "mcp_serena", tool_name: "find_referencing_symbols", args: {"name_path": "executeFullSync", "relative_path": "internal/task/application/service/task_service.go"})
-
-// Check for errors
-run_mcp(server_name: "mcp_serena", tool_name: "get_diagnostics_for_file", args: {"relative_path": "internal/sync/fullload/engine.go", "min_severity": 2})
-
-// Search for patterns
-run_mcp(server_name: "mcp_serena", tool_name: "search_for_pattern", args: {"substring_pattern": "UNIQUE_CHECKS", "restrict_search_to_code_files": true})
-```
-
-#### Serena vs Graph: when to use which
-
-| Scenario | Tool |
-|----------|------|
-| "Who calls X and what does X call?" (full chain) | `trace_path` (graph) |
-| "Where exactly is X called? Show me the line" | `find_referencing_symbols` (Serena) |
-| "What's the architecture of module X?" | `get_architecture` (graph) |
-| "What's the signature of function X?" | `find_symbol` (Serena) |
-| "What files are in this package?" | `get_symbols_overview` (Serena) |
-| "Which modules depend on this package?" | `trace_path` (graph) |
-
-### Codebase-memory knowledge graph (Windows)
-
-Workspace roots:
-
-- `D:\Epan\BaiduNetdiskDownload\go\` — mysql_to_asyns, lianghua, aiops, bindip
-- `D:\E\BaiduNetdiskDownload\go\` — goInception, archery
-
-MCP server id in Cursor: `user-codebase-memory-mcp` (global) or `project-0-<workspace>-codebase-memory-mcp` (project-level). Add `.cursor/mcp.json` with `CBM_ALLOWED_ROOT` = `C:/temp/<folder>` (ASCII junction) when indexing from this machine.
-
-#### Indexed projects (use `"project"` in every MCP call)
-
-| Folder | MCP `project` | Local path | Index status | Junction |
-|--------|---------------|------------|--------------|----------|
-| `mysql_to_asyns` | **`mysql_to_asyns`** | `D:\Epan\BaiduNetdiskDownload\go\mysql_to_asyns` | ✅ indexed (3489 nodes) | `C:\temp\mysql_to_asyns` |
-| `lianghua` | **`lianghua`** | `D:\Epan\BaiduNetdiskDownload\go\lianghua` | ✅ indexed (2410 nodes) | `C:\temp\lianghua` |
-| `aiops` | **`aiops`** | `D:\Epan\BaiduNetdiskDownload\go\aiops` | ✅ indexed (7282 nodes) | `C:\temp\aiops` |
-| `bindip` | **`bindip`** | `D:\Epan\BaiduNetdiskDownload\go\bindip` | ✅ indexed (407 nodes) | `C:\temp\bindip` |
-| `goInception` | **`goInception`** | `D:\E\BaiduNetdiskDownload\go\goInception` | ✅ indexed (16908 nodes) | `C:\temp\goInception` |
-| `archery` | **`archery`** | `D:\E\BaiduNetdiskDownload\go\archery` | ✅ indexed (8012 nodes) | `C:\temp\archery` |
-
-**This repo:** always pass `"project": "mysql_to_asyns"`.
-
-**Sibling repo in Cursor:** pass the matching `project` from the table (same as folder name).
-
-#### Query tools (use via run_mcp)
-
-All graph tools are called via `run_mcp` with `server_name: "mcp_codebase-memory-mcp"` and the tool_name below:
-
-| Question | tool_name | Key args |
-|----------|-----------|----------|
-| Find functions/classes by keyword | `search_graph` | `query` or `name_pattern` |
-| Text search enriched with graph context | `search_code` | `query` |
-| Who calls X / what does X call | `trace_path` | `function_name`, `direction`: inbound/outbound/both |
-| Complex graph patterns | `query_graph` | `cypher` (Cypher query) |
-| Read source for a symbol | `get_code_snippet` | `qualified_name` (get from `search_graph` first) |
-| Package/module overview | `get_architecture` | (no required args beyond `project`) |
-| Node/edge types | `get_graph_schema` | (no required args beyond `project`) |
-
-All calls require `"project": "mysql_to_asyns"` in args.
-
-Examples:
-
-```
-// Search by keyword
-run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "search_graph", args: {"project": "mysql_to_asyns", "query": "full load engine", "limit": 20})
-
-// Trace call chain
-run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "trace_path", args: {"project": "mysql_to_asyns", "function_name": "executeFullSync", "direction": "both", "depth": 3})
-
-// Architecture overview
-run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "get_architecture", args: {"project": "mysql_to_asyns"})
-
-// Get code snippet by qualified name
-run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "get_code_snippet", args: {"project": "mysql_to_asyns", "qualified_name": "mysql_to_asyns.internal.sync.fullload.Run"})
-
-// Sibling project examples
-run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "search_graph", args: {"project": "aiops", "query": "runbook execution", "limit": 20})
-run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "search_graph", args: {"project": "lianghua", "name_pattern": ".*Order.*", "label": "Function"})
-```
-
-Prefer these graph tools over `rg`/Grep when exploring structure, callers, or architecture.
-
-#### Tools not exposed in Cursor (MCP pagination — use CLI instead)
-
-Cursor only loads the first page of MCP tools. These require the standalone CLI:
+Run this check before activating Serena, starting either MCP server, refreshing
+an index, or calling any operation that accepts a repository path:
 
 ```powershell
-& "$env:USERPROFILE\.local\bin\codebase-memory-mcp.exe" cli list_projects
-& "$env:USERPROFILE\.local\bin\codebase-memory-mcp.exe" cli detect_changes --project mysql_to_asyns
-& "$env:USERPROFILE\.local\bin\codebase-memory-mcp.exe" cli index_status --project mysql_to_asyns
+$expectedRepo = [System.IO.Path]::GetFullPath(
+  "D:\Epan\BaiduNetdiskDownload\go\mysql_to_asyns"
+).TrimEnd("\")
+$actualRepo = [System.IO.Path]::GetFullPath(
+  (git rev-parse --show-toplevel).Trim()
+).TrimEnd("\")
+
+if ($actualRepo -ine $expectedRepo) {
+  throw "Wrong repository root. Expected '$expectedRepo', got '$actualRepo'."
+}
+if (-not (Test-Path -LiteralPath (Join-Path $actualRepo ".git"))) {
+  throw "The validated path is not the mysql_to_asyns Git repository."
+}
 ```
 
-Replace `mysql_to_asyns` with any project name from the table as needed.
+Safety requirements:
 
-#### Indexing (do not use MCP `index_repository` while Cursor is connected)
+- The only valid project root for these instructions is
+  `D:\Epan\BaiduNetdiskDownload\go\mysql_to_asyns`.
+- Both MCP processes must use that exact directory as their working directory.
+- `CBM_ALLOWED_ROOT` must resolve to that exact directory. Never set it to
+  `C:\`, `C:\Users`, a user profile, a drive root, the parent `go` directory,
+  or another broad workspace.
+- Treat unresolved values such as `${workspaceFolder}`, `${cwd}`, an empty
+  string, or `.` as unsafe. Resolve and compare the final absolute path first.
+- Never infer an index path from the MCP process's inherited current directory.
+- Never run `index_repository` without an explicit validated `repo_path` and
+  the explicit project name `mysql_to_asyns`.
+- Never index a sibling repository under these instructions.
+- If path validation fails or the active project cannot be verified, stop MCP
+  work. Do not try a broader parent directory and do not fall back to `C:\`.
 
-The MCP server holds the SQLite graph open and the worker exits immediately. Paths containing non-ASCII characters (e.g. `E盘`) also crash the worker. Always index through an ASCII junction: `C:\temp\<folder>`.
+Recommended Codebase Memory process limits for this repository:
 
-**This repo (`mysql_to_asyns`):**
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/index-codebase.ps1
-# or: make index-codebase
+```text
+CBM_ALLOWED_ROOT=D:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns
+CBM_MEM_BUDGET_MB=2048
+CBM_WORKERS=2
+CBM_LOG_LEVEL=warn
 ```
 
-**Sibling repos — generic recipe:**
+These limits are a secondary guard only. Correct root validation is mandatory.
+
+### Startup and Project Verification
+
+For Serena:
+
+1. Start it with the validated repository root as its working directory.
+2. Use `--project-from-cwd`, or activate the absolute validated repository path
+   when the client requires an explicit activation call.
+3. Confirm that the active project is `mysql_to_asyns` and that its root equals
+   the validated repository root before any broad search.
+4. Use project-relative paths in subsequent Serena calls.
+
+For Codebase Memory:
+
+1. Start it with the validated repository root and the exact
+   `CBM_ALLOWED_ROOT` above.
+2. Call `list_projects` or `index_status` before assuming an index is missing.
+3. Every graph query must include `project: "mysql_to_asyns"`.
+4. Confirm that the selected project's canonical/worktree root resolves to the
+   validated repository root.
+5. Do not automatically create or rebuild an index. Prefer `index_status` and
+   `detect_changes`; indexing is an explicit maintenance operation.
+
+When indexing is explicitly required, use the standalone Codebase Memory CLI
+after stopping or reloading any client process that holds the graph database:
 
 ```powershell
+$repo = "D:\Epan\BaiduNetdiskDownload\go\mysql_to_asyns"
 $cbm = "$env:USERPROFILE\.local\bin\codebase-memory-mcp.exe"
-$name = "goInception"   # or aiops / lianghua / bindip / archery
-$repo = "D:\E\BaiduNetdiskDownload\go\$name"   # use D:\Epan\... for Epan-path repos
-$junction = "C:\temp\$name"
+$validatedRepo = [System.IO.Path]::GetFullPath($repo).TrimEnd("\")
+$gitRepo = [System.IO.Path]::GetFullPath(
+  (git -C $repo rev-parse --show-toplevel).Trim()
+).TrimEnd("\")
 
-if (-not (Test-Path $junction)) {
-  New-Item -ItemType Junction -Path $junction -Target $repo | Out-Null
+if ($gitRepo -ine $validatedRepo) {
+  throw "Refusing to index an unexpected path."
 }
 
-& $cbm cli index_repository --repo-path $junction --name $name --mode full --persistence true
+& $cbm cli index_repository `
+  --repo-path $validatedRepo `
+  --name mysql_to_asyns `
+  --mode full `
+  --persistence true
 ```
 
-Then reload MCP servers (or restart Cursor). Artifact: `<repo>/.codebase-memory/graph.db.zst` (gitignored).
+Do not use the old Chinese path, a `C:\temp` fallback, or a generic
+`workspaceFolder` placeholder. The repository path is ASCII now, so a junction
+is not required.
+
+### Tool Selection Priority
+
+1. **Serena** for exact symbols, signatures, references, diagnostics, and file
+   structure.
+2. **Codebase Memory** for architecture, callers/callees, dependency paths, and
+   cross-module impact.
+3. **`rg` / `rg --files`** for string literals, error messages, configuration,
+   documentation, and cases not answered by semantic tools.
+
+Use capabilities rather than client-specific invocation syntax:
+
+| Need | Preferred capability |
+|------|----------------------|
+| File symbol overview | Serena `get_symbols_overview` |
+| Find a symbol or signature | Serena `find_symbol` |
+| Find exact references | Serena `find_referencing_symbols` |
+| File diagnostics | Serena diagnostics tool exposed by the client |
+| Semantic source pattern search | Serena `search_for_pattern` |
+| Find graph entities | Codebase Memory `search_graph` |
+| Trace inbound/outbound calls | Codebase Memory `trace_path` |
+| Read graph-located source | Codebase Memory `get_code_snippet` |
+| Architecture overview | Codebase Memory `get_architecture` |
+| Complex dependency query | Codebase Memory `query_graph` |
+
+Example argument payloads are portable even when the outer invocation differs:
+
+```json
+{"project":"mysql_to_asyns","query":"full load engine","limit":20}
+{"project":"mysql_to_asyns","function_name":"executeFullSync","direction":"both","depth":3}
+{"project":"mysql_to_asyns","qualified_name":"mysql_to_asyns.internal.sync.fullload.Run"}
+```
+
+For Serena, pass project-relative paths such as
+`internal/sync/fullload/engine.go`; do not pass paths outside the validated
+repository.
 
 Useful context files:
 

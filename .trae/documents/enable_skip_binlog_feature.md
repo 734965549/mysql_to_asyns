@@ -6,11 +6,11 @@
 
 ## Current State Analysis
 
-- 全量同步在目标端专用 `*sql.Conn` 上统一通过 [session_options.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/session_options.go) 的 `disableFullSyncWriteSession(ctx, conn, label)` 关闭 `FOREIGN_KEY_CHECKS=0` / `UNIQUE_CHECKS=0` 并 verify，`restoreFullSyncWriteSession(conn, label)` 在 defer 中恢复。该专用连接在整个批量写入期间被复用，因此 `sql_log_bin` 在同一连接上对后续 INSERT 生效。
-- 该函数在 5 处被调用：[task_service.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go) 的 4 条全量读取路径（nopk/keyset/range/sample，L2877/L3151/L3441/L3681）与 [channel_sync.go:304](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/channel_sync.go#L304)。所有调用点所在方法均持有 `task *taskEntity.SyncTask`，可访问 `task.Config`。
-- 任务级 `enable_` 开关的贯穿链路已成熟，参考 `enable_drop_table_before_ddl`：[TaskConfig](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74-100) 实体字段 -> [task_handler.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go) 的 `CreateTaskRequest`(bool) / `UpdateTaskRequest`(*bool+omitempty) -> [App.vue](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/web/src/App.vue) 的 taskForm/重置/回填/checkbox/详情展示。
+- 全量同步在目标端专用 `*sql.Conn` 上统一通过 [session_options.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/session_options.go) 的 `disableFullSyncWriteSession(ctx, conn, label)` 关闭 `FOREIGN_KEY_CHECKS=0` / `UNIQUE_CHECKS=0` 并 verify，`restoreFullSyncWriteSession(conn, label)` 在 defer 中恢复。该专用连接在整个批量写入期间被复用，因此 `sql_log_bin` 在同一连接上对后续 INSERT 生效。
+- 该函数在 5 处被调用：[task_service.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go) 的 4 条全量读取路径（nopk/keyset/range/sample，L2877/L3151/L3441/L3681）与 [channel_sync.go:304](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/channel_sync.go#L304)。所有调用点所在方法均持有 `task *taskEntity.SyncTask`，可访问 `task.Config`。
+- 任务级 `enable_` 开关的贯穿链路已成熟，参考 `enable_drop_table_before_ddl`：[TaskConfig](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L74-100) 实体字段 -> [task_handler.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go) 的 `CreateTaskRequest`(bool) / `UpdateTaskRequest`(*bool+omitempty) -> [App.vue](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/web/src/App.vue) 的 taskForm/重置/回填/checkbox/详情展示。
 - `SET SESSION sql_log_bin=0` 需 SUPER 权限（或 MySQL 8 的 `SESSION_VARIABLES_ADMIN`），与现有 `FOREIGN_KEY_CHECKS`、`read_only_manager` 的 SUPER 权限假设一致。
-- 增量同步 [sync_service.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go) 的 `writeConn` 也设置了 `FOREIGN_KEY_CHECKS=0`，但本次范围不含增量，不动 `SyncConfig` 与 `sync_service.go`。
+- 增量同步 [sync_service.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go) 的 `writeConn` 也设置了 `FOREIGN_KEY_CHECKS=0`，但本次范围不含增量，不动 `SyncConfig` 与 `sync_service.go`。
 
 ## Assumptions & Decisions
 
@@ -24,7 +24,7 @@
 ## Proposed Changes
 
 ### 1. 实体层：新增配置字段
-文件：[internal/task/domain/entity/task.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L95-97)
+文件：[internal/task/domain/entity/task.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go#L95-97)
 - 在 `TaskConfig` 中 `EnableDropTableBeforeDDL` 之后新增字段：
   ```go
   EnableSkipBinlog bool `json:"enable_skip_binlog"` // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
@@ -32,7 +32,7 @@
 - 字段为 `bool`，零值 `false`，向后兼容已有任务存档（反序列化缺失该键即为 false）。
 
 ### 2. 全量同步 session 层：增加 binlog 关闭/恢复
-文件：[internal/task/application/service/session_options.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/session_options.go)
+文件：[internal/task/application/service/session_options.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/session_options.go)
 - 新增常量：
   ```go
   fullSyncDisableBinlogSQL  = "SET SESSION sql_log_bin=0"
@@ -56,7 +56,7 @@
   ```
 
 ### 3. 全量同步调用点：传递开关
-文件：[internal/task/application/service/task_service.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go)（4 处：L2877/L3151/L3441/L3681）
+文件：[internal/task/application/service/task_service.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go)（4 处：L2877/L3151/L3441/L3681）
 - 每处调用改为传入 `task.Config.EnableSkipBinlog`：
   ```go
   if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel, task.Config.EnableSkipBinlog); err != nil { ... }
@@ -69,7 +69,7 @@
   }()
   ```
 
-文件：[internal/task/application/service/channel_sync.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/channel_sync.go#L304)（1 处）
+文件：[internal/task/application/service/channel_sync.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/channel_sync.go#L304)（1 处）
 - `processBatchTask` 已接收 `task *taskEntity.SyncTask`，同样传入 `task.Config.EnableSkipBinlog`：
   ```go
   if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel, task.Config.EnableSkipBinlog); err != nil { ... }
@@ -77,7 +77,7 @@
   ```
 
 ### 4. API 层：请求/响应字段
-文件：[internal/api/handler/task_handler.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go)
+文件：[internal/api/handler/task_handler.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/api/handler/task_handler.go)
 - `CreateTaskRequest` 新增：`EnableSkipBinlog bool `json:"enable_skip_binlog"``
 - `UpdateTaskRequest` 新增：`EnableSkipBinlog *bool `json:"enable_skip_binlog,omitempty"``（指针，区分"未传"与"传 false"，与 `enable_read_only`/`enable_drop_table_before_ddl` 一致）
 - `CreateTask` 映射：`taskCfg.EnableSkipBinlog = req.EnableSkipBinlog`
@@ -89,23 +89,23 @@
   ```
 
 ### 5. 前端 UI
-文件：[web/src/App.vue](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/web/src/App.vue)
+文件：[web/src/App.vue](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/web/src/App.vue)
 - taskForm 初始定义（~L300-320）与重置函数（~L750-773）新增：`enable_skip_binlog: false`
 - 编辑回填（~L1515-1537）新增：`enable_skip_binlog: task.config.enable_skip_binlog || false`
 - 表单 checkbox 渲染（在 `enable_drop_table_before_ddl` checkbox 附近，`v-if="targetType === 'MYSQL'"` 块内）新增一个 `<a-checkbox v-model="taskForm.enable_skip_binlog">`，文案说明"全量同步写入前临时关闭目标端 binlog（sql_log_bin=0），可加速导入并减少目标 binlog 体积；需目标库账号具备 SUPER 权限"，并以 `a-typography-text type="secondary"` 给出副标题说明。
 - 详情页展示（~L3041 附近开关状态展示区）新增：`{{ detailPageTask.config.enable_skip_binlog ? '开启' : '关闭' }}`
 
 ### 6. 测试更新
-文件：[internal/task/application/service/full_sync_insert_mode_test.go](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/full_sync_insert_mode_test.go)
+文件：[internal/task/application/service/full_sync_insert_mode_test.go](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/full_sync_insert_mode_test.go)
 - 现有直接调用 `disableFullSyncWriteSession(...)` 的 3 处（L232/L254/L276）补 `false` 参数（默认路径，期望不变）。
 - 现有辅助 `expectTargetWriteSession` / `expectParallelTargetWriteSessions` 无需改动（默认 skipBinlog=false，不触发新 SQL）。
 - 新增测试 `TestDisableFullSyncWriteSession_SkipBinlog`：用 sqlmock 期望顺序 `FK=0 → UNIQUE=0 → verify(0,0) → sql_log_bin=0 → restore FK=1 → UNIQUE=1 → sql_log_bin=1`，断言成功。
 - 新增测试 `TestDisableFullSyncWriteSession_SkipBinlogFailsHard`：让 `sql_log_bin=0` 返回权限错误，断言返回 error 且包含 "disable binlog"。
 
 ### 7. 文档更新
-- [README.md](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/README.md)：任务字段表（~L463）新增 `enable_skip_binlog` 行；JSON 示例（~L426-427、~L516-517）补 `"enable_skip_binlog": false`；全量 INSERT 说明段（~L1077）补一句 binlog 关闭语义与 SUPER 权限前提。
-- [docs/design/shejiwendang.md](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/docs/design/shejiwendang.md)：全量写 session 行为段（~L128/L144）补 `enable_skip_binlog` 说明。
-- 核对 [docs/CONFIGURATION.md](file:///d:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/docs/CONFIGURATION.md)：该文件聚焦全局 TOML/env 配置，任务级字段不在其范围，预计无需改动（实施时确认）。
+- [README.md](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/README.md)：任务字段表（~L463）新增 `enable_skip_binlog` 行；JSON 示例（~L426-427、~L516-517）补 `"enable_skip_binlog": false`；全量 INSERT 说明段（~L1077）补一句 binlog 关闭语义与 SUPER 权限前提。
+- [docs/design/shejiwendang.md](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/docs/design/shejiwendang.md)：全量写 session 行为段（~L128/L144）补 `enable_skip_binlog` 说明。
+- 核对 [docs/CONFIGURATION.md](file:///d:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/docs/CONFIGURATION.md)：该文件聚焦全局 TOML/env 配置，任务级字段不在其范围，预计无需改动（实施时确认）。
 
 ## Verification Steps
 

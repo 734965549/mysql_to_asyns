@@ -983,6 +983,50 @@ func TestCreateTask(t *testing.T) {
 	assert.True(t, retrievedTask.Config.EnableDropTableBeforeDDL)
 }
 
+// TestCreateTask_RetryRequiresStaging 验证 service 层入口契约：
+// full_load_read_retry_times>0 且 full_load_enable_staging=false 时，
+// CreateTask 必须在 ValidateFullLoadOptions 处被拒，且任务不得持久化。
+func TestCreateTask_RetryRequiresStaging(t *testing.T) {
+	ts := NewTaskService(newDefaultConfig())
+	defer ts.Close()
+
+	// Case A: retry>0 且 staging=false 必须在 CreateTask 入口被拒（fail-closed）。
+	t.Run("rejects retry without staging", func(t *testing.T) {
+		cfg := taskEntity.TaskConfig{
+			ID:                     "retry-no-staging",
+			Name:                   "retry no staging",
+			SourceSchema:           "src",
+			TargetSchema:           "tgt",
+			Mode:                   taskEntity.SyncModeFull,
+			FullLoadReadRetryTimes: 2,
+			FullLoadEnableStaging:  false,
+		}
+		_, err := ts.CreateTask(cfg)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "requires full_load_enable_staging")
+		_, exists := ts.GetTask("retry-no-staging")
+		assert.False(t, exists, "rejected task must not be persisted")
+	})
+
+	// Case B: retry>0 且 staging=true 应创建成功。
+	t.Run("accepts retry with staging", func(t *testing.T) {
+		cfg := taskEntity.TaskConfig{
+			ID:                     "retry-with-staging",
+			Name:                   "retry with staging",
+			SourceSchema:           "src",
+			TargetSchema:           "tgt",
+			Mode:                   taskEntity.SyncModeFull,
+			FullLoadReadRetryTimes: 2,
+			FullLoadEnableStaging:  true,
+		}
+		task, err := ts.CreateTask(cfg)
+		assert.NoError(t, err)
+		assert.NotNil(t, task)
+		_, exists := ts.GetTask("retry-with-staging")
+		assert.True(t, exists)
+	})
+}
+
 func TestGetTask(t *testing.T) {
 	dataDir := t.TempDir()
 

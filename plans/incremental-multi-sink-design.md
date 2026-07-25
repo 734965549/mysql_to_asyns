@@ -16,13 +16,13 @@
 
 基于当前代码实现，现状如下：
 
-- 任务模式编排在 [internal/task/application/service/task_service.go](D:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go) 中，已经支持 `FULL`、`INCREMENTAL`、`ALL`。
-- 增量同步入口在 [internal/task/application/service/task_service.go](D:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go) 中，当前由 `executeIncrementalSync` 创建 `IncrementalSyncService`。
-- 增量同步主服务在 [internal/sync/application/sync_service.go](D:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go) 中，核心链路是：
+- 任务模式编排在 [internal/task/application/service/task_service.go](D:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go) 中，已经支持 `FULL`、`INCREMENTAL`、`ALL`。
+- 增量同步入口在 [internal/task/application/service/task_service.go](D:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/application/service/task_service.go) 中，当前由 `executeIncrementalSync` 创建 `IncrementalSyncService`。
+- 增量同步主服务在 [internal/sync/application/sync_service.go](D:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/application/sync_service.go) 中，核心链路是：
   `Binlog Subscriber -> syncEventHandler -> writer.BufferedWriter/BatchWriter -> MySQL target`
-- Binlog 事件模型在 [pkg/binlog/subscriber.go](D:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/pkg/binlog/subscriber.go) 中，已具备统一事件结构 `BinlogEvent`。
+- Binlog 事件模型在 [pkg/binlog/subscriber.go](D:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/pkg/binlog/subscriber.go) 中，已具备统一事件结构 `BinlogEvent`。
 - 当前 checkpoint 已经抽象为 `checkpoint.Manager`，这对多目标增量同步完全可复用。
-- 当前任务配置定义在 [internal/task/domain/entity/task.go](D:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go)，但目标端配置仍然是“数据库导向”的，不适合表达 Kafka、Webhook 等目标。
+- 当前任务配置定义在 [internal/task/domain/entity/task.go](D:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go)，但目标端配置仍然是“数据库导向”的，不适合表达 Kafka、Webhook 等目标。
 
 ### 2.1 当前架构的优势
 
@@ -189,7 +189,7 @@ type ChangeEvent struct {
 ### 6.2 Sink 抽象
 
 新增统一接口，建议定义在：
-[internal/sync/domain/sink/sink.go](D:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/domain/sink/sink.go)
+[internal/sync/domain/sink/sink.go](D:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/sync/domain/sink/sink.go)
 
 ```go
 type Sink interface {
@@ -242,7 +242,7 @@ type BatchSink interface {
 
 ## 7. 任务配置设计
 
-当前 [internal/task/domain/entity/task.go](D:/E盘/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go) 中的目标配置过于数据库化，必须升级。
+当前 [internal/task/domain/entity/task.go](D:/Epan/BaiduNetdiskDownload/go/mysql_to_asyns/internal/task/domain/entity/task.go) 中的目标配置过于数据库化，必须升级。
 
 建议新增：
 
