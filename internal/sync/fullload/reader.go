@@ -1109,12 +1109,13 @@ func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *ba
 			if stateTracker != nil && batch.AttemptID > 0 {
 				stateTracker.onBatchReleased(batch.Schema, batch.Table, batch.AttemptID)
 			}
+			// 父 context 取消优先于 watch 超时，与 classifyScanError 一致。
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			// stream 看门狗（含 max_duration）在队列背压期间触发：必须返回超时错误，不能当成功退出。
 			if to := cr.watchTimeoutError(); to != nil {
 				return fmt.Errorf("read chunk %s: %w", chunk.ID, to)
-			}
-			if ctx.Err() != nil {
-				return ctx.Err()
 			}
 			return nil
 		}
