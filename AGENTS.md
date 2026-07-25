@@ -9,6 +9,67 @@ These instructions apply to the entire repository. Read this file before making 
 - Read the smallest relevant source files before editing. Do not rely only on documentation.
 - Preserve user changes. Do not revert unrelated modified files.
 
+### Serena (LSP semantic analysis) — use FIRST
+
+Serena provides IDE-level semantic analysis via LSP (gopls). Always use it for **precise symbol-level queries** before falling back to the knowledge graph or grep.
+
+**MCP server:** `mcp_serena`
+**Always start with:** `run_mcp` → `server_name: "mcp_serena"`, `tool_name: "activate_project"`, `args: {"project": "mysql_to_asyns"}`
+
+#### Core tools
+
+All Serena tools are called via `run_mcp` with `server_name: "mcp_serena"` and the tool_name below:
+
+| Question | tool_name | Key args |
+|----------|-----------|----------|
+| What's in this file? (symbols) | `get_symbols_overview` | `relative_path` |
+| Where is symbol X defined? | `find_symbol` | `name_path_pattern`, `include_info: true` |
+| Who references symbol X? | `find_referencing_symbols` | `name_path`, `relative_path` |
+| Are there compilation errors? | `get_diagnostics_for_file` | `relative_path` |
+| Regex search across project | `search_for_pattern` | `substring_pattern`, `restrict_search_to_code_files: true` |
+| Read a file (LSP-aware) | `read_file` | `relative_path` |
+
+#### Tool selection priority (MUST follow this order)
+
+1. **Serena** (`mcp_serena`) — precise symbol lookup, references, diagnostics, file overview
+2. **Codebase-memory graph** (`mcp_codebase-memory-mcp`) — architecture-level call chains, cross-module impact analysis, `trace_path`
+3. **Grep** — raw text search (last resort, only when Serena and graph can't answer)
+
+#### Examples
+
+All examples use `run_mcp(server_name: "mcp_serena", tool_name: "...", args: {...})`:
+
+```
+// Activate project (always first)
+run_mcp(server_name: "mcp_serena", tool_name: "activate_project", args: {"project": "mysql_to_asyns"})
+
+// Get file structure
+run_mcp(server_name: "mcp_serena", tool_name: "get_symbols_overview", args: {"relative_path": "internal/sync/fullload/engine.go"})
+
+// Find symbol with signature
+run_mcp(server_name: "mcp_serena", tool_name: "find_symbol", args: {"name_path_pattern": "executeFullSync", "include_info": true, "max_matches": 1})
+
+// Find all references to a symbol
+run_mcp(server_name: "mcp_serena", tool_name: "find_referencing_symbols", args: {"name_path": "executeFullSync", "relative_path": "internal/task/application/service/task_service.go"})
+
+// Check for errors
+run_mcp(server_name: "mcp_serena", tool_name: "get_diagnostics_for_file", args: {"relative_path": "internal/sync/fullload/engine.go", "min_severity": 2})
+
+// Search for patterns
+run_mcp(server_name: "mcp_serena", tool_name: "search_for_pattern", args: {"substring_pattern": "UNIQUE_CHECKS", "restrict_search_to_code_files": true})
+```
+
+#### Serena vs Graph: when to use which
+
+| Scenario | Tool |
+|----------|------|
+| "Who calls X and what does X call?" (full chain) | `trace_path` (graph) |
+| "Where exactly is X called? Show me the line" | `find_referencing_symbols` (Serena) |
+| "What's the architecture of module X?" | `get_architecture` (graph) |
+| "What's the signature of function X?" | `find_symbol` (Serena) |
+| "What files are in this package?" | `get_symbols_overview` (Serena) |
+| "Which modules depend on this package?" | `trace_path` (graph) |
+
 ### Codebase-memory knowledge graph (Windows)
 
 Workspace roots:
@@ -33,27 +94,40 @@ MCP server id in Cursor: `user-codebase-memory-mcp` (global) or `project-0-<work
 
 **Sibling repo in Cursor:** pass the matching `project` from the table (same as folder name).
 
-#### Query tools (use via MCP)
+#### Query tools (use via run_mcp)
 
-| Question | Tool |
-|----------|------|
-| Find functions/classes by keyword | `search_graph` with `query` or `name_pattern` |
-| Text search enriched with graph context | `search_code` |
-| Who calls X / what does X call | `trace_path` (`direction`: inbound/outbound/both) |
-| Complex graph patterns | `query_graph` (Cypher) |
-| Read source for a symbol | `get_code_snippet` (get `qualified_name` from `search_graph` first) |
-| Package/module overview | `get_architecture` |
-| Node/edge types | `get_graph_schema` |
+All graph tools are called via `run_mcp` with `server_name: "mcp_codebase-memory-mcp"` and the tool_name below:
+
+| Question | tool_name | Key args |
+|----------|-----------|----------|
+| Find functions/classes by keyword | `search_graph` | `query` or `name_pattern` |
+| Text search enriched with graph context | `search_code` | `query` |
+| Who calls X / what does X call | `trace_path` | `function_name`, `direction`: inbound/outbound/both |
+| Complex graph patterns | `query_graph` | `cypher` (Cypher query) |
+| Read source for a symbol | `get_code_snippet` | `qualified_name` (get from `search_graph` first) |
+| Package/module overview | `get_architecture` | (no required args beyond `project`) |
+| Node/edge types | `get_graph_schema` | (no required args beyond `project`) |
+
+All calls require `"project": "mysql_to_asyns"` in args.
 
 Examples:
 
-```json
-{"project": "mysql_to_asyns", "query": "full load engine", "limit": 20}
-{"project": "aiops", "query": "runbook execution", "limit": 20}
-{"project": "lianghua", "name_pattern": ".*Order.*", "label": "Function"}
-{"project": "bindip", "query": "binding state", "limit": 10}
-{"project": "goInception", "query": "sql audit execute", "limit": 20}
-{"project": "archery", "query": "sql workflow review", "limit": 20}
+```
+// Search by keyword
+run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "search_graph", args: {"project": "mysql_to_asyns", "query": "full load engine", "limit": 20})
+
+// Trace call chain
+run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "trace_path", args: {"project": "mysql_to_asyns", "function_name": "executeFullSync", "direction": "both", "depth": 3})
+
+// Architecture overview
+run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "get_architecture", args: {"project": "mysql_to_asyns"})
+
+// Get code snippet by qualified name
+run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "get_code_snippet", args: {"project": "mysql_to_asyns", "qualified_name": "mysql_to_asyns.internal.sync.fullload.Run"})
+
+// Sibling project examples
+run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "search_graph", args: {"project": "aiops", "query": "runbook execution", "limit": 20})
+run_mcp(server_name: "mcp_codebase-memory-mcp", tool_name: "search_graph", args: {"project": "lianghua", "name_pattern": ".*Order.*", "label": "Function"})
 ```
 
 Prefer these graph tools over `rg`/Grep when exploring structure, callers, or architecture.
@@ -127,7 +201,7 @@ This is a Go 1.24 MySQL-to-MySQL sync service with a Vue management UI.
 
 - Keep `TaskStatus` and `SyncPhase` separate. `TaskStatus` is the external lifecycle state; `SyncPhase` decides whether full sync must run or hand off to incremental sync.
 - Keep historical full-sync progress fields in task archives at `context.full_sync_resume` for compatibility only. Do not move them to Redis. Redis/memory checkpoints are for incremental binlog positions.
-- Do not resume full sync after interruption. If `sync_phase` is `FULL_STARTED` or `FULL_FAILED` and `enable_drop_table_before_ddl=false`, starting `FULL` or `ALL` must be rejected.
+- Do not resume full sync after interruption. If `sync_phase` is `FULL_STARTED` or `FULL_FAILED` and `enable_drop_table_before_ddl=false`, starting `FULL` or `ALL` must be rejected. Exception: `full_load_engine=v2` with persisted `full_load_v2_states` allows resume — already-PUBLISHED tables are skipped and incomplete tables restart with a fresh snapshot.
 - Clear historical full-sync progress before any new full sync. With `enable_drop_table_before_ddl=true`, the target table is rebuilt and a fresh full sync can run.
 - Keep full-sync read paths distinct: `keyset`, `range`, `sample`, and `nopk` still choose different read strategies, but none of them performs current full-sync resume.
 - Preserve the short `FLUSH TABLES WITH READ LOCK` binlog-position capture before full sync. Do not reintroduce long global snapshot behavior or `enable_consistent_snapshot`.
