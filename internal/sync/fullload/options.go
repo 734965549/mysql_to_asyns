@@ -8,7 +8,10 @@
 // full_load_engine=v2 灰度开关分发；V1 完全保留、默认行为不变。
 package fullload
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // 4C8G 平衡预设默认值。所有 <=0 的配置项都会回退到这里。
 const (
@@ -26,6 +29,13 @@ const (
 	defaultLargeTableRows = int64(1_000_000)
 	// 取表锁等待超时（秒），同时用于客户端 context 与 SESSION lock_wait_timeout。
 	defaultLockWaitTimeoutSec = 10
+
+	// 单次源端查询超时（秒），防止单条 SQL 无限执行拖死读端。
+	defaultQueryTimeoutSec = 300
+	// 慢查询告警阈值（秒），超过后输出一次告警。
+	defaultSlowQueryWarnSec = 30
+	// 查询超时/慢查询阈值上限（秒）。
+	hardMaxQueryTimeoutSec = 7200
 
 	// mysqlMaxPlaceholders 单条预处理语句占位符上限（留余量），与 writer 包保持一致。
 	mysqlMaxPlaceholders = 62000
@@ -60,6 +70,19 @@ type RawOptions struct {
 	LockWaitTimeoutSec int
 	// DegradeOnAlignLockFail nil 时默认 true（降级单连接）；显式 false 为 fail-closed。
 	DegradeOnAlignLockFail *bool
+
+	// QueryTimeoutSec 单次源端查询超时（秒）；<=0 时使用默认 300。
+	QueryTimeoutSec int
+	// SlowQueryWarnSec 慢查询告警阈值（秒）；<=0 时使用默认 30。
+	SlowQueryWarnSec int
+	// TableNoProgressSec 表无进展告警阈值（秒）；<=0 时关闭。P0 阶段预留，未实现。
+	TableNoProgressSec int
+	// ReadRetryTimes 表级读取自动重试次数；<=0 时不启用重试。
+	ReadRetryTimes int
+	// EnableTwoPhaseRead 启用单列 PK 两阶段读取（pk_probe + payload_fetch）。
+	EnableTwoPhaseRead bool
+	// EnableStaging 启用 staging 表隔离：全量数据先写入 staging 表，完成后原子 RENAME 发布。
+	EnableStaging bool
 }
 
 // Options 是经过默认值推导后引擎实际使用的运行参数。
@@ -87,6 +110,29 @@ type Options struct {
 	LockWaitTimeoutSec int
 	// DegradeOnAlignLockFail 对齐多连接取锁失败时是否降级为单连接快照（ALL+无PK 捕获 HWM 时仍 fail-closed）。
 	DegradeOnAlignLockFail bool
+
+	// QueryTimeout 单次源端查询超时。
+	QueryTimeout time.Duration
+	// SlowQueryWarnThreshold 慢查询告警阈值。
+	SlowQueryWarnThreshold time.Duration
+	// TableNoProgressSec 表无进展告警阈值（秒）；0=关闭。P0 未使用。
+	TableNoProgressSec int
+	// ReadRetryTimes 表级读取额外重试次数；0=仅首次 attempt，不重试。
+	// 语义：总 attempt 数 = 1 + ReadRetryTimes。
+	ReadRetryTimes int
+	// TwoPhaseRead 启用单列 PK 两阶段读取。仅单列 PK 表生效。
+	TwoPhaseRead bool
+	// StagingEnabled 启用 staging 表隔离：全量数据先写入 staging 表，完成后原子 RENAME 发布。
+	StagingEnabled bool
+}
+
+// Validate 校验运行参数的安全约束（fail-closed）。
+// ReadRetryTimes>0 时必须启用 staging，否则首次 attempt 已提交的数据无法撤销，重跑会主键冲突或混合快照。
+func (opt Options) Validate() error {
+	if opt.ReadRetryTimes > 0 && !opt.StagingEnabled {
+		return fmt.Errorf("full_load_read_retry_times=%d requires full_load_enable_staging=true (fail-closed: retry without staging would duplicate or conflict on the final table)", opt.ReadRetryTimes)
+	}
+	return nil
 }
 
 // ResolveOptions 将原始配置推导为生效运行参数，应用 4C8G 平衡预设。
@@ -107,6 +153,14 @@ func ResolveOptions(raw RawOptions) Options {
 		LockWaitTimeoutSec:     clampInt(raw.LockWaitTimeoutSec, defaultLockWaitTimeoutSec, 1, hardMaxLockWaitTimeoutSec),
 		DegradeOnAlignLockFail: degrade,
 	}
+
+	// 单次查询超时与慢查询告警阈值。
+	opt.QueryTimeout = time.Duration(clampInt(raw.QueryTimeoutSec, defaultQueryTimeoutSec, 1, hardMaxQueryTimeoutSec)) * time.Second
+	opt.SlowQueryWarnThreshold = time.Duration(clampInt(raw.SlowQueryWarnSec, defaultSlowQueryWarnSec, 1, hardMaxQueryTimeoutSec)) * time.Second
+	opt.TableNoProgressSec = raw.TableNoProgressSec             // P0 阶段暂不使用，直接透传
+	opt.ReadRetryTimes = clampInt(raw.ReadRetryTimes, 0, 0, 10) // P2：表级重试次数，上限 10
+	opt.TwoPhaseRead = raw.EnableTwoPhaseRead                   // P1：单列 PK 两阶段读取开关
+	opt.StagingEnabled = raw.EnableStaging                      // P2.3：staging 表隔离开关
 
 	opt.BufferBytes = mebibytes(raw.BufferMB, defaultBufferBytes, hardMaxBufferMB)
 	opt.BatchBytes = mebibytes(raw.BatchBytesMB, defaultBatchBytes, hardMaxBatchMB)

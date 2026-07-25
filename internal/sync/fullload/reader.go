@@ -3,6 +3,7 @@ package fullload
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -20,16 +21,64 @@ type chunkReader struct {
 	selectSQL  string   // "`c1`, `c2`, ..."
 	batchRows  int
 	batchBytes int64
+	opt        Options // 查询超时和慢查询阈值
+	attemptID  int     // 表级重试序号（P2.2），填充到每个 RowBatch
+	stats      *Stats  // P3.6: 用于查询超时/慢查询计数
 
 	cursorCols []string
-	cursorIdx  []int // cursorCols 在 cols 中的位置
+	cursorIdx  []int // cursorCols 在 cols 的位置
 
-	stream *sql.Rows // 仅无主键流式使用
-	cursor []any     // keyset 游标当前值
-	done   bool
+	stream       *sql.Rows // 仅无主键流式使用
+	cursor       []any     // keyset 游标当前值
+	done         bool
+	slowWarnOnce bool // 标记是否已输出慢查询告警，避免重复刷屏
+
+	// queryCancel/slowCancel 必须存活到 Rows.Close，覆盖整个结果集消费周期。
+	queryCancel context.CancelFunc
+	slowCancel  context.CancelFunc
 }
 
-func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchBytes int64) (*chunkReader, error) {
+// effectiveBatchRows 根据表列类型动态计算实际批次行数，对含大字段表降低单批量，
+// 减少单次结果集体积，缓解大 JSON/BLOB 表拖死查询的问题。下限 25，上限不超过 opt.BatchRows。
+func effectiveBatchRows(spec *TableSpec, opt Options) int {
+	if spec == nil || spec.Identity == nil {
+		return opt.BatchRows
+	}
+	largeCount := 0
+	hasLongField := false
+	for _, col := range spec.Identity.Columns {
+		dt := strings.ToLower(strings.TrimSpace(col.DataType))
+		if i := strings.IndexByte(dt, '('); i >= 0 {
+			dt = dt[:i]
+		}
+		dt = strings.TrimSpace(dt)
+		switch dt {
+		case "longtext", "longblob":
+			hasLongField = true
+			largeCount++
+		case "json", "text", "mediumtext", "blob", "mediumblob":
+			largeCount++
+		}
+	}
+	base := opt.BatchRows
+	switch {
+	case hasLongField:
+		base = base / 20
+	case largeCount >= 2:
+		base = base / 10
+	case largeCount == 1:
+		base = base / 4
+	}
+	if base < 25 {
+		base = 25
+	}
+	if base > opt.BatchRows {
+		base = opt.BatchRows
+	}
+	return base
+}
+
+func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchBytes int64, opt Options, attemptID int, stats *Stats) (*chunkReader, error) {
 	id := chunk.Spec.Identity
 	if id == nil || len(id.Columns) == 0 {
 		return nil, fmt.Errorf("chunk %s has no table columns", chunk.ID)
@@ -50,6 +99,9 @@ func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchB
 		selectSQL:  strings.Join(parts, ", "),
 		batchRows:  batchRows,
 		batchBytes: batchBytes,
+		opt:        opt,
+		attemptID:  attemptID,
+		stats:      stats,
 	}
 	if !chunk.NoPK {
 		cr.cursorCols = id.EffectiveCursorCols()
@@ -68,11 +120,111 @@ func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchB
 	return cr, nil
 }
 
+// finishQuery 取消查询超时 context 与慢查询监控；必须在 Rows.Close 之后调用。
+func (r *chunkReader) finishQuery() {
+	if r == nil {
+		return
+	}
+	if r.slowCancel != nil {
+		r.slowCancel()
+		r.slowCancel = nil
+	}
+	if r.queryCancel != nil {
+		r.queryCancel()
+		r.queryCancel = nil
+	}
+}
+
+// runQuery 执行源端查询，带超时控制和慢查询监控。phase 为 "stream" 或 "keyset"。
+// 成功返回的 *sql.Rows 对应的超时 context 会挂在 chunkReader 上，直到 closeRows/close 才取消。
+// 零值 QueryTimeout/SlowQueryWarnThreshold 会被防护。
+func (r *chunkReader) runQuery(ctx context.Context, phase string, query string, args ...any) (*sql.Rows, time.Duration, error) {
+	timeout := r.opt.QueryTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	slowWarn := r.opt.SlowQueryWarnThreshold
+	if slowWarn <= 0 {
+		slowWarn = 30 * time.Second
+	}
+
+	// 上一次查询若未 finish（异常路径），先清理。
+	r.finishQuery()
+
+	queryCtx, queryCancel := context.WithTimeout(ctx, timeout)
+	slowCtx, slowCancel := context.WithCancel(ctx)
+	queryStart := time.Now()
+	go func() {
+		select {
+		case <-time.After(slowWarn):
+			if !r.slowWarnOnce {
+				r.slowWarnOnce = true
+				if r.stats != nil {
+					atomic.AddInt64(&r.stats.SlowQueries, 1)
+				}
+				if phase == "keyset" {
+					logger.Warn("[FullLoadV2] slow source query: table=%s.%s chunk=%s phase=%s cursor=%v end=%v elapsed=%s batch_rows=%d",
+						r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, phase,
+						r.cursor, r.chunk.End, time.Since(queryStart), r.batchRows)
+				} else {
+					logger.Warn("[FullLoadV2] slow source query: table=%s.%s chunk=%s phase=%s elapsed=%s batch_rows=%d",
+						r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, phase,
+						time.Since(queryStart), r.batchRows)
+				}
+			}
+		case <-slowCtx.Done():
+			return
+		}
+	}()
+
+	rows, err := r.queryer.QueryContext(queryCtx, query, args...)
+	elapsed := time.Since(queryStart)
+
+	if err != nil {
+		slowCancel()
+		queryCancel()
+		if queryCtx.Err() == context.DeadlineExceeded || errorsIsDeadline(err) {
+			if r.stats != nil {
+				atomic.AddInt64(&r.stats.QueryTimeouts, 1)
+			}
+			return nil, elapsed, &ReadQueryTimeoutError{
+				Schema:  r.chunk.Spec.SourceSchema,
+				Table:   r.chunk.Spec.SourceTable,
+				ChunkID: r.chunk.ID,
+				Phase:   phase,
+				Cursor:  r.cursor,
+				Start:   r.chunk.Start,
+				End:     r.chunk.End,
+				Timeout: timeout,
+				Elapsed: elapsed,
+			}
+		}
+		return nil, elapsed, err
+	}
+
+	// 成功：超时 context 必须覆盖 Rows.Next/Scan 直至 Close。
+	r.queryCancel = queryCancel
+	r.slowCancel = slowCancel
+	return rows, elapsed, nil
+}
+
+func errorsIsDeadline(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func (r *chunkReader) closeRows(rows *sql.Rows) {
+	if rows != nil {
+		_ = rows.Close()
+	}
+	r.finishQuery()
+}
+
 func (r *chunkReader) close() {
 	if r.stream != nil {
 		_ = r.stream.Close()
 		r.stream = nil
 	}
+	r.finishQuery()
 }
 
 // nextBatch 返回下一批；无更多数据时返回 (nil, nil)。
@@ -83,6 +235,10 @@ func (r *chunkReader) nextBatch(ctx context.Context) (*RowBatch, error) {
 	if r.chunk.NoPK {
 		return r.nextStreamBatch(ctx)
 	}
+	// P1.1：单列 PK + TwoPhaseRead 启用时走两阶段路径（pk_probe + payload_fetch）
+	if r.opt.TwoPhaseRead && len(r.cursorCols) == 1 && !r.chunk.Sequential {
+		return r.nextTwoPhaseKeysetBatch(ctx)
+	}
 	return r.nextKeysetBatch(ctx)
 }
 
@@ -90,27 +246,31 @@ func (r *chunkReader) nextStreamBatch(ctx context.Context) (*RowBatch, error) {
 	if r.stream == nil {
 		q := fmt.Sprintf("SELECT %s FROM %s.%s", r.selectSQL,
 			quoteIdentifier(r.chunk.Spec.SourceSchema), quoteIdentifier(r.chunk.Spec.SourceTable))
-		rows, err := r.queryer.QueryContext(ctx, q)
+
+		rows, elapsed, err := r.runQuery(ctx, "stream", q)
 		if err != nil {
 			return nil, err
 		}
 		r.stream = rows
+
+		logger.Debug("[FullLoadV2] source query started: table=%s.%s chunk=%s phase=stream elapsed=%s",
+			r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
 	}
 	rowsData, bytes, exhausted, err := scanUpTo(r.stream, len(r.cols), r.batchRows, r.batchBytes)
 	if err != nil {
-		r.stream.Close()
+		r.closeRows(r.stream)
 		r.stream = nil
 		r.done = true
 		return nil, err
 	}
 	if len(rowsData) == 0 {
-		r.stream.Close()
+		r.closeRows(r.stream)
 		r.stream = nil
 		r.done = true
 		return nil, nil
 	}
 	if exhausted {
-		r.stream.Close()
+		r.closeRows(r.stream)
 		r.stream = nil
 		r.done = true
 	}
@@ -127,12 +287,16 @@ func (r *chunkReader) nextKeysetBatch(ctx context.Context) (*RowBatch, error) {
 	q += " ORDER BY " + r.orderBy() + " LIMIT ?"
 	args = append(args, r.batchRows)
 
-	rows, err := r.queryer.QueryContext(ctx, q, args...)
+	rows, elapsed, err := r.runQuery(ctx, "keyset", q, args...)
 	if err != nil {
 		return nil, err
 	}
+
+	logger.Debug("[FullLoadV2] source query completed: table=%s.%s chunk=%s phase=keyset elapsed=%s",
+		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
+
 	rowsData, bytes, exhausted, err := scanUpTo(rows, len(r.cols), r.batchRows, r.batchBytes)
-	rows.Close()
+	r.closeRows(rows)
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +314,85 @@ func (r *chunkReader) nextKeysetBatch(ctx context.Context) (*RowBatch, error) {
 	if exhausted {
 		r.done = true
 	}
+	return r.makeBatch(rowsData, bytes), nil
+}
+
+// nextTwoPhaseKeysetBatch 两阶段读取：先查主键值（pk_probe），再 IN 查完整行（payload_fetch）。
+// 仅在单列 PK 且 TwoPhaseRead=true 时调用；复合 PK/无 PK 降级为标准 keyset/stream。
+func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, error) {
+	where, args := r.buildWhere()
+	pkCol := r.cursorCols[0]
+
+	// Phase 1: pk_probe - 只查主键列，快速扫过稀疏/删除行
+	pkQuery := fmt.Sprintf("SELECT %s FROM %s.%s", quoteIdentifier(pkCol),
+		quoteIdentifier(r.chunk.Spec.SourceSchema), quoteIdentifier(r.chunk.Spec.SourceTable))
+	if where != "" {
+		pkQuery += " WHERE " + where
+	}
+	pkQuery += " ORDER BY " + quoteIdentifier(pkCol) + " LIMIT ?"
+	pkArgs := append(args, r.batchRows)
+
+	pkRows, elapsed, err := r.runQuery(ctx, "pk_probe", pkQuery, pkArgs...)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debug("[FullLoadV2] pk_probe completed: table=%s.%s chunk=%s elapsed=%s",
+		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
+
+	// pk_probe 只取主键列，PK 值极小（远低于 batchBytes），maxBytes 传 0 确保取满 batchRows。
+	pkValues, _, pkExhausted, err := scanUpTo(pkRows, 1, r.batchRows, 0)
+	r.closeRows(pkRows)
+	if err != nil {
+		return nil, err
+	}
+	if len(pkValues) == 0 {
+		r.done = true
+		return nil, nil
+	}
+
+	// Phase 2: payload_fetch - 用 IN 一次性获取完整行数据
+	placeholders := make([]string, len(pkValues))
+	inArgs := make([]any, len(pkValues))
+	for i, row := range pkValues {
+		placeholders[i] = "?"
+		inArgs[i] = row[0]
+	}
+
+	payloadQuery := fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s IN (%s) ORDER BY %s",
+		r.selectSQL,
+		quoteIdentifier(r.chunk.Spec.SourceSchema), quoteIdentifier(r.chunk.Spec.SourceTable),
+		quoteIdentifier(pkCol), strings.Join(placeholders, ", "), quoteIdentifier(pkCol))
+
+	payloadRows, elapsed2, err := r.runQuery(ctx, "payload_fetch", payloadQuery, inArgs...)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debug("[FullLoadV2] payload_fetch completed: table=%s.%s chunk=%s probe_pks=%d elapsed=%s",
+		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, len(pkValues), elapsed2)
+
+	// payload 可能被 batchBytes 截断（大 JSON）；未截断时 payloadExhausted=true。
+	rowsData, bytes, payloadExhausted, err := scanUpTo(payloadRows, len(r.cols), r.batchRows, r.batchBytes)
+	r.closeRows(payloadRows)
+	if err != nil {
+		return nil, err
+	}
+	if len(rowsData) == 0 {
+		r.done = true
+		return nil, nil
+	}
+
+	// 推进游标到最后一行的主键列值（与 nextKeysetBatch 逻辑一致）。
+	// 若 payload 被 batchBytes 截断，游标停在已扫描的最后一行，下一轮 pk_probe 从该 PK 之后继续，
+	// 未扫描的 PK 会被重新探测，不丢行。
+	lastRow := rowsData[len(rowsData)-1]
+	r.cursor = make([]any, 1)
+	r.cursor[0] = lastRow[r.cursorIdx[0]]
+
+	// 仅当 payload 已完整扫完且 pk_probe 是尾批（不足 batchRows）时，才判定 chunk 结束。
+	if payloadExhausted && pkExhausted {
+		r.done = true
+	}
+
 	return r.makeBatch(rowsData, bytes), nil
 }
 
@@ -196,6 +439,10 @@ func (r *chunkReader) makeBatch(rowsData [][]any, bytes int64) *RowBatch {
 		Rows:         rowsData,
 		ApproxBytes:  bytes,
 		ChunkID:      r.chunk.ID,
+		AttemptID:    r.attemptID,
+	}
+	if r.opt.StagingEnabled && r.attemptID > 0 {
+		b.StagingTable = stagingTableName(r.chunk.Spec.TargetTable, r.attemptID)
 	}
 	if len(r.cursorIdx) > 0 {
 		b.StartKey = cursorKey(rowsData[0], r.cursorIdx)
@@ -304,6 +551,12 @@ func runTableReaders(ctx context.Context, db *sql.DB, jobs []*tableReadJob, q *b
 		lim = newSnapshotLimiter(opt.MaxSnapshotGroups, opt.MaxSnapshotConns)
 	}
 
+	// P2.5: 表级状态跟踪器（用于重试和 inflight barrier）
+	var stateTracker *tableStateTracker
+	if eng != nil {
+		stateTracker = eng.stateTracker
+	}
+
 	var wg sync.WaitGroup
 	var firstErr error
 	var errOnce sync.Once
@@ -342,10 +595,11 @@ func runTableReaders(ctx context.Context, db *sql.DB, jobs []*tableReadJob, q *b
 					cancel()
 					return
 				}
-				if err := readTableWithSnapshot(workerCtx, db, job, q, eng, lim, opt, stats, isStopped, cancel); err != nil {
+				if err := readTableWithRetry(workerCtx, db, job, q, eng, lim, opt, stats, isStopped, cancel, stateTracker); err != nil {
 					setErr(err)
 					return
 				}
+				// note: setErr cancels workerCtx (task-level) only after retry exhausted / non-retryable
 			}
 		}()
 	}
@@ -355,13 +609,20 @@ func runTableReaders(ctx context.Context, db *sql.DB, jobs []*tableReadJob, q *b
 }
 
 type tableReadJob struct {
-	spec   *TableSpec
-	chunks []*Chunk
+	spec      *TableSpec
+	chunks    []*Chunk
+	AttemptID int // P2.2: 表级重试序号，传递给所有 RowBatch
 }
 
-func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q *batchQueue, eng *Engine, lim *snapshotLimiter, opt Options, stats *Stats, isStopped func() bool, cancel context.CancelFunc) error {
+// readTableWithSnapshot 在表级一致性快照内读取。
+// taskCancel：用户停止/致命错误时取消整个任务流水线。
+// attemptCancel：可重试的表内错误只取消当前 attempt（可为 nil，此时退化为 taskCancel）。
+func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q *batchQueue, eng *Engine, lim *snapshotLimiter, opt Options, stats *Stats, isStopped func() bool, taskCancel context.CancelFunc, attemptCancel context.CancelFunc) error {
 	if job == nil || job.spec == nil || job.spec.Identity == nil || len(job.spec.Identity.Columns) == 0 {
 		return fmt.Errorf("invalid table read job")
+	}
+	if attemptCancel == nil {
+		attemptCancel = taskCancel
 	}
 
 	lease, err := lim.acquireGroup(ctx)
@@ -371,8 +632,9 @@ func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q
 	defer lease.release()
 
 	readers := decideTableReadersForSpec(job.spec, opt)
-	captureHWM := eng != nil && eng.CaptureTableHWM && isNoPKSpec(job.spec)
-	// 无 PK/UK + ALL：必须单连接 + 表锁绑 HWM，不允许降级到无锁路径。
+	// captureHWM 条件: 无PK/UK 表必须捕获 HWM(ALL 模式增量依赖);
+	// 启用表级重试时所有表也捕获 HWM，确保每次新 attempt 的快照位点能原子覆盖旧值。
+	captureHWM := eng != nil && eng.CaptureTableHWM && (isNoPKSpec(job.spec) || opt.ReadRetryTimes > 0)
 	if captureHWM {
 		readers = 1
 	}
@@ -403,7 +665,6 @@ func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q
 		lim.releaseConns(reserved)
 	}()
 
-	// 在快照事务内规划 chunk，使边界与读取共享同一 ReadView。
 	targetChunks := opt.ReadWorkers * opt.ChunkOvershoot
 	if targetChunks < 1 {
 		targetChunks = 1
@@ -419,8 +680,10 @@ func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q
 		len(chunks), job.spec.SourceSchema, job.spec.SourceTable, len(snaps))
 
 	tracker := (*tableCompletionTracker)(nil)
+	var stateTracker *tableStateTracker
 	if eng != nil {
 		tracker = eng.tracker
+		stateTracker = eng.stateTracker
 	}
 
 	if len(chunks) == 0 {
@@ -429,21 +692,25 @@ func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q
 		}
 	} else if len(snaps) == 1 {
 		for _, chunk := range chunks {
-			if ctx.Err() != nil || (isStopped != nil && isStopped()) {
-				cancel()
+			if isStopped != nil && isStopped() {
+				if taskCancel != nil {
+					taskCancel()
+				}
 				return nil
 			}
-			if err := readChunk(ctx, snaps[0].conn, chunk, q, opt, stats, tracker, isStopped, cancel); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err := readChunk(ctx, snaps[0].conn, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, job.AttemptID); err != nil {
 				return fmt.Errorf("read table %s.%s chunk %s: %w", job.spec.SourceSchema, job.spec.SourceTable, chunk.ID, err)
 			}
 		}
 	} else {
-		// 并行度不超过 chunk 数：多余快照连接空闲提交即可。
 		active := snaps
 		if len(chunks) < len(snaps) {
 			active = snaps[:len(chunks)]
 		}
-		if err := readChunksParallel(ctx, active, chunks, q, opt, stats, tracker, isStopped, cancel); err != nil {
+		if err := readChunksParallel(ctx, active, chunks, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, attemptCancel, job.AttemptID); err != nil {
 			return fmt.Errorf("read table %s.%s parallel: %w", job.spec.SourceSchema, job.spec.SourceTable, err)
 		}
 	}
@@ -501,7 +768,7 @@ func openTableSnapshotsWithLimiter(ctx context.Context, db *sql.DB, schema, tabl
 	return nil, 0, err
 }
 
-func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*Chunk, q *batchQueue, opt Options, stats *Stats, tracker *tableCompletionTracker, isStopped func() bool, cancel context.CancelFunc) error {
+func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*Chunk, q *batchQueue, opt Options, stats *Stats, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, taskCancel, attemptCancel context.CancelFunc, attemptID int) error {
 	chunkCh := make(chan *Chunk, len(chunks))
 	for _, c := range chunks {
 		chunkCh <- c
@@ -511,11 +778,14 @@ func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*C
 	var wg sync.WaitGroup
 	var firstErr error
 	var errOnce sync.Once
+	// 表内并行错误只取消 attemptCtx，保留任务级 ctx 以便表级重试。
 	setErr := func(err error) {
 		if err != nil {
 			errOnce.Do(func() {
 				firstErr = err
-				cancel()
+				if attemptCancel != nil {
+					attemptCancel()
+				}
 			})
 		}
 	}
@@ -525,11 +795,16 @@ func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*C
 		go func(idx int, s *tableSnapshot) {
 			defer wg.Done()
 			for chunk := range chunkCh {
-				if ctx.Err() != nil || (isStopped != nil && isStopped()) {
-					cancel()
+				if isStopped != nil && isStopped() {
+					if taskCancel != nil {
+						taskCancel()
+					}
 					return
 				}
-				if err := readChunk(ctx, s.conn, chunk, q, opt, stats, tracker, isStopped, cancel); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := readChunk(ctx, s.conn, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, attemptID); err != nil {
 					setErr(fmt.Errorf("reader[%d] chunk %s: %w", idx, chunk.ID, err))
 					return
 				}
@@ -540,17 +815,23 @@ func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*C
 	return firstErr
 }
 
-func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *batchQueue, opt Options, stats *Stats, tracker *tableCompletionTracker, isStopped func() bool, cancel context.CancelFunc) error {
-	cr, err := newChunkReader(queryer, chunk, opt.BatchRows, opt.BatchBytes)
+func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *batchQueue, opt Options, stats *Stats, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, taskCancel context.CancelFunc, attemptID int) error {
+	batchRows := effectiveBatchRows(chunk.Spec, opt)
+	cr, err := newChunkReader(queryer, chunk, batchRows, opt.BatchBytes, opt, attemptID, stats)
 	if err != nil {
 		return err
 	}
 	defer cr.close()
 
 	for {
-		if ctx.Err() != nil || (isStopped != nil && isStopped()) {
-			cancel()
+		if isStopped != nil && isStopped() {
+			if taskCancel != nil {
+				taskCancel()
+			}
 			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		start := time.Now()
 		batch, err := cr.nextBatch(ctx)
@@ -563,10 +844,18 @@ func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *ba
 		}
 		stats.addReadBatch(int64(len(batch.Rows)), batch.ApproxBytes, time.Since(start))
 
-		// 必须先增加 inflight，再 Put：否则 writer 可能先提交并把计数从 0 减到 0，
-		// 随后 reader 再 +1，markReadDone 会永远看到 inflight>0，OnTableDataReady 不触发。
+		// completion tracker：先 +1 再 Put，避免 writer 先提交导致 OnTableDataReady 假死。
 		if tracker != nil {
 			tracker.onBatchEnqueued(batch.Schema, batch.Table)
+		}
+		// stateTracker：在 Put 前预增，使队列中批次对 inflight barrier 可见。
+		if stateTracker != nil && batch.AttemptID > 0 {
+			if eErr := stateTracker.onBatchEnqueued(batch.Schema, batch.Table, batch.AttemptID); eErr != nil {
+				if tracker != nil {
+					_ = tracker.onBatchEnqueueAborted(batch.Schema, batch.Table)
+				}
+				return eErr
+			}
 		}
 		enq := time.Now()
 		if err := q.Put(ctx, batch); err != nil {
@@ -574,6 +863,12 @@ func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *ba
 				if decErr := tracker.onBatchEnqueueAborted(batch.Schema, batch.Table); decErr != nil {
 					return decErr
 				}
+			}
+			if stateTracker != nil && batch.AttemptID > 0 {
+				stateTracker.onBatchReleased(batch.Schema, batch.Table, batch.AttemptID)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 			return nil
 		}

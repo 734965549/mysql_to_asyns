@@ -757,3 +757,119 @@ func TestTableBinlogHWM_Lifecycle(t *testing.T) {
 	task.ResetSyncPhase()
 	assert.Nil(t, task.Context.TableBinlogHWMs)
 }
+
+// TestFullLoadV2State_Lifecycle 验证 V2 表级状态的持久化生命周期(P3)。
+func TestFullLoadV2State_Lifecycle(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "v2_life", Mode: SyncModeAll, FullLoadEngine: "v2"})
+
+	// 设置单表状态
+	task.SetFullLoadV2TableState("db.orders", &FullLoadV2TableState{
+		Phase:     "COPYING",
+		AttemptID: 1,
+	})
+	st := task.GetFullLoadV2TableState("db.orders")
+	require.NotNil(t, st)
+	assert.Equal(t, "COPYING", st.Phase)
+	assert.Equal(t, 1, st.AttemptID)
+
+	// 更新为 PUBLISHED
+	task.SetFullLoadV2TableState("db.orders", &FullLoadV2TableState{
+		Phase:     "PUBLISHED",
+		AttemptID: 1,
+	})
+
+	// 未全部 PUBLISHED 时 AllFullLoadV2TablesPublished 返回 false
+	task.SetFullLoadV2TableState("db.users", &FullLoadV2TableState{
+		Phase:     "COPYING",
+		AttemptID: 1,
+	})
+	assert.False(t, task.AllFullLoadV2TablesPublished())
+
+	// 全部 PUBLISHED 后返回 true
+	task.SetFullLoadV2TableState("db.users", &FullLoadV2TableState{
+		Phase:     "PUBLISHED",
+		AttemptID: 1,
+	})
+	assert.True(t, task.AllFullLoadV2TablesPublished())
+
+	// ExpectedTables 大于 map 时不得误判完成
+	task.Context.FullLoadExpectedTables = 3
+	assert.False(t, task.AllFullLoadV2TablesPublished())
+
+	// 清空
+	task.ClearFullLoadV2States()
+	assert.Nil(t, task.Context.FullLoadV2States)
+	assert.Empty(t, task.Context.FullLoadRunID)
+	assert.Zero(t, task.Context.FullLoadExpectedTables)
+	assert.False(t, task.AllFullLoadV2TablesPublished())
+}
+
+func TestValidateFullLoadOptions_RetryRequiresStaging(t *testing.T) {
+	cfg := TaskConfig{FullLoadReadRetryTimes: 2, FullLoadEnableStaging: false}
+	assert.Error(t, cfg.ValidateFullLoadOptions())
+	cfg.FullLoadEnableStaging = true
+	assert.NoError(t, cfg.ValidateFullLoadOptions())
+}
+
+func TestInitFullLoadV2Manifest(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "manifest", FullLoadEngine: "v2"})
+	task.InitFullLoadV2Manifest("run-1", []string{"db.a", "db.b"})
+	assert.Equal(t, "run-1", task.Context.FullLoadRunID)
+	assert.Equal(t, 2, task.Context.FullLoadExpectedTables)
+	assert.Equal(t, "PENDING", task.GetFullLoadV2TableState("db.a").Phase)
+	assert.False(t, task.AllFullLoadV2TablesPublished())
+}
+
+// TestFullSyncIncomplete_V2ResumeAllowed 验证 V2 + 有持久化状态时允许续传(P3.4)。
+func TestFullSyncIncomplete_V2ResumeAllowed(t *testing.T) {
+	// V1 任务: FULL_STARTED 时 incomplete=true
+	v1Task := NewSyncTask(TaskConfig{ID: "v1", Mode: SyncModeAll, FullLoadEngine: "v1"})
+	v1Task.Context.SyncPhase = SyncPhaseFullStarted
+	assert.True(t, v1Task.FullSyncIncomplete(), "V1 without V2 states should be incomplete")
+
+	// V2 任务 + 无状态: incomplete=true
+	v2Task := NewSyncTask(TaskConfig{ID: "v2", Mode: SyncModeAll, FullLoadEngine: "v2"})
+	v2Task.Context.SyncPhase = SyncPhaseFullStarted
+	assert.True(t, v2Task.FullSyncIncomplete(), "V2 without V2 states should be incomplete")
+
+	// V2 任务 + 有状态: incomplete=false(可恢复)
+	v2Task.SetFullLoadV2TableState("db.orders", &FullLoadV2TableState{
+		Phase:     "COPYING",
+		AttemptID: 1,
+	})
+	assert.False(t, v2Task.FullSyncIncomplete(), "V2 with V2 states should not be incomplete")
+
+	// V2 任务 + FULL_FAILED + 有状态: incomplete=false(可恢复)
+	v2Task.Context.SyncPhase = SyncPhaseFullFailed
+	assert.False(t, v2Task.FullSyncIncomplete(), "V2 FULL_FAILED with V2 states should not be incomplete")
+
+	// 清空状态后恢复 incomplete=true
+	v2Task.ClearFullLoadV2States()
+	assert.True(t, v2Task.FullSyncIncomplete(), "V2 without V2 states after clear should be incomplete")
+}
+
+// TestCloneForRead_V2States 验证 CloneForRead 正确复制 V2 状态(P3.2)。
+func TestCloneForRead_V2States(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "clone_v2", Mode: SyncModeAll, FullLoadEngine: "v2"})
+	task.Context.FullLoadRunID = "run-123"
+	task.SetFullLoadV2TableState("db.orders", &FullLoadV2TableState{
+		Phase:     "PUBLISHED",
+		AttemptID: 2,
+	})
+
+	clone := task.CloneForRead()
+	require.NotNil(t, clone)
+	assert.Equal(t, "run-123", clone.Context.FullLoadRunID)
+	st := clone.GetFullLoadV2TableState("db.orders")
+	require.NotNil(t, st)
+	assert.Equal(t, "PUBLISHED", st.Phase)
+	assert.Equal(t, 2, st.AttemptID)
+
+	// 修改克隆不影响原对象
+	clone.SetFullLoadV2TableState("db.orders", &FullLoadV2TableState{
+		Phase:     "COPYING",
+		AttemptID: 3,
+	})
+	origSt := task.GetFullLoadV2TableState("db.orders")
+	assert.Equal(t, "PUBLISHED", origSt.Phase, "original should be unchanged")
+}

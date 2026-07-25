@@ -32,11 +32,20 @@ type Engine struct {
 	OnTableSnapshotReady TableSnapshotCallback
 	// OnTableDataReady 在表数据全部提交后调用；用于逐表重建索引（P2）。
 	OnTableDataReady TableDataReadyCallback
+	// OnTableStateChange 在表级状态变更时调用(P3 持久化);由集成层落盘到任务存档。
+	OnTableStateChange TableStateCallback
 
-	limiter  *snapshotLimiter
-	tracker  *tableCompletionTracker
-	reported StatsSnapshot // 已上报到 Prometheus 的累计快照（仅 reportLoop / pushFinalMetrics 访问）
+	limiter      *snapshotLimiter
+	tracker      *tableCompletionTracker
+	stateTracker *tableStateTracker // P2.5: 表级重试状态跟踪
+	reported     StatsSnapshot      // 已上报到 Prometheus 的累计快照（仅 reportLoop / pushFinalMetrics 访问）
 }
+
+// TableStateCallback 表级状态变更回调(P3 持久化用)。
+// schema/table 为源端表名;phase 为新阶段;attemptID 为当前 attempt 序号;
+// stagingTable 为 staging 表名(空表示未启用);errMsg 为错误信息(仅 FAILED 时非空);
+// committedRows 为当前 attempt 已提交行数。
+type TableStateCallback func(schema, table, phase string, attemptID int, stagingTable, errMsg string, committedRows int64) error
 
 // Run 对给定表集合执行任务级流水线全量复制。
 func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
@@ -49,6 +58,9 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	}
 	if opt.ReadWorkers < 1 || opt.WriteWorkers < 1 || opt.BatchRows < 1 || opt.BufferBytes < 1 {
 		return fmt.Errorf("full-load V2 received unresolved or invalid options")
+	}
+	if err := opt.Validate(); err != nil {
+		return err
 	}
 
 	// 快照连接预算不得超过真实源池上限（默认 source_max_open_conns=32）。
@@ -136,6 +148,12 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	}
 	e.tracker = newTableCompletionTracker(specs, e.OnTableDataReady)
 	e.limiter = newSnapshotLimiter(opt.MaxSnapshotGroups, opt.MaxSnapshotConns)
+	// P2.5: 启用重试或 staging 时创建表级状态跟踪器
+	if opt.ReadRetryTimes > 0 || opt.StagingEnabled {
+		e.stateTracker = newTableStateTracker(specs)
+		// P3: 绑定状态变更回调,由集成层持久化到任务存档
+		e.stateTracker.onChange = e.OnTableStateChange
+	}
 
 	q := newBatchQueue(opt.BufferBytes, e.Stats)
 	q.watchContext(cctx)
@@ -163,7 +181,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		writerErr = runWriters(cctx, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.IsStopped, runID)
+		writerErr = runWriters(cctx, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.stateTracker, e.IsStopped, runID)
 		if writerErr != nil {
 			cancel()
 		}
@@ -247,6 +265,12 @@ func (e *Engine) pushMetrics(prev, cur StatsSnapshot) {
 	m.AddFullLoadSnapshotGroups(cur.ActiveSnapshotGroups - prev.ActiveSnapshotGroups)
 	m.AddFullLoadSnapshotTxns(cur.ActiveSnapshotTxns - prev.ActiveSnapshotTxns)
 	m.AddFullLoadSnapshotAlignDegrades(cur.SnapshotAlignDegrades - prev.SnapshotAlignDegrades)
+	// P3.6: P0/P2 可观测性指标
+	m.AddFullLoadQueryTimeouts(cur.QueryTimeouts - prev.QueryTimeouts)
+	m.AddFullLoadSlowQueries(cur.SlowQueries - prev.SlowQueries)
+	m.AddFullLoadTableRetries(cur.TableRetries - prev.TableRetries)
+	m.AddFullLoadTableRetryExhausted(cur.TableRetryExhausted - prev.TableRetryExhausted)
+	m.AddFullLoadActiveStagingTables(cur.ActiveStagingTables - prev.ActiveStagingTables)
 	taskID := e.TaskID
 	if taskID == "" {
 		taskID = "_unknown"

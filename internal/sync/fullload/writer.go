@@ -47,7 +47,7 @@ type CommitCallback func(schema, table string, rows, bytes int64)
 // P0 正确性：一个事务内可能已成功写入若干批次，后续批次遇到可重试锁错误时，
 // 回滚整个事务并重放全部未提交批次，而不是只重试当前批次；只有事务提交成功后
 // 才通过 onCommit 推进进度，避免静默缺数。
-func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, isStopped func() bool, runID string) error {
+func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string) error {
 	if runID == "" {
 		return fmt.Errorf("runWriters: run_id is required")
 	}
@@ -73,7 +73,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 			defer wg.Done()
 			atomic.AddInt64(&stats.ActiveWriters, 1)
 			defer atomic.AddInt64(&stats.ActiveWriters, -1)
-			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, tracker, isStopped, runID); err != nil {
+			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, tracker, stateTracker, isStopped, runID); err != nil {
 				setErr(err)
 			}
 		}(w)
@@ -83,7 +83,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 	return firstErr
 }
 
-func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, isStopped func() bool, runID string) error {
+func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string) error {
 	conn, err := targetDB.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("writer %d get conn: %w", id, err)
@@ -166,6 +166,14 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			_ = tx.Rollback()
 			tx = nil
 		}
+		// 回滚未提交批次：必须按批次回减 reader 预增的 attempt inflight。
+		if stateTracker != nil {
+			for _, b := range buf {
+				if b != nil && b.AttemptID > 0 {
+					stateTracker.onBatchReleased(b.Schema, b.Table, b.AttemptID)
+				}
+			}
+		}
 		buf = nil
 		txRows, txBytes = 0, 0
 		clearTxMarker()
@@ -234,7 +242,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 				stats.addCommit(rows, bytes, time.Since(cs))
 				commitRecoveries = 0
 				clearTxMarker()
-				return reportCommitted(pending, onCommit, tracker)
+				return reportCommitted(pending, onCommit, tracker, stateTracker)
 			}
 			logger.Warn("[FullLoadV2] writer %d commit verified rolled back via tx marker; replaying %d batches", id, len(pending))
 			clearTxMarker()
@@ -264,7 +272,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 		}
 		dur := time.Since(cs)
 		stats.addCommit(txRows, txBytes, dur)
-		if err := reportCommitted(pending, onCommit, tracker); err != nil {
+		if err := reportCommitted(pending, onCommit, tracker, stateTracker); err != nil {
 			buf = nil
 			txRows, txBytes = 0, 0
 			clearTxMarker()
@@ -361,6 +369,13 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 		rows := int64(len(batch.Rows))
 		bytes := batch.ApproxBytes
 
+		// 旧 attempt 批次：reader 已预增 inflight；若 attempt 已推进则静默丢弃并释放计数。
+		if stateTracker != nil && batch.AttemptID > 0 &&
+			!stateTracker.isCurrentAttempt(batch.Schema, batch.Table, batch.AttemptID) {
+			stateTracker.onBatchReleased(batch.Schema, batch.Table, batch.AttemptID)
+			continue
+		}
+
 		ws := time.Now()
 		if tx == nil {
 			if err := beginTx(); err != nil {
@@ -429,13 +444,14 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	return nil
 }
 
-func reportCommitted(buf []*RowBatch, onCommit CommitCallback, tracker *tableCompletionTracker) error {
-	if onCommit == nil && tracker == nil {
+func reportCommitted(buf []*RowBatch, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker) error {
+	if onCommit == nil && tracker == nil && stateTracker == nil {
 		return nil
 	}
 	type key struct{ schema, table string }
 	agg := make(map[key][2]int64)
 	batches := make(map[key]int)
+	attempts := make(map[key]int)
 	for _, b := range buf {
 		k := key{b.Schema, b.Table}
 		v := agg[k]
@@ -443,6 +459,9 @@ func reportCommitted(buf []*RowBatch, onCommit CommitCallback, tracker *tableCom
 		v[1] += b.ApproxBytes
 		agg[k] = v
 		batches[k]++
+		if b.AttemptID > 0 {
+			attempts[k] = b.AttemptID
+		}
 	}
 	if onCommit != nil {
 		for k, v := range agg {
@@ -452,6 +471,17 @@ func reportCommitted(buf []*RowBatch, onCommit CommitCallback, tracker *tableCom
 	for k, n := range batches {
 		if err := tracker.onBatchesCommitted(k.schema, k.table, n); err != nil {
 			return err
+		}
+	}
+	// 按实际批次数回减 attempt inflight（同一事务可能含多批）。
+	if stateTracker != nil {
+		for k, n := range batches {
+			attemptID := attempts[k]
+			if attemptID <= 0 {
+				continue
+			}
+			rows := agg[k][0]
+			stateTracker.onBatchesCommitted(k.schema, k.table, attemptID, n, rows)
 		}
 	}
 	return nil
@@ -574,8 +604,12 @@ func insertPrefix(batch *RowBatch) string {
 	for i, c := range batch.Columns {
 		cols[i] = quoteIdentifier(c)
 	}
+	writeTable := batch.TargetTable
+	if batch.StagingTable != "" {
+		writeTable = batch.StagingTable
+	}
 	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES ",
-		quoteIdentifier(batch.TargetSchema), quoteIdentifier(batch.TargetTable), strings.Join(cols, ", "))
+		quoteIdentifier(batch.TargetSchema), quoteIdentifier(writeTable), strings.Join(cols, ", "))
 }
 
 // isRetryableTxConflict 仅判断事务内语句可安全重放的锁冲突。

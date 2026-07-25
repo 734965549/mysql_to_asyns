@@ -698,6 +698,9 @@ func NewTaskService(cfg *config.Config) *TaskService {
 
 	ts.loadTasks() // 加载任务
 
+	// P3.5: 生产入口也必须执行 V2 状态恢复（此前仅挂在 NewTaskServiceWithDBAndConfig）。
+	ts.recoverFullLoadV2States()
+
 	// 启动定时调度器
 	ts.StartScheduler()
 
@@ -840,6 +843,26 @@ func NewTaskServiceWithDBAndConfig(sourceDB, targetDB *sql.DB, analyzer service.
 
 	ts.loadTasks()
 
+	// P3.5: 扫描 V2 任务的持久化状态,标记需要恢复的任务。
+	// 不自动启动恢复;只修正状态:已全量完成的标记为可接增量,未完成的保持 Paused 等待手动启动。
+	ts.recoverFullLoadV2States()
+
+	// P3.1: 按持久化精确 staging 表名清理（禁止全库前缀扫描）。
+	if ts.targetDB != nil {
+		staleRefs := ts.collectStaleStagingTableRefs()
+		if len(staleRefs) > 0 {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			dropped, err := fullload.CleanupStaleStagingTables(cleanupCtx, ts.targetDB, staleRefs)
+			cleanupCancel()
+			if err != nil {
+				logger.Warn("[TaskService] startup staging cleanup failed (partial): %v", err)
+			}
+			if dropped > 0 {
+				logger.Info("[TaskService] startup staging cleanup: dropped %d stale staging tables from manifest", dropped)
+			}
+		}
+	}
+
 	// 启动定时调度器
 	ts.StartScheduler()
 
@@ -946,9 +969,85 @@ func (s *TaskService) loadTasks() {
 
 }
 
+// initFullLoadV2Manifest 在全量开始前持久化完整预期表清单（全部 PENDING）与 runID。
+func (s *TaskService) initFullLoadV2Manifest(taskID, runID string, tableKeys []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return fmt.Errorf("task %s not found", taskID)
+	}
+	task.InitFullLoadV2Manifest(runID, tableKeys)
+	if err := s.storage.Save(task); err != nil {
+		return fmt.Errorf("save V2 manifest: %w", err)
+	}
+	return nil
+}
+
+// recoverFullLoadV2States 扫描所有 V2 任务的持久化表级状态,进行恢复决策(P3.5)。
+//
+// 恢复策略:
+//   - 全部表 PUBLISHED: 标记全量完成(SyncPhaseFullCompleted),允许接增量
+//   - 有表未完成: 保持当前状态(Paused),用户手动 StartTask 时 V2 引擎会跳过 PUBLISHED 表、重新处理未完成表
+//   - 无 V2 状态: 跳过(非 V2 任务或全新任务)
+//
+// 注意:此方法不自动启动恢复,只修正状态。实际恢复在用户手动 StartTask 时由 V2 引擎执行。
+func (s *TaskService) recoverFullLoadV2States() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	recovered := 0
+	for taskID, task := range s.tasks {
+		if task == nil || !task.Config.UsesFullLoadV2() {
+			continue
+		}
+		if len(task.Context.FullLoadV2States) == 0 {
+			continue
+		}
+
+		// 检查是否所有表都已 PUBLISHED
+		if task.AllFullLoadV2TablesPublished() {
+			// 全量已完成,修正 SyncPhase
+			if task.Context.SyncPhase == taskEntity.SyncPhaseFullStarted ||
+				task.Context.SyncPhase == taskEntity.SyncPhaseFullFailed {
+				now := time.Now()
+				task.Context.SyncPhase = taskEntity.SyncPhaseFullCompleted
+				task.Context.FullSyncCompletedAt = &now
+				task.Context.FullSyncFailedReason = ""
+				if err := s.storage.Save(task); err != nil {
+					logger.Warn("[Task %s] recoverFullLoadV2: failed to save recovered state: %v", taskID, err)
+				} else {
+					logger.Info("[Task %s] recoverFullLoadV2: all tables PUBLISHED, marked full sync completed", taskID)
+					recovered++
+				}
+			}
+		} else {
+			// 有未完成的表,记录日志供排查
+			published := 0
+			pending := 0
+			for _, st := range task.Context.FullLoadV2States {
+				if st != nil && st.Phase == "PUBLISHED" {
+					published++
+				} else {
+					pending++
+				}
+			}
+			logger.Info("[Task %s] recoverFullLoadV2: %d published, %d pending; task remains paused for manual restart",
+				taskID, published, pending)
+		}
+	}
+	if recovered > 0 {
+		logger.Info("[TaskService] recoverFullLoadV2States: recovered %d tasks to full sync completed", recovered)
+	}
+}
+
 // CreateTask 创建任务
 
 func (s *TaskService) CreateTask(config taskEntity.TaskConfig) (*taskEntity.SyncTask, error) {
+
+	if err := config.ValidateFullLoadOptions(); err != nil {
+		return nil, err
+	}
 
 	s.mu.Lock() // 获取写锁
 
@@ -1210,13 +1309,16 @@ func (s *TaskService) getTasksPageFromMemory(page, pageSize int, status, keyword
 
 func (s *TaskService) UpdateTask(task *taskEntity.SyncTask) error {
 
-	s.mu.Lock()
-
-	defer s.mu.Unlock()
-
 	if task == nil {
 		return fmt.Errorf("task is nil")
 	}
+	if err := task.Config.ValidateFullLoadOptions(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+
+	defer s.mu.Unlock()
 
 	existing, exists := s.tasks[task.Config.ID]
 	if !exists {
@@ -1943,6 +2045,7 @@ func (s *TaskService) abortFullSyncIfCancelled(ctx context.Context, taskID strin
 	}
 	return nil
 }
+
 // updateSyncPhase 持有写锁修改任务阶段相关字段并持久化。mutator 必须是无副作用的纯字段写入。
 // 若任务不存在则静默返回，不抛错，与 updateTaskStatus 行为一致。
 func (s *TaskService) updateSyncPhase(taskID string, mutator func(*taskEntity.SyncTask)) {
@@ -1988,6 +2091,85 @@ func (s *TaskService) persistTableBinlogHWM(taskID, schema, table string, pos my
 		return fmt.Errorf("persist table binlog HWM for %s: %w", tableKey, err)
 	}
 	return nil
+}
+
+// persistFullLoadV2TableState 持久化单表 V2 加载状态(P3)。
+// 由 fullload.Engine 的表级状态机在状态转换时通过 OnTableStateChange 回调触发。
+// 持久化失败必须返回错误（fail-closed），由引擎中止以免重启后状态与目标不一致。
+func (s *TaskService) persistFullLoadV2TableState(taskID, schema, table, phase string, attemptID int, stagingTable, errMsg string, committedRows int64) error {
+	tableKey := schema + "." + table
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return fmt.Errorf("task %s not found while persisting V2 state for %s", taskID, tableKey)
+	}
+	task.SetFullLoadV2TableState(tableKey, &taskEntity.FullLoadV2TableState{
+		Phase:         phase,
+		AttemptID:     attemptID,
+		StagingTable:  stagingTable,
+		CommittedRows: committedRows,
+		LastError:     errMsg,
+		UpdatedAt:     time.Now(),
+	})
+	if err := s.storage.Save(task); err != nil {
+		return fmt.Errorf("persist V2 table state for %s: %w", tableKey, err)
+	}
+	return nil
+}
+
+// collectStaleStagingTableRefs 从持久化 V2 状态收集需清理的精确 staging 表（目标 schema + staging 名）。
+// StagingTable 由引擎写入；目标 schema 从任务映射的源 schema 推导（同名映射场景）。
+func (s *TaskService) collectStaleStagingTableRefs() []fullload.StagingTableRef {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var refs []fullload.StagingTableRef
+	seen := make(map[string]struct{})
+	for _, task := range s.tasks {
+		if task == nil || !task.Config.UsesFullLoadV2() {
+			continue
+		}
+		for tableKey, st := range task.Context.FullLoadV2States {
+			if st == nil || st.Phase == "PUBLISHED" || st.StagingTable == "" {
+				continue
+			}
+			schema, _, ok := splitSourceTableKey(tableKey)
+			if !ok {
+				continue
+			}
+			// 目标 schema：优先任务级库映射，否则与源同名。
+			targetSchema := schema
+			if task.Config.TargetSchema != "" && schema == task.Config.SourceSchema {
+				targetSchema = task.Config.TargetSchema
+			}
+			for i, src := range task.Config.SourceDatabases {
+				if src != schema {
+					continue
+				}
+				if i < len(task.Config.TargetDatabases) && task.Config.TargetDatabases[i] != "" {
+					targetSchema = task.Config.TargetDatabases[i]
+				} else if task.Config.TargetDatabase != "" {
+					targetSchema = task.Config.TargetDatabase
+				}
+				break
+			}
+			refKey := targetSchema + "." + st.StagingTable
+			if _, ok := seen[refKey]; ok {
+				continue
+			}
+			seen[refKey] = struct{}{}
+			refs = append(refs, fullload.StagingTableRef{Schema: targetSchema, Table: st.StagingTable})
+		}
+	}
+	return refs
+}
+
+func splitSourceTableKey(key string) (schema, table string, ok bool) {
+	idx := strings.IndexByte(key, '.')
+	if idx <= 0 || idx >= len(key)-1 {
+		return "", "", false
+	}
+	return key[:idx], key[idx+1:], true
 }
 
 // parseTableBinlogHWMs 将任务存档中的 "schema.table" -> "file:pos" 解析为增量过滤用位点图。
@@ -2518,11 +2700,39 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		ctx = lockCtx
 	}
 
+	// V2 恢复模式：已有未完成的 FullLoadV2States 时，禁止库级重建，避免已 PUBLISHED 表被删后跳过复制导致丢数。
+	isV2Resume := false
+	if task.Config.UsesFullLoadV2() {
+		s.mu.RLock()
+		live := s.tasks[taskID]
+		isV2Resume = live != nil && len(live.Context.FullLoadV2States) > 0 && !live.AllFullLoadV2TablesPublished()
+		s.mu.RUnlock()
+	}
+
+	// 全新 V2 全量：在任何 destructive DDL 前持久化完整表清单（全部 PENDING）+ runID。
+	if task.Config.UsesFullLoadV2() && !isV2Resume {
+		tableKeys := make([]string, 0, len(allTableEntries))
+		for _, e := range allTableEntries {
+			tableKeys = append(tableKeys, e.schema+"."+e.table)
+		}
+		runID := fmt.Sprintf("flv2-%s-%d", taskID, time.Now().UnixNano())
+		if err := s.initFullLoadV2Manifest(taskID, runID, tableKeys); err != nil {
+			errMsg := fmt.Sprintf("Failed to init full-load V2 manifest: %v", err)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		logger.Info("[Task %s] FullLoadV2 manifest initialized: run_id=%s tables=%d", taskID, runID, len(tableKeys))
+	}
+
 	// 库级别同步且开启"DDL 前删除"时，在任何目标表 DDL/数据写入前统一重建目标库。
 	// 表级别同步保持原有逐表 DROP TABLE 行为（在 ensureTargetTable 内执行）。
 	// 增量阶段不会进入 executeFullSync，故此处天然不会在增量阶段执行删除。
+	// V2 恢复模式禁止库级重建。
 	dbLevelRebuilt := false
-	if task.Config.EnableDropTableBeforeDDL && task.Config.SyncLevel == taskEntity.SyncLevelDatabase {
+	if task.Config.EnableDropTableBeforeDDL && task.Config.SyncLevel == taskEntity.SyncLevelDatabase && !isV2Resume {
 		rebuildSchemas := make([]string, 0, len(pairs))
 		for _, p := range pairs {
 			rebuildSchemas = append(rebuildSchemas, p.dst)
@@ -2551,6 +2761,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		dbLevelRebuilt = true
 		logger.Info("[Task %s] Database-level rebuild completed for %d target database(s); per-table DROP TABLE disabled",
 			taskID, len(rebuildSchemas))
+	} else if isV2Resume {
+		logger.Info("[Task %s] FullLoadV2 resume mode: skip database-level rebuild to preserve published tables", taskID)
 	}
 
 	// 依次同步每个库（库间串行，库内表间并行）。索引恢复任务跨库累计，
@@ -5642,6 +5854,9 @@ func resumeEnabled(task *taskEntity.SyncTask) bool {
 // resetResumeIfFresh 在全量开始时清空历史断点和运行计数：
 // 全量续传已禁用，每次进入全量前都清空历史断点；
 // 同时重置运行计数（ProcessedRows/TotalRows/ProgressPercent 等），避免新一轮全量累加旧值。
+//
+// P3 例外: V2 引擎 + 有持久化表级状态(FullLoadV2States)时,保留 V2 状态用于恢复(跳过已 PUBLISHED 的表)。
+// 仅在全新全量(无 V2 状态或已全部完成)时清空 V2 状态。
 func (s *TaskService) resetResumeIfFresh(taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5651,6 +5866,16 @@ func (s *TaskService) resetResumeIfFresh(taskID string) {
 	}
 	task.ResetFullSyncResume()
 	task.ResetFullSyncCounters()
+	// V2 恢复场景:有未完成的表时保留 V2 状态,否则清空
+	if task.Config.UsesFullLoadV2() && len(task.Context.FullLoadV2States) > 0 {
+		if task.AllFullLoadV2TablesPublished() {
+			// 全部已完成,清空开始新一轮
+			task.ClearFullLoadV2States()
+		}
+		// 否则保留 V2 状态(恢复模式)
+	} else {
+		task.ClearFullLoadV2States()
+	}
 	s.storage.Save(task)
 }
 

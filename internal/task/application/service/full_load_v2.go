@@ -66,6 +66,12 @@ type tableReadyV2 struct {
 func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, sourceSchema, targetSchema string, specifiedTables []string, pending *[]pendingIndexRestore, dbLevelRebuilt bool, schemaLocks *fullload.SchemaLocks) error {
 	taskID := task.Config.ID
 
+	if err := task.Config.ValidateFullLoadOptions(); err != nil {
+		errMsg := fmt.Sprintf("invalid full-load options: %v", err)
+		s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+		return fmt.Errorf("%s", errMsg)
+	}
+
 	tables := append([]string{}, specifiedTables...)
 	if len(tables) == 0 {
 		allTables, err := runtime.analyzer.GetAllTables(sourceSchema)
@@ -80,12 +86,21 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	}
 
 	// === 阶段1：串行准备表结构（集中 DDL）===
+	// 恢复模式：必须在任何 destructive DDL 之前识别并跳过已 PUBLISHED 的表。
 	logger.Info("[Task %s] FullLoadV2 阶段1: 准备 %d 个表结构...", taskID, len(tables))
 	ready := make([]tableReadyV2, 0, len(tables))
+	skippedPublished := 0
 	for i, tableName := range tables {
 		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
 			return err
 		}
+		tableKey := sourceSchema + "." + tableName
+		if st := task.GetFullLoadV2TableState(tableKey); st != nil && st.Phase == "PUBLISHED" {
+			skippedPublished++
+			logger.Info("[Task %s] FullLoadV2: skip already-published table %s (before DDL)", taskID, tableKey)
+			continue
+		}
+
 		targetTableName := s.resolveTableTargetName(task, sourceSchema, tableName, i)
 		identity, err := runtime.analyzer.AnalyzeTable(sourceSchema, tableName)
 		if err != nil {
@@ -113,7 +128,7 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		est, _ := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity).GetEstimatedCount(ctx)
 		ready = append(ready, tableReadyV2{sourceName: tableName, targetName: targetTableName, identity: identity, savedIndexes: savedIndexes, estimated: est})
 	}
-	logger.Info("[Task %s] FullLoadV2 阶段1完成：%d 个表就绪", taskID, len(ready))
+	logger.Info("[Task %s] FullLoadV2 阶段1完成：%d 个表就绪 (skipped_published=%d)", taskID, len(ready), skippedPublished)
 
 	if len(ready) == 0 {
 		return nil
@@ -122,8 +137,9 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	readyByKey := make(map[string]tableReadyV2, len(ready))
 	specs := make([]*fullload.TableSpec, 0, len(ready))
 	for _, r := range ready {
+		tableKey := sourceSchema + "." + r.sourceName
 		s.startTableProgress(taskID, sourceSchema, r.sourceName, r.estimated)
-		readyByKey[sourceSchema+"."+r.sourceName] = r
+		readyByKey[tableKey] = r
 		specs = append(specs, &fullload.TableSpec{
 			SourceSchema:  sourceSchema,
 			TargetSchema:  targetSchema,
@@ -146,7 +162,18 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		SkipBinlog:                   task.Config.EnableSkipBinlog,
 		LockWaitTimeoutSec:           task.Config.FullLoadLockWaitTimeoutSec,
 		DegradeOnAlignLockFail:       task.Config.FullLoadDegradeOnAlignLockFail,
+		QueryTimeoutSec:              task.Config.FullLoadQueryTimeoutSec,
+		SlowQueryWarnSec:             task.Config.FullLoadSlowQueryWarnSec,
+		TableNoProgressSec:           task.Config.FullLoadTableNoProgressSec,
+		ReadRetryTimes:               task.Config.FullLoadReadRetryTimes,
+		EnableTwoPhaseRead:           task.Config.FullLoadTwoPhaseRead,
+		EnableStaging:                task.Config.FullLoadEnableStaging,
 	})
+	if err := opt.Validate(); err != nil {
+		errMsg := fmt.Sprintf("invalid full-load options: %v", err)
+		s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+		return fmt.Errorf("%s", errMsg)
+	}
 
 	stats := &fullload.Stats{}
 	setFullLoadStats(taskID, stats)
@@ -185,6 +212,9 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 			}
 			s.completeTableProgress(taskID, schema, table)
 			return nil
+		},
+		OnTableStateChange: func(schema, table, phase string, attemptID int, stagingTable, errMsg string, committedRows int64) error {
+			return s.persistFullLoadV2TableState(taskID, schema, table, phase, attemptID, stagingTable, errMsg, committedRows)
 		},
 	}
 

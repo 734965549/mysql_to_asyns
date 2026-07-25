@@ -201,7 +201,7 @@ func TestChunkReaderUsesSnapshotQueryer(t *testing.T) {
 	}
 	defer conn.Close()
 
-	cr, err := newChunkReader(conn, chunk, 10, defaultBatchBytes)
+	cr, err := newChunkReader(conn, chunk, 10, defaultBatchBytes, Options{}, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestReadChunksThroughTableSnapshot_ExcludesPostSnapshotPKSwapVersion(t *tes
 	var got [][]any
 	ukSeen := map[string]int64{}
 	for _, chunk := range chunks {
-		cr, err := newChunkReader(snap.conn, chunk, 100, defaultBatchBytes)
+		cr, err := newChunkReader(snap.conn, chunk, 100, defaultBatchBytes, Options{}, 1, nil)
 		if err != nil {
 			t.Fatalf("newChunkReader %s: %v", chunk.ID, err)
 		}

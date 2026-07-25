@@ -153,7 +153,13 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	FullLoadCommitBytesMB      int      `json:"full_load_commit_bytes_mb,omitempty"`       // V2 单事务字节上限(MiB)；0=32
 	FullLoadLockWaitTimeoutSec int      `json:"full_load_lock_wait_timeout_sec,omitempty"` // V2 取表锁等待秒数；0=10
 	// FullLoadDegradeOnAlignLockFail nil=默认降级单连接；false=对齐取锁失败 fail-closed
-	FullLoadDegradeOnAlignLockFail *bool                  `json:"full_load_degrade_on_align_lock_fail,omitempty"`
+	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
+	FullLoadQueryTimeoutSec        int   `json:"full_load_query_timeout_sec,omitempty"`     // V2 单次查询超时秒数；0=300
+	FullLoadSlowQueryWarnSec       int   `json:"full_load_slow_query_warn_sec,omitempty"`   // V2 慢查询告警秒数；0=30
+	FullLoadTableNoProgressSec     int   `json:"full_load_table_no_progress_sec,omitempty"` // V2 表无进展告警秒数；0=关闭
+	FullLoadReadRetryTimes         int   `json:"full_load_read_retry_times,omitempty"`      // V2 表级读取重试次数；0=不重试
+	FullLoadTwoPhaseRead           bool  `json:"full_load_two_phase_read,omitempty"`        // V2 单列PK两阶段读取；默认关
+	FullLoadEnableStaging          bool  `json:"full_load_enable_staging,omitempty"`        // V2 staging表隔离；默认关
 	SourceDB                       *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
 	TargetDB                       *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
 	SinkConfigs                    []SinkConfigRequest    `json:"sink_configs,omitempty"`       // 增量目标端配置（可选，默认 MYSQL）
@@ -263,6 +269,12 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		FullLoadCommitBytesMB:          req.FullLoadCommitBytesMB,          // 设置V2单事务字节上限
 		FullLoadLockWaitTimeoutSec:     req.FullLoadLockWaitTimeoutSec,     // 设置V2取表锁等待秒数
 		FullLoadDegradeOnAlignLockFail: req.FullLoadDegradeOnAlignLockFail, // 设置对齐取锁失败策略
+		FullLoadQueryTimeoutSec:        req.FullLoadQueryTimeoutSec,        // 设置V2单次查询超时秒数
+		FullLoadSlowQueryWarnSec:       req.FullLoadSlowQueryWarnSec,       // 设置V2慢查询告警秒数
+		FullLoadTableNoProgressSec:     req.FullLoadTableNoProgressSec,     // 设置V2表无进展告警秒数
+		FullLoadReadRetryTimes:         req.FullLoadReadRetryTimes,         // 设置V2表级读取重试次数
+		FullLoadTwoPhaseRead:           req.FullLoadTwoPhaseRead,           // 设置V2单列PK两阶段读取
+		FullLoadEnableStaging:          req.FullLoadEnableStaging,          // 设置V2 staging表隔离
 		SourceDB:                       sourceDB,                           // 设置源数据库配置
 		TargetDB:                       targetDB,                           // 设置目标数据库配置
 		SinkConfigs:                    sinkConfigs,                        // 设置增量目标端配置
@@ -922,6 +934,24 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.FullLoadDegradeOnAlignLockFail != nil {
 		task.Config.FullLoadDegradeOnAlignLockFail = req.FullLoadDegradeOnAlignLockFail
 	}
+	if req.FullLoadQueryTimeoutSec != nil {
+		task.Config.FullLoadQueryTimeoutSec = *req.FullLoadQueryTimeoutSec
+	}
+	if req.FullLoadSlowQueryWarnSec != nil {
+		task.Config.FullLoadSlowQueryWarnSec = *req.FullLoadSlowQueryWarnSec
+	}
+	if req.FullLoadTableNoProgressSec != nil {
+		task.Config.FullLoadTableNoProgressSec = *req.FullLoadTableNoProgressSec
+	}
+	if req.FullLoadReadRetryTimes != nil {
+		task.Config.FullLoadReadRetryTimes = *req.FullLoadReadRetryTimes
+	}
+	if req.FullLoadTwoPhaseRead != nil {
+		task.Config.FullLoadTwoPhaseRead = *req.FullLoadTwoPhaseRead
+	}
+	if req.FullLoadEnableStaging != nil {
+		task.Config.FullLoadEnableStaging = *req.FullLoadEnableStaging
+	}
 
 	// 更新数据库配置
 	if req.SourceDB != nil { // 如果提供了源数据库配置
@@ -1026,6 +1056,12 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	FullLoadCommitBytesMB          *int                   `json:"full_load_commit_bytes_mb,omitempty"`            // V2 单事务字节上限MiB（可选）
 	FullLoadLockWaitTimeoutSec     *int                   `json:"full_load_lock_wait_timeout_sec,omitempty"`      // V2 取表锁等待秒数（可选）
 	FullLoadDegradeOnAlignLockFail *bool                  `json:"full_load_degrade_on_align_lock_fail,omitempty"` // 对齐取锁失败是否降级（可选）
+	FullLoadQueryTimeoutSec        *int                   `json:"full_load_query_timeout_sec,omitempty"`          // V2 单次查询超时秒数（可选）
+	FullLoadSlowQueryWarnSec       *int                   `json:"full_load_slow_query_warn_sec,omitempty"`        // V2 慢查询告警秒数（可选）
+	FullLoadTableNoProgressSec     *int                   `json:"full_load_table_no_progress_sec,omitempty"`      // V2 表无进展告警秒数（可选）
+	FullLoadReadRetryTimes         *int                   `json:"full_load_read_retry_times,omitempty"`           // V2 表级重试次数（可选）
+	FullLoadTwoPhaseRead           *bool                  `json:"full_load_two_phase_read,omitempty"`             // V2 单列PK两阶段读取（可选）
+	FullLoadEnableStaging          *bool                  `json:"full_load_enable_staging,omitempty"`             // V2 staging表隔离（可选）
 	SourceDB                       *DatabaseConfigRequest `json:"source_db,omitempty"`                            // 源数据库配置（可选）
 	TargetDB                       *DatabaseConfigRequest `json:"target_db,omitempty"`                            // 目标数据库配置（可选）
 	SinkConfigs                    []SinkConfigRequest    `json:"sink_configs,omitempty"`                         // 增量目标端配置（可选）

@@ -16,6 +16,8 @@ type RowBatch struct {
 	EndKey       []any    // 本批结束游标值（游标推进用）
 	ApproxBytes  int64    // 估算字节数（背压与提交频率用）
 	ChunkID      string   // 所属 chunk 标识
+	AttemptID    int      // 表级重试序号（P2.2）；0 表示不启用重试校验
+	StagingTable string   // P2.3: staging 表名（非空时 writer 写此表而非 TargetTable）；为空表示直写最终表
 }
 
 // estimateValueBytes 估算单个值的传输字节数。

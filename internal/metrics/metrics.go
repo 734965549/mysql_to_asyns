@@ -55,6 +55,13 @@ type Metrics struct { // 定义Prometheus指标结构体
 	FullLoadOldestSnapshotMs   prometheus.Gauge   // V2 最老活跃 snapshot group 存活毫秒
 	FullLoadAlignDegradesTotal prometheus.Counter // V2 对齐取锁失败降级次数
 
+	// P3.6: P0/P2 可观测性指标(低基数聚合,不带任务 ID / 表名标签)
+	FullLoadQueryTimeoutsTotal       prometheus.Counter // V2 源端查询超时次数
+	FullLoadSlowQueriesTotal         prometheus.Counter // V2 源端慢查询次数
+	FullLoadTableRetriesTotal        prometheus.Counter // V2 表级重试次数
+	FullLoadTableRetryExhaustedTotal prometheus.Counter // V2 表级重试耗尽次数
+	FullLoadActiveStagingTables      prometheus.Gauge   // V2 当前活跃 staging 表数
+
 	// oldestSnapshotByTask 进程内各任务当前最老快照年龄；全局 gauge 取其 max，避免并行任务互相覆盖。
 	oldestSnapshotMu     sync.Mutex
 	oldestSnapshotByTask map[string]int64
@@ -191,10 +198,30 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 				Help: "Age in milliseconds of the oldest active full-load snapshot group",
 			}),
 			FullLoadAlignDegradesTotal: prometheus.NewCounter(prometheus.CounterOpts{
-				Name: "mysql_sync_full_load_snapshot_align_degrades_total",
-				Help: "Times multi-reader snapshot alignment lock failed and degraded to single-reader",
-			}),
-		}
+			Name: "mysql_sync_full_load_snapshot_align_degrades_total",
+			Help: "Times multi-reader snapshot alignment lock failed and degraded to single-reader",
+		}),
+		FullLoadQueryTimeoutsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "mysql_sync_full_load_source_query_timeouts_total",
+			Help: "Total source query timeouts in the full-load V2 engine",
+		}),
+		FullLoadSlowQueriesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "mysql_sync_full_load_slow_queries_total",
+			Help: "Total slow source queries (exceeded slow_query_warn threshold) in the full-load V2 engine",
+		}),
+		FullLoadTableRetriesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "mysql_sync_full_load_table_retries_total",
+			Help: "Total table-level read retries in the full-load V2 engine",
+		}),
+		FullLoadTableRetryExhaustedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "mysql_sync_full_load_table_retry_exhausted_total",
+			Help: "Total table-level read retries exhausted in the full-load V2 engine",
+		}),
+		FullLoadActiveStagingTables: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "mysql_sync_full_load_staging_tables",
+			Help: "Current active staging tables in the full-load V2 engine",
+		}),
+	}
 
 		// 注册指标
 		prometheus.MustRegister(instance.TasksTotal)       // 注册任务总数指标
@@ -228,6 +255,11 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 		prometheus.MustRegister(instance.FullLoadSnapshotTxns)
 		prometheus.MustRegister(instance.FullLoadOldestSnapshotMs)
 		prometheus.MustRegister(instance.FullLoadAlignDegradesTotal)
+		prometheus.MustRegister(instance.FullLoadQueryTimeoutsTotal)
+		prometheus.MustRegister(instance.FullLoadSlowQueriesTotal)
+		prometheus.MustRegister(instance.FullLoadTableRetriesTotal)
+		prometheus.MustRegister(instance.FullLoadTableRetryExhaustedTotal)
+		prometheus.MustRegister(instance.FullLoadActiveStagingTables)
 	})
 
 	return instance // 返回实例
@@ -354,6 +386,31 @@ func (m *Metrics) ClearTaskFullLoadOldestSnapshotAge(taskID string) {
 // AddFullLoadSnapshotAlignDegrades 累加对齐取锁失败降级次数。
 func (m *Metrics) AddFullLoadSnapshotAlignDegrades(n int64) {
 	addNonNegative(m.FullLoadAlignDegradesTotal, n)
+}
+
+// AddFullLoadQueryTimeouts 累加源端查询超时次数(P3.6)。
+func (m *Metrics) AddFullLoadQueryTimeouts(n int64) {
+	addNonNegative(m.FullLoadQueryTimeoutsTotal, n)
+}
+
+// AddFullLoadSlowQueries 累加源端慢查询次数(P3.6)。
+func (m *Metrics) AddFullLoadSlowQueries(n int64) {
+	addNonNegative(m.FullLoadSlowQueriesTotal, n)
+}
+
+// AddFullLoadTableRetries 累加表级重试次数(P3.6)。
+func (m *Metrics) AddFullLoadTableRetries(n int64) {
+	addNonNegative(m.FullLoadTableRetriesTotal, n)
+}
+
+// AddFullLoadTableRetryExhausted 累加表级重试耗尽次数(P3.6)。
+func (m *Metrics) AddFullLoadTableRetryExhausted(n int64) {
+	addNonNegative(m.FullLoadTableRetryExhaustedTotal, n)
+}
+
+// AddFullLoadActiveStagingTables 按差值更新活跃 staging 表数(P3.6)。
+func (m *Metrics) AddFullLoadActiveStagingTables(delta int64) {
+	m.FullLoadActiveStagingTables.Add(float64(delta))
 }
 
 // UpdateTaskMetrics 更新任务指标方法

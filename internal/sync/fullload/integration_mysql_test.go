@@ -383,7 +383,7 @@ func readAllChunks(t *testing.T, ctx context.Context, q snapshotQueryer, chunks 
 	t.Helper()
 	var out [][]any
 	for _, chunk := range chunks {
-		cr, err := newChunkReader(q, chunk, batchRows, defaultBatchBytes)
+		cr, err := newChunkReader(q, chunk, batchRows, defaultBatchBytes, Options{}, 1, nil)
 		if err != nil {
 			t.Fatalf("newChunkReader %s: %v", chunk.ID, err)
 		}

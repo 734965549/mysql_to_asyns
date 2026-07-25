@@ -2,6 +2,7 @@ package entity // 声明当前文件属于entity包，用于定义数据实体
 
 import ( // 导入外部包和标准库
 
+	"fmt"
 	"strings"
 	"time" // 导入time包，用于时间处理
 
@@ -114,6 +115,20 @@ type TaskConfig struct { // 定义任务配置结构体
 	// FullLoadDegradeOnAlignLockFail nil/省略=对齐取锁失败时降级单连接；显式 false=fail-closed。
 	// ALL+无PK 捕获表级 HWM 时仍强制 fail-closed，不受该字段影响。
 	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
+	// FullLoadQueryTimeoutSec 单次源端查询超时（秒）；0=默认 300（5 分钟）。
+	FullLoadQueryTimeoutSec int `json:"full_load_query_timeout_sec,omitempty"`
+	// FullLoadSlowQueryWarnSec 慢查询告警阈值（秒）；0=默认 30。
+	FullLoadSlowQueryWarnSec int `json:"full_load_slow_query_warn_sec,omitempty"`
+	// FullLoadTableNoProgressSec 表无进展告警阈值（秒）；0=关闭。P0 阶段预留，未实现。
+	FullLoadTableNoProgressSec int `json:"full_load_table_no_progress_sec,omitempty"`
+	// FullLoadReadRetryTimes 表级读取自动重试次数；0=不重试。
+	FullLoadReadRetryTimes int `json:"full_load_read_retry_times,omitempty"`
+	// FullLoadTwoPhaseRead 启用单列 PK 两阶段读取（pk_probe + payload_fetch）；默认 false。
+	// 仅对单列 PK 表有效；复合 PK/无 PK 表自动跳过。
+	FullLoadTwoPhaseRead bool `json:"full_load_two_phase_read,omitempty"`
+	// FullLoadEnableStaging 启用 staging 表隔离：全量数据先写入 staging 表，完成后原子 RENAME 发布。
+	// 默认 false。启用后单表失败可重试而不污染最终表。
+	FullLoadEnableStaging bool `json:"full_load_enable_staging,omitempty"`
 
 	SourceDB    *DatabaseConfig   `json:"source_db,omitempty"`    // 源数据库配置（可选，覆盖配置文件）
 	TargetDB    *DatabaseConfig   `json:"target_db,omitempty"`    // 目标数据库配置（可选，覆盖配置文件）
@@ -168,6 +183,15 @@ type ProcessContext struct { // 定义处理上下文结构体
 	// 有 PK/UK 表不写此字段，增量从 FullSyncStartPosition 重放并依赖 upsert 幂等。
 	// V1 全量不写入此字段；V1 ALL 增量不强校验 HWM，无 PK/UK 表存在重复行风险。
 	TableBinlogHWMs map[string]string `json:"table_binlog_hwms,omitempty"`
+
+	// FullLoadV2States 记录 V2 引擎每张表的加载状态(P3 持久化,用于进程重启恢复)。
+	// key = "sourceSchema.sourceTable"。V1 任务不写入此字段。
+	// 重启后根据每张表的 Phase 决策: PUBLISHED 跳过, DATA_READY 发布, COPYING/RETRY_WAIT 重新开始, FAILED 保持失败。
+	FullLoadV2States map[string]*FullLoadV2TableState `json:"full_load_v2_states,omitempty"`
+	// FullLoadRunID 当前 V2 全量运行 ID(用于重启后识别是否同一轮全量)。
+	FullLoadRunID string `json:"full_load_run_id,omitempty"`
+	// FullLoadExpectedTables 本轮全量预期表数量；与 FullLoadV2States 一起用于防止不完整 map 被误判为全部完成。
+	FullLoadExpectedTables int `json:"full_load_expected_tables,omitempty"`
 
 	// === 行数对比（手动触发，与同步流程解耦）===
 	// 由用户在任务结束/完成后点击"对比行数"触发，后台精确统计源端和目标端 COUNT(*)，
@@ -280,6 +304,17 @@ func (ctx ProcessContext) CloneForRead() ProcessContext {
 			cloned.TableBinlogHWMs[k] = v
 		}
 	}
+	if len(ctx.FullLoadV2States) > 0 {
+		cloned.FullLoadV2States = make(map[string]*FullLoadV2TableState, len(ctx.FullLoadV2States))
+		for k, v := range ctx.FullLoadV2States {
+			if v != nil {
+				cpy := *v
+				cloned.FullLoadV2States[k] = &cpy
+			}
+		}
+	}
+	cloned.FullLoadRunID = ctx.FullLoadRunID
+	cloned.FullLoadExpectedTables = ctx.FullLoadExpectedTables
 	cloned.RowCountComparison = CloneRowCountComparison(ctx.RowCountComparison)
 	return cloned
 }
@@ -301,6 +336,12 @@ func (t *SyncTask) CloneForRead() *SyncTask {
 		degrade := *t.Config.FullLoadDegradeOnAlignLockFail
 		cloned.Config.FullLoadDegradeOnAlignLockFail = &degrade
 	}
+	cloned.Config.FullLoadQueryTimeoutSec = t.Config.FullLoadQueryTimeoutSec
+	cloned.Config.FullLoadSlowQueryWarnSec = t.Config.FullLoadSlowQueryWarnSec
+	cloned.Config.FullLoadTableNoProgressSec = t.Config.FullLoadTableNoProgressSec
+	cloned.Config.FullLoadReadRetryTimes = t.Config.FullLoadReadRetryTimes
+	cloned.Config.FullLoadTwoPhaseRead = t.Config.FullLoadTwoPhaseRead
+	cloned.Config.FullLoadEnableStaging = t.Config.FullLoadEnableStaging
 	if t.Config.SourceDB != nil {
 		sourceDB := *t.Config.SourceDB
 		cloned.Config.SourceDB = &sourceDB
@@ -332,6 +373,22 @@ type TableSyncProgress struct {
 	ShardCursors     map[int]*ResumeKey `json:"shard_cursors,omitempty"`     // 并行路径每分片游标，key = worker 序号
 	SampleBoundaries []*ResumeKey       `json:"sample_boundaries,omitempty"` // sample 路径首跑边界（历史断点字段）
 	ProcessedRows    int64              `json:"processed_rows,omitempty"`    // 该表已处理行数（仅用于展示/排查）
+}
+
+// FullLoadV2TableState 持久化的单表 V2 全量加载状态(P3 进程重启恢复用)。
+// 由 fullload.Engine 的表级状态机在状态转换时通过回调同步落盘。
+// 重启后根据 Phase 决策恢复策略:
+//   - PUBLISHED: 该表已完成,直接跳过
+//   - DATA_READY: staging 表数据就绪,可继续发布
+//   - COPYING/SNAPSHOT_OPENING/RETRY_WAIT/PENDING: 旧快照已失效,清理 staging 后重新开始
+//   - FAILED: 保持失败,等待人工处理
+type FullLoadV2TableState struct {
+	Phase         string    `json:"phase"`                   // 表级阶段: PENDING/SNAPSHOT_OPENING/COPYING/DATA_READY/PUBLISHED/FAILED
+	AttemptID     int       `json:"attempt_id"`              // 当前 attempt 序号(从 1 开始)
+	StagingTable  string    `json:"staging_table,omitempty"` // staging 表名(空表示未启用 staging 或直写最终表)
+	CommittedRows int64     `json:"committed_rows"`          // 已提交行数(仅用于展示/排查)
+	LastError     string    `json:"last_error,omitempty"`    // 最后错误信息
+	UpdatedAt     time.Time `json:"updated_at"`              // 最后更新时间
 }
 
 // SyncTask 同步任务
@@ -569,6 +626,94 @@ func (t *SyncTask) ClearTableBinlogHWMs() {
 	t.Context.TableBinlogHWMs = nil
 }
 
+// SetFullLoadV2TableState 持久化单表 V2 加载状态(P3)。
+// tableKey = "sourceSchema.sourceTable"。state 为 nil 时删除该表条目。
+func (t *SyncTask) SetFullLoadV2TableState(tableKey string, state *FullLoadV2TableState) {
+	if tableKey == "" {
+		return
+	}
+	if t.Context.FullLoadV2States == nil {
+		t.Context.FullLoadV2States = make(map[string]*FullLoadV2TableState)
+	}
+	if state == nil {
+		delete(t.Context.FullLoadV2States, tableKey)
+	} else {
+		state.UpdatedAt = time.Now()
+		t.Context.FullLoadV2States[tableKey] = state
+	}
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// GetFullLoadV2TableState 获取单表 V2 加载状态;不存在返回 nil。
+func (t *SyncTask) GetFullLoadV2TableState(tableKey string) *FullLoadV2TableState {
+	if t.Context.FullLoadV2States == nil {
+		return nil
+	}
+	return t.Context.FullLoadV2States[tableKey]
+}
+
+// ClearFullLoadV2States 清空所有 V2 表级状态(新一轮全量开始时调用)。
+func (t *SyncTask) ClearFullLoadV2States() {
+	t.Context.FullLoadV2States = nil
+	t.Context.FullLoadRunID = ""
+	t.Context.FullLoadExpectedTables = 0
+}
+
+// InitFullLoadV2Manifest 在全量开始前一次性写入完整表清单为 PENDING，并设置 runID/预期表数。
+// 已存在且 Phase=PUBLISHED 的条目在恢复模式下应跳过调用方过滤；此方法用于全新全量。
+func (t *SyncTask) InitFullLoadV2Manifest(runID string, tableKeys []string) {
+	t.Context.FullLoadRunID = runID
+	t.Context.FullLoadExpectedTables = len(tableKeys)
+	t.Context.FullLoadV2States = make(map[string]*FullLoadV2TableState, len(tableKeys))
+	now := time.Now()
+	for _, key := range tableKeys {
+		if key == "" {
+			continue
+		}
+		t.Context.FullLoadV2States[key] = &FullLoadV2TableState{
+			Phase:     "PENDING",
+			AttemptID: 0,
+			UpdatedAt: now,
+		}
+	}
+	t.Context.LastUpdateTime = now
+}
+
+// AllFullLoadV2TablesPublished 检查所有 V2 表是否都已 PUBLISHED(全量完成)。
+// states 为空时返回 false(无状态,不是恢复场景)。
+// 若设置了 FullLoadExpectedTables，map 条目数不足时也返回 false，防止崩溃后不完整 map 被误判完成。
+func (t *SyncTask) AllFullLoadV2TablesPublished() bool {
+	if len(t.Context.FullLoadV2States) == 0 {
+		return false
+	}
+	if t.Context.FullLoadExpectedTables > 0 && len(t.Context.FullLoadV2States) < t.Context.FullLoadExpectedTables {
+		return false
+	}
+	for _, s := range t.Context.FullLoadV2States {
+		if s == nil || s.Phase != "PUBLISHED" {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateFullLoadOptions 校验 V2 全量相关配置（创建/更新任务时 fail-closed）。
+func (c *TaskConfig) ValidateFullLoadOptions() error {
+	if c == nil {
+		return nil
+	}
+	if c.FullLoadReadRetryTimes > 0 && !c.FullLoadEnableStaging {
+		return fmt.Errorf("full_load_read_retry_times=%d requires full_load_enable_staging=true (retry without staging would duplicate or conflict on the final table)", c.FullLoadReadRetryTimes)
+	}
+	if c.FullLoadReadRetryTimes < 0 {
+		return fmt.Errorf("full_load_read_retry_times must be >= 0")
+	}
+	if c.FullLoadReadRetryTimes > 10 {
+		return fmt.Errorf("full_load_read_retry_times must be <= 10")
+	}
+	return nil
+}
+
 // HasFullSyncEverCompleted 返回是否曾经完成过一次全量（含 INCREMENTAL_STARTED 阶段）。
 // 这是"INCREMENTAL 模式能不能直接启动"以及"ALL 模式能不能跳过全量"的唯一判据。
 func (t *SyncTask) HasFullSyncEverCompleted() bool {
@@ -578,9 +723,19 @@ func (t *SyncTask) HasFullSyncEverCompleted() bool {
 
 // FullSyncIncomplete 返回全量是否处于"开始过但未完成"的中间态（崩溃/暂停/失败留下的不一致快照）。
 // 该状态下不允许直接接增量；未开启 destructive rebuild 时也不允许继续全量续传。
+//
+// P3 例外: V2 引擎 + 有持久化表级状态(FullLoadV2States)时,允许续传。
+// 重启恢复逻辑会根据每张表的 Phase 决策: PUBLISHED 跳过, 未完成的重新开始。
 func (t *SyncTask) FullSyncIncomplete() bool {
-	return t.Context.SyncPhase == SyncPhaseFullStarted ||
-		t.Context.SyncPhase == SyncPhaseFullFailed
+	if t.Context.SyncPhase == SyncPhaseFullStarted ||
+		t.Context.SyncPhase == SyncPhaseFullFailed {
+		// V2 + 有持久化状态:不算 incomplete(可恢复)
+		if t.Config.UsesFullLoadV2() && len(t.Context.FullLoadV2States) > 0 {
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // ResetFullSyncResume 清空所有表的历史全量断点（全新一轮全量开始时调用）。

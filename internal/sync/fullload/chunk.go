@@ -8,7 +8,12 @@ import (
 	"strings"
 
 	"mysql-to-sync/internal/metadata/domain/entity"
+	"mysql-to-sync/pkg/logger"
 )
+
+// pkSparseRatioThreshold 整数主键值域超过估算行数该倍数时视为稀疏，
+// 放弃等值域切分，改用 keyset 采样按近似等行数生成边界。
+const pkSparseRatioThreshold = 4
 
 // TableSpec 描述一张待全量同步的表（源与目标已就绪，仅差数据复制）。
 type TableSpec struct {
@@ -118,6 +123,18 @@ func (p *Planner) planIntegerRange(ctx context.Context, spec *TableSpec, col str
 	minBig := big.NewInt(minV.Int64)
 	span := new(big.Int).Sub(big.NewInt(maxV.Int64), minBig)
 	span.Add(span, big.NewInt(1))
+
+	// 稀疏检测：当值域是估算行数 pkSparseRatioThreshold 倍以上时，
+	// 等值域切分会导致每个 chunk 覆盖大量已删除/空洞行，切换为 keyset 采样切分。
+	if spec.EstimatedRows > 0 {
+		threshold := new(big.Int).Mul(big.NewInt(spec.EstimatedRows), big.NewInt(pkSparseRatioThreshold))
+		if span.Cmp(threshold) > 0 {
+			logger.Info("[FullLoadV2] sparse PK detected for %s.%s (range=%s estimated_rows=%d ratio>%d), switching to keyset sampling",
+				spec.SourceSchema, spec.SourceTable, span.String(), spec.EstimatedRows, pkSparseRatioThreshold)
+			return p.planKeysetBoundaries(ctx, spec, []string{col}, targetChunks)
+		}
+	}
+
 	nChunks := int64(targetChunks)
 	if span.Cmp(big.NewInt(nChunks)) < 0 {
 		nChunks = span.Int64()

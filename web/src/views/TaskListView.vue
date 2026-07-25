@@ -28,6 +28,13 @@ import {
   showTaskDetail,
 } from "../utils/taskFormatters.js";
 
+function getSinkTypeLabel(type) {
+  if (type === 'MYSQL') return 'MySQL 目标';
+  if (type === 'KAFKA') return 'Kafka';
+  if (type === 'HTTP_WEBHOOK') return 'HTTP Webhook';
+  return type;
+}
+
 const route = useRoute();
 const router = useRouter();
 const { configForm, ensureDefaultConfig } = useDefaultConfig();
@@ -200,88 +207,92 @@ onUnmounted(() => {
           <!-- 统计卡片 -->
 
           <a-row :gutter="16" class="stat-cards">
-            <a-col :span="6">
-              <a-card class="stat-card">
-                <a-statistic title="总任务数" :value="tasks.length">
-                  <template #prefix>
-                    <icon-branch class="stat-icon blue" />
-                  </template>
-                </a-statistic>
+            <a-col :xs="12" :md="6">
+              <a-card class="stat-card stat-card-total" :bordered="false">
+                <div class="stat-card-body">
+                  <div class="stat-card-icon">
+                    <icon-branch />
+                  </div>
+                  <div class="stat-card-info">
+                    <div class="stat-card-title">总任务数</div>
+                    <div class="stat-card-value">{{ tasks.length }}</div>
+                  </div>
+                </div>
               </a-card>
             </a-col>
 
-            <a-col :span="6">
-              <a-card class="stat-card">
-                <a-statistic
-                  title="执行中"
-                  :value="
-                    tasks.filter((t) => t.context.status === 'RUNNING').length
-                  "
-                >
-                  <template #prefix>
-                    <icon-play-arrow class="stat-icon green" />
-                  </template>
-                </a-statistic>
+            <a-col :xs="12" :md="6">
+              <a-card class="stat-card stat-card-running" :bordered="false">
+                <div class="stat-card-body">
+                  <div class="stat-card-icon">
+                    <icon-play-arrow />
+                  </div>
+                  <div class="stat-card-info">
+                    <div class="stat-card-title">执行中</div>
+                    <div class="stat-card-value">
+                      {{ tasks.filter((t) => t.context.status === 'RUNNING').length }}
+                    </div>
+                  </div>
+                </div>
               </a-card>
             </a-col>
 
-            <a-col :span="6">
-              <a-card class="stat-card">
-                <a-statistic
-                  title="已完成"
-                  :value="
-                    tasks.filter((t) => t.context.status === 'COMPLETED').length
-                  "
-                >
-                  <template #prefix>
-                    <icon-check class="stat-icon blue" />
-                  </template>
-                </a-statistic>
+            <a-col :xs="12" :md="6">
+              <a-card class="stat-card stat-card-completed" :bordered="false">
+                <div class="stat-card-body">
+                  <div class="stat-card-icon">
+                    <icon-check />
+                  </div>
+                  <div class="stat-card-info">
+                    <div class="stat-card-title">已完成</div>
+                    <div class="stat-card-value">
+                      {{ tasks.filter((t) => t.context.status === 'COMPLETED').length }}
+                    </div>
+                  </div>
+                </div>
               </a-card>
             </a-col>
 
-            <a-col :span="6">
-              <a-card class="stat-card">
-                <a-statistic
-                  title="失败"
-                  :value="
-                    tasks.filter((t) => t.context.status === 'FAILED').length
-                  "
-                >
-                  <template #prefix>
-                    <icon-close class="stat-icon red" />
-                  </template>
-                </a-statistic>
+            <a-col :xs="12" :md="6">
+              <a-card class="stat-card stat-card-failed" :bordered="false">
+                <div class="stat-card-body">
+                  <div class="stat-card-icon">
+                    <icon-close />
+                  </div>
+                  <div class="stat-card-info">
+                    <div class="stat-card-title">失败任务</div>
+                    <div class="stat-card-value">
+                      {{ tasks.filter((t) => t.context.status === 'FAILED').length }}
+                    </div>
+                  </div>
+                </div>
               </a-card>
             </a-col>
           </a-row>
 
           <!-- 任务列表 -->
 
-          <a-card class="task-list-card">
+          <a-card class="task-list-card" :bordered="false">
             <template #title>
               <div class="task-list-header">
                 <div class="task-list-title-wrap">
-                  <a-typography-title :heading="6" style="margin: 0">
+                  <a-typography-title :heading="6" style="margin: 0; font-weight: 600;">
                     任务列表
                   </a-typography-title>
-                  <a-typography-text type="secondary">
-                    统一筛选、排序与搜索，帮助快速定位任务
+                  <a-typography-text type="secondary" style="font-size: 13px;">
+                    统一筛选、排序与搜索，帮助快速定位同步任务
                   </a-typography-text>
                 </div>
 
                 <div class="task-list-toolbar">
-                  <a-tag color="arcoblue" size="small" bordered>
-                    共 {{ taskPagination.total }} 条
-                  </a-tag>
                   <a-select
                     v-model="taskFilters.status"
-                    placeholder="任务状态"
+                    placeholder="全部状态"
                     allow-clear
-                    style="width: 150px"
+                    style="width: 130px"
                     @change="() => fetchTasks(1, taskPagination.pageSize)"
                   >
-                    <a-option value="">全部</a-option>
+                    <a-option value="">全部状态</a-option>
                     <a-option value="PENDING">待执行</a-option>
                     <a-option value="RUNNING">运行中</a-option>
                     <a-option value="PAUSED">已暂停</a-option>
@@ -293,7 +304,7 @@ onUnmounted(() => {
                   <a-select
                     v-model="taskFilters.sort"
                     placeholder="排序方式"
-                    style="width: 160px"
+                    style="width: 170px"
                     @change="() => fetchTasks(1, taskPagination.pageSize)"
                   >
                     <a-option
@@ -306,83 +317,18 @@ onUnmounted(() => {
                   </a-select>
                   <a-input-search
                     v-model="taskFilters.keyword"
-                    placeholder="搜索任务名称 / ID / 表名"
-                    style="width: 320px"
+                    placeholder="搜索任务名称 / ID / 库表名..."
+                    style="width: 260px"
                     allow-clear
                     @search="() => fetchTasks(1, taskPagination.pageSize)"
                     @clear="() => fetchTasks(1, taskPagination.pageSize)"
                   />
+                  <a-button type="outline" size="small" @click="clearAllTaskFilters" v-if="hasActiveTaskFilters">
+                    重置
+                  </a-button>
                 </div>
               </div>
             </template>
-
-            <a-card class="task-filter-panel" :bordered="false">
-              <template #title>
-                <div class="task-filter-panel__header">
-                  <div>
-                    <div class="task-filter-panel__title">筛选面板</div>
-                    <div class="task-filter-panel__desc">支持状态、排序与关键词组合筛选</div>
-                  </div>
-                  <div class="task-filter-panel__actions">
-                    <a-tag color="arcoblue" bordered>当前页 {{ paginatedTasks.length }} 条</a-tag>
-                    <a-button size="small" type="text" @click="clearAllTaskFilters">
-                      一键清空
-                    </a-button>
-                  </div>
-                </div>
-              </template>
-
-              <div class="task-filter-summary">
-                <div class="task-filter-summary__title">已选筛选条件</div>
-                <div v-if="activeTaskFilterChips.length > 0" class="task-filter-summary__chips">
-                  <a-tag
-                    v-for="chip in activeTaskFilterChips"
-                    :key="chip.key + chip.label"
-                    size="small"
-                    color="arcoblue"
-                    bordered
-                    class="filter-chip"
-                  >
-                    {{ chip.label }}
-                  </a-tag>
-                </div>
-                <div v-else class="task-filter-summary__empty">当前没有生效的筛选条件，将展示全部任务。</div>
-              </div>
-
-              <a-collapse class="advanced-filter-collapse" :default-active-key="['advanced']">
-                <a-collapse-item key="advanced" header="高级筛选">
-                  <a-row :gutter="12" class="task-filter-form-row">
-                    <a-col :span="8">
-                      <a-form-item label="快速筛选">
-                        <a-select v-model="taskFilters.status" allow-clear placeholder="按状态筛选">
-                          <a-option value="">全部</a-option>
-                          <a-option value="PENDING">待执行</a-option>
-                          <a-option value="RUNNING">运行中</a-option>
-                          <a-option value="PAUSED">已暂停</a-option>
-                          <a-option value="SCHEDULED">已计划</a-option>
-                          <a-option value="COMPLETED">已完成</a-option>
-                          <a-option value="FAILED">失败</a-option>
-                        </a-select>
-                      </a-form-item>
-                    </a-col>
-                    <a-col :span="8">
-                      <a-form-item label="排序预设">
-                        <a-select v-model="taskFilters.sort">
-                          <a-option v-for="option in taskSortOptions" :key="option.value" :value="option.value">
-                            {{ option.label }}
-                          </a-option>
-                        </a-select>
-                      </a-form-item>
-                    </a-col>
-                    <a-col :span="8">
-                      <a-form-item label="关键词搜索">
-                        <a-input-search v-model="taskFilters.keyword" placeholder="任务名 / ID / 表名" allow-clear @search="() => fetchTasks(1, taskPagination.pageSize)" @clear="() => fetchTasks(1, taskPagination.pageSize)" />
-                      </a-form-item>
-                    </a-col>
-                  </a-row>
-                </a-collapse-item>
-              </a-collapse>
-            </a-card>
 
             <div v-if="filteredTasks.length === 0" class="empty-state empty-state--card">
               <a-empty description="暂无匹配的任务">
@@ -472,7 +418,7 @@ onUnmounted(() => {
                               v-if="task.config.source_databases?.length"
                             >
                               <a-tag
-                                v-for="db in task.config.source_databases"
+                                v-for="db in task.config.source_databases.slice(0, 3)"
                                 :key="db"
                                 size="small"
                                 color="arcoblue"
@@ -480,6 +426,11 @@ onUnmounted(() => {
                                 bordered
                                 >{{ db }}</a-tag
                               >
+                              <a-tooltip v-if="task.config.source_databases.length > 3" :content="task.config.source_databases.join(', ')">
+                                <a-tag size="small" color="arcoblue" class="inline-tag" bordered>
+                                  +{{ task.config.source_databases.length - 3 }}
+                                </a-tag>
+                              </a-tooltip>
                             </template>
 
                             <template v-else>{{ task.config.source_schema || '-' }}</template>
@@ -529,7 +480,7 @@ onUnmounted(() => {
                                 </template>
                                 <template v-else>
                                   <a-tag
-                                    v-for="mapping in getTaskDatabaseMappings(task)"
+                                    v-for="mapping in getTaskDatabaseMappings(task).slice(0, 3)"
                                     :key="mapping.source"
                                     size="small"
                                     color="green"
@@ -538,12 +489,17 @@ onUnmounted(() => {
                                     :title="`${mapping.source} → ${mapping.target}`"
                                     >{{ mapping.target }}</a-tag
                                   >
+                                  <a-tooltip v-if="getTaskDatabaseMappings(task).length > 3" :content="getTaskDatabaseMappings(task).map(m => `${m.source}→${m.target}`).join(', ')">
+                                    <a-tag size="small" color="green" class="inline-tag" bordered>
+                                      +{{ getTaskDatabaseMappings(task).length - 3 }}
+                                    </a-tag>
+                                  </a-tooltip>
                                 </template>
                               </template>
                             </template>
                             <template v-else>
                               <a-tag
-                                v-for="mapping in getTaskDatabaseMappings(task)"
+                                v-for="mapping in getTaskDatabaseMappings(task).slice(0, 3)"
                                 :key="mapping.source"
                                 size="small"
                                 color="green"
@@ -552,6 +508,11 @@ onUnmounted(() => {
                                 :title="`${mapping.source} → ${mapping.target}`"
                                 >{{ mapping.target }}</a-tag
                               >
+                              <a-tooltip v-if="getTaskDatabaseMappings(task).length > 3" :content="getTaskDatabaseMappings(task).map(m => `${m.source}→${m.target}`).join(', ')">
+                                <a-tag size="small" color="green" class="inline-tag" bordered>
+                                  +{{ getTaskDatabaseMappings(task).length - 3 }}
+                                </a-tag>
+                              </a-tooltip>
                             </template>
                           </div>
                         </div>
@@ -714,29 +675,73 @@ onUnmounted(() => {
   margin-bottom: 24px;
 }
 .stat-card {
-  border-radius: 8px;
+  border-radius: 12px;
+  background: #fff;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  border: 1px solid var(--app-border-soft, #edf2f7);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.02);
 }
-.stat-icon {
-  font-size: 20px;
-  margin-right: 8px;
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.06);
 }
-.stat-icon.blue {
+.stat-card-body {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 4px;
+}
+.stat-card-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
+  font-size: 24px;
+  flex-shrink: 0;
+}
+.stat-card-total .stat-card-icon {
+  background: rgba(22, 93, 255, 0.1);
   color: #165dff;
 }
-.stat-icon.green {
+.stat-card-running .stat-card-icon {
+  background: rgba(0, 180, 42, 0.1);
   color: #00b42a;
 }
-.stat-icon.red {
+.stat-card-completed .stat-card-icon {
+  background: rgba(22, 93, 255, 0.1);
+  color: #165dff;
+}
+.stat-card-failed .stat-card-icon {
+  background: rgba(245, 63, 63, 0.1);
   color: #f53f3f;
 }
+.stat-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.stat-card-title {
+  font-size: 13px;
+  color: #86909c;
+}
+.stat-card-value {
+  font-size: 22px;
+  font-weight: 600;
+  color: #1d2129;
+  line-height: 1.2;
+}
+
 .task-list-card {
   border-radius: 16px;
-  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
-  border: 1px solid var(--app-border-soft);
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.04);
+  border: 1px solid var(--app-border-soft, #edf2f7);
   overflow: hidden;
+  background: #fff;
 }
 .task-list-card :deep(.arco-card-header) {
-  border-bottom: 1px solid var(--app-border-soft);
+  border-bottom: 1px solid var(--app-border-soft, #edf2f7);
   padding: 20px 24px 18px;
   height: auto;
   min-height: 72px;
@@ -745,20 +750,6 @@ onUnmounted(() => {
 }
 .task-list-card :deep(.arco-card-body) {
   padding: 20px 24px 24px;
-}
-.task-filter-panel {
-  margin-bottom: 18px;
-  border: 1px solid #e5eaf3;
-  border-radius: 16px;
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
-  overflow: hidden;
-}
-.task-filter-panel :deep(.arco-card-header) {
-  padding: 16px 20px 12px;
-  border-bottom: 1px solid #edf2f7;
-}
-.task-filter-panel :deep(.arco-card-body) {
-  padding: 16px 20px 20px;
 }
 .task-filter-panel__title {
   font-size: 14px;
@@ -809,13 +800,120 @@ onUnmounted(() => {
   margin: 4px 0 18px;
 }
 .task-card-inner {
-  border-radius: 14px;
+  border-radius: 12px;
   border: 1px solid #edf2f7;
   width: 100%;
-  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.02);
+  background: #fff;
+  transition: all 0.2s ease;
+  margin-bottom: 8px;
+}
+.task-card-inner:hover {
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.05);
+  border-color: var(--color-neutral-3);
 }
 .task-card-inner :deep(.arco-card-body) {
-  padding: 20px;
+  padding: 18px 20px;
+}
+.task-card-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 140px;
+  gap: 16px;
+  align-items: center;
+}
+.task-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.task-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+.task-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.task-title :deep(.arco-typography) {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: #1d2129;
+}
+.task-info-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  background: var(--color-fill-1);
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--color-neutral-2);
+}
+.task-info-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.task-info-label {
+  font-size: 11px;
+  color: #86909c;
+  text-transform: uppercase;
+}
+.task-info-value {
+  font-size: 13px;
+  color: #1d2129;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.task-info-tags {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  overflow: hidden;
+  max-height: 24px;
+}
+.inline-tag {
+  margin: 0 !important;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.task-card-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+  align-items: stretch;
+  border-left: 1px solid var(--color-neutral-3);
+  padding-left: 16px;
+  height: 100%;
+  min-height: 100px;
+}
+.task-card-actions :deep(.arco-btn) {
+  width: 100%;
+  justify-content: center;
+  font-size: 12px;
+  height: 28px;
 }
 .task-list-header {
   display: grid;
@@ -960,9 +1058,6 @@ onUnmounted(() => {
 
 /* 响应式样式 */
 @media (max-width: 920px) {
-  .task-filter-summary {
-    grid-template-columns: 1fr;
-  }
   .task-list-header {
     grid-template-columns: 1fr;
     align-items: stretch;
@@ -981,12 +1076,16 @@ onUnmounted(() => {
     min-height: auto;
     padding: 16px 0 0;
     border-left: 0;
-    border-top: 1px solid var(--app-border-soft, #edf2f7);
+    border-top: 1px solid var(--color-neutral-3);
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    grid-auto-rows: 32px;
+    gap: 8px;
     justify-content: stretch;
     align-content: start;
+    padding-left: 0;
+  }
+  .task-card-actions :deep(.arco-btn) {
+    width: 100%;
   }
   .task-info-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1003,7 +1102,7 @@ onUnmounted(() => {
     justify-self: stretch;
   }
   .task-card-actions {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>

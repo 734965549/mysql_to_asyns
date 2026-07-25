@@ -41,6 +41,13 @@ type Stats struct {
 
 	ChunksTotal int64
 	ChunksDone  int64
+
+	// P3.6: P0/P2 可观测性指标
+	QueryTimeouts       int64 // 源端查询超时次数(P0)
+	SlowQueries         int64 // 源端慢查询次数(P0,超过 SlowQueryWarnThreshold)
+	TableRetries        int64 // 表级重试次数(P2)
+	TableRetryExhausted int64 // 表级重试耗尽次数(P2)
+	ActiveStagingTables int64 // 当前活跃 staging 表数(P2)
 }
 
 func (s *Stats) addReadBatch(rows, bytes int64, dur time.Duration) {
@@ -101,6 +108,11 @@ type StatsSnapshot struct {
 	QueueCap                int64 `json:"queue_cap_bytes"`
 	ChunksTotal             int64 `json:"chunks_total"`
 	ChunksDone              int64 `json:"chunks_done"`
+	QueryTimeouts           int64 `json:"query_timeouts"`
+	SlowQueries             int64 `json:"slow_queries"`
+	TableRetries            int64 `json:"table_retries"`
+	TableRetryExhausted     int64 `json:"table_retry_exhausted"`
+	ActiveStagingTables     int64 `json:"active_staging_tables"`
 }
 
 // Snapshot 返回当前统计的一致快照。
@@ -131,5 +143,10 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		QueueCap:                atomic.LoadInt64(&s.QueueCap),
 		ChunksTotal:             atomic.LoadInt64(&s.ChunksTotal),
 		ChunksDone:              atomic.LoadInt64(&s.ChunksDone),
+		QueryTimeouts:           atomic.LoadInt64(&s.QueryTimeouts),
+		SlowQueries:             atomic.LoadInt64(&s.SlowQueries),
+		TableRetries:            atomic.LoadInt64(&s.TableRetries),
+		TableRetryExhausted:     atomic.LoadInt64(&s.TableRetryExhausted),
+		ActiveStagingTables:     atomic.LoadInt64(&s.ActiveStagingTables),
 	}
 }
