@@ -358,16 +358,10 @@ env:
 同步期间发生的变化不进行追平。如需覆盖同步期间的变化，请使用 ALL 模式。
 
 > 注：历史上提供过 `enable_consistent_snapshot` 任务级开关（用于"严格全局快照
-> + 长事务连接池"模式），现已下线。
->
-> **V1（默认 `full_load_engine=v1`）**：P0 仍用毫秒级 `FLUSH TABLES WITH READ LOCK` 捕获；
-> 全量读取为普通短查询，不长期持有源库 `MDL_SHARED_READ`。
->
-> **V2（`full_load_engine=v2`）**：全量读取改为表级 `REPEATABLE READ` +
-> `WITH CONSISTENT SNAPSHOT` 长生命周期只读事务（详见下方「全量 V2 引擎」），每张表在读期间
-> 持有表级 `MDL_SHARED_READ`；大表并行读前可能短暂 `FLUSH TABLES t WITH READ LOCK`。
-> ALL 模式无 PK/UK 表还会在快照窗口内捕获**表级 binlog HWM**（`table_binlog_hwms`），增量启动
-> 时对这类表 fail-closed 校验并按 HWM 过滤。运维需关注源库 undo 保留与 MDL 等待。
+> + 长事务连接池"模式）以及 V2 引擎的表级一致性快照（aligned snapshot）/ 表级 binlog HWM
+> 机制，均已下线。V1、V2 全量读取均为普通短查询，不长期持有源库 `MDL_SHARED_READ`，
+> 不生成表级 binlog HWM。ALL 模式依赖 P0..P1 bounded catch-up 收敛全量期间的变更，
+> 不再需要表级 HWM 过滤。
 
 ### 并行事务提交间隔（tx_commit_every_n_parallel）
 
@@ -402,15 +396,13 @@ env:
 按字节限流的有界队列做背压、事务合并提交、可重试锁错误整事务重放、免 map 的固定
 结构 `RowBatch`，用于消除逐表调度的长尾并降低 GC 压力。
 
-V2 读取侧按**表级一致性快照（snapshot group）**执行：同一张表的所有 chunk 绑定到同一
-（或经短暂表锁对齐的一组）InnoDB `REPEATABLE READ` + `WITH CONSISTENT SNAPSHOT` 只读事务，
-避免全量期间源库“换主键重写 / 唯一列改值”导致目标端重建唯一索引报 1062。中小表走单连接
-快照（无显式写阻塞锁）；估算行数达到约 100 万且 chunk>1 的超大表，短暂
-`FLUSH TABLES t WITH READ LOCK` 对齐多连接 ReadView 后并行读。非 InnoDB 表 fail-closed。
-InnoDB 引擎在打开快照前预检一次，并在持有表锁或首次 `SELECT ... LIMIT 1` 取得表级 MDL 后再权威校验一次，避免 DDL 竞态窗口内被改成 MyISAM 却仍继续一致性快照。
-对齐取锁失败时默认降级为单连接快照；ALL 模式无主键表捕获表级 binlog HWM 时取锁失败
-不降级（fail-closed）。ALL 模式有主键/唯一键表依赖增量幂等收敛；无主键表在快照窗口内
-捕获表级 HWM，增量按事务提交位点过滤并仍推进 checkpoint。
+V2 读取侧统一走**普通短查询**（plain short query）：每个 chunk 独立用连接池中的连接
+执行短查询，不开表级 `REPEATABLE READ` / `WITH CONSISTENT SNAPSHOT` 长事务，不持有
+表级 `MDL_SHARED_READ`，也不做多连接对齐取锁。中小表单连接读取；估算行数达到约 100 万
+且 chunk>1 的超大表，在表内用多连接并行读取（并行度默认等于 `full_load_read_workers`，
+不单独暴露配置项），不同 chunk 可能读到不同时间点的数据。非 InnoDB 表 fail-closed。
+ALL 模式有主键/唯一键表依赖增量幂等收敛；无主键表依赖 P0..P1 bounded catch-up
+覆盖全量期间的变更，不再捕获或依赖表级 binlog HWM。
 
 #### 写事务提交标记表（`__mts_fl_tx`）
 
@@ -453,12 +445,7 @@ Commit 错误、服务端结果未知时，writer 换连后对该 UUID 做 `SELE
 - 请勿手工删除、改名或清空**正在运行**任务使用的 `__mts_fl_tx`。同一目标 schema 上不得并发跑多个 V2 全量（代码以 `GET_LOCK` 强制互斥）。
 - 若早期版本已创建无注释或不兼容结构的同名表，应手工修正（`ALTER`/`ENGINE=InnoDB`/`PRIMARY KEY`/补 `run_id`）或删表后由下次 V2 全量重建；不符合结构时任务会直接失败。
 
-注意：表级 HWM 捕获与增量启动时的 `RequireNoPKTableHWM` fail-closed 校验**仅在
-`full_load_engine=v2` 生效**。默认 `v1` 保持旧语义：不生成表级 HWM，也不强校验；
-因此 V1 的 ALL + 无主键/无唯一键表在增量接管阶段存在重复 INSERT 风险。需要无主键表
-正确去重时请使用 `full_load_engine=v2`。
-
-chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView），改善负载均衡。开启
+chunk 边界规划与读取共用同一连接池，改善负载均衡。开启
 `optimize_index` 时，每张表数据全部提交后即异步重建该表索引，不必等到全部表灌数结束。
 
 ```json
@@ -470,8 +457,6 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
   "full_load_batch_bytes_mb": 4,
   "full_load_commit_rows": 10000,
   "full_load_commit_bytes_mb": 32,
-  "full_load_lock_wait_timeout_sec": 10,
-  "full_load_degrade_on_align_lock_fail": true,
   "full_load_query_timeout_sec": 300,
   "full_load_stream_idle_timeout_sec": 300,
   "full_load_stream_max_duration_sec": 0
@@ -487,8 +472,6 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
 | `full_load_batch_bytes_mb` | 单批目标字节数（MiB），达到即入队 | 4（范围 1–64） |
 | `full_load_commit_rows` | 单事务累计提交行数阈值 | 10000（不小于 `batch_size`，上限 10000000） |
 | `full_load_commit_bytes_mb` | 单事务累计提交字节阈值（MiB） | 32（不小于单批字节，上限 4096） |
-| `full_load_lock_wait_timeout_sec` | 超大表对齐取锁等待超时（秒，双保险：客户端 context + `SESSION lock_wait_timeout`） | 10（范围 1–3600） |
-| `full_load_degrade_on_align_lock_fail` | 对齐多连接取锁失败时是否降级为单连接快照；`false` 为 fail-closed | `true`（省略时同样按 true） |
 | `full_load_query_timeout_sec` | 源端查询超时（秒）。keyset：整次查询绝对超时；stream：仅打开查询等待上限 | 300（范围 1–7200） |
 | `full_load_stream_idle_timeout_sec` | 无主键流式查询无进展超时（秒）。每次 `Rows.Next` 成功后重置；等待写队列时暂停 | 300（范围 1–7200） |
 | `full_load_stream_max_duration_sec` | 无主键流式查询绝对最长时长（秒）；`0` 表示不限制整表复制总时长 | 0（不限制；显式值范围 1–86400） |
@@ -503,15 +486,19 @@ chunk 边界在**该表快照事务内**规划（与读取共享同一 ReadView�
 - V2 沿用 V1 的建表 / 删索引 / 索引回放（`optimize_index`、`index_restore_worker_count`）
   与目标库只读保护、`enable_drop_table_before_ddl`、`enable_skip_binlog` 语义。
 - 全量批量写入仍为普通 `INSERT`：请确保目标表为空或开启 `enable_drop_table_before_ddl`。
-- V2 运行期指标（读/写/提交行数与字节、队列水位、活跃 worker、事务重放与锁重试次数、
-  活跃 snapshot group / 快照事务数、最老快照存活时长、对齐降级次数）通过 Prometheus
-  `mysql_sync_full_load_*` 指标与任务详情接口暴露。
-- `full_load_read_workers` 同时约束并发表数与单表并行读上限；快照连接信号量会为协调锁
-  连接预留槽位，避免取锁自死锁。源库写入频繁时多个长 ReadView 会放大 undo / history list，
+- `FULL`（V2）使用普通短查询并行读取；不捕获全量期间增量，同表不同 chunk 可能对应
+  不同时间点。在线不停写请用 `ALL`。
+- `ALL`：无锁捕获 P0 → 基线短查询 → 捕获 P1 → bounded catch-up 到 P1 → 再恢复非 identity 索引 → 持续增量。
+  含无 PK/UK 表时需提交 `allow_nopk_all=true`（best-effort）。
+- V2 运行期指标（读/写/提交行数与字节、队列水位、活跃 worker、事务重放与锁重试次数）
+  通过 Prometheus `mysql_sync_full_load_*` 指标与任务详情接口暴露。
+- `full_load_read_workers` 同时约束并发表数与单表内并行读连接数上限（`TableParallelReaders`
+  默认等于该值）；`CapBySourcePool` 会用真实源库连接池上限进一步约束两者，避免超过
+  `source_max_open_conns`。源库写入频繁、并行读连接数较大时会放大 undo / history list，
   请按源库承受能力保守设置 worker 数。
-- `full_load_degrade_on_align_lock_fail=false` 时，超大表对齐取锁失败会直接让该表/任务失败；
-  默认 `true` 则降级为单连接一致性快照继续。无论该开关如何，ALL 模式无主键表在捕获表级
-  binlog HWM 时取锁失败始终 fail-closed。
+- `full_load_lock_wait_timeout_sec`、`full_load_degrade_on_align_lock_fail` 已废弃：
+  aligned snapshot 架构移除后这两个字段不再产生任何执行语义，API/任务存档仍可接收、
+  持久化并回显以兼容旧任务，Web UI 已隐藏对应控件。
 - 无主键表（`FULL_COLUMNS_STRATEGY`）在 V2 中走单条全表流式 `SELECT`。不要把
   `full_load_query_timeout_sec` 当成整表复制总时长：stream 打开后改用
   `full_load_stream_idle_timeout_sec` 无进展超时；只要持续读到行就不会因总时长超时。

@@ -177,15 +177,13 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 
 GRANT SELECT ON *.* TO 'username'@'%';
 
-# ALL 必须具备 RELOAD；FULL 默认可在缺权限时降级单连接，
-
-# 但超大表多连接对齐或 degrade=false 同样需要
+# ALL/FULL V2 多连接对齐均需要 RELOAD（或 FLUSH_TABLES）；缺权限立即失败，不再自动降级
 
 GRANT RELOAD ON *.* TO 'username'@'%';
 
 FLUSH PRIVILEGES;
 
-``
+```
 
 
 

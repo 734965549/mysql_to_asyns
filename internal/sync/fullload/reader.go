@@ -10,8 +10,47 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mysql-to-sync/internal/metadata/domain/entity"
 	"mysql-to-sync/pkg/logger"
 )
+
+// snapshotQueryer 是 chunk 读取使用的查询接口；可绑定单连接（如 db.Conn）或整个连接池（*sql.DB）。
+type snapshotQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// isNoPKSpec 判断表是否无 PK/UK（走全列匹配策略）。
+func isNoPKSpec(spec *TableSpec) bool {
+	return spec != nil && spec.Identity != nil && spec.Identity.Strategy == entity.FullColumnsStrategy
+}
+
+// decideTableReadersForSpec 在规划 chunk 之前，仅根据估算行数决定单表内并行读连接数。
+// 无 PK 表始终 1；中小表 1；超大表用 TableParallelReaders。
+func decideTableReadersForSpec(spec *TableSpec, opt Options) int {
+	if spec == nil || isNoPKSpec(spec) {
+		return 1
+	}
+	if opt.LargeTableRows > 0 && (spec.EstimatedRows <= 0 || spec.EstimatedRows < opt.LargeTableRows) {
+		return 1
+	}
+	n := opt.TableParallelReaders
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// decideTableReaders 在已有 chunk 时收紧并行度（不超过 chunk 数）。
+func decideTableReaders(job *tableReadJob, opt Options) int {
+	n := decideTableReadersForSpec(job.spec, opt)
+	if job == nil || len(job.chunks) <= 1 {
+		return 1
+	}
+	if n > len(job.chunks) {
+		n = len(job.chunks)
+	}
+	return n
+}
 
 // chunkReader 以 map-free 方式读取单个 chunk，直接扫描成 [][]any。
 type chunkReader struct {
@@ -779,17 +818,12 @@ func scanUpTo(rows *sql.Rows, nCols, maxRows int, maxBytes int64, onProgress fun
 	return out, bytes, false, nil
 }
 
-// runTableReaders 按表打开一致性快照：表间并发由 ReadWorkers/信号量限制；
-// 超大表可在单表内用对齐多连接并行读 chunk（禁止跨表窃取事务）。
+// runTableReaders 用普通连接池并行读取多张表：表间并发由 ReadWorkers 限制；
+// 超大表可在单表内用多连接并行读 chunk（不同 chunk 允许看到不同事务版本）。
 func runTableReaders(ctx context.Context, db *sql.DB, jobs []*tableReadJob, q *batchQueue, eng *Engine, opt Options, stats *Stats, isStopped func() bool) error {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	q.watchContext(workerCtx)
-
-	lim := eng.limiter
-	if lim == nil {
-		lim = newSnapshotLimiter(opt.MaxSnapshotGroups, opt.MaxSnapshotConns)
-	}
 
 	// P2.5: 表级状态跟踪器（用于重试和 inflight barrier）
 	var stateTracker *tableStateTracker
@@ -819,9 +853,6 @@ func runTableReaders(ctx context.Context, db *sql.DB, jobs []*tableReadJob, q *b
 	if workers < 1 {
 		workers = 1
 	}
-	if workers > opt.MaxSnapshotGroups && opt.MaxSnapshotGroups > 0 {
-		workers = opt.MaxSnapshotGroups
-	}
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -835,7 +866,7 @@ func runTableReaders(ctx context.Context, db *sql.DB, jobs []*tableReadJob, q *b
 					cancel()
 					return
 				}
-				if err := readTableWithRetry(workerCtx, db, job, q, eng, lim, opt, stats, isStopped, cancel, stateTracker); err != nil {
+				if err := readTableWithRetry(workerCtx, db, job, q, eng, opt, stats, isStopped, cancel, stateTracker); err != nil {
 					setErr(err)
 					return
 				}
@@ -854,70 +885,49 @@ type tableReadJob struct {
 	AttemptID int // P2.2: 表级重试序号，传递给所有 RowBatch
 }
 
-// readTableWithSnapshot 在表级一致性快照内读取。
+// readTable 按普通连接池短查询读取整张表。
 // taskCancel：用户停止/致命错误时取消整个任务流水线。
 // attemptCancel：可重试的表内错误只取消当前 attempt（可为 nil，此时退化为 taskCancel）。
-func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q *batchQueue, eng *Engine, lim *snapshotLimiter, opt Options, stats *Stats, isStopped func() bool, taskCancel context.CancelFunc, attemptCancel context.CancelFunc) error {
+func readTable(ctx context.Context, db *sql.DB, job *tableReadJob, q *batchQueue, eng *Engine, opt Options, stats *Stats, isStopped func() bool, taskCancel context.CancelFunc, attemptCancel context.CancelFunc) error {
+	return readTablePlain(ctx, db, job, q, eng, opt, stats, isStopped, taskCancel, attemptCancel)
+}
+
+// readTablePlain 无表级快照读取：普通连接规划 chunk，短查询并行读。
+// 同表不同 chunk 允许看到 T1/T2/T3；失败不得降级改变用户配置的并发度。
+func readTablePlain(ctx context.Context, db *sql.DB, job *tableReadJob, q *batchQueue, eng *Engine, opt Options, stats *Stats, isStopped func() bool, taskCancel context.CancelFunc, attemptCancel context.CancelFunc) error {
 	if job == nil || job.spec == nil || job.spec.Identity == nil || len(job.spec.Identity.Columns) == 0 {
 		return fmt.Errorf("invalid table read job")
 	}
 	if attemptCancel == nil {
 		attemptCancel = taskCancel
 	}
-
-	lease, err := lim.acquireGroup(ctx)
-	if err != nil {
-		return err
+	if db == nil {
+		return fmt.Errorf("full read failed: table=%s.%s stage=connect cause=nil source db", job.spec.SourceSchema, job.spec.SourceTable)
 	}
-	defer lease.release()
 
+	schema := job.spec.SourceSchema
+	table := job.spec.SourceTable
 	readers := decideTableReadersForSpec(job.spec, opt)
-	// captureHWM 条件: 无PK/UK 表必须捕获 HWM(ALL 模式增量依赖);
-	// 启用表级重试时所有表也捕获 HWM，确保每次新 attempt 的快照位点能原子覆盖旧值。
-	captureHWM := eng != nil && eng.CaptureTableHWM && (isNoPKSpec(job.spec) || opt.ReadRetryTimes > 0)
-	if captureHWM {
-		readers = 1
-	}
-
-	firstCol := job.spec.Identity.Columns[0].Name
-	snapOpt := SnapshotOptions{
-		CaptureHWM:         captureHWM,
-		LockWaitTimeoutSec: opt.LockWaitTimeoutSec,
-	}
-	if eng != nil {
-		snapOpt.OnReady = eng.OnTableSnapshotReady
-	}
-
-	snaps, reserved, err := openTableSnapshotsWithLimiter(ctx, db, job.spec.SourceSchema, job.spec.SourceTable, firstCol, readers, snapOpt, lim, opt, stats)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			rollbackSnapshots(ctx, snaps)
-		}
-		n := len(snaps)
-		closeSnapshots(snaps)
-		if n > 0 {
-			atomic.AddInt64(&stats.ActiveSnapshotTxns, -int64(n))
-		}
-		lim.releaseConns(reserved)
-	}()
+	strategy := string(job.spec.Identity.Strategy)
 
 	targetChunks := opt.ReadWorkers * opt.ChunkOvershoot
 	if targetChunks < 1 {
 		targetChunks = 1
 	}
-	planner := NewPlanner(snaps[0].conn)
-	chunks, err := planner.planTable(ctx, job.spec, targetChunks)
+
+	planConn, err := db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("plan chunks in snapshot for %s.%s: %w", job.spec.SourceSchema, job.spec.SourceTable, err)
+		return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=connect readers=%d cause=%w", schema, table, strategy, readers, err)
+	}
+	planner := NewPlanner(planConn)
+	chunks, planErr := planner.planTable(ctx, job.spec, targetChunks)
+	_ = planConn.Close()
+	if planErr != nil {
+		return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=plan readers=%d cause=%w", schema, table, strategy, readers, planErr)
 	}
 	job.chunks = chunks
 	atomic.AddInt64(&stats.ChunksTotal, int64(len(chunks)))
-	logger.Info("[FullLoadV2] planned %d chunk(s) in-snapshot for %s.%s (readers=%d)",
-		len(chunks), job.spec.SourceSchema, job.spec.SourceTable, len(snaps))
+	logger.Info("[FullLoadV2] planned %d chunk(s) plain for %s.%s (readers=%d)", len(chunks), schema, table, readers)
 
 	tracker := (*tableCompletionTracker)(nil)
 	var stateTracker *tableStateTracker
@@ -927,10 +937,18 @@ func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q
 	}
 
 	if len(chunks) == 0 {
-		if err := tracker.markReadDone(job.spec.SourceSchema, job.spec.SourceTable); err != nil {
+		if err := tracker.markReadDone(schema, table); err != nil {
 			return err
 		}
-	} else if len(snaps) == 1 {
+		return nil
+	}
+
+	if readers <= 1 || len(chunks) == 1 {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=connect chunk=%s readers=1 cause=%w", schema, table, strategy, chunks[0].ID, err)
+		}
+		defer conn.Close()
 		for _, chunk := range chunks {
 			if isStopped != nil && isStopped() {
 				if taskCancel != nil {
@@ -941,74 +959,31 @@ func readTableWithSnapshot(ctx context.Context, db *sql.DB, job *tableReadJob, q
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err := readChunk(ctx, snaps[0].conn, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, job.AttemptID); err != nil {
-				return fmt.Errorf("read table %s.%s chunk %s: %w", job.spec.SourceSchema, job.spec.SourceTable, chunk.ID, err)
+			if err := readChunk(ctx, conn, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, job.AttemptID); err != nil {
+				return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=scan chunk=%s readers=1 cause=%w", schema, table, strategy, chunk.ID, err)
 			}
 		}
 	} else {
-		active := snaps
-		if len(chunks) < len(snaps) {
-			active = snaps[:len(chunks)]
-		}
-		if err := readChunksParallel(ctx, active, chunks, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, attemptCancel, job.AttemptID); err != nil {
-			return fmt.Errorf("read table %s.%s parallel: %w", job.spec.SourceSchema, job.spec.SourceTable, err)
+		if err := readChunksParallelPlain(ctx, db, readers, chunks, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, attemptCancel, job.AttemptID); err != nil {
+			return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=scan readers=%d cause=%w", schema, table, strategy, readers, err)
 		}
 	}
 
-	if err := tracker.markReadDone(job.spec.SourceSchema, job.spec.SourceTable); err != nil {
+	if err := tracker.markReadDone(schema, table); err != nil {
 		return err
 	}
-
-	if err := commitSnapshots(ctx, snaps); err != nil {
-		return fmt.Errorf("commit snapshot for %s.%s: %w", job.spec.SourceSchema, job.spec.SourceTable, err)
-	}
-	committed = true
 	return nil
 }
 
-func openTableSnapshotsWithLimiter(ctx context.Context, db *sql.DB, schema, table, firstCol string, readers int, snapOpt SnapshotOptions, lim *snapshotLimiter, opt Options, stats *Stats) ([]*tableSnapshot, int, error) {
-	tryOpen := func(n int) ([]*tableSnapshot, int, error) {
-		needLock := n > 1 || snapOpt.CaptureHWM
-		reserve := n
-		if needLock {
-			reserve = n + 1 // 预留协调锁连接，避免自死锁
-		}
-		if err := lim.acquireConns(ctx, reserve); err != nil {
-			return nil, 0, err
-		}
-		snaps, err := openAlignedTableSnapshots(ctx, db, schema, table, firstCol, n, snapOpt)
-		if err != nil {
-			lim.releaseConns(reserve)
-			return nil, 0, err
-		}
-		// 锁已释放：归还协调连接槽位，仅保留 N 条快照连接。
-		if needLock {
-			lim.releaseConns(1)
-			reserve = n
-		}
-		atomic.AddInt64(&stats.ActiveSnapshotTxns, int64(n))
-		return snaps, reserve, nil
+// readChunksParallelPlain 用池连接并行读 chunk，不开一致性快照事务。
+func readChunksParallelPlain(ctx context.Context, db *sql.DB, readers int, chunks []*Chunk, q *batchQueue, opt Options, stats *Stats, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, taskCancel, attemptCancel context.CancelFunc, attemptID int) error {
+	if readers < 1 {
+		readers = 1
+	}
+	if readers > len(chunks) {
+		readers = len(chunks)
 	}
 
-	snaps, reserved, err := tryOpen(readers)
-	if err == nil {
-		return snaps, reserved, nil
-	}
-
-	// 对齐多连接取锁失败：可降级为单连接（仍保持一致性快照）。CaptureHWM 路径禁止降级。
-	if readers > 1 && opt.DegradeOnAlignLockFail && !snapOpt.CaptureHWM {
-		logger.Warn("[FullLoadV2] align lock for %s.%s failed (%v); degrade to single-reader snapshot", schema, table, err)
-		stats.incSnapshotAlignDegrades()
-		snaps, reserved, err2 := tryOpen(1)
-		if err2 != nil {
-			return nil, 0, fmt.Errorf("open aligned snapshots for %s.%s failed (%v); single-reader degrade also failed: %w", schema, table, err, err2)
-		}
-		return snaps, reserved, nil
-	}
-	return nil, 0, err
-}
-
-func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*Chunk, q *batchQueue, opt Options, stats *Stats, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, taskCancel, attemptCancel context.CancelFunc, attemptID int) error {
 	chunkCh := make(chan *Chunk, len(chunks))
 	for _, c := range chunks {
 		chunkCh <- c
@@ -1018,7 +993,6 @@ func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*C
 	var wg sync.WaitGroup
 	var firstErr error
 	var errOnce sync.Once
-	// 表内并行错误只取消 attemptCtx，保留任务级 ctx 以便表级重试。
 	setErr := func(err error) {
 		if err != nil {
 			errOnce.Do(func() {
@@ -1030,10 +1004,17 @@ func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*C
 		}
 	}
 
-	for i, snap := range snaps {
+	for i := 0; i < readers; i++ {
 		wg.Add(1)
-		go func(idx int, s *tableSnapshot) {
+		go func(idx int) {
 			defer wg.Done()
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				setErr(fmt.Errorf("reader[%d] connect: %w", idx, err))
+				return
+			}
+			defer conn.Close()
+
 			for chunk := range chunkCh {
 				if isStopped != nil && isStopped() {
 					if taskCancel != nil {
@@ -1044,12 +1025,12 @@ func readChunksParallel(ctx context.Context, snaps []*tableSnapshot, chunks []*C
 				if ctx.Err() != nil {
 					return
 				}
-				if err := readChunk(ctx, s.conn, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, attemptID); err != nil {
+				if err := readChunk(ctx, conn, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, attemptID); err != nil {
 					setErr(fmt.Errorf("reader[%d] chunk %s: %w", idx, chunk.ID, err))
 					return
 				}
 			}
-		}(i, snap)
+		}(i)
 	}
 	wg.Wait()
 	return firstErr

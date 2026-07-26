@@ -669,6 +669,11 @@ func assertTargetTablesInnoDB(ctx context.Context, db *sql.DB, specs []*TableSpe
 	return nil
 }
 
+// rowQueryer 是单行查询接口，兼容 *sql.DB / *sql.Conn / *sql.Tx。
+type rowQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 func assertTargetInnoDBTable(ctx context.Context, q rowQueryer, schema, table string) error {
 	var engine sql.NullString
 	query := "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"

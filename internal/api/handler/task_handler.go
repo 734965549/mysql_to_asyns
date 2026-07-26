@@ -124,48 +124,50 @@ const secretMask = "******"
 
 // CreateTaskRequest 创建任务请求结构体
 type CreateTaskRequest struct { // 定义创建任务请求结构体
-	Name                       string   `json:"name" binding:"required"`                   // 任务名称，必填
-	SyncLevel                  string   `json:"sync_level"`                                // 同步级别: DATABASE 或 TABLE
-	SourceSchema               string   `json:"source_schema"`                             // 源模式名
-	TargetSchema               string   `json:"target_schema"`                             // 目标模式名
-	SourceDatabases            []string `json:"source_databases"`                          // 源数据库列表（库级别同步时使用）
-	TargetDatabase             string   `json:"target_database"`                           // 目标数据库（库级别同步时，所有库同步到此库）
-	TargetDatabases            []string `json:"target_databases"`                          // 目标数据库列表（与 SourceDatabases 一一对应）
-	Tables                     []string `json:"tables"`                                    // 源表列表
-	TargetTables               []string `json:"target_tables"`                             // 目标表列表（与 Tables 一一对应；空则沿用源表名）
-	Mode                       string   `json:"mode" binding:"required"`                   // 同步模式，必填
-	BatchSize                  int      `json:"batch_size"`                                // 批处理大小
-	WorkerCount                int      `json:"worker_count"`                              // 工作线程数
-	IntraTableWorkerCount      int      `json:"intra_table_worker_count"`                  // 表内工作线程数
-	IndexRestoreWorkerCount    int      `json:"index_restore_worker_count"`                // 索引回放并发度；0=自动推导
-	EnableLimitOne             bool     `json:"enable_limit_one"`                          // 是否启用LIMIT 1优化
-	OptimizeIndex              bool     `json:"optimize_index"`                            // 索引优化：先删后建
-	EnableReadOnly             bool     `json:"enable_read_only"`                          // 同步前关闭目标只读，同步后恢复
-	EnableDropTableBeforeDDL   bool     `json:"enable_drop_table_before_ddl"`              // 同步DDL前先执行 DROP TABLE IF EXISTS
-	EnableSkipBinlog           bool     `json:"enable_skip_binlog"`                        // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
-	TxCommitEveryNParallel     int      `json:"tx_commit_every_n_parallel"`                // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5
-	FullLoadEngine             string   `json:"full_load_engine,omitempty"`                // 全量引擎：v1 / v2；空视为 v1
-	FullLoadReadWorkers        int      `json:"full_load_read_workers,omitempty"`          // V2 任务级源读取上限；0=自动
-	FullLoadWriteWorkers       int      `json:"full_load_write_workers,omitempty"`         // V2 任务级目标写入上限；0=自动
-	FullLoadBufferMB           int      `json:"full_load_buffer_mb,omitempty"`             // V2 队列上限(MiB)；0=128
-	FullLoadBatchBytesMB       int      `json:"full_load_batch_bytes_mb,omitempty"`        // V2 单条INSERT字节上限(MiB)；0=4
-	FullLoadCommitRows         int      `json:"full_load_commit_rows,omitempty"`           // V2 单事务行数上限；0=10000
-	FullLoadCommitBytesMB      int      `json:"full_load_commit_bytes_mb,omitempty"`       // V2 单事务字节上限(MiB)；0=32
-	FullLoadLockWaitTimeoutSec int      `json:"full_load_lock_wait_timeout_sec,omitempty"` // V2 取表锁等待秒数；0=10
-	// FullLoadDegradeOnAlignLockFail nil=默认降级单连接；false=对齐取锁失败 fail-closed
-	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
-	FullLoadQueryTimeoutSec        int   `json:"full_load_query_timeout_sec,omitempty"`      // V2 查询超时秒数；keyset绝对/stream打开；0=300
-	FullLoadStreamIdleTimeoutSec   int   `json:"full_load_stream_idle_timeout_sec,omitempty"` // V2 无主键流式无进展超时；0=300
-	FullLoadStreamMaxDurationSec   int   `json:"full_load_stream_max_duration_sec,omitempty"` // V2 无主键流式绝对最长时长；0=不限制
-	FullLoadSlowQueryWarnSec       int   `json:"full_load_slow_query_warn_sec,omitempty"`    // V2 慢查询告警秒数；0=30
-	FullLoadTableNoProgressSec     int   `json:"full_load_table_no_progress_sec,omitempty"` // V2 表无进展告警秒数；0=关闭
-	FullLoadReadRetryTimes         int   `json:"full_load_read_retry_times,omitempty"`      // V2 表级读取重试次数；0=不重试
-	FullLoadTwoPhaseRead           bool  `json:"full_load_two_phase_read,omitempty"`        // V2 单列PK两阶段读取；默认关
-	FullLoadEnableStaging          bool  `json:"full_load_enable_staging,omitempty"`        // V2 staging表隔离；默认关
-	SourceDB                       *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
-	TargetDB                       *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
-	SinkConfigs                    []SinkConfigRequest    `json:"sink_configs,omitempty"`       // 增量目标端配置（可选，默认 MYSQL）
-	CloneFromTaskID                string                 `json:"clone_from_task_id,omitempty"` // 复制新建时沿用源任务密码等敏感字段
+	Name                     string   `json:"name" binding:"required"`             // 任务名称，必填
+	SyncLevel                string   `json:"sync_level"`                          // 同步级别: DATABASE 或 TABLE
+	SourceSchema             string   `json:"source_schema"`                       // 源模式名
+	TargetSchema             string   `json:"target_schema"`                       // 目标模式名
+	SourceDatabases          []string `json:"source_databases"`                    // 源数据库列表（库级别同步时使用）
+	TargetDatabase           string   `json:"target_database"`                     // 目标数据库（库级别同步时，所有库同步到此库）
+	TargetDatabases          []string `json:"target_databases"`                    // 目标数据库列表（与 SourceDatabases 一一对应）
+	Tables                   []string `json:"tables"`                              // 源表列表
+	TargetTables             []string `json:"target_tables"`                       // 目标表列表（与 Tables 一一对应；空则沿用源表名）
+	Mode                     string   `json:"mode" binding:"required"`             // 同步模式，必填
+	BatchSize                int      `json:"batch_size"`                          // 批处理大小
+	WorkerCount              int      `json:"worker_count"`                        // 工作线程数
+	IntraTableWorkerCount    int      `json:"intra_table_worker_count"`            // 表内工作线程数
+	IndexRestoreWorkerCount  int      `json:"index_restore_worker_count"`          // 索引回放并发度；0=自动推导
+	EnableLimitOne           bool     `json:"enable_limit_one"`                    // 是否启用LIMIT 1优化
+	OptimizeIndex            bool     `json:"optimize_index"`                      // 索引优化：先删后建
+	EnableReadOnly           bool     `json:"enable_read_only"`                    // 同步前关闭目标只读，同步后恢复
+	EnableDropTableBeforeDDL bool     `json:"enable_drop_table_before_ddl"`        // 同步DDL前先执行 DROP TABLE IF EXISTS
+	EnableSkipBinlog         bool     `json:"enable_skip_binlog"`                  // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
+	TxCommitEveryNParallel   int      `json:"tx_commit_every_n_parallel"`          // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5
+	FullLoadEngine           string   `json:"full_load_engine,omitempty"`          // 全量引擎：v1 / v2；空视为 v1
+	FullLoadReadWorkers      int      `json:"full_load_read_workers,omitempty"`    // V2 任务级源读取上限；0=自动
+	FullLoadWriteWorkers     int      `json:"full_load_write_workers,omitempty"`   // V2 任务级目标写入上限；0=自动
+	FullLoadBufferMB         int      `json:"full_load_buffer_mb,omitempty"`       // V2 队列上限(MiB)；0=128
+	FullLoadBatchBytesMB     int      `json:"full_load_batch_bytes_mb,omitempty"`  // V2 单条INSERT字节上限(MiB)；0=4
+	FullLoadCommitRows       int      `json:"full_load_commit_rows,omitempty"`     // V2 单事务行数上限；0=10000
+	FullLoadCommitBytesMB    int      `json:"full_load_commit_bytes_mb,omitempty"` // V2 单事务字节上限(MiB)；0=32
+	// FullLoadLockWaitTimeoutSec 已废弃：aligned snapshot 架构移除后无效，仅接收/回显兼容旧任务。
+	FullLoadLockWaitTimeoutSec int `json:"full_load_lock_wait_timeout_sec,omitempty"`
+	// FullLoadDegradeOnAlignLockFail 已废弃：aligned snapshot 架构移除后无效，仅接收/回显兼容旧任务。
+	FullLoadDegradeOnAlignLockFail *bool                  `json:"full_load_degrade_on_align_lock_fail,omitempty"`
+	FullLoadQueryTimeoutSec        int                    `json:"full_load_query_timeout_sec,omitempty"`       // V2 查询超时秒数；keyset绝对/stream打开；0=300
+	FullLoadStreamIdleTimeoutSec   int                    `json:"full_load_stream_idle_timeout_sec,omitempty"` // V2 无主键流式无进展超时；0=300
+	FullLoadStreamMaxDurationSec   int                    `json:"full_load_stream_max_duration_sec,omitempty"` // V2 无主键流式绝对最长时长；0=不限制
+	FullLoadSlowQueryWarnSec       int                    `json:"full_load_slow_query_warn_sec,omitempty"`     // V2 慢查询告警秒数；0=30
+	FullLoadTableNoProgressSec     int                    `json:"full_load_table_no_progress_sec,omitempty"`   // V2 表无进展告警秒数；0=关闭
+	FullLoadReadRetryTimes         int                    `json:"full_load_read_retry_times,omitempty"`        // V2 表级读取重试次数；0=不重试
+	FullLoadTwoPhaseRead           bool                   `json:"full_load_two_phase_read,omitempty"`          // V2 单列PK两阶段读取；默认关
+	FullLoadEnableStaging          bool                   `json:"full_load_enable_staging,omitempty"`          // V2 staging表隔离；默认关
+	AllowNopkAll                   bool                   `json:"allow_nopk_all,omitempty"`                    // ALL 无PK/UK 风险确认
+	SourceDB                       *DatabaseConfigRequest `json:"source_db,omitempty"`                         // 源数据库配置（可选）
+	TargetDB                       *DatabaseConfigRequest `json:"target_db,omitempty"`                         // 目标数据库配置（可选）
+	SinkConfigs                    []SinkConfigRequest    `json:"sink_configs,omitempty"`                      // 增量目标端配置（可选，默认 MYSQL）
+	CloneFromTaskID                string                 `json:"clone_from_task_id,omitempty"`                // 复制新建时沿用源任务密码等敏感字段
 }
 
 // CreateTask 创建任务方法
@@ -269,16 +271,17 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		FullLoadBatchBytesMB:           req.FullLoadBatchBytesMB,           // 设置V2单条INSERT字节上限
 		FullLoadCommitRows:             req.FullLoadCommitRows,             // 设置V2单事务行数上限
 		FullLoadCommitBytesMB:          req.FullLoadCommitBytesMB,          // 设置V2单事务字节上限
-		FullLoadLockWaitTimeoutSec:     req.FullLoadLockWaitTimeoutSec,     // 设置V2取表锁等待秒数
-		FullLoadDegradeOnAlignLockFail: req.FullLoadDegradeOnAlignLockFail, // 设置对齐取锁失败策略
-		FullLoadQueryTimeoutSec:      req.FullLoadQueryTimeoutSec,      // 设置V2查询超时秒数
-		FullLoadStreamIdleTimeoutSec: req.FullLoadStreamIdleTimeoutSec, // 设置V2流式无进展超时
-		FullLoadStreamMaxDurationSec: req.FullLoadStreamMaxDurationSec, // 设置V2流式最长时长
-		FullLoadSlowQueryWarnSec:     req.FullLoadSlowQueryWarnSec,     // 设置V2慢查询告警秒数
+		FullLoadLockWaitTimeoutSec:     req.FullLoadLockWaitTimeoutSec,     // 已废弃字段：仅持久化兼容，引擎忽略
+		FullLoadDegradeOnAlignLockFail: req.FullLoadDegradeOnAlignLockFail, // 已废弃字段：仅持久化兼容，引擎忽略
+		FullLoadQueryTimeoutSec:        req.FullLoadQueryTimeoutSec,        // 设置V2查询超时秒数
+		FullLoadStreamIdleTimeoutSec:   req.FullLoadStreamIdleTimeoutSec,   // 设置V2流式无进展超时
+		FullLoadStreamMaxDurationSec:   req.FullLoadStreamMaxDurationSec,   // 设置V2流式最长时长
+		FullLoadSlowQueryWarnSec:       req.FullLoadSlowQueryWarnSec,       // 设置V2慢查询告警秒数
 		FullLoadTableNoProgressSec:     req.FullLoadTableNoProgressSec,     // 设置V2表无进展告警秒数
 		FullLoadReadRetryTimes:         req.FullLoadReadRetryTimes,         // 设置V2表级读取重试次数
 		FullLoadTwoPhaseRead:           req.FullLoadTwoPhaseRead,           // 设置V2单列PK两阶段读取
 		FullLoadEnableStaging:          req.FullLoadEnableStaging,          // 设置V2 staging表隔离
+		AllowNopkAll:                   req.AllowNopkAll,                   // ALL 无PK/UK 风险确认
 		SourceDB:                       sourceDB,                           // 设置源数据库配置
 		TargetDB:                       targetDB,                           // 设置目标数据库配置
 		SinkConfigs:                    sinkConfigs,                        // 设置增量目标端配置
@@ -962,6 +965,10 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.FullLoadEnableStaging != nil {
 		task.Config.FullLoadEnableStaging = *req.FullLoadEnableStaging
 	}
+	if req.AllowNopkAll != nil {
+		// 仅写入配置开关；确认时间戳由 TaskService.UpdateTask 在 live 任务上原子维护。
+		task.Config.AllowNopkAll = *req.AllowNopkAll
+	}
 
 	// 更新数据库配置
 	if req.SourceDB != nil { // 如果提供了源数据库配置
@@ -1064,16 +1071,17 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	FullLoadBatchBytesMB           *int                   `json:"full_load_batch_bytes_mb,omitempty"`             // V2 单条INSERT字节上限MiB（可选）
 	FullLoadCommitRows             *int                   `json:"full_load_commit_rows,omitempty"`                // V2 单事务行数上限（可选）
 	FullLoadCommitBytesMB          *int                   `json:"full_load_commit_bytes_mb,omitempty"`            // V2 单事务字节上限MiB（可选）
-	FullLoadLockWaitTimeoutSec     *int                   `json:"full_load_lock_wait_timeout_sec,omitempty"`      // V2 取表锁等待秒数（可选）
-	FullLoadDegradeOnAlignLockFail *bool                  `json:"full_load_degrade_on_align_lock_fail,omitempty"` // 对齐取锁失败是否降级（可选）
-	FullLoadQueryTimeoutSec        *int                   `json:"full_load_query_timeout_sec,omitempty"`           // V2 查询超时秒数（可选）
-	FullLoadStreamIdleTimeoutSec   *int                   `json:"full_load_stream_idle_timeout_sec,omitempty"`  // V2 流式无进展超时（可选）
-	FullLoadStreamMaxDurationSec   *int                   `json:"full_load_stream_max_duration_sec,omitempty"`  // V2 流式最长时长（可选）
-	FullLoadSlowQueryWarnSec       *int                   `json:"full_load_slow_query_warn_sec,omitempty"`         // V2 慢查询告警秒数（可选）
+	FullLoadLockWaitTimeoutSec     *int                   `json:"full_load_lock_wait_timeout_sec,omitempty"`      // 已废弃：可选，引擎忽略
+	FullLoadDegradeOnAlignLockFail *bool                  `json:"full_load_degrade_on_align_lock_fail,omitempty"` // 已废弃：可选，引擎忽略
+	FullLoadQueryTimeoutSec        *int                   `json:"full_load_query_timeout_sec,omitempty"`          // V2 查询超时秒数（可选）
+	FullLoadStreamIdleTimeoutSec   *int                   `json:"full_load_stream_idle_timeout_sec,omitempty"`    // V2 流式无进展超时（可选）
+	FullLoadStreamMaxDurationSec   *int                   `json:"full_load_stream_max_duration_sec,omitempty"`    // V2 流式最长时长（可选）
+	FullLoadSlowQueryWarnSec       *int                   `json:"full_load_slow_query_warn_sec,omitempty"`        // V2 慢查询告警秒数（可选）
 	FullLoadTableNoProgressSec     *int                   `json:"full_load_table_no_progress_sec,omitempty"`      // V2 表无进展告警秒数（可选）
 	FullLoadReadRetryTimes         *int                   `json:"full_load_read_retry_times,omitempty"`           // V2 表级重试次数（可选）
 	FullLoadTwoPhaseRead           *bool                  `json:"full_load_two_phase_read,omitempty"`             // V2 单列PK两阶段读取（可选）
 	FullLoadEnableStaging          *bool                  `json:"full_load_enable_staging,omitempty"`             // V2 staging表隔离（可选）
+	AllowNopkAll                   *bool                  `json:"allow_nopk_all,omitempty"`                       // ALL 无PK/UK 风险确认（可选）
 	SourceDB                       *DatabaseConfigRequest `json:"source_db,omitempty"`                            // 源数据库配置（可选）
 	TargetDB                       *DatabaseConfigRequest `json:"target_db,omitempty"`                            // 目标数据库配置（可选）
 	SinkConfigs                    []SinkConfigRequest    `json:"sink_configs,omitempty"`                         // 增量目标端配置（可选）

@@ -19,6 +19,7 @@ import (
 	"mysql-to-sync/internal/checkpoint"
 	"mysql-to-sync/internal/config"
 	"mysql-to-sync/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/sync/fullload"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -117,6 +118,286 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepsAutoIncrementKey(t *testing.T)
 	assert.NotContains(t, stripped, "KEY `idx_dealer_id` (`dealer_id`)")
 	assert.NotContains(t, stripped, "KEY `idx_name` (`name`)")
 	assert.False(t, strings.Contains(stripped, ",\n) ENGINE"))
+}
+
+func TestSelectDeferredIndexes_ALLKeepsIdentityUK(t *testing.T) {
+	ukIdentity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.UKStrategy,
+		HasUK:        true,
+		IdentifyCols: []string{"email"},
+	}
+	indexes := []map[string]interface{}{
+		{"name": "uk_email", "non_unique": 0, "columns": "`email`"},
+		{"name": "uk_phone", "non_unique": 0, "columns": "`phone`"},
+		{"name": "idx_name", "non_unique": 1, "columns": "`name`"},
+	}
+
+	// optimize_index=true：保留 identity UK，延迟其他唯一+非唯一
+	deferred := selectDeferredIndexes(indexes, ukIdentity, taskEntity.SyncModeAll, true)
+	require.Len(t, deferred, 2)
+	assert.Equal(t, "uk_phone", deferred[0]["name"])
+	assert.Equal(t, "idx_name", deferred[1]["name"])
+
+	// optimize_index=false：仍延迟非 identity 唯一索引，但保留普通二级索引
+	deferred = selectDeferredIndexes(indexes, ukIdentity, taskEntity.SyncModeAll, false)
+	require.Len(t, deferred, 1)
+	assert.Equal(t, "uk_phone", deferred[0]["name"])
+
+	// FULL + optimize：延迟全部非 PK（含 identity UK）
+	deferred = selectDeferredIndexes(indexes, ukIdentity, taskEntity.SyncModeFull, true)
+	require.Len(t, deferred, 3)
+}
+
+func TestDropDeferredIndexes_FailClosedRestoresDropped(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	// SHOW INDEX: two unique indexes to defer
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_phone`").WillReturnError(fmt.Errorf("cannot drop"))
+	// rollback already-dropped uk_code
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		context.Background(),
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.Contains(t, dropErr.Error(), "failed to drop deferred index")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDropDeferredIndexes_ContextCanceled_RestoresWithCleanupContext(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	// 父 ctx 在第一次 DROP 后取消：第二次 DROP 在进入 driver 前即以 context.Canceled 失败。
+	// rollback 必须走独立 cleanup context，否则 restoreIndexes 会立刻因同一已取消 ctx 失败。
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	afterDeferredIndexDropped = func() { cancel() }
+	defer func() { afterDeferredIndexDropped = nil }()
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		ctx,
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.ErrorIs(t, dropErr, context.Canceled)
+	assert.Contains(t, dropErr.Error(), "failed to drop deferred index")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDropDeferredIndexes_SchemaLockLost_RestoresWithCleanupContext(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	// second DROP is not attempted after schema lock lost; rollback uk_code instead
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	afterDeferredIndexDropped = func() { cancel(fullload.ErrSchemaLockLost) }
+	defer func() { afterDeferredIndexDropped = nil }()
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		ctx,
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.ErrorIs(t, dropErr, fullload.ErrSchemaLockLost)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDropDeferredIndexes_SingleIndexCancelAfterDrop_Restores(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	// 唯一待删索引 DROP 后立即取消：无下一轮循环，依赖 return 前检查触发回滚。
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	afterDeferredIndexDropped = func() { cancel() }
+	defer func() { afterDeferredIndexDropped = nil }()
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		ctx,
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.ErrorIs(t, dropErr, context.Canceled)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDropDeferredIndexes_SingleIndexSchemaLockLostAfterDrop_Restores(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	afterDeferredIndexDropped = func() { cancel(fullload.ErrSchemaLockLost) }
+	defer func() { afterDeferredIndexDropped = nil }()
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		ctx,
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.ErrorIs(t, dropErr, fullload.ErrSchemaLockLost)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMergePendingIndexRestores_MergesIndexesForSameTable(t *testing.T) {
+	base := []pendingIndexRestore{{
+		targetSchema: "db",
+		targetTable:  "t",
+		indexes: []map[string]interface{}{
+			{"name": "idx_a", "columns": "`a`"},
+		},
+	}}
+	extra := []pendingIndexRestore{{
+		targetSchema: "db",
+		targetTable:  "t",
+		indexes: []map[string]interface{}{
+			{"name": "idx_a", "columns": "`a`"}, // duplicate
+			{"name": "idx_b", "columns": "`b`"}, // supplementary
+		},
+	}, {
+		targetSchema: "db",
+		targetTable:  "other",
+		indexes: []map[string]interface{}{
+			{"name": "idx_x", "columns": "`x`"},
+		},
+	}}
+
+	merged := mergePendingIndexRestores(base, extra)
+	require.Len(t, merged, 2)
+
+	require.Equal(t, "t", merged[0].targetTable)
+	require.Len(t, merged[0].indexes, 2)
+	assert.Equal(t, "idx_a", merged[0].indexes[0]["name"])
+	assert.Equal(t, "idx_b", merged[0].indexes[1]["name"])
+
+	require.Equal(t, "other", merged[1].targetTable)
+	require.Len(t, merged[1].indexes, 1)
+	assert.Equal(t, "idx_x", merged[1].indexes[0]["name"])
+}
+
+func TestStripIndexesByNameFromCreateSQL_KeepsIdentityUK(t *testing.T) {
+	createSQL := "CREATE TABLE `users` (\n" +
+		"  `id` bigint NOT NULL,\n" +
+		"  `email` varchar(255) NOT NULL,\n" +
+		"  `phone` varchar(32) DEFAULT NULL,\n" +
+		"  UNIQUE KEY `uk_email` (`email`),\n" +
+		"  UNIQUE KEY `uk_phone` (`phone`),\n" +
+		"  KEY `idx_phone` (`phone`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+	stripped := stripIndexesByNameFromCreateSQL(createSQL, map[string]struct{}{
+		"uk_phone":  {},
+		"idx_phone": {},
+	})
+	assert.Contains(t, stripped, "UNIQUE KEY `uk_email` (`email`)")
+	assert.NotContains(t, stripped, "UNIQUE KEY `uk_phone`")
+	assert.NotContains(t, stripped, "KEY `idx_phone`")
 }
 
 func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
@@ -430,7 +711,7 @@ func TestFilterIndexesUsingAutoIncrementColumns_EmptyAutoIncrements(t *testing.T
 	assert.Equal(t, indexes, filtered)
 }
 
-func TestDropNonPrimaryKeyIndexes_SkipsFailedDrops(t *testing.T) {
+func TestDropNonPrimaryKeyIndexes_FailClosedRestoresDropped(t *testing.T) {
 	targetDB, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer targetDB.Close()
@@ -445,14 +726,18 @@ func TestDropNonPrimaryKeyIndexes_SkipsFailedDrops(t *testing.T) {
 	mock.ExpectQuery("SHOW INDEX FROM `db`.`t`").WillReturnRows(rows)
 	mock.ExpectExec("ALTER TABLE `db`.`t` DROP INDEX `idx_a`").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `db`.`t` DROP INDEX `idx_b`").WillReturnError(fmt.Errorf("lock wait timeout"))
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_a").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a`").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{}
 	runtime := &taskRuntime{targetDB: targetDB}
 	dropped, err := ts.dropNonPrimaryKeyIndexes(context.Background(), runtime, "db", "t")
 
-	require.NoError(t, err)
-	require.Len(t, dropped, 1)
-	assert.Equal(t, "idx_a", dropped[0]["name"])
+	require.Error(t, err)
+	assert.Nil(t, dropped)
+	assert.Contains(t, err.Error(), "failed to drop deferred index")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -1160,6 +1445,43 @@ func TestUpdateTask_PreservesLiveContextFromSnapshot(t *testing.T) {
 	assert.Equal(t, "renamed", live.Config.Name)
 	assert.Equal(t, int64(42), live.Context.TotalRows)
 	assert.InDelta(t, 12.5, live.Context.ProgressPercent, 0.01)
+}
+
+func TestUpdateTask_PersistsNopkAllRiskAcknowledgement(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newTestTaskService(dataDir)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "nopk_ack_upd", Name: "orig", Mode: taskEntity.SyncModeAll})
+	require.NoError(t, err)
+	assert.False(t, task.HasNopkAllRiskAcknowledgement())
+
+	snap, ok := ts.GetTaskSnapshot("nopk_ack_upd")
+	require.True(t, ok)
+	snap.Config.AllowNopkAll = true
+	// 模拟 handler：只改 Config，不碰 live Context。
+	require.NoError(t, ts.UpdateTask(snap))
+
+	live, _ := ts.GetTask("nopk_ack_upd")
+	require.True(t, live.HasNopkAllRiskAcknowledgement())
+	assert.True(t, live.Config.AllowNopkAll)
+	firstAck := *live.Context.NopkAllRiskAcknowledgedAt
+
+	// 再次勾选不应覆盖已有确认时间。
+	snap2, ok := ts.GetTaskSnapshot("nopk_ack_upd")
+	require.True(t, ok)
+	snap2.Config.AllowNopkAll = true
+	require.NoError(t, ts.UpdateTask(snap2))
+	live2, _ := ts.GetTask("nopk_ack_upd")
+	assert.Equal(t, firstAck, *live2.Context.NopkAllRiskAcknowledgedAt)
+
+	// 取消勾选必须清除服务端时间戳。
+	snap3, ok := ts.GetTaskSnapshot("nopk_ack_upd")
+	require.True(t, ok)
+	snap3.Config.AllowNopkAll = false
+	require.NoError(t, ts.UpdateTask(snap3))
+	live3, _ := ts.GetTask("nopk_ack_upd")
+	assert.False(t, live3.HasNopkAllRiskAcknowledgement())
+	assert.False(t, live3.Config.AllowNopkAll)
 }
 
 func TestDeleteTask_RejectsRunning(t *testing.T) {
@@ -2934,7 +3256,7 @@ func TestEnsureTargetTable_DropBeforeDDLRecreatesExistingTable(t *testing.T) {
 		runtime.targetDB = targetDB
 
 		// ensureTargetTable ??? CREATE TABLE LIKE ???????? DROP????????????
-		_, err = ts.ensureTargetTable(context.Background(), runtime, "source_db", "target_db", "users", "users", false, true)
+		_, err = ts.ensureTargetTable(context.Background(), runtime, "source_db", "target_db", "users", "users", false, true, pkUsersIdentity(), taskEntity.SyncModeFull)
 		require.NoError(t, err)
 	})
 
@@ -2955,14 +3277,13 @@ func TestMin(t *testing.T) {
 
 // captureFullSyncStartPosition ????"?????"???
 // ??? FTWRL?SHOW MASTER STATUS ??????? UNLOCK?
-func TestCaptureFullSyncStartPosition_ShortReadLock(t *testing.T) {
+func TestCaptureFullSyncStartPosition_UnlockedMasterStatus(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
 
-	mock.ExpectExec("FLUSH TABLES WITH READ LOCK").WillReturnResult(sqlmock.NewResult(0, 0))
+	// 新语义：无 FTWRL / UNLOCK，仅 SHOW MASTER STATUS。
 	mock.ExpectQuery("SHOW MASTER STATUS").WillReturnRows(sqlmock.NewRows([]string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set"}).AddRow("mysql-bin.000123", 456, "", "", ""))
-	mock.ExpectExec("UNLOCK TABLES").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := newTestTaskService(t.TempDir())
 	pos, err := ts.captureFullSyncStartPosition(context.Background(), &taskRuntime{sourceDB: db})
@@ -3562,6 +3883,107 @@ func TestErrFullSyncStoppedByUser_IsSentinel(t *testing.T) {
 	assert.False(t, errors.Is(other, errFullSyncStoppedByUser))
 }
 
+func TestErrFullSyncPreflight_IsSentinel(t *testing.T) {
+	wrapped := fmt.Errorf("%w: need allow_nopk_all", errFullSyncPreflight)
+	assert.True(t, errors.Is(wrapped, errFullSyncPreflight))
+	assert.False(t, errors.Is(fmt.Errorf("other"), errFullSyncPreflight))
+}
+
+type nopkIdentityAnalyzer struct{}
+
+func (a *nopkIdentityAnalyzer) AnalyzeTable(_, tableName string) (*entity.TableIdentity, error) {
+	return &entity.TableIdentity{
+		TableName:    tableName,
+		Strategy:     entity.FullColumnsStrategy,
+		IdentifyCols: []string{"a", "b"},
+	}, nil
+}
+func (a *nopkIdentityAnalyzer) GetAllTables(string) ([]entity.TableInfo, error) {
+	return nil, nil
+}
+func (a *nopkIdentityAnalyzer) GetAllDatabases() ([]string, error) { return nil, nil }
+
+type failingAnalyzeAnalyzer struct{ err error }
+
+func (a *failingAnalyzeAnalyzer) AnalyzeTable(_, _ string) (*entity.TableIdentity, error) {
+	return nil, a.err
+}
+func (a *failingAnalyzeAnalyzer) GetAllTables(string) ([]entity.TableInfo, error) {
+	return nil, nil
+}
+func (a *failingAnalyzeAnalyzer) GetAllDatabases() ([]string, error) { return nil, nil }
+
+func TestExecuteSync_ALLMissingNopkAckDoesNotMarkFullFailed(t *testing.T) {
+	sourceDB, sourceMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer sourceDB.Close()
+	targetDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+	sourceMock.MatchExpectationsInOrder(false)
+	// 估算行数允许失败；确认门禁只依赖 AnalyzeTable。
+	sourceMock.ExpectQuery("SELECT TABLE_ROWS").WillReturnError(fmt.Errorf("skip estimate"))
+
+	ts := newTestTaskService(t.TempDir())
+	ts.checkpointManager = checkpoint.NewMemoryCheckpointManager()
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:           "all_nopk_no_ack",
+		Name:         "ALL No Ack",
+		Mode:         taskEntity.SyncModeAll,
+		SourceSchema: "src",
+		Tables:       []string{"audit"},
+	})
+	task.Start()
+	ts.tasks[task.Config.ID] = task
+	phaseBefore := task.Context.SyncPhase
+
+	runtime := &taskRuntime{
+		sourceDB: sourceDB,
+		targetDB: targetDB,
+		analyzer: &nopkIdentityAnalyzer{},
+	}
+	ts.runtimes[task.Config.ID] = runtime
+	ts.executeSync(context.Background(), task.Config.ID, runtime)
+
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Equal(t, phaseBefore, task.Context.SyncPhase, "missing ack must not pollute SyncPhase to FULL_FAILED")
+	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
+	assert.Contains(t, task.Context.ErrorStack, "allow_nopk_all")
+}
+
+func TestExecuteFullSync_ALLAnalyzeFailureIsFailClosedPreflight(t *testing.T) {
+	sourceDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer sourceDB.Close()
+	targetDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:           "all_meta_fail",
+		Name:         "ALL Meta Fail",
+		Mode:         taskEntity.SyncModeAll,
+		SourceSchema: "src",
+		Tables:       []string{"t1"},
+		AllowNopkAll: true,
+	})
+	task.AcknowledgeNopkAllRisk(time.Now())
+	task.Start()
+	ts.tasks[task.Config.ID] = task
+
+	runtime := &taskRuntime{
+		sourceDB: sourceDB,
+		targetDB: targetDB,
+		analyzer: &failingAnalyzeAnalyzer{err: fmt.Errorf("metadata unavailable")},
+	}
+	err = ts.executeFullSync(context.Background(), task, runtime)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errFullSyncPreflight)
+	assert.Contains(t, err.Error(), "analyze table")
+	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
+}
+
 // TestFormatBinlogPosition ??????????????????
 func TestFormatBinlogPosition(t *testing.T) {
 	cases := []struct {
@@ -3589,49 +4011,6 @@ type mysqlPositionLike struct {
 
 func (p mysqlPositionLike) toMysql() mysql.Position {
 	return mysql.Position{Name: p.Name, Pos: p.Pos}
-}
-
-func TestParseTableBinlogHWMs(t *testing.T) {
-	got := parseTableBinlogHWMs(map[string]string{
-		"db.a": "mysql-bin.000001:100",
-		"db.b": "bad",
-		"db.c": "mysql-bin.000002:200",
-	})
-	require.Len(t, got, 2)
-	assert.Equal(t, mysql.Position{Name: "mysql-bin.000001", Pos: 100}, got["db.a"])
-	assert.Equal(t, mysql.Position{Name: "mysql-bin.000002", Pos: 200}, got["db.c"])
-	assert.Nil(t, parseTableBinlogHWMs(map[string]string{"db.z": "mysql-bin.000001:0"}))
-	assert.Nil(t, parseTableBinlogHWMs(nil))
-}
-
-func TestPersistTableBinlogHWM_PersistsBeforeCompleted(t *testing.T) {
-	ts := newTestTaskService(t.TempDir())
-	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "hwm_persist", Mode: taskEntity.SyncModeAll})
-	ts.tasks[task.Config.ID] = task
-
-	err := ts.persistTableBinlogHWM(task.Config.ID, "src", "nopk", mysql.Position{Name: "mysql-bin.000003", Pos: 456})
-	require.NoError(t, err)
-	assert.Equal(t, "mysql-bin.000003:456", task.Context.TableBinlogHWMs["src.nopk"])
-
-	// clearFullSyncResume ???????? HWM????????
-	ts.clearFullSyncResume(task.Config.ID)
-	assert.Equal(t, "mysql-bin.000003:456", task.Context.TableBinlogHWMs["src.nopk"])
-
-	// ???????????
-	ts.updateSyncPhase(task.Config.ID, func(t *taskEntity.SyncTask) {
-		t.ClearTableBinlogHWMs()
-		t.MarkFullSyncStarted("mysql-bin.000004:1")
-	})
-	assert.Nil(t, task.Context.TableBinlogHWMs)
-}
-
-func TestPersistTableBinlogHWM_FailsClosedOnEmptyPosition(t *testing.T) {
-	ts := newTestTaskService(t.TempDir())
-	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "hwm_empty"})
-	ts.tasks[task.Config.ID] = task
-	err := ts.persistTableBinlogHWM(task.Config.ID, "s", "t", mysql.Position{})
-	require.Error(t, err)
-	assert.Nil(t, task.Context.TableBinlogHWMs)
 }
 
 // ==================== ??????? ====================

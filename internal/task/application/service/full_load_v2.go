@@ -11,8 +11,6 @@ import (
 	"mysql-to-sync/internal/sync/infrastructure/reader"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 	"mysql-to-sync/pkg/logger"
-
-	"github.com/go-mysql-org/go-mysql/mysql"
 )
 
 // fullLoadStatsStore 保存每个任务最近一次 V2 引擎运行的统计快照指针，供任务详情接口读取。
@@ -110,19 +108,21 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		}
 
 		effectiveDropBeforeDDL := task.Config.EnableDropTableBeforeDDL && !dbLevelRebuilt
-		savedIndexes, err := s.ensureTargetTable(ctx, runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL)
+		savedIndexes, err := s.ensureTargetTable(ctx, runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL, identity, task.Config.Mode)
 		if err != nil {
 			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s -> %s.%s: %v", sourceSchema, tableName, targetSchema, targetTableName, err)
 			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
 			return fmt.Errorf("%s", errMsg)
 		}
-		if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
-			indexes, dropErr := s.dropNonPrimaryKeyIndexes(ctx, runtime, targetSchema, targetTableName)
+		needDefer := (task.Config.OptimizeIndex || task.Config.Mode == taskEntity.SyncModeAll) && len(savedIndexes) == 0
+		if needDefer {
+			indexes, dropErr := s.dropDeferredIndexes(ctx, runtime, targetSchema, targetTableName, identity, task.Config.Mode, task.Config.OptimizeIndex)
 			if dropErr != nil {
-				logger.Warn("[Task %s] FullLoadV2: drop indexes for %s.%s failed: %v", taskID, targetSchema, targetTableName, dropErr)
-			} else {
-				savedIndexes = indexes
+				errMsg := fmt.Sprintf("Failed to drop deferred indexes for %s.%s: %v", targetSchema, targetTableName, dropErr)
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
+			savedIndexes = indexes
 		}
 
 		est, _ := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity).GetEstimatedCount(ctx)
@@ -160,8 +160,6 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		BatchSize:                    task.Config.BatchSize,
 		LegacyTxCommitEveryNParallel: task.Config.TxCommitEveryNParallel,
 		SkipBinlog:                   task.Config.EnableSkipBinlog,
-		LockWaitTimeoutSec:           task.Config.FullLoadLockWaitTimeoutSec,
-		DegradeOnAlignLockFail:       task.Config.FullLoadDegradeOnAlignLockFail,
 		QueryTimeoutSec:              task.Config.FullLoadQueryTimeoutSec,
 		StreamIdleTimeoutSec:         task.Config.FullLoadStreamIdleTimeoutSec,
 		StreamMaxDurationSec:         task.Config.FullLoadStreamMaxDurationSec,
@@ -186,22 +184,13 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	}
 
 	engine := &fullload.Engine{
-		SourceDB:        runtime.sourceDB,
-		TargetDB:        runtime.targetDB,
-		Options:         opt,
-		Stats:           stats,
-		TaskID:          taskID,
-		SchemaLocks:     schemaLocks,
-		IsStopped:       func() bool { return s.isTaskStopped(taskID) },
-		CaptureTableHWM: task.Config.Mode == taskEntity.SyncModeAll,
-		OnTableSnapshotReady: func(schema, table string, pos mysql.Position) error {
-			if err := s.persistTableBinlogHWM(taskID, schema, table, pos); err != nil {
-				return err
-			}
-			logger.Info("[Task %s] FullLoadV2: persisted table binlog HWM for %s.%s at %s:%d",
-				taskID, schema, table, pos.Name, pos.Pos)
-			return nil
-		},
+		SourceDB:    runtime.sourceDB,
+		TargetDB:    runtime.targetDB,
+		Options:     opt,
+		Stats:       stats,
+		TaskID:      taskID,
+		SchemaLocks: schemaLocks,
+		IsStopped:   func() bool { return s.isTaskStopped(taskID) },
 		OnCommit: func(schema, table string, rows, bytes int64) {
 			mark := schema + "." + table
 			taskTotalRows := s.incrementTaskProgress(taskID, rows, mark)
@@ -231,7 +220,7 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	}
 
 	// 数据复制完成后再入队索引恢复，避免与写路径争抢目标库连接池。
-	if pending != nil && task.Config.OptimizeIndex {
+	if pending != nil {
 		for _, r := range ready {
 			if len(r.savedIndexes) == 0 {
 				continue

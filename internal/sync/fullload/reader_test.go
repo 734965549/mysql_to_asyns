@@ -516,6 +516,109 @@ func TestClassifyScanError_QueryTimeoutRetryable(t *testing.T) {
 	}
 }
 
+func TestChunkReaderUsesSnapshotQueryer(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload"}},
+		},
+	}
+	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{int64(0)}, End: []any{int64(10)}}
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE").
+		WithArgs(int64(0), int64(10), 10).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(1), "x"))
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	cr, err := newChunkReader(conn, chunk, 10, defaultBatchBytes, Options{}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cr.close()
+	batch, err := cr.nextBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Rows) != 1 {
+		t.Fatalf("rows=%d", len(batch.Rows))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlanIntegerRange_UsesPlanQueryer(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", EstimatedRows: 100,
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id", DataType: "bigint"}},
+		},
+	}
+	mock.ExpectQuery("SELECT MIN\\(`id`\\), MAX\\(`id`\\) FROM `s`.`t`").
+		WillReturnRows(sqlmock.NewRows([]string{"min", "max"}).AddRow(int64(1), int64(100)))
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	chunks, err := NewPlanner(conn).planTable(context.Background(), spec, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 4 {
+		t.Fatalf("chunks=%d want 4", len(chunks))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDecideTableReaders 验证按估算行数/chunk 数决定单表内并行读连接数。
+func TestDecideTableReaders(t *testing.T) {
+	opt := ResolveOptions(RawOptions{ReadWorkers: 4})
+	job := &tableReadJob{
+		spec: &TableSpec{
+			EstimatedRows: 50,
+			Identity:      &entity.TableIdentity{Strategy: entity.PKStrategy, Columns: []entity.ColumnMeta{{Name: "id"}}},
+		},
+		chunks: []*Chunk{{ID: "1"}, {ID: "2"}, {ID: "3"}},
+	}
+	if got := decideTableReaders(job, opt); got != 1 {
+		t.Fatalf("small table readers=%d want 1", got)
+	}
+	job.spec.EstimatedRows = defaultLargeTableRows
+	if got := decideTableReaders(job, opt); got != 3 {
+		t.Fatalf("large table readers=%d want 3 (min chunks)", got)
+	}
+	if got := decideTableReadersForSpec(job.spec, opt); got != 4 {
+		t.Fatalf("large table pre-plan readers=%d want 4", got)
+	}
+	job.chunks = []*Chunk{{ID: "only"}}
+	if got := decideTableReaders(job, opt); got != 1 {
+		t.Fatalf("single chunk readers=%d want 1", got)
+	}
+}
+
 // TestClassifyScanError_ParentCancelNotTimeout 验证父 ctx 取消时不误判为查询超时。
 func TestClassifyScanError_ParentCancelNotTimeout(t *testing.T) {
 	spec := &TableSpec{

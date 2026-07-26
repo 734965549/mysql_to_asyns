@@ -31,11 +31,6 @@ type Stats struct {
 	ActiveReaders int64
 	ActiveWriters int64
 
-	ActiveSnapshotGroups    int64 // 当前活跃表级 snapshot group 数
-	ActiveSnapshotTxns      int64 // 当前持有的快照事务/连接数
-	OldestSnapshotAgeMillis int64 // 最老活跃 snapshot group 存活时长
-	SnapshotAlignDegrades   int64 // 对齐取锁失败后降级为单连接的次数
-
 	QueueBytes int64 // 队列当前字节数（瞬时）
 	QueueCap   int64 // 队列容量字节数
 
@@ -75,7 +70,6 @@ func (s *Stats) addEnqueueWait(dur time.Duration) { atomic.AddInt64(&s.EnqueueWa
 func (s *Stats) incTxReplays()                    { atomic.AddInt64(&s.TxReplays, 1) }
 func (s *Stats) incLockRetries()                  { atomic.AddInt64(&s.LockRetries, 1) }
 func (s *Stats) incChunkDone()                    { atomic.AddInt64(&s.ChunksDone, 1) }
-func (s *Stats) incSnapshotAlignDegrades()        { atomic.AddInt64(&s.SnapshotAlignDegrades, 1) }
 func (s *Stats) setQueue(bytes, cap int64) {
 	atomic.StoreInt64(&s.QueueBytes, bytes)
 	atomic.StoreInt64(&s.QueueCap, cap)
@@ -83,70 +77,62 @@ func (s *Stats) setQueue(bytes, cap int64) {
 
 // StatsSnapshot 是 Stats 的只读快照，可直接 JSON 序列化返回给任务详情接口。
 type StatsSnapshot struct {
-	ReadRows                int64 `json:"read_rows"`
-	ReadBytes               int64 `json:"read_bytes"`
-	ReadBatches             int64 `json:"read_batches"`
-	ReadMillis              int64 `json:"read_millis"`
-	WrittenRows             int64 `json:"written_rows"`
-	WrittenBytes            int64 `json:"written_bytes"`
-	WrittenBatches          int64 `json:"written_batches"`
-	WriteMillis             int64 `json:"write_millis"`
-	CommittedRows           int64 `json:"committed_rows"`
-	CommittedBytes          int64 `json:"committed_bytes"`
-	Commits                 int64 `json:"commits"`
-	CommitMillis            int64 `json:"commit_millis"`
-	EnqueueWaitMs           int64 `json:"enqueue_wait_millis"`
-	TxReplays               int64 `json:"tx_replays"`
-	LockRetries             int64 `json:"lock_retries"`
-	ActiveReaders           int64 `json:"active_readers"`
-	ActiveWriters           int64 `json:"active_writers"`
-	ActiveSnapshotGroups    int64 `json:"active_snapshot_groups"`
-	ActiveSnapshotTxns      int64 `json:"active_snapshot_txns"`
-	OldestSnapshotAgeMillis int64 `json:"oldest_snapshot_age_millis"`
-	SnapshotAlignDegrades   int64 `json:"snapshot_align_degrades"`
-	QueueBytes              int64 `json:"queue_bytes"`
-	QueueCap                int64 `json:"queue_cap_bytes"`
-	ChunksTotal             int64 `json:"chunks_total"`
-	ChunksDone              int64 `json:"chunks_done"`
-	QueryTimeouts           int64 `json:"query_timeouts"`
-	SlowQueries             int64 `json:"slow_queries"`
-	TableRetries            int64 `json:"table_retries"`
-	TableRetryExhausted     int64 `json:"table_retry_exhausted"`
-	ActiveStagingTables     int64 `json:"active_staging_tables"`
+	ReadRows            int64 `json:"read_rows"`
+	ReadBytes           int64 `json:"read_bytes"`
+	ReadBatches         int64 `json:"read_batches"`
+	ReadMillis          int64 `json:"read_millis"`
+	WrittenRows         int64 `json:"written_rows"`
+	WrittenBytes        int64 `json:"written_bytes"`
+	WrittenBatches      int64 `json:"written_batches"`
+	WriteMillis         int64 `json:"write_millis"`
+	CommittedRows       int64 `json:"committed_rows"`
+	CommittedBytes      int64 `json:"committed_bytes"`
+	Commits             int64 `json:"commits"`
+	CommitMillis        int64 `json:"commit_millis"`
+	EnqueueWaitMs       int64 `json:"enqueue_wait_millis"`
+	TxReplays           int64 `json:"tx_replays"`
+	LockRetries         int64 `json:"lock_retries"`
+	ActiveReaders       int64 `json:"active_readers"`
+	ActiveWriters       int64 `json:"active_writers"`
+	QueueBytes          int64 `json:"queue_bytes"`
+	QueueCap            int64 `json:"queue_cap_bytes"`
+	ChunksTotal         int64 `json:"chunks_total"`
+	ChunksDone          int64 `json:"chunks_done"`
+	QueryTimeouts       int64 `json:"query_timeouts"`
+	SlowQueries         int64 `json:"slow_queries"`
+	TableRetries        int64 `json:"table_retries"`
+	TableRetryExhausted int64 `json:"table_retry_exhausted"`
+	ActiveStagingTables int64 `json:"active_staging_tables"`
 }
 
 // Snapshot 返回当前统计的一致快照。
 func (s *Stats) Snapshot() StatsSnapshot {
 	return StatsSnapshot{
-		ReadRows:                atomic.LoadInt64(&s.ReadRows),
-		ReadBytes:               atomic.LoadInt64(&s.ReadBytes),
-		ReadBatches:             atomic.LoadInt64(&s.ReadBatches),
-		ReadMillis:              atomic.LoadInt64(&s.ReadNanos) / int64(time.Millisecond),
-		WrittenRows:             atomic.LoadInt64(&s.WrittenRows),
-		WrittenBytes:            atomic.LoadInt64(&s.WrittenBytes),
-		WrittenBatches:          atomic.LoadInt64(&s.WrittenBatches),
-		WriteMillis:             atomic.LoadInt64(&s.WriteNanos) / int64(time.Millisecond),
-		CommittedRows:           atomic.LoadInt64(&s.CommittedRows),
-		CommittedBytes:          atomic.LoadInt64(&s.CommittedBytes),
-		Commits:                 atomic.LoadInt64(&s.Commits),
-		CommitMillis:            atomic.LoadInt64(&s.CommitNanos) / int64(time.Millisecond),
-		EnqueueWaitMs:           atomic.LoadInt64(&s.EnqueueWaitNanos) / int64(time.Millisecond),
-		TxReplays:               atomic.LoadInt64(&s.TxReplays),
-		LockRetries:             atomic.LoadInt64(&s.LockRetries),
-		ActiveReaders:           atomic.LoadInt64(&s.ActiveReaders),
-		ActiveWriters:           atomic.LoadInt64(&s.ActiveWriters),
-		ActiveSnapshotGroups:    atomic.LoadInt64(&s.ActiveSnapshotGroups),
-		ActiveSnapshotTxns:      atomic.LoadInt64(&s.ActiveSnapshotTxns),
-		OldestSnapshotAgeMillis: atomic.LoadInt64(&s.OldestSnapshotAgeMillis),
-		SnapshotAlignDegrades:   atomic.LoadInt64(&s.SnapshotAlignDegrades),
-		QueueBytes:              atomic.LoadInt64(&s.QueueBytes),
-		QueueCap:                atomic.LoadInt64(&s.QueueCap),
-		ChunksTotal:             atomic.LoadInt64(&s.ChunksTotal),
-		ChunksDone:              atomic.LoadInt64(&s.ChunksDone),
-		QueryTimeouts:           atomic.LoadInt64(&s.QueryTimeouts),
-		SlowQueries:             atomic.LoadInt64(&s.SlowQueries),
-		TableRetries:            atomic.LoadInt64(&s.TableRetries),
-		TableRetryExhausted:     atomic.LoadInt64(&s.TableRetryExhausted),
-		ActiveStagingTables:     atomic.LoadInt64(&s.ActiveStagingTables),
+		ReadRows:            atomic.LoadInt64(&s.ReadRows),
+		ReadBytes:           atomic.LoadInt64(&s.ReadBytes),
+		ReadBatches:         atomic.LoadInt64(&s.ReadBatches),
+		ReadMillis:          atomic.LoadInt64(&s.ReadNanos) / int64(time.Millisecond),
+		WrittenRows:         atomic.LoadInt64(&s.WrittenRows),
+		WrittenBytes:        atomic.LoadInt64(&s.WrittenBytes),
+		WrittenBatches:      atomic.LoadInt64(&s.WrittenBatches),
+		WriteMillis:         atomic.LoadInt64(&s.WriteNanos) / int64(time.Millisecond),
+		CommittedRows:       atomic.LoadInt64(&s.CommittedRows),
+		CommittedBytes:      atomic.LoadInt64(&s.CommittedBytes),
+		Commits:             atomic.LoadInt64(&s.Commits),
+		CommitMillis:        atomic.LoadInt64(&s.CommitNanos) / int64(time.Millisecond),
+		EnqueueWaitMs:       atomic.LoadInt64(&s.EnqueueWaitNanos) / int64(time.Millisecond),
+		TxReplays:           atomic.LoadInt64(&s.TxReplays),
+		LockRetries:         atomic.LoadInt64(&s.LockRetries),
+		ActiveReaders:       atomic.LoadInt64(&s.ActiveReaders),
+		ActiveWriters:       atomic.LoadInt64(&s.ActiveWriters),
+		QueueBytes:          atomic.LoadInt64(&s.QueueBytes),
+		QueueCap:            atomic.LoadInt64(&s.QueueCap),
+		ChunksTotal:         atomic.LoadInt64(&s.ChunksTotal),
+		ChunksDone:          atomic.LoadInt64(&s.ChunksDone),
+		QueryTimeouts:       atomic.LoadInt64(&s.QueryTimeouts),
+		SlowQueries:         atomic.LoadInt64(&s.SlowQueries),
+		TableRetries:        atomic.LoadInt64(&s.TableRetries),
+		TableRetryExhausted: atomic.LoadInt64(&s.TableRetryExhausted),
+		ActiveStagingTables: atomic.LoadInt64(&s.ActiveStagingTables),
 	}
 }

@@ -758,6 +758,21 @@ func TestTableBinlogHWM_Lifecycle(t *testing.T) {
 	assert.Nil(t, task.Context.TableBinlogHWMs)
 }
 
+func TestNopkAllRiskAcknowledgementLifecycle(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "nopk_ack", Mode: SyncModeAll})
+	assert.False(t, task.HasNopkAllRiskAcknowledgement())
+
+	task.AcknowledgeNopkAllRisk(time.Time{})
+	require.True(t, task.HasNopkAllRiskAcknowledgement())
+	assert.True(t, task.Config.AllowNopkAll)
+	require.NotNil(t, task.Context.NopkAllRiskAcknowledgedAt)
+
+	task.ClearNopkAllRiskAcknowledgement()
+	assert.False(t, task.HasNopkAllRiskAcknowledgement())
+	assert.False(t, task.Config.AllowNopkAll)
+	assert.Nil(t, task.Context.NopkAllRiskAcknowledgedAt)
+}
+
 // TestFullLoadV2State_Lifecycle 验证 V2 表级状态的持久化生命周期(P3)。
 func TestFullLoadV2State_Lifecycle(t *testing.T) {
 	task := NewSyncTask(TaskConfig{ID: "v2_life", Mode: SyncModeAll, FullLoadEngine: "v2"})

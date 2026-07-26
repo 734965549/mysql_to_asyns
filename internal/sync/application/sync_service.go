@@ -47,8 +47,9 @@ type IncrementalSyncService struct {
 	// identities 保留在 service 中，供 OnEvent 的 normalizer 使用。与 MySQLSink 内部 identities 独立。
 	identities map[string]*entity.TableIdentity
 
-	// tableHWMs 表级高水位，key 为 "schema.table"。由 P0-2 注入；未设置时不启用过滤。
-	tableHWMs map[string]mysql.Position
+	// untilPosition bounded catch-up 目标；nil 表示持续增量。
+	untilPosition *mysql.Position
+	catchUpDone   bool
 
 	mu sync.RWMutex
 
@@ -65,27 +66,6 @@ func (s *IncrementalSyncService) SetPositionPersister(p PositionPersister) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.positionPersister = p
-}
-
-// SetTableHWMs 注入表级 binlog 高水位。传 nil 可清除；P0-2 负责从任务存档加载并调用。
-func (s *IncrementalSyncService) SetTableHWMs(hwms map[string]mysql.Position) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if hwms == nil {
-		s.tableHWMs = nil
-		return
-	}
-	copied := make(map[string]mysql.Position, len(hwms))
-	for key, pos := range hwms {
-		copied[key] = pos
-	}
-	s.tableHWMs = copied
-}
-
-func (s *IncrementalSyncService) snapshotTableHWMs() map[string]mysql.Position {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.tableHWMs
 }
 
 // AuditLog 审计日志
@@ -119,6 +99,15 @@ func NewIncrementalSyncService(
 // Start 启动增量同步
 func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, config *SyncConfig) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.mu.Lock()
+	s.catchUpDone = false
+	if config != nil && config.UntilPosition != nil && config.UntilPosition.Name != "" {
+		pos := *config.UntilPosition
+		s.untilPosition = &pos
+	} else {
+		s.untilPosition = nil
+	}
+	s.mu.Unlock()
 
 	// 构建数据库映射
 	dbMapping := make(map[string]string)
@@ -157,12 +146,6 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 		}
 	}
 
-	if config.RequireNoPKTableHWM {
-		if err := s.requireNoPKTableHWMs(); err != nil {
-			return err
-		}
-	}
-
 	// 创建 Sink 实例
 	factoryDeps := infraSink.SinkDeps{
 		TargetDB:  s.targetDB,
@@ -198,6 +181,14 @@ func (s *IncrementalSyncService) Start(ctx context.Context, taskID string, confi
 	pos, err := s.checkpointMgr.GetPosition(s.ctx, taskID)
 	if err != nil {
 		logger.Warn("failed to get checkpoint: %v", err)
+	}
+
+	// bounded catch-up：checkpoint 已达/超过 P1 则直接完成。
+	if until := s.getUntilPosition(); until != nil && pos.Name != "" && binlog.ComparePosition(pos, *until) >= 0 {
+		logger.Info("[Task %s] bounded catch-up already satisfied: checkpoint=%s:%d until=%s:%d",
+			taskID, pos.Name, pos.Pos, until.Name, until.Pos)
+		s.markCatchUpDone()
+		return nil
 	}
 
 	// 创建Binlog订阅器
@@ -284,16 +275,6 @@ func (s *IncrementalSyncService) getIdentity(tableName string) *entity.TableIden
 	return s.identities[tableName]
 }
 
-func (s *IncrementalSyncService) getTableHWM(tableKey string) (mysql.Position, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.tableHWMs == nil {
-		return mysql.Position{}, false
-	}
-	pos, ok := s.tableHWMs[tableKey]
-	return pos, ok
-}
-
 // snapshotPositionPersister 在写锁外取一份 persister 的"现值"，避免每事件路径都持锁。
 // 返回值可能为 nil（未注入或被清除），调用方判空。
 func (s *IncrementalSyncService) snapshotPositionPersister() PositionPersister {
@@ -330,9 +311,8 @@ type SyncConfig struct {
 
 	SinkConfigs []sink.SinkConfig
 
-	// RequireNoPKTableHWM 为 true 时（ALL + full_load_engine=v2），每张 FullColumnsStrategy 表必须有合法表级 HWM，否则拒绝启动。
-	// V1 ALL 不设此标志：V1 全量不落盘表级 HWM，强校验会导致增量永久无法启动。
-	RequireNoPKTableHWM bool
+	// UntilPosition 非 nil 时为 bounded catch-up：事务提交位点达到或超过该位点后正常停止。
+	UntilPosition *mysql.Position
 }
 
 // syncEventHandler 同步事件处理器
@@ -342,7 +322,7 @@ type syncEventHandler struct {
 	txnOpen bool
 	// sinkSkipApply[i] 为 true 表示该 sink 已持久化本源事务位点，本事务跳过对其写入/提交。
 	sinkSkipApply []bool
-	// txnHasWrites 表示本事务至少有一条事件实际写入了 sink（未被表级 HWM 过滤）。
+	// txnHasWrites 表示本事务至少有一条事件实际写入了 sink。
 	txnHasWrites bool
 }
 
@@ -357,15 +337,6 @@ func (h *syncEventHandler) OnEvent(event *binlog.BinlogEvent) error {
 	identity := h.service.getIdentity(key)
 	if identity == nil {
 		return nil // 不是我们需要同步的表
-	}
-
-	skipByHWM, err := h.eventSkipByHWM(event, identity)
-	if err != nil {
-		return err
-	}
-	if skipByHWM {
-		h.addEventAudit(event, nil)
-		return nil
 	}
 
 	if err := h.ensureSinkTransaction(commitPositionOf(event)); err != nil {
@@ -417,7 +388,11 @@ func (h *syncEventHandler) OnTransactionCommit(pos mysql.Position) error {
 
 	if !h.txnHasWrites || h.allSinksSkipped() {
 		h.abortSinkTransaction()
-		return h.saveExternalCheckpoint(pos)
+		if err := h.saveExternalCheckpoint(pos); err != nil {
+			return err
+		}
+		h.maybeFinishCatchUp(pos)
+		return nil
 	}
 
 	hadTxn := h.txnOpen && h.anySinkNeedsWork()
@@ -481,7 +456,47 @@ func (h *syncEventHandler) OnTransactionCommit(pos mysql.Position) error {
 			h.taskID, pos.Name, pos.Pos, err)
 		return err
 	}
+	h.maybeFinishCatchUp(pos)
 	return nil
+}
+
+func (h *syncEventHandler) maybeFinishCatchUp(pos mysql.Position) {
+	until := h.service.getUntilPosition()
+	if until == nil {
+		return
+	}
+	if binlog.ComparePosition(pos, *until) < 0 {
+		return
+	}
+	logger.Info("[Task %s] bounded catch-up reached until position %s:%d (commit=%s:%d)",
+		h.taskID, until.Name, until.Pos, pos.Name, pos.Pos)
+	h.service.markCatchUpDone()
+	if h.service.cancel != nil {
+		h.service.cancel()
+	}
+}
+
+func (s *IncrementalSyncService) getUntilPosition() *mysql.Position {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.untilPosition == nil {
+		return nil
+	}
+	pos := *s.untilPosition
+	return &pos
+}
+
+func (s *IncrementalSyncService) markCatchUpDone() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.catchUpDone = true
+}
+
+// CatchUpCompleted 报告最近一次 Start 是否因 UntilPosition 正常追平而结束。
+func (s *IncrementalSyncService) CatchUpCompleted() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.catchUpDone
 }
 
 func (h *syncEventHandler) saveExternalCheckpoint(pos mysql.Position) error {
@@ -602,53 +617,6 @@ func commitPositionOf(event *binlog.BinlogEvent) mysql.Position {
 		return event.CommitPosition
 	}
 	return event.Position
-}
-
-// eventSkipByHWM 按表级 HWM 判断本条 no-PK 事件是否已被全量快照覆盖。
-// PK/UK 表不受 HWM 影响；跨表事务中各表独立过滤，剩余事件仍在同一目标事务提交。
-func (h *syncEventHandler) eventSkipByHWM(event *binlog.BinlogEvent, identity *entity.TableIdentity) (bool, error) {
-	if identity == nil || identity.Strategy != entity.FullColumnsStrategy {
-		return false, nil
-	}
-	hwms := h.service.snapshotTableHWMs()
-	if len(hwms) == 0 {
-		return false, nil
-	}
-	key := fmt.Sprintf("%s.%s", event.Schema, event.Table)
-	hwm, ok := hwms[key]
-	if !ok || hwm.Name == "" {
-		return false, fmt.Errorf("missing or invalid table binlog HWM for no-PK table %s (fail-closed)", key)
-	}
-	if err := binlog.ValidatePosition(hwm); err != nil {
-		return false, fmt.Errorf("invalid table binlog HWM for no-PK table %s: %w", key, err)
-	}
-	commitPos := commitPositionOf(event)
-	return binlog.ComparePosition(commitPos, hwm) <= 0, nil
-}
-
-// requireNoPKTableHWMs 校验 identities 中每张无 PK/UK 表都有合法 HWM。
-func (s *IncrementalSyncService) requireNoPKTableHWMs() error {
-	hwms := s.snapshotTableHWMs()
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var missing []string
-	for key, id := range s.identities {
-		if id == nil || id.Strategy != entity.FullColumnsStrategy {
-			continue
-		}
-		hwm, ok := hwms[key]
-		if !ok || hwm.Name == "" {
-			missing = append(missing, key)
-			continue
-		}
-		if err := binlog.ValidatePosition(hwm); err != nil {
-			missing = append(missing, key)
-		}
-	}
-	if len(missing) == 0 {
-		return nil
-	}
-	return fmt.Errorf("ALL+V2 mode requires valid table binlog HWM for no-PK table(s) %v (fail-closed)", missing)
 }
 
 // singleRowEvent 从多行事件中提取单行，用于 normalizer 逐行转换

@@ -110,10 +110,9 @@ type TaskConfig struct { // 定义任务配置结构体
 	FullLoadBatchBytesMB  int    `json:"full_load_batch_bytes_mb,omitempty"`  // 单条 INSERT 字节上限(MiB)；0=4
 	FullLoadCommitRows    int    `json:"full_load_commit_rows,omitempty"`     // 单事务行数上限；0=10000
 	FullLoadCommitBytesMB int    `json:"full_load_commit_bytes_mb,omitempty"` // 单事务字节上限(MiB)；0=32
-	// FullLoadLockWaitTimeoutSec 超大表对齐取锁等待超时（秒）；0=默认 10。
+	// FullLoadLockWaitTimeoutSec 已废弃：aligned snapshot 架构移除后无效；仅保留字段兼容旧任务 JSON/API。
 	FullLoadLockWaitTimeoutSec int `json:"full_load_lock_wait_timeout_sec,omitempty"`
-	// FullLoadDegradeOnAlignLockFail nil/省略=对齐取锁失败时降级单连接；显式 false=fail-closed。
-	// ALL+无PK 捕获表级 HWM 时仍强制 fail-closed，不受该字段影响。
+	// FullLoadDegradeOnAlignLockFail 已废弃：aligned snapshot 架构移除后无效；仅保留字段兼容旧任务 JSON/API。
 	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
 	// FullLoadQueryTimeoutSec 单次源端查询超时（秒）；0=默认 300（5 分钟）。
 	// keyset：整次查询绝对超时；stream：仅打开查询等待上限。
@@ -135,6 +134,9 @@ type TaskConfig struct { // 定义任务配置结构体
 	// FullLoadEnableStaging 启用 staging 表隔离：全量数据先写入 staging 表，完成后原子 RENAME 发布。
 	// 默认 false。启用后单表失败可重试而不污染最终表。
 	FullLoadEnableStaging bool `json:"full_load_enable_staging,omitempty"`
+	// AllowNopkAll 用户确认接受 ALL 模式下无 PK/UK 表的 best-effort 一致性风险。
+	// 仅请求/配置开关；真正生效以 Context.NopkAllRiskAcknowledgedAt 为准。
+	AllowNopkAll bool `json:"allow_nopk_all,omitempty"`
 
 	SourceDB    *DatabaseConfig   `json:"source_db,omitempty"`    // 源数据库配置（可选，覆盖配置文件）
 	TargetDB    *DatabaseConfig   `json:"target_db,omitempty"`    // 目标数据库配置（可选，覆盖配置文件）
@@ -172,12 +174,17 @@ type ProcessContext struct { // 定义处理上下文结构体
 	// === 全量/增量阶段状态机（独立于 Status）===
 	// 这些字段持久化在任务存档中，重启 / 重新 StartTask 时用于判断"该跑全量还是直接接增量"。
 	// 历史任务无这些字段时按零值处理（SyncPhase=""），等价于 SyncPhaseInit，需要按 Mode 走完整流程。
-	SyncPhase               SyncPhase  `json:"sync_phase,omitempty"`                // 同步阶段：FULL_STARTED / FULL_COMPLETED / FULL_FAILED / INCREMENTAL_STARTED
-	FullSyncStartedAt       *time.Time `json:"full_sync_started_at,omitempty"`      // 最近一次全量启动时间
-	FullSyncCompletedAt     *time.Time `json:"full_sync_completed_at,omitempty"`    // 全量完成时间（仅 SyncPhaseFullCompleted/IncrementalStarted 时有意义）
-	FullSyncStartPosition   string     `json:"full_sync_start_position,omitempty"`  // 全量启动时捕获的 binlog 位点 "file:pos"（增量的起点）
-	LastIncrementalPosition string     `json:"last_incremental_position,omitempty"` // 最近一次成功落库的增量位点 "file:pos"
-	FullSyncFailedReason    string     `json:"full_sync_failed_reason,omitempty"`   // 全量失败原因（便于排查；SyncPhase=FULL_FAILED 时填充）
+	SyncPhase               SyncPhase  `json:"sync_phase,omitempty"`                 // 同步阶段：FULL_STARTED / FULL_COMPLETED / FULL_FAILED / INCREMENTAL_STARTED
+	FullSyncStartedAt       *time.Time `json:"full_sync_started_at,omitempty"`       // 最近一次全量启动时间
+	FullSyncCompletedAt     *time.Time `json:"full_sync_completed_at,omitempty"`     // 全量完成时间（仅 SyncPhaseFullCompleted/IncrementalStarted 时有意义）
+	FullSyncStartPosition   string     `json:"full_sync_start_position,omitempty"`   // 全量启动时捕获的 binlog 位点 "file:pos"（P0，增量的起点）
+	FullSyncEndPosition     string     `json:"full_sync_end_position,omitempty"`     // 基线扫描结束后的 binlog 位点 "file:pos"（P1，bounded catch-up 目标）
+	FullSyncCatchupPosition string     `json:"full_sync_catchup_position,omitempty"` // catch-up 当前已提交位点
+	FullSyncSubphase        string     `json:"full_sync_subphase,omitempty"`         // BASE_SCAN / CATCH_UP / RESTORE_INDEX / STREAMING
+	LastIncrementalPosition string     `json:"last_incremental_position,omitempty"`  // 最近一次成功落库的增量位点 "file:pos"
+	FullSyncFailedReason    string     `json:"full_sync_failed_reason,omitempty"`    // 全量失败原因（便于排查；SyncPhase=FULL_FAILED 时填充）
+	// NopkAllRiskAcknowledgedAt 用户确认 ALL 下无 PK/UK 表 best-effort 风险的时间（服务端写入）。
+	NopkAllRiskAcknowledgedAt *time.Time `json:"nopk_all_risk_acknowledged_at,omitempty"`
 
 	// === 历史全量断点字段 ===
 	// 历史兼容字段：曾用于记录每张表的全量同步进度，key = "sourceSchema.tableName"。
@@ -304,6 +311,7 @@ func (ctx ProcessContext) CloneForRead() ProcessContext {
 	}
 	cloned.FullSyncStartedAt = cloneTimePtr(ctx.FullSyncStartedAt)
 	cloned.FullSyncCompletedAt = cloneTimePtr(ctx.FullSyncCompletedAt)
+	cloned.NopkAllRiskAcknowledgedAt = cloneTimePtr(ctx.NopkAllRiskAcknowledgedAt)
 	if len(ctx.TableBinlogHWMs) > 0 {
 		cloned.TableBinlogHWMs = make(map[string]string, len(ctx.TableBinlogHWMs))
 		for k, v := range ctx.TableBinlogHWMs {
@@ -570,9 +578,36 @@ func (t *SyncTask) MarkFullSyncStarted(startPosition string) {
 	t.Context.SyncPhase = SyncPhaseFullStarted
 	t.Context.FullSyncStartedAt = &now
 	t.Context.FullSyncStartPosition = startPosition
+	t.Context.FullSyncEndPosition = ""
+	t.Context.FullSyncCatchupPosition = ""
+	t.Context.FullSyncSubphase = "BASE_SCAN"
 	t.Context.FullSyncCompletedAt = nil
 	t.Context.FullSyncFailedReason = ""
+	t.Context.TableBinlogHWMs = nil // 新一轮全量不再使用表级 HWM
 	t.Context.LastUpdateTime = now
+}
+
+// AcknowledgeNopkAllRisk 记录用户已确认 ALL 无 PK/UK 风险。
+func (t *SyncTask) AcknowledgeNopkAllRisk(at time.Time) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	t.Config.AllowNopkAll = true
+	acked := at
+	t.Context.NopkAllRiskAcknowledgedAt = &acked
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// HasNopkAllRiskAcknowledgement 是否已具备无 PK/UK ALL 风险确认。
+func (t *SyncTask) HasNopkAllRiskAcknowledgement() bool {
+	return t != nil && t.Context.NopkAllRiskAcknowledgedAt != nil && !t.Context.NopkAllRiskAcknowledgedAt.IsZero()
+}
+
+// ClearNopkAllRiskAcknowledgement 撤销 ALL 无 PK/UK 风险确认（编辑任务取消勾选时）。
+func (t *SyncTask) ClearNopkAllRiskAcknowledgement() {
+	t.Config.AllowNopkAll = false
+	t.Context.NopkAllRiskAcknowledgedAt = nil
+	t.Context.LastUpdateTime = time.Now()
 }
 
 // MarkFullSyncCompleted 标记全量同步完成。完成后才允许增量直接接管。

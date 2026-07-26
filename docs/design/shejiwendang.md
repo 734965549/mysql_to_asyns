@@ -234,7 +234,7 @@ TaskService.executeIncrementalSync
 
 - 如果目标库已有漂移，UPDATE/DELETE 可能匹配 0 行。
 - 如果存在完全重复行，无主键场景无法精确定位逻辑上的"第几行"。
-- ALL 模式下"短锁位点 + 非快照全量 + binlog 回放"无法保证无主键表收敛：全量扫描和 binlog 回放可能写入同一行，`INSERT IGNORE` 无冲突键可去重，产生重复行。该风险对应默认 `full_load_engine=v1` 旧语义；`full_load_engine=v2` 在表级一致性快照窗口内捕获 HWM，增量启动时对无 PK/UK 表 fail-closed 校验并按 HWM 过滤，避免重复 INSERT。V1 ALL 不强校验 HWM，以免默认引擎在 `FULL_COMPLETED` 后永久卡死增量启动。
+- ALL 模式依赖"短锁位点 P0 + 普通短查询全量 + 捕获 P1 + bounded catch-up 到 P1 + 持续增量"收敛无主键表：全量扫描期间发生的变更由 P0..P1 catch-up 阶段重放覆盖，之后转入持续增量。`full_load_engine=v1`/`v2` 均不再生成或依赖表级 binlog HWM（历史上 v2 曾在表级一致性快照窗口内捕获 HWM 并 fail-closed 校验，该机制已下线）。
 - 推荐给业务表补主键或唯一键。
 
 ## 7. 存储与安全
