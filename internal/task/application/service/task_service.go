@@ -5494,18 +5494,66 @@ func mergePendingIndexRestores(base, extra []pendingIndexRestore) []pendingIndex
 	if len(extra) == 0 {
 		return base
 	}
-	seen := make(map[string]struct{}, len(base))
-	for _, p := range base {
-		seen[p.targetSchema+"."+p.targetTable] = struct{}{}
+
+	indexNameOf := func(idx map[string]interface{}) string {
+		name, _ := idx["name"].(string)
+		return name
 	}
-	out := append([]pendingIndexRestore(nil), base...)
-	for _, p := range extra {
-		key := p.targetSchema + "." + p.targetTable
-		if _, ok := seen[key]; ok {
+	mergeIndexes := func(dst, src []map[string]interface{}) []map[string]interface{} {
+		if len(src) == 0 {
+			return dst
+		}
+		seen := make(map[string]struct{}, len(dst))
+		for _, idx := range dst {
+			if name := indexNameOf(idx); name != "" {
+				seen[name] = struct{}{}
+			}
+		}
+		out := append([]map[string]interface{}(nil), dst...)
+		for _, idx := range src {
+			name := indexNameOf(idx)
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, idx)
+		}
+		return out
+	}
+
+	tableKey := func(schema, table string) string {
+		return schema + "." + table
+	}
+	byTable := make(map[string]int, len(base)+len(extra))
+	out := make([]pendingIndexRestore, 0, len(base)+len(extra))
+	for _, p := range base {
+		key := tableKey(p.targetSchema, p.targetTable)
+		if i, ok := byTable[key]; ok {
+			out[i].indexes = mergeIndexes(out[i].indexes, p.indexes)
 			continue
 		}
-		seen[key] = struct{}{}
-		out = append(out, p)
+		byTable[key] = len(out)
+		out = append(out, pendingIndexRestore{
+			targetSchema: p.targetSchema,
+			targetTable:  p.targetTable,
+			indexes:      append([]map[string]interface{}(nil), p.indexes...),
+		})
+	}
+	for _, p := range extra {
+		key := tableKey(p.targetSchema, p.targetTable)
+		if i, ok := byTable[key]; ok {
+			out[i].indexes = mergeIndexes(out[i].indexes, p.indexes)
+			continue
+		}
+		byTable[key] = len(out)
+		out = append(out, pendingIndexRestore{
+			targetSchema: p.targetSchema,
+			targetTable:  p.targetTable,
+			indexes:      append([]map[string]interface{}(nil), p.indexes...),
+		})
 	}
 	return out
 }
@@ -7922,6 +7970,20 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 
 // dropNonPrimaryKeyIndexes 删除非主键索引（兼容旧调用：等价于 FULL + optimize_index=true）。
 
+// deferredIndexRollbackTimeout 限制 DROP 失败/取消/丢锁后的索引回滚最长耗时，避免 cleanup 无限挂起。
+const deferredIndexRollbackTimeout = 5 * time.Minute
+
+// afterDeferredIndexDropped 仅供测试在两次 DROP 之间注入取消/丢锁；生产路径保持 nil。
+var afterDeferredIndexDropped func()
+
+// deferredIndexRollbackContext 返回不受父 ctx 取消影响、且有截止时间的 cleanup context。
+func deferredIndexRollbackContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), deferredIndexRollbackTimeout)
+}
+
 func (s *TaskService) dropNonPrimaryKeyIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string) ([]map[string]interface{}, error) {
 	return s.dropDeferredIndexes(ctx, runtime, schema, tableName, nil, taskEntity.SyncModeFull, true)
 }
@@ -7960,10 +8022,24 @@ func (s *TaskService) dropDeferredIndexes(ctx context.Context, runtime *taskRunt
 
 	dropped := make([]map[string]interface{}, 0, len(savedIndexes))
 
+	// 回滚使用独立、有界 cleanup context：父 ctx 取消/超时/丢锁时仍可尽最大努力恢复本轮已删索引。
+	// 策略：即使目标 schema 顾问锁已丢失，也对“本函数自己删掉的索引”做 best-effort 回滚，避免目标表长期缺索引；任务仍因原始错误 fail-closed。
+	rollbackDropped := func(cause error) ([]map[string]interface{}, error) {
+		if len(dropped) == 0 {
+			return nil, cause
+		}
+		cleanupCtx, cancel := deferredIndexRollbackContext(ctx)
+		defer cancel()
+		if restoreErr := s.restoreIndexes(cleanupCtx, runtime, schema, tableName, dropped); restoreErr != nil {
+			return dropped, fmt.Errorf("%v; additionally failed to restore already-dropped indexes: %w", cause, restoreErr)
+		}
+		return nil, cause
+	}
+
 	for _, indexInfo := range savedIndexes {
 
 		if err := fullload.SchemaLockLostError(ctx); err != nil {
-			return dropped, err
+			return rollbackDropped(err)
 		}
 
 		name, ok := indexInfo["name"].(string)
@@ -7981,17 +8057,17 @@ func (s *TaskService) dropDeferredIndexes(ctx context.Context, runtime *taskRunt
 		if err != nil {
 			// ALL 要求非 identity 唯一索引在 catch-up 前不存在：DROP 失败必须 fail-closed。
 			// 同时回滚本轮已成功删除的索引，避免目标表长期缺索引。
-			if len(dropped) > 0 {
-				if restoreErr := s.restoreIndexes(ctx, runtime, schema, tableName, dropped); restoreErr != nil {
-					return dropped, fmt.Errorf("failed to drop deferred index %s on %s.%s: %v; additionally failed to restore already-dropped indexes: %w", name, schema, tableName, err, restoreErr)
-				}
-			}
-			return nil, fmt.Errorf("failed to drop deferred index %s on %s.%s: %w", name, schema, tableName, err)
+			dropErr := fmt.Errorf("failed to drop deferred index %s on %s.%s: %w", name, schema, tableName, err)
+			return rollbackDropped(dropErr)
 		}
 
 		dropped = append(dropped, indexInfo)
 
 		logger.Info("Dropped index %s from table %s.%s", name, schema, tableName)
+
+		if afterDeferredIndexDropped != nil {
+			afterDeferredIndexDropped()
+		}
 
 	}
 

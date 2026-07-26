@@ -19,6 +19,7 @@ import (
 	"mysql-to-sync/internal/checkpoint"
 	"mysql-to-sync/internal/config"
 	"mysql-to-sync/internal/metadata/domain/entity"
+	"mysql-to-sync/internal/sync/fullload"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -183,6 +184,124 @@ func TestDropDeferredIndexes_FailClosedRestoresDropped(t *testing.T) {
 	assert.Nil(t, dropped)
 	assert.Contains(t, dropErr.Error(), "failed to drop deferred index")
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDropDeferredIndexes_ContextCanceled_RestoresWithCleanupContext(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	// 父 ctx 在第一次 DROP 后取消：第二次 DROP 在进入 driver 前即以 context.Canceled 失败。
+	// rollback 必须走独立 cleanup context，否则 restoreIndexes 会立刻因同一已取消 ctx 失败。
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	afterDeferredIndexDropped = func() { cancel() }
+	defer func() { afterDeferredIndexDropped = nil }()
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		ctx,
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.ErrorIs(t, dropErr, context.Canceled)
+	assert.Contains(t, dropErr.Error(), "failed to drop deferred index")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDropDeferredIndexes_SchemaLockLost_RestoresWithCleanupContext(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	// second DROP is not attempted after schema lock lost; rollback uk_code instead
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	afterDeferredIndexDropped = func() { cancel(fullload.ErrSchemaLockLost) }
+	defer func() { afterDeferredIndexDropped = nil }()
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		ctx,
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.ErrorIs(t, dropErr, fullload.ErrSchemaLockLost)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMergePendingIndexRestores_MergesIndexesForSameTable(t *testing.T) {
+	base := []pendingIndexRestore{{
+		targetSchema: "db",
+		targetTable:  "t",
+		indexes: []map[string]interface{}{
+			{"name": "idx_a", "columns": "`a`"},
+		},
+	}}
+	extra := []pendingIndexRestore{{
+		targetSchema: "db",
+		targetTable:  "t",
+		indexes: []map[string]interface{}{
+			{"name": "idx_a", "columns": "`a`"}, // duplicate
+			{"name": "idx_b", "columns": "`b`"}, // supplementary
+		},
+	}, {
+		targetSchema: "db",
+		targetTable:  "other",
+		indexes: []map[string]interface{}{
+			{"name": "idx_x", "columns": "`x`"},
+		},
+	}}
+
+	merged := mergePendingIndexRestores(base, extra)
+	require.Len(t, merged, 2)
+
+	require.Equal(t, "t", merged[0].targetTable)
+	require.Len(t, merged[0].indexes, 2)
+	assert.Equal(t, "idx_a", merged[0].indexes[0]["name"])
+	assert.Equal(t, "idx_b", merged[0].indexes[1]["name"])
+
+	require.Equal(t, "other", merged[1].targetTable)
+	require.Len(t, merged[1].indexes, 1)
+	assert.Equal(t, "idx_x", merged[1].indexes[0]["name"])
 }
 
 func TestStripIndexesByNameFromCreateSQL_KeepsIdentityUK(t *testing.T) {
@@ -3787,7 +3906,6 @@ func TestExecuteFullSync_ALLAnalyzeFailureIsFailClosedPreflight(t *testing.T) {
 	assert.Contains(t, err.Error(), "analyze table")
 	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
 }
-
 
 // TestFormatBinlogPosition ??????????????????
 func TestFormatBinlogPosition(t *testing.T) {
