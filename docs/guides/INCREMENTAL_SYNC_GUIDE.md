@@ -55,6 +55,8 @@ expire_logs_days=7
 ```sql
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 GRANT SELECT ON *.* TO 'username'@'%';
+-- ALL 必须具备 RELOAD；FULL 默认可在缺权限时降级单连接，但超大表多连接对齐或 degrade=false 同样需要
+GRANT RELOAD ON *.* TO 'username'@'%';
 FLUSH PRIVILEGES;
 ```
 
@@ -113,6 +115,7 @@ GET /api/tasks/{task_id}/metrics
 {
   "processed_rows": 1234,
   "total_rows": 0,
+  "estimated_total_rows": 50000,
   "progress_percent": 0,
   "tables_completed": 0,
   "tables_total": 2,
@@ -191,6 +194,8 @@ POST /api/tasks/{task_id}/pause
 - 使用全列匹配进行UPDATE和DELETE
 - 要求`binlog_row_image=FULL`
 - 同步性能可能受影响
+
+> **警告**：无主键表在 ALL 模式下无法保证数据一致性。"短锁位点 + 非快照全量 + binlog 回放"的收敛保证仅适用于有可靠非空 PK/UK 的表。无主键表在全量扫描与 binlog 回放同时写入同一行时，`INSERT IGNORE` 因无冲突键无法去重，会产生重复行。建议给表补充主键或唯一键。
 
 ## 监控与告警
 

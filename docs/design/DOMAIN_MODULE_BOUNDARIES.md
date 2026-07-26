@@ -382,7 +382,6 @@ GetAllDatabases() ([]string, error)
 ```go
 ReadBatch(ctx, offset, limit int64) ([]map[string]interface{}, error)
 ReadBatchByKeys(ctx, lastID interface{}, limit int64) ([]map[string]interface{}, error)
-GetTotalCount(ctx context.Context) (int64, error)
 GetEstimatedCount(ctx context.Context) (int64, error)
 ```
 

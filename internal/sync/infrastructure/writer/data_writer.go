@@ -9,6 +9,7 @@ import ( // 导入外部包和标准库
 	"mysql-to-sync/internal/metrics"                // 导入指标包，用于零行匹配等漂移指标
 	"mysql-to-sync/pkg/logger"                      // 导入log包，用于日志输出
 	"sync"                                          // 导入sync包，用于并发控制
+	"sync/atomic"                                   // 导入atomic，用于暂停后台 auto-flush
 	"time"                                          // 导入time包，用于时间处理
 )
 
@@ -105,6 +106,11 @@ func NewBatchWriterWithTx(tx *sql.Tx, identity *entity.TableIdentity, batchSize 
 		batchSize:  batchSize,                                 // 设置批处理大小
 		timeout:    300 * time.Second,                         // 设置超时时间
 	}
+}
+
+// SetExecutor 切换底层 SQL 执行器（例如 autocommit 连接 ↔ 活动事务）。
+func (w *BatchWriter) SetExecutor(db SQLExecutor) {
+	w.db = db
 }
 
 // NewBatchWriterWithConn 创建使用固定连接的批量写入器函数
@@ -297,6 +303,9 @@ type BufferedWriter struct { // 定义带缓冲的写入器结构体
 	batchSize     int                      // 批处理大小
 	flushInterval time.Duration            // 刷新间隔
 	stopCh        chan struct{}            // 停止通道
+	// autoFlushPaused 为 true 时跳过定时 flush。事务路径依赖显式 Flush/Commit 同步传播错误，
+	// 必须暂停后台 timer，避免与事务 commit/rollback 竞态。
+	autoFlushPaused atomic.Bool
 }
 
 // NewBufferedWriter 创建缓冲写入器函数
@@ -348,6 +357,32 @@ func NewBufferedWriterWithConn(conn *sql.Conn, identity *entity.TableIdentity, b
 	return w // 返回写入器
 }
 
+// SetExecutor 切换底层 BatchWriter 的 SQL 执行器。
+func (w *BufferedWriter) SetExecutor(db SQLExecutor) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.writer != nil {
+		w.writer.SetExecutor(db)
+	}
+}
+
+// PauseAutoFlush 暂停后台定时 flush（事务路径在 Begin 时调用）。
+func (w *BufferedWriter) PauseAutoFlush() {
+	w.autoFlushPaused.Store(true)
+}
+
+// ResumeAutoFlush 恢复后台定时 flush（事务 Commit/Rollback 完成后调用）。
+func (w *BufferedWriter) ResumeAutoFlush() {
+	w.autoFlushPaused.Store(false)
+}
+
+// DiscardBuffer 丢弃尚未 flush 的缓冲行（事务回滚时使用）。
+func (w *BufferedWriter) DiscardBuffer() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buffer = make([]map[string]interface{}, 0, w.batchSize)
+}
+
 // Write 写入数据到缓冲区方法
 func (w *BufferedWriter) Write(row map[string]interface{}) error { // 写入数据到缓冲区
 	w.mu.Lock()                                 // 获取锁
@@ -361,7 +396,7 @@ func (w *BufferedWriter) Write(row map[string]interface{}) error { // 写入数�
 	return nil // 返回成功
 }
 
-// Flush 刷新缓冲区方法
+// Flush 刷新缓冲区方法。WriteBatch 失败时把已取出的行 prepend 回 buffer，避免静默丢行。
 func (w *BufferedWriter) Flush() error { // 刷新缓冲区
 	w.mu.Lock()             // 获取锁
 	if len(w.buffer) == 0 { // 如果缓冲区为空
@@ -372,10 +407,16 @@ func (w *BufferedWriter) Flush() error { // 刷新缓冲区
 	w.buffer = make([]map[string]interface{}, 0, w.batchSize) // 重置缓冲区
 	w.mu.Unlock()                                             // 释放锁
 
-	return w.writer.WriteBatch(context.Background(), rows) // 批量写入数据
+	if err := w.writer.WriteBatch(context.Background(), rows); err != nil {
+		w.mu.Lock()
+		w.buffer = append(rows, w.buffer...)
+		w.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
-// flushLoop 定时刷新循环方法
+// flushLoop 定时刷新循环。事务路径会 PauseAutoFlush，使 timer 分支跳过，错误改由显式 Flush 同步返回。
 func (w *BufferedWriter) flushLoop() { // 定时刷新循环
 	ticker := time.NewTicker(w.flushInterval) // 创建定时器
 	defer ticker.Stop()                       // 延迟停止定时器
@@ -383,10 +424,17 @@ func (w *BufferedWriter) flushLoop() { // 定时刷新循环
 	for { // 无限循环
 		select { // 多路复用
 		case <-ticker.C: // 定时器触发
-			w.Flush() // 执行刷新
+			if w.autoFlushPaused.Load() {
+				continue
+			}
+			if err := w.Flush(); err != nil {
+				logger.Error("buffered writer auto-flush failed: %v", err)
+			}
 		case <-w.stopCh: // 停止信号
-			w.Flush() // 执行最后一次刷新
-			return    // 返回
+			if err := w.Flush(); err != nil {
+				logger.Error("buffered writer final flush failed: %v", err)
+			}
+			return // 返回
 		}
 	}
 }

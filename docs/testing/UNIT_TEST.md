@@ -102,6 +102,28 @@ go tool cover -html=coverage.out -o coverage.html
 go test -v ./...
 ```
 
+### 可选：真实 MySQL 全量快照并发集成（§12.1）
+
+默认 `go test ./...` **不编译** `//go:build integration` 用例。本地或夜间任务需真实 InnoDB（可复用仓库 `docker-compose.yml` 的 `mysql-source`）：
+
+```bash
+# 示例 DSN（root，需具备 CREATE DATABASE）
+export TEST_MYSQL_DSN='root:root_password@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true'
+
+go test -tags=integration -count=1 -timeout=5m -v ./internal/sync/fullload/ -run TestIntegration
+```
+
+覆盖场景（`integration_mysql_test.go`）：
+
+| 测试用例 | 描述 |
+|----------|------|
+| TestIntegration_SnapshotExcludesPostSnapshotPKSwap | 快照后删旧 PK + 新 PK 同唯一键重插，读结果不混入新版本 |
+| TestIntegration_SnapshotExcludesUniqueColumnRewrite | 快照后唯一列改写成另一行已有值，快照仍见旧版本且无重复 UK |
+| TestIntegration_SnapshotBoundaryCrossingPKMove | PK 跨 chunk 边界挪移，同表快照不漏不重 |
+| TestIntegration_EngineConcurrentPKSwap_NoDuplicateUKOnIndexRestore | Engine.Run 灌数中并发换 PK，目标无重复 UK 且 ADD UNIQUE 无 1062 |
+
+未设置 `TEST_MYSQL_DSN` 时上述用例会 `Skip`。
+
 ## 测试覆盖范围
 
 ### Config 模块

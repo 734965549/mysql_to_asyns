@@ -98,11 +98,9 @@
 // 测试用例：
 - TestCursorReader_ReadBatch - 批量读取测试
 - TestCursorReader_ReadBatch_Empty - 空结果测试
-- TestCursorReader_GetTotalCount - 获取总数
 - TestCursorReader_GetMaxID - 无主键返回0
 - TestCursorReader_GetMinID - 无主键返回0
 - TestRangeShardingReader_ReadBatch - 范围分片读取
-- TestRangeShardingReader_GetTotalCount - 获取总数
 - TestRangeShardingReader_GetMaxID - 获取最大ID
 - TestRangeShardingReader_GetMinID - 获取最小ID
 // 使用 sqlmock 模拟数据库

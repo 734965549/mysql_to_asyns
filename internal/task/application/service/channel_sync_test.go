@@ -7,6 +7,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	taskEntity "mysql-to-sync/internal/task/domain/entity"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEffectiveChannelBufferBatches(t *testing.T) {
@@ -195,4 +200,34 @@ func TestChannelSync_AddBatchRespectsContextCancel(t *testing.T) {
 	if err := cs.WaitForCompletion(ctx); err != nil {
 		t.Fatalf("WaitForCompletion: %v", err)
 	}
+}
+
+func TestChannelSyncExecutor_ProcessBatchTask_SkipBinlogSession(t *testing.T) {
+	targetDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	insertSQL := "INSERT IGNORE INTO `tgt_db`.`users` (`id`, `name`) VALUES (?, ?)"
+	expectTargetWriteSessionWithBinlog(mock, insertSQL, true)
+
+	executor := NewChannelSyncExecutor(nil, targetDB, nil, nil, nil, nil)
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:               "channel_skip_binlog",
+		BatchSize:        100,
+		EnableSkipBinlog: true,
+	})
+	batch := &BatchTask{
+		BatchID:  1,
+		WorkerID: 2,
+		Mark:     "src_db.users:batch1",
+		Data: []map[string]interface{}{
+			{"id": int64(1), "name": "alice"},
+		},
+	}
+
+	err = executor.processBatchTask(
+		context.Background(), task, batch, "src_db", "tgt_db", "users", pkUsersIdentity(), 1,
+	)
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

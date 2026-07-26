@@ -1,9 +1,14 @@
-import { createApp } from 'vue' // 从vue包导入createApp函数，用于创建Vue应用实例
-import ArcoVue from '@arco-design/web-vue' // 导入Arco Design Vue组件库
-import '@arco-design/web-vue/dist/arco.css' // 导入Arco Design的CSS样式文件
-import App from './App.vue' // 导入根组件App.vue
-import './style.css' // 导入全局样式文件
+import { createApp } from "vue";
+import ArcoVue from "@arco-design/web-vue";
+import ArcoVueIcon from "@arco-design/web-vue/es/icon";
+import "@arco-design/web-vue/dist/arco.css";
+import App from "./App.vue";
+import router from "./router/index.js";
+import "./style.css";
+import "./styles/themes.css";
 
-const app = createApp(App) // 创建Vue应用实例
-app.use(ArcoVue) // 使用Arco Design Vue组件库
-app.mount('#app') // 将应用挂载到DOM元素#app上
+const app = createApp(App);
+app.use(ArcoVue);
+app.use(ArcoVueIcon);
+app.use(router);
+app.mount("#app");

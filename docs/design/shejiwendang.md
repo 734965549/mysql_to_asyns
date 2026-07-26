@@ -64,6 +64,19 @@ Sync 负责实际数据同步执行。
 
 Sync 不保存任务配置和生命周期状态；这些由 TaskService 维护。
 
+#### Sink 抽象（多目标写入）
+
+增量同步通过 Sink 接口抽象目标端写入，支持同时写入多个目标：
+
+- **Sink 接口**：定义 `Type()` / `Open(ctx)` / `Write(ctx, *ChangeEvent)` / `Flush(ctx)` / `Close(ctx)` 生命周期方法，位于 `internal/sync/domain/sink/`
+- **ChangeEvent**：统一事件模型，将 `BinlogEvent` 归一化为 `TaskID` / `SourceSchema` / `SourceTable` / `EventType` / `Before` / `After` / `PrimaryKeys` / `BinlogFile` / `BinlogPos`，隔离 Sink 实现与 binlog 细节
+- **MySQLSink**：封装现有 `BufferedWriter`，保持 MySQL 增量写入行为完全不变（兼容性基准）
+- **KafkaSink**：基于 `kafka-go`，支持 SASL（PLAIN/SCRAM-SHA-256/SCRAM-SHA-512）、TLS 双向认证、per-table topic 路由
+- **WebhookSink**：基于标准库 `net/http`，支持自定义 Header、失败重试与退避策略
+- **SinkFactory**：`NewSinks(configs, deps)` 按 `sink_configs` 类型创建对应 Sink 实例；空配置默认返回 `[{MYSQL}]`
+- **交付语义**：同一 binlog 事务内全部事件对所有 Sink 写入并 flush 成功后，才在 `OnTransactionCommit` 统一 `SavePosition`；任一事件/Sink 失败则任务 FAILED，位点不越过该事务（At-Least-Once）
+- **模式限制**：仅 `INCREMENTAL` 模式支持非 `MYSQL` 类型 Sink；`FULL`/`ALL` 含非 MYSQL Sink 时拒绝启动
+
 ### Checkpoint 领域
 
 Checkpoint 只负责增量 binlog 位点。
@@ -115,9 +128,17 @@ StartTask
 5. P0 之后发生的变更会再次应用到目标库，用于追平全量读取期间的时间差。
 ```
 
+> **重要限制**：上述"短锁位点 + 非快照全量 + binlog 回放"的严格收敛保证**仅适用于有可靠非空 PK/UK 的表**。无 PK/UK 的表无法保证收敛，原因如下：
+> 1. P0 之后源库插入了一行新数据；
+> 2. 全量扫描也读取到了该行并写入目标表；
+> 3. 随后增量 binlog 回放再次 INSERT 该行；
+> 4. 由于无冲突键，`INSERT IGNORE` 无法去重，导致目标表产生重复行。
+>
+> 无主键表在任何时候都无法保证数据一致性，建议给表补充主键或唯一键。
+
 重复处理不是单一的“全部跳过”：
 
-- 全量批量写统一使用普通 `INSERT`，目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 在全量前重建为空；非空目标属于不支持场景，可能失败或污染目标数据。
+- 全量批量写统一使用普通 `INSERT`，目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 在全量前重建为空；非空目标属于不支持场景，可能失败或污染目标数据。开启 `enable_skip_binlog=true` 时，全量写入前在目标端写入连接上执行 `SET SESSION sql_log_bin=0`，写入完成后恢复为 1，避免目标端 binlog 膨胀与级联复制回环；需目标库账号具备 SUPER 权限。
 - 增量 PK/UK 表的 INSERT 使用 `INSERT ... ON DUPLICATE KEY UPDATE`，重复到达时要覆盖旧值，保证最终收敛。
 - 增量 UPDATE/DELETE 使用 PK/UK 定位；无主键表使用 before image 或行镜像做全列 WHERE。
 - 无主键表 INSERT 没有真正冲突键，无法可靠去重，仍建议给表补主键或唯一键。
@@ -133,7 +154,11 @@ StartTask
 
 ### 写入语义
 
-全量写统一使用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE）。目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 后由程序在全量前重建为空；如果目标表已有数据，属于不支持场景，可能失败或污染目标数据。全量不是增量回放，不使用 upsert 作为默认语义。
+全量写统一使用普通 `INSERT`（无 IGNORE、无 ON DUPLICATE KEY UPDATE）。目标端必须由用户保证为空，或开启 `enable_drop_table_before_ddl=true` 后由程序在全量前重建为空；如果目标表已有数据，属于不支持场景，可能失败或污染目标数据。全量不是增量回放，不使用 upsert 作为默认语义。开启 `enable_skip_binlog=true` 时，全量写入前在目标端写入连接上执行 `SET SESSION sql_log_bin=0`，写入完成后恢复为 1；需目标库账号具备 SUPER 权限。
+
+#### V2 写事务提交与 `__mts_fl_tx`
+
+`full_load_engine=v2` 时，写入侧在每个目标 schema 维护系统表 `__mts_fl_tx`（InnoDB，带表/列注释，含 `run_id`）。每个写事务提交前插入唯一 UUID marker，与业务行同事务提交。客户端遇到连接类 Commit 错误时，**不得**用业务行存在性推断结果（无主键跨事务相同行会误判；非锁定读可能与仍在处理的 COMMIT 竞态），而是对该 marker 做 `SELECT ... FOR UPDATE`：命中则只推进进度，无行则整事务重放；无法判定则 fail-closed。启动前还会：在首次目标端 DDL 前对目标 schema 获取 `GET_LOCK` 强制互斥（禁止同 schema 并发 V2；持有至任务级收尾；要求 MySQL ≥ 5.7.5 以支持同连接多锁；`target_max_open_conns` ≥ 2）；拒绝业务目标表占用保留名 `__mts_fl_tx`（大小写不敏感）；校验所有目标业务表为 InnoDB；并对已存在的 marker 表 fail-closed 校验 `BASE TABLE`/InnoDB/`id` 完整唯一键（`SUB_PART` NULL 或 ≥ 36）与 `run_id` 列。数据流水线成功后按本趟 `run_id` 删除本任务行（**不** `DROP` 共享表；清理独立短超时；失败/暂停保留行）。目标账号除 `CREATE TABLE` 外，还需对 marker 表具备 `INSERT`、`SELECT ... FOR UPDATE`、`DELETE`，以及 `GET_LOCK`/`RELEASE_LOCK`。详见 `docs/CONFIGURATION.md`「写事务提交标记表」。
 
 ## 4. 全量中断处理
 
@@ -162,15 +187,23 @@ SyncTask.Context.FullSyncResume
 TaskService.executeIncrementalSync
   -> IncrementalSyncService.Start
   -> checkpoint.GetPosition
+  -> SinkFactory.NewSinks(sink_configs)
+  -> for each sink: sink.Open() / sink.PrepareTables()
   -> pkg/binlog.Subscriber.Start
-  -> syncEventHandler.OnEvent
+  -> OnRow 缓冲同一事务事件
+  -> OnXID
+    -> 逐条 syncEventHandler.OnEvent（Write + Flush，不推进位点）
+    -> 全部成功后 syncEventHandler.OnTransactionCommit
+      -> 最终 Flush -> checkpointMgr.SavePosition + 任务存档位点回写
+    -> 任一 OnEvent / OnTransactionCommit 失败 -> 返回错误，位点不推进，任务 FAILED
 ```
 
 增量要求：
 
 - MySQL binlog 必须是 ROW 格式。
 - 对无主键表，`binlog_row_image=FULL` 是安全处理 UPDATE/DELETE 的关键前提。
-- 增量 checkpoint 保存 binlog file/pos。
+- 增量 checkpoint 保存 binlog file/pos（XID 提交边界）。
+- **同一事务内所有事件成功写入并 flush 后，才统一推进 checkpoint / 任务存档位点**；中途失败不得越过该事务，否则重启会永久漏数。
 
 事件处理：
 
@@ -180,7 +213,7 @@ TaskService.executeIncrementalSync
 | UPDATE | after image 更新，身份列 WHERE | before image 全列 WHERE |
 | DELETE | 身份列 WHERE | 全列 WHERE |
 
-写入成功后保存 checkpoint。checkpoint 保存失败应视为本次事件处理失败，避免后续恢复丢事件。
+整事务成功后保存 checkpoint。checkpoint 保存失败应视为本次事务提交失败，避免后续恢复丢事件。
 
 ## 6. 无主键表设计
 
@@ -200,7 +233,8 @@ TaskService.executeIncrementalSync
 风险：
 
 - 如果目标库已有漂移，UPDATE/DELETE 可能匹配 0 行。
-- 如果存在完全重复行，无主键场景无法精确定位逻辑上的“第几行”。
+- 如果存在完全重复行，无主键场景无法精确定位逻辑上的"第几行"。
+- ALL 模式下"短锁位点 + 非快照全量 + binlog 回放"无法保证无主键表收敛：全量扫描和 binlog 回放可能写入同一行，`INSERT IGNORE` 无冲突键可去重，产生重复行。该风险对应默认 `full_load_engine=v1` 旧语义；`full_load_engine=v2` 在表级一致性快照窗口内捕获 HWM，增量启动时对无 PK/UK 表 fail-closed 校验并按 HWM 过滤，避免重复 INSERT。V1 ALL 不强校验 HWM，以免默认引擎在 `FULL_COMPLETED` 后永久卡死增量启动。
 - 推荐给业务表补主键或唯一键。
 
 ## 7. 存储与安全

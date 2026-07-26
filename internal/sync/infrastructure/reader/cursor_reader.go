@@ -107,8 +107,9 @@ type DataReader interface { // 定义数据读取器接口
 	ReadBatch(ctx context.Context, offset, limit int64) ([]map[string]interface{}, error) // 批量读取数据
 	// ReadBatchByKeys 批量读取数据（基于主键范围，优化深分页）方法
 	ReadBatchByKeys(ctx context.Context, lastID interface{}, limit int64) ([]map[string]interface{}, error) // 基于主键批量读取
-	// GetTotalCount 获取总行数方法（精确，可能慢）
-	GetTotalCount(ctx context.Context) (int64, error) // 获取总行数
+	// ReadBatchByKeyRange 批量读取数据（指定上下边界，上界写入 SQL 让 MySQL 用原生类型/collation 判断）
+	// endID 为 nil 时等价于 ReadBatchByKeys；startID 为 nil 时从表头开始读到 endID
+	ReadBatchByKeyRange(ctx context.Context, startID, endID interface{}, limit int64) ([]map[string]interface{}, error)
 	// GetEstimatedCount 通过 information_schema 快速获取估算行数（毫秒级，有误差）
 	GetEstimatedCount(ctx context.Context) (int64, error) // 获取估算行数
 }
@@ -192,12 +193,9 @@ func (r *CursorReader) ReadBatchByKeys(ctx context.Context, lastID interface{}, 
 	return nil, fmt.Errorf("ReadBatchByKeys not supported for no-PK tables") // 返回不支持错误
 }
 
-// GetTotalCount 获取总行数方法
-func (r *CursorReader) GetTotalCount(ctx context.Context) (int64, error) { // 获取表的总行数
-	var count int64                                                           // 定义计数变量
-	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", r.schema, r.table) // 构建查询
-	err := r.db.QueryRowContext(ctx, query).Scan(&count)                      // 执行查询
-	return count, err                                                         // 返回计数和错误
+// ReadBatchByKeyRange 无主键表不支持按主键范围读取
+func (r *CursorReader) ReadBatchByKeyRange(ctx context.Context, startID, endID interface{}, limit int64) ([]map[string]interface{}, error) {
+	return nil, fmt.Errorf("ReadBatchByKeyRange not supported for no-PK tables")
 }
 
 // GetEstimatedCount 通过 information_schema 快速获取估算行数
@@ -304,6 +302,84 @@ func (r *RangeShardingReader) ReadBatchByKeys(ctx context.Context, lastID interf
 	return retryableQuery(ctx, r.db, query, r.scanRows, args...)
 }
 
+// ReadBatchByKeyRange 批量读取数据（Keyset Pagination，指定上下边界）。
+// 上界 endID 写入 SQL WHERE 子句，让 MySQL 用原生字段类型和 collation 判断，
+// 避免 Go 侧字符串比较导致的语义不等价（数字 100000 vs 90000、varchar collation 差异等）。
+// endID 为 nil 时等价于 ReadBatchByKeys（最后一个 worker 无上界）。
+// startID 为 nil 时从表头开始读到 endID（第一个 worker 无下界）。
+func (r *RangeShardingReader) ReadBatchByKeyRange(ctx context.Context, startID, endID interface{}, limit int64) ([]map[string]interface{}, error) {
+	// 无上界时退化为普通 keyset 分页
+	if endID == nil {
+		return r.ReadBatchByKeys(ctx, startID, limit)
+	}
+
+	limit = normalizeSelectLimit(limit)
+	var colParts []string
+	for _, col := range r.identity.Columns {
+		colParts = append(colParts, selectExprForColumn(col))
+	}
+	columns := strings.Join(colParts, ", ")
+
+	pkCols := r.identity.EffectiveCursorCols()
+
+	var query string
+	var args []interface{}
+
+	if len(pkCols) == 1 {
+		// 单列主键：上界 <= endID（含边界行），下界 > startID（排他，避免重复）
+		hasStart := startID != nil
+		if hasStart {
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` > ? AND `%s` <= ? ORDER BY `%s` ASC LIMIT ?",
+				columns, r.schema, r.table, pkCols[0], pkCols[0], pkCols[0])
+			args = []interface{}{startID, endID, limit}
+		} else {
+			// 第一个 worker：只有上界（含边界行）
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` <= ? ORDER BY `%s` ASC LIMIT ?",
+				columns, r.schema, r.table, pkCols[0], pkCols[0])
+			args = []interface{}{endID, limit}
+		}
+	} else {
+		// 复合主键
+		var bkCols []string
+		for _, col := range pkCols {
+			bkCols = append(bkCols, "`"+col+"`")
+		}
+		colList := strings.Join(bkCols, ", ")
+
+		// 构建上界 WHERE 片段
+		var upperWhere string
+		var upperArgs []interface{}
+		if endIDs, ok := endID.([]interface{}); ok && len(endIDs) == len(pkCols) {
+			upperWhere, upperArgs = buildCompositeKeysetUpperBound(pkCols, endIDs)
+		} else {
+			// endID 不是完整复合主键值，退化为按首列上界（含边界行）
+			upperWhere = fmt.Sprintf("`%s` <= ?", pkCols[0])
+			upperArgs = []interface{}{endID}
+		}
+
+		if startID == nil {
+			// 第一个 worker：只有上界
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s ORDER BY %s ASC LIMIT ?",
+				columns, r.schema, r.table, upperWhere, colList)
+			args = append(append(args, upperArgs...), limit)
+		} else if startIDs, ok := startID.([]interface{}); ok && len(startIDs) == len(pkCols) {
+			// 完整复合主键下界 + 上界
+			lowerWhere, lowerArgs := buildCompositeKeysetWhere(pkCols, startIDs)
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE (%s) AND (%s) ORDER BY %s ASC LIMIT ?",
+				columns, r.schema, r.table, lowerWhere, upperWhere, colList)
+			args = append(append(lowerArgs, upperArgs...), limit)
+		} else {
+			// 单值下界（仅按首列）+ 上界
+			query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE `%s` > ? AND (%s) ORDER BY %s ASC LIMIT ?",
+				columns, r.schema, r.table, pkCols[0], upperWhere, colList)
+			args = append([]interface{}{startID}, upperArgs...)
+			args = append(args, limit)
+		}
+	}
+
+	return retryableQuery(ctx, r.db, query, r.scanRows, args...)
+}
+
 // ReadBatchInRange 批量读取数据方法（指定范围内，且带 LIMIT）
 func (r *RangeShardingReader) ReadBatchInRange(ctx context.Context, startID, endID, limit int64) ([]map[string]interface{}, error) { // 在指定范围内批量读取
 	// 必须带 LIMIT：limit 由任务 batch_size 驱动；<=0 时兜底，避免 WHERE 区间内一次扫出全部行。
@@ -347,14 +423,6 @@ func (r *RangeShardingReader) OpenRangeStream(conn *sql.Conn, ctx context.Contex
 		return nil, nil, err // 返回错误
 	}
 	return rows, cols, nil // 返回结果集和列名
-}
-
-// GetTotalCount 获取总行数方法
-func (r *RangeShardingReader) GetTotalCount(ctx context.Context) (int64, error) { // 获取表的总行数
-	var count int64                                                           // 定义计数变量
-	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", r.schema, r.table) // 构建查询
-	err := r.db.QueryRowContext(ctx, query).Scan(&count)                      // 执行查询
-	return count, err                                                         // 返回计数和错误
 }
 
 // GetEstimatedCount 通过 information_schema 快速获取估算行数
@@ -412,6 +480,38 @@ func buildCompositeKeysetWhere(pkCols []string, lastIDs []interface{}) (string, 
 		}
 		conds = append(conds, fmt.Sprintf("`%s` > ?", pkCols[k-1]))
 		args = append(args, lastIDs[k-1])
+		branches = append(branches, "("+strings.Join(conds, " AND ")+")")
+	}
+	return strings.Join(branches, " OR "), args
+}
+
+// buildCompositeKeysetUpperBound 将复合主键元组比较 (pk1,...,pkN) <= (e1,...,eN) 展开为 OR 表达式。
+// 上界含边界行（<=），使采样分片边界行归属前一个 worker，避免漏数。
+// 2 列示例：(pk1 = ? AND pk2 = ?) OR (pk1 = ? AND pk2 < ?) OR (pk1 < ?)
+// N 列通用：(pk1=e1 AND ... AND pkN=eN) OR (pk1=e1 AND ... AND pk_{k-1}=e_{k-1} AND pk_k < ek) OR ... OR (pk1 < e1)
+// 返回值不含外层括号，调用方在与其他条件 AND 组合时需自行加括号。
+func buildCompositeKeysetUpperBound(pkCols []string, endIDs []interface{}) (string, []interface{}) {
+	n := len(pkCols)
+	var branches []string
+	var args []interface{}
+
+	// 完整元组相等分支：(pk1=e1 AND ... AND pkN=eN)
+	var eqConds []string
+	for j := 0; j < n; j++ {
+		eqConds = append(eqConds, fmt.Sprintf("`%s` = ?", pkCols[j]))
+		args = append(args, endIDs[j])
+	}
+	branches = append(branches, "("+strings.Join(eqConds, " AND ")+")")
+
+	// 严格小于分支：(pk1=e1 AND ... AND pk_{k-1}=e_{k-1} AND pk_k < ek) OR ... OR (pk1 < e1)
+	for k := n; k >= 1; k-- {
+		var conds []string
+		for j := 0; j < k-1; j++ {
+			conds = append(conds, fmt.Sprintf("`%s` = ?", pkCols[j]))
+			args = append(args, endIDs[j])
+		}
+		conds = append(conds, fmt.Sprintf("`%s` < ?", pkCols[k-1]))
+		args = append(args, endIDs[k-1])
 		branches = append(branches, "("+strings.Join(conds, " AND ")+")")
 	}
 	return strings.Join(branches, " OR "), args

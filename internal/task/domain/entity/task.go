@@ -2,9 +2,11 @@ package entity // 声明当前文件属于entity包，用于定义数据实体
 
 import ( // 导入外部包和标准库
 
+	"fmt"
 	"strings"
 	"time" // 导入time包，用于时间处理
 
+	sink "mysql-to-sync/internal/sync/domain/sink"
 	"mysql-to-sync/pkg/crypto"
 )
 
@@ -14,19 +16,20 @@ type TaskStatus string // 定义任务状态为字符串类型
 const ( // 定义常量
 	TaskStatusPending   TaskStatus = "PENDING"   // 待执行：任务已创建但未开始
 	TaskStatusRunning   TaskStatus = "RUNNING"   // 执行中：任务正在执行
-	TaskStatusPaused    TaskStatus = "PAUSED"    // 已暂停：任务被暂停
-	TaskStatusCompleted TaskStatus = "COMPLETED" // 已完成：任务执行完成
+	TaskStatusPaused    TaskStatus = "PAUSED"    // 已暂停：任务被暂停，允许原任务继续启动
+	TaskStatusCompleted TaskStatus = "COMPLETED" // 已完成：一次性任务（如 FULL）自然执行完成
 	TaskStatusFailed    TaskStatus = "FAILED"    // 失败：任务执行失败
 	TaskStatusScheduled TaskStatus = "SCHEDULED" // 已计划：任务已设定定时启动时间
+	TaskStatusStopped   TaskStatus = "STOPPED"   // 已结束：用户在增量阶段手动结束持续运行的 ALL 任务，终态，不允许原任务再次启动/编辑/调度；仍允许查看、行数对比、复制新建和删除
 )
 
 // SyncMode 同步模式
 type SyncMode string // 定义同步模式为字符串类型
 
 const ( // 定义常量
-	SyncModeFull        SyncMode = "FULL"        // 全量同步：同步所有数据
+	SyncModeFull        SyncMode = "FULL"        // 全量同步：执行一次无缝全表遍历，不捕获 binlog 位点，不追平同步期间的变化
 	SyncModeIncremental SyncMode = "INCREMENTAL" // 增量同步：只同步变更数据
-	SyncModeAll         SyncMode = "ALL"         // 全量+增量：先全量同步后增量同步
+	SyncModeAll         SyncMode = "ALL"         // 全量+增量：先捕获 binlog 位点，再全量遍历，然后从位点回放 binlog 追平变化并持续同步
 )
 
 // SyncLevel 同步级别
@@ -91,12 +94,51 @@ type TaskConfig struct { // 定义任务配置结构体
 	OptimizeIndex         bool      `json:"optimize_index"`           // 索引优化：先删除非主键索引，数据迁移完成后再重建
 	// IndexRestoreWorkerCount 阶段3索引回放的表级并发度；0 表示按 min(worker_count,4) 推导。
 	// 单表内多个索引仍串行重建，避免同表 MDL 锁竞争。建议 ≤ target_max_open_conns。
-	IndexRestoreWorkerCount  int             `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
-	EnableReadOnly           bool            `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
-	EnableDropTableBeforeDDL bool            `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后可重建目标端重新全量
-	TxCommitEveryNParallel   int             `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐
-	SourceDB                 *DatabaseConfig `json:"source_db,omitempty"`          // 源数据库配置（可选，覆盖配置文件）
-	TargetDB                 *DatabaseConfig `json:"target_db,omitempty"`          // 目标数据库配置（可选，覆盖配置文件）
+	IndexRestoreWorkerCount  int  `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
+	EnableReadOnly           bool `json:"enable_read_only"`             // 同步前临时关闭目标库只读，同步后恢复
+	EnableDropTableBeforeDDL bool `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS；开启后可重建目标端重新全量
+	EnableSkipBinlog         bool `json:"enable_skip_binlog"`           // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
+	TxCommitEveryNParallel   int  `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5。减小可降低锁等待，增大可减少 fsync 频率提高吞吐
+
+	// === 全量 V2 引擎（任务级流水线）配置 ===
+	// full_load_engine=v1 时保持旧行为（内联 syncDatabasePair）；=v2 时使用任务级
+	// chunk 调度 + 读写解耦流水线。其余 full_load_* 字段 0 表示使用 4C8G 平衡预设自动值。
+	FullLoadEngine        string `json:"full_load_engine,omitempty"`          // v1 / v2；空视为 v1
+	FullLoadReadWorkers   int    `json:"full_load_read_workers,omitempty"`    // 任务级源读取上限；0=自动(4)
+	FullLoadWriteWorkers  int    `json:"full_load_write_workers,omitempty"`   // 任务级目标写入上限；0=自动(4)
+	FullLoadBufferMB      int    `json:"full_load_buffer_mb,omitempty"`       // 任务级数据队列上限(MiB)；0=128
+	FullLoadBatchBytesMB  int    `json:"full_load_batch_bytes_mb,omitempty"`  // 单条 INSERT 字节上限(MiB)；0=4
+	FullLoadCommitRows    int    `json:"full_load_commit_rows,omitempty"`     // 单事务行数上限；0=10000
+	FullLoadCommitBytesMB int    `json:"full_load_commit_bytes_mb,omitempty"` // 单事务字节上限(MiB)；0=32
+	// FullLoadLockWaitTimeoutSec 超大表对齐取锁等待超时（秒）；0=默认 10。
+	FullLoadLockWaitTimeoutSec int `json:"full_load_lock_wait_timeout_sec,omitempty"`
+	// FullLoadDegradeOnAlignLockFail nil/省略=对齐取锁失败时降级单连接；显式 false=fail-closed。
+	// ALL+无PK 捕获表级 HWM 时仍强制 fail-closed，不受该字段影响。
+	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
+	// FullLoadQueryTimeoutSec 单次源端查询超时（秒）；0=默认 300（5 分钟）。
+	// keyset：整次查询绝对超时；stream：仅打开查询等待上限。
+	FullLoadQueryTimeoutSec int `json:"full_load_query_timeout_sec,omitempty"`
+	// FullLoadStreamIdleTimeoutSec 无主键流式查询无进展超时（秒）；0=默认 300。
+	// 每次 Rows.Next 成功后重置；等待写队列时暂停，不计入空闲。
+	FullLoadStreamIdleTimeoutSec int `json:"full_load_stream_idle_timeout_sec,omitempty"`
+	// FullLoadStreamMaxDurationSec 无主键流式查询绝对最长时长（秒）；0=不限制总时长。
+	FullLoadStreamMaxDurationSec int `json:"full_load_stream_max_duration_sec,omitempty"`
+	// FullLoadSlowQueryWarnSec 慢查询告警阈值（秒）；0=默认 30。
+	FullLoadSlowQueryWarnSec int `json:"full_load_slow_query_warn_sec,omitempty"`
+	// FullLoadTableNoProgressSec 表无进展告警阈值（秒）；0=关闭。P0 阶段预留，未实现。
+	FullLoadTableNoProgressSec int `json:"full_load_table_no_progress_sec,omitempty"`
+	// FullLoadReadRetryTimes 表级读取自动重试次数；0=不重试。
+	FullLoadReadRetryTimes int `json:"full_load_read_retry_times,omitempty"`
+	// FullLoadTwoPhaseRead 启用单列 PK 两阶段读取（pk_probe + payload_fetch）；默认 false。
+	// 仅对单列 PK 表有效；复合 PK/无 PK 表自动跳过。
+	FullLoadTwoPhaseRead bool `json:"full_load_two_phase_read,omitempty"`
+	// FullLoadEnableStaging 启用 staging 表隔离：全量数据先写入 staging 表，完成后原子 RENAME 发布。
+	// 默认 false。启用后单表失败可重试而不污染最终表。
+	FullLoadEnableStaging bool `json:"full_load_enable_staging,omitempty"`
+
+	SourceDB    *DatabaseConfig   `json:"source_db,omitempty"`    // 源数据库配置（可选，覆盖配置文件）
+	TargetDB    *DatabaseConfig   `json:"target_db,omitempty"`    // 目标数据库配置（可选，覆盖配置文件）
+	SinkConfigs []sink.SinkConfig `json:"sink_configs,omitempty"` // 增量目标端配置（可选，默认 MYSQL）
 }
 
 // ProcessContext 处理上下文
@@ -107,17 +149,18 @@ type TaskConfig struct { // 定义任务配置结构体
 // take over. FullSyncResume remains here as a historical archive-compatible
 // field; incremental binlog positions are stored separately.
 type ProcessContext struct { // 定义处理上下文结构体
-	Status              TaskStatus  `json:"status"`                 // 任务状态
-	CurrentPosition     string      `json:"current_position"`       // 当前位点
-	ProgressPercent     float64     `json:"progress_percent"`       // 进度百分比
-	TotalRows           int64       `json:"total_rows"`             // 总行数
-	ProcessedRows       int64       `json:"processed_rows"`         // 已处理行数
-	CreatedAt           time.Time   `json:"created_at"`             // 创建时间
-	StartTime           time.Time   `json:"start_time"`             // 开始时间
-	EndTime             time.Time   `json:"end_time"`               // 结束时间
-	LastUpdateTime      time.Time   `json:"last_update_time"`       // 最后更新时间
-	ErrorStack          string      `json:"error_stack"`            // 错误堆栈
-	ScheduledAt         *time.Time  `json:"scheduled_at,omitempty"` // 下次定时启动时间（为空表示立即启动）
+	Status              TaskStatus  `json:"status"`                         // 任务状态
+	CurrentPosition     string      `json:"current_position"`               // 当前位点
+	ProgressPercent     float64     `json:"progress_percent"`               // 进度百分比
+	TotalRows           int64       `json:"total_rows"`                     // 已同步总行数（由 worker 汇总），仅用于进度展示
+	EstimatedTotalRows  int64       `json:"estimated_total_rows,omitempty"` // 估算总行数（information_schema），仅用于 ETA，不用于正确性校验
+	ProcessedRows       int64       `json:"processed_rows"`                 // 已处理行数
+	CreatedAt           time.Time   `json:"created_at"`                     // 创建时间
+	StartTime           time.Time   `json:"start_time"`                     // 开始时间
+	EndTime             time.Time   `json:"end_time"`                       // 结束时间
+	LastUpdateTime      time.Time   `json:"last_update_time"`               // 最后更新时间
+	ErrorStack          string      `json:"error_stack"`                    // 错误堆栈
+	ScheduledAt         *time.Time  `json:"scheduled_at,omitempty"`         // 下次定时启动时间（为空表示立即启动）
 	ScheduledFromStatus *TaskStatus `json:"scheduled_from_status,omitempty"`
 	RepeatCount         int         `json:"repeat_count,omitempty"`        // 定时启动总次数（包含首次执行）
 	RepeatRemaining     int         `json:"repeat_remaining,omitempty"`    // 剩余重复次数（包含下一次执行）
@@ -140,6 +183,183 @@ type ProcessContext struct { // 定义处理上下文结构体
 	// 历史兼容字段：曾用于记录每张表的全量同步进度，key = "sourceSchema.tableName"。
 	// 当前全量使用普通 INSERT，暂停/失败后不再续传；进入新一轮全量前会清空。
 	FullSyncResume map[string]*TableSyncProgress `json:"full_sync_resume,omitempty"`
+
+	// TableBinlogHWMs 记录 ALL + full_load_engine=v2 下无 PK/UK 表在表级一致性快照窗口内捕获的 binlog 高水位。
+	// key = "schema.table"，value = "file:pos"（与 SHOW MASTER STATUS / canal OnXID 同语义：下一事件起始位置）。
+	// 有 PK/UK 表不写此字段，增量从 FullSyncStartPosition 重放并依赖 upsert 幂等。
+	// V1 全量不写入此字段；V1 ALL 增量不强校验 HWM，无 PK/UK 表存在重复行风险。
+	TableBinlogHWMs map[string]string `json:"table_binlog_hwms,omitempty"`
+
+	// FullLoadV2States 记录 V2 引擎每张表的加载状态(P3 持久化,用于进程重启恢复)。
+	// key = "sourceSchema.sourceTable"。V1 任务不写入此字段。
+	// 重启后根据每张表的 Phase 决策: PUBLISHED 跳过, DATA_READY 发布, COPYING/RETRY_WAIT 重新开始, FAILED 保持失败。
+	FullLoadV2States map[string]*FullLoadV2TableState `json:"full_load_v2_states,omitempty"`
+	// FullLoadRunID 当前 V2 全量运行 ID(用于重启后识别是否同一轮全量)。
+	FullLoadRunID string `json:"full_load_run_id,omitempty"`
+	// FullLoadExpectedTables 本轮全量预期表数量；与 FullLoadV2States 一起用于防止不完整 map 被误判为全部完成。
+	FullLoadExpectedTables int `json:"full_load_expected_tables,omitempty"`
+
+	// === 行数对比（手动触发，与同步流程解耦）===
+	// 由用户在任务结束/完成后点击"对比行数"触发，后台精确统计源端和目标端 COUNT(*)，
+	// 结果随任务存档持久化。不会因为同步完成自动触发，也不会因不一致而修改原任务终态。
+	// 旧任务 JSON 没有该字段时按 nil 处理，无需数据库表结构迁移。
+	RowCountComparison *RowCountComparison `json:"row_count_comparison,omitempty"`
+}
+
+// RowCountComparisonStatus 行数对比汇总状态。
+type RowCountComparisonStatus string
+
+const (
+	RowCountComparisonChecking   RowCountComparisonStatus = "CHECKING"   // 后台核对进行中
+	RowCountComparisonMatched    RowCountComparisonStatus = "MATCHED"    // 全部表查询成功且行数一致
+	RowCountComparisonMismatched RowCountComparisonStatus = "MISMATCHED" // 全部表查询成功，至少一张表不一致
+	RowCountComparisonPartial    RowCountComparisonStatus = "PARTIAL"    // 部分表查询失败，其余结果正常保存
+	RowCountComparisonFailed     RowCountComparisonStatus = "FAILED"     // 连接/表清单获取失败，或所有表均无法完成核对
+)
+
+// RowCountComparison 行数对比汇总结果。
+//
+// difference 统一定义为"目标端行数减源端行数"。
+// source_total / target_total 只汇总两端都查询成功的表。
+// 行数使用 *int64 指针区分真实的 0 与查询失败时的未知值（nil）。
+type RowCountComparison struct {
+	Status           RowCountComparisonStatus  `json:"status"`                   // 汇总状态
+	StartedAt        *time.Time                `json:"started_at,omitempty"`     // 核对开始时间
+	CompletedAt      *time.Time                `json:"completed_at,omitempty"`   // 核对完成时间（CHECKING 时为空）
+	TotalTables      int                       `json:"total_tables"`             // 待核对表总数
+	CheckedTables    int                       `json:"checked_tables"`           // 已完成核对表数（含失败）
+	MatchedTables    int                       `json:"matched_tables"`           // 行数一致表数
+	MismatchedTables int                       `json:"mismatched_tables"`        // 行数不一致表数
+	FailedTables     int                       `json:"failed_tables"`            // 查询失败表数
+	SourceTotal      int64                     `json:"source_total"`             // 源端总行数（仅两端均成功）
+	TargetTotal      int64                     `json:"target_total"`             // 目标端总行数（仅两端均成功）
+	Difference       int64                     `json:"difference"`               // 目标总行数 - 源端总行数
+	FailureReason    string                    `json:"failure_reason,omitempty"` // FAILED 时的原因（如服务重启中断）
+	Tables           []RowCountComparisonTable `json:"tables,omitempty"`         // 逐表结果
+}
+
+// RowCountComparisonTable 单表行数对比结果。
+type RowCountComparisonTable struct {
+	SourceSchema string `json:"source_schema"`         // 源库
+	SourceTable  string `json:"source_table"`          // 源表
+	TargetSchema string `json:"target_schema"`         // 目标库
+	TargetTable  string `json:"target_table"`          // 目标表
+	SourceRows   *int64 `json:"source_rows,omitempty"` // 源端行数；nil 表示查询失败
+	TargetRows   *int64 `json:"target_rows,omitempty"` // 目标端行数；nil 表示查询失败
+	Difference   *int64 `json:"difference,omitempty"`  // 目标端 - 源端；nil 表示至少一端查询失败
+	Matched      bool   `json:"matched"`               // 两端均成功且行数一致
+	Error        string `json:"error,omitempty"`       // 查询失败时的错误信息（按端区分：source: ... / target: ...）
+}
+
+func cloneInt64Ptr(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	copied := *v
+	return &copied
+}
+
+func cloneTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	copied := *t
+	return &copied
+}
+
+// CloneRowCountComparison 深拷贝行数对比结果，供 API 在锁外安全序列化。
+func CloneRowCountComparison(rc *RowCountComparison) *RowCountComparison {
+	if rc == nil {
+		return nil
+	}
+	cloned := *rc
+	cloned.StartedAt = cloneTimePtr(rc.StartedAt)
+	cloned.CompletedAt = cloneTimePtr(rc.CompletedAt)
+	if len(rc.Tables) > 0 {
+		cloned.Tables = make([]RowCountComparisonTable, len(rc.Tables))
+		for i, tbl := range rc.Tables {
+			cloned.Tables[i] = RowCountComparisonTable{
+				SourceSchema: tbl.SourceSchema,
+				SourceTable:  tbl.SourceTable,
+				TargetSchema: tbl.TargetSchema,
+				TargetTable:  tbl.TargetTable,
+				SourceRows:   cloneInt64Ptr(tbl.SourceRows),
+				TargetRows:   cloneInt64Ptr(tbl.TargetRows),
+				Difference:   cloneInt64Ptr(tbl.Difference),
+				Matched:      tbl.Matched,
+				Error:        tbl.Error,
+			}
+		}
+	}
+	return &cloned
+}
+
+// CloneForRead 返回 ProcessContext 的只读快照，避免与后台 goroutine 并发读写同一指针字段。
+func (ctx ProcessContext) CloneForRead() ProcessContext {
+	cloned := ctx
+	cloned.ScheduledAt = cloneTimePtr(ctx.ScheduledAt)
+	if ctx.ScheduledFromStatus != nil {
+		status := *ctx.ScheduledFromStatus
+		cloned.ScheduledFromStatus = &status
+	}
+	cloned.FullSyncStartedAt = cloneTimePtr(ctx.FullSyncStartedAt)
+	cloned.FullSyncCompletedAt = cloneTimePtr(ctx.FullSyncCompletedAt)
+	if len(ctx.TableBinlogHWMs) > 0 {
+		cloned.TableBinlogHWMs = make(map[string]string, len(ctx.TableBinlogHWMs))
+		for k, v := range ctx.TableBinlogHWMs {
+			cloned.TableBinlogHWMs[k] = v
+		}
+	}
+	if len(ctx.FullLoadV2States) > 0 {
+		cloned.FullLoadV2States = make(map[string]*FullLoadV2TableState, len(ctx.FullLoadV2States))
+		for k, v := range ctx.FullLoadV2States {
+			if v != nil {
+				cpy := *v
+				cloned.FullLoadV2States[k] = &cpy
+			}
+		}
+	}
+	cloned.FullLoadRunID = ctx.FullLoadRunID
+	cloned.FullLoadExpectedTables = ctx.FullLoadExpectedTables
+	cloned.RowCountComparison = CloneRowCountComparison(ctx.RowCountComparison)
+	return cloned
+}
+
+// CloneForRead 返回任务只读快照；GetTask 仍返回 live 指针供服务内部修改，
+// API/路由读取应优先使用 TaskService.GetTaskSnapshot / GetAllTasks（已克隆）。
+func (t *SyncTask) CloneForRead() *SyncTask {
+	if t == nil {
+		return nil
+	}
+	cloned := *t
+	cloned.Context = t.Context.CloneForRead()
+	cloned.Config = t.Config
+	cloned.Config.SourceDatabases = append([]string(nil), t.Config.SourceDatabases...)
+	cloned.Config.TargetDatabases = append([]string(nil), t.Config.TargetDatabases...)
+	cloned.Config.Tables = append([]string(nil), t.Config.Tables...)
+	cloned.Config.TargetTables = append([]string(nil), t.Config.TargetTables...)
+	if t.Config.FullLoadDegradeOnAlignLockFail != nil {
+		degrade := *t.Config.FullLoadDegradeOnAlignLockFail
+		cloned.Config.FullLoadDegradeOnAlignLockFail = &degrade
+	}
+	cloned.Config.FullLoadQueryTimeoutSec = t.Config.FullLoadQueryTimeoutSec
+	cloned.Config.FullLoadStreamIdleTimeoutSec = t.Config.FullLoadStreamIdleTimeoutSec
+	cloned.Config.FullLoadStreamMaxDurationSec = t.Config.FullLoadStreamMaxDurationSec
+	cloned.Config.FullLoadSlowQueryWarnSec = t.Config.FullLoadSlowQueryWarnSec
+	cloned.Config.FullLoadTableNoProgressSec = t.Config.FullLoadTableNoProgressSec
+	cloned.Config.FullLoadReadRetryTimes = t.Config.FullLoadReadRetryTimes
+	cloned.Config.FullLoadTwoPhaseRead = t.Config.FullLoadTwoPhaseRead
+	cloned.Config.FullLoadEnableStaging = t.Config.FullLoadEnableStaging
+	if t.Config.SourceDB != nil {
+		sourceDB := *t.Config.SourceDB
+		cloned.Config.SourceDB = &sourceDB
+	}
+	if t.Config.TargetDB != nil {
+		targetDB := *t.Config.TargetDB
+		cloned.Config.TargetDB = &targetDB
+	}
+	cloned.Config.SinkConfigs = sink.CloneConfigs(t.Config.SinkConfigs)
+	return &cloned
 }
 
 // ResumeKey 历史全量断点键：主键各列的字符串化值（单列主键长度为 1，复合主键按列顺序）。
@@ -163,6 +383,22 @@ type TableSyncProgress struct {
 	ProcessedRows    int64              `json:"processed_rows,omitempty"`    // 该表已处理行数（仅用于展示/排查）
 }
 
+// FullLoadV2TableState 持久化的单表 V2 全量加载状态(P3 进程重启恢复用)。
+// 由 fullload.Engine 的表级状态机在状态转换时通过回调同步落盘。
+// 重启后根据 Phase 决策恢复策略:
+//   - PUBLISHED: 该表已完成,直接跳过
+//   - DATA_READY: staging 表数据就绪,可继续发布
+//   - COPYING/SNAPSHOT_OPENING/RETRY_WAIT/PENDING: 旧快照已失效,清理 staging 后重新开始
+//   - FAILED: 保持失败,等待人工处理
+type FullLoadV2TableState struct {
+	Phase         string    `json:"phase"`                   // 表级阶段: PENDING/SNAPSHOT_OPENING/COPYING/DATA_READY/PUBLISHED/FAILED
+	AttemptID     int       `json:"attempt_id"`              // 当前 attempt 序号(从 1 开始)
+	StagingTable  string    `json:"staging_table,omitempty"` // staging 表名(空表示未启用 staging 或直写最终表)
+	CommittedRows int64     `json:"committed_rows"`          // 已提交行数(仅用于展示/排查)
+	LastError     string    `json:"last_error,omitempty"`    // 最后错误信息
+	UpdatedAt     time.Time `json:"updated_at"`              // 最后更新时间
+}
+
 // SyncTask 同步任务
 type SyncTask struct { // 定义同步任务结构体
 	Config  TaskConfig     `json:"config"`  // 任务配置
@@ -171,6 +407,8 @@ type SyncTask struct { // 定义同步任务结构体
 
 // NewSyncTask 创建同步任务函数
 func NewSyncTask(config TaskConfig) *SyncTask { // 创建同步任务实例
+	// 归一化 Mode 为大写，确保所有下游比较（校验、执行路径）大小写不敏感
+	config.Mode = SyncMode(strings.ToUpper(string(config.Mode)))
 	now := time.Now()
 	return &SyncTask{ // 返回任务实例
 		Config: config, // 设置配置
@@ -182,13 +420,23 @@ func NewSyncTask(config TaskConfig) *SyncTask { // 创建同步任务实例
 	}
 }
 
-// Start 启动任务方法
+// Start 启动任务方法（仅管理生命周期状态，不清除全量统计）
 func (t *SyncTask) Start() { // 启动任务
 	t.Context.Status = TaskStatusRunning  // 设置状态为执行中
 	t.Context.StartTime = time.Now()      // 记录开始时间
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
 	t.Context.ScheduledAt = nil           // 清除定时启动时间
 	t.Context.ScheduledFromStatus = nil
+}
+
+// ResetFullSyncCounters 重置全量同步运行计数。
+// 仅在确定进入 executeFullSync 时调用，避免 ALL/INCREMENTAL 重启时清空历史全量统计。
+func (t *SyncTask) ResetFullSyncCounters() {
+	t.Context.ProcessedRows = 0
+	t.Context.TotalRows = 0
+	t.Context.EstimatedTotalRows = 0
+	t.Context.ProgressPercent = 0
+	t.Context.CurrentPosition = ""
 }
 
 // ConfigureRepeat 设置重复定时启动参数
@@ -221,11 +469,24 @@ func (t *SyncTask) ConsumeScheduledRun() bool {
 	return t.Context.RepeatRemaining > 0
 }
 
-// ResetRepeat 清空重复定时配置
+// ResetRepeat 清空重复定时配置。
+// 仅清理 repeat 相关字段，不触碰 cron/once 的调度字段与 ScheduledFromStatus，
+// 以便 ConfigureCronSchedule 在调用本方法后仍能保留刚写入的 cron 配置。
 func (t *SyncTask) ResetRepeat() {
 	t.Context.RepeatCount = 0
 	t.Context.RepeatRemaining = 0
 	t.Context.RepeatIntervalSec = 0
+}
+
+// ClearScheduleConfig 清空所有定时调度配置（once / repeat / cron 模式字段 + 调度位点）。
+// 用于任务最终完成、取消定时或立即启动时清除残留调度状态，避免前端在非 SCHEDULED 状态下误展示。
+func (t *SyncTask) ClearScheduleConfig() {
+	t.ResetRepeat()
+	t.Context.ScheduleMode = ""
+	t.Context.CronExpression = ""
+	t.Context.CronTimezone = ""
+	t.Context.ScheduledAt = nil
+	t.Context.ScheduledFromStatus = nil
 }
 
 // Schedule 设置定时启动
@@ -249,9 +510,7 @@ func (t *SyncTask) CancelSchedule() { // 取消定时启动
 		restoreStatus = *t.Context.ScheduledFromStatus
 	}
 	t.Context.Status = restoreStatus
-	t.Context.ScheduledAt = nil
-	t.Context.ScheduledFromStatus = nil
-	t.ResetRepeat()
+	t.ClearScheduleConfig()
 	t.Context.LastUpdateTime = time.Now()
 }
 
@@ -261,16 +520,24 @@ func (t *SyncTask) Pause() { // 暂停任务
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
 }
 
+// Stop 结束任务方法。
+// 用于持续运行的 ALL 任务在增量阶段被用户手动结束：进入终态 STOPPED，记录结束时间，
+// 清除 Cron/repeat 等调度配置。STOPPED 不允许原任务再次启动、编辑或设置定时调度。
+// 人工结束不计入自然完成任务数（tasks_completed 指标仍只统计 COMPLETED）。
+func (t *SyncTask) Stop() {
+	now := time.Now()
+	t.Context.Status = TaskStatusStopped // 设置状态为已结束
+	t.Context.EndTime = now              // 记录结束时间
+	t.Context.LastUpdateTime = now       // 更新最后更新时间
+	t.ClearScheduleConfig()              // 清除 Cron/repeat/once 调度配置
+}
+
 // Complete 完成任务方法
 func (t *SyncTask) Complete() { // 完成任务
 	t.Context.Status = TaskStatusCompleted // 设置状态为已完成
 	t.Context.EndTime = time.Now()         // 记录结束时间
 	t.Context.LastUpdateTime = time.Now()  // 更新最后更新时间
 	t.Context.ProgressPercent = 100        // 设置进度为100%
-	// 全量总行数可能来自 information_schema 估算，与实处理行数不一致；完成时以实处理为准
-	if t.Context.ProcessedRows > 0 {
-		t.Context.TotalRows = t.Context.ProcessedRows
-	}
 }
 
 // Fail 任务失败方法
@@ -285,14 +552,19 @@ func (t *SyncTask) Fail(err error) { // 任务失败处理
 func (t *SyncTask) UpdateProgress(processedRows int64, position string) { // 更新任务进度
 	t.Context.ProcessedRows = processedRows // 设置已处理行数
 	t.Context.CurrentPosition = position    // 设置当前位点
-	if t.Context.TotalRows > 0 {            // 如果总行数大于0
-		t.Context.ProgressPercent = float64(processedRows) / float64(t.Context.TotalRows) * 100 // 计算进度百分比
+	// 进度计算优先使用精确总数，未到位时用估算总数兜底（仅 ETA 展示）
+	effectiveTotal := t.Context.TotalRows
+	if effectiveTotal <= 0 {
+		effectiveTotal = t.Context.EstimatedTotalRows
+	}
+	if effectiveTotal > 0 {
+		t.Context.ProgressPercent = float64(processedRows) / float64(effectiveTotal) * 100
 	}
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
 }
 
 // MarkFullSyncStarted 标记全量同步进入"已开始但未完成"阶段，并记录 binlog 起点位点字符串。
-// startPosition 形如 "mysql-bin.000123:456"；空串表示位点尚未捕获（捕获失败时也要打点，方便排查）。
+// startPosition 形如 "mysql-bin.000123:456"；FULL 模式传空串（不捕获位点），ALL 模式传实际位点。
 func (t *SyncTask) MarkFullSyncStarted(startPosition string) {
 	now := time.Now()
 	t.Context.SyncPhase = SyncPhaseFullStarted
@@ -341,7 +613,113 @@ func (t *SyncTask) ResetSyncPhase() {
 	t.Context.FullSyncStartPosition = ""
 	t.Context.LastIncrementalPosition = ""
 	t.Context.FullSyncFailedReason = ""
+	t.Context.TableBinlogHWMs = nil
 	t.Context.LastUpdateTime = time.Now()
+}
+
+// SetTableBinlogHWM 持久化单表 binlog 高水位（ALL + 无 PK/UK）。pos 形如 "file:pos"。
+func (t *SyncTask) SetTableBinlogHWM(tableKey, pos string) {
+	if tableKey == "" || pos == "" {
+		return
+	}
+	if t.Context.TableBinlogHWMs == nil {
+		t.Context.TableBinlogHWMs = make(map[string]string)
+	}
+	t.Context.TableBinlogHWMs[tableKey] = pos
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// ClearTableBinlogHWMs 清空表级 HWM（新一轮全量开始时调用）。
+func (t *SyncTask) ClearTableBinlogHWMs() {
+	t.Context.TableBinlogHWMs = nil
+}
+
+// SetFullLoadV2TableState 持久化单表 V2 加载状态(P3)。
+// tableKey = "sourceSchema.sourceTable"。state 为 nil 时删除该表条目。
+func (t *SyncTask) SetFullLoadV2TableState(tableKey string, state *FullLoadV2TableState) {
+	if tableKey == "" {
+		return
+	}
+	if t.Context.FullLoadV2States == nil {
+		t.Context.FullLoadV2States = make(map[string]*FullLoadV2TableState)
+	}
+	if state == nil {
+		delete(t.Context.FullLoadV2States, tableKey)
+	} else {
+		state.UpdatedAt = time.Now()
+		t.Context.FullLoadV2States[tableKey] = state
+	}
+	t.Context.LastUpdateTime = time.Now()
+}
+
+// GetFullLoadV2TableState 获取单表 V2 加载状态;不存在返回 nil。
+func (t *SyncTask) GetFullLoadV2TableState(tableKey string) *FullLoadV2TableState {
+	if t.Context.FullLoadV2States == nil {
+		return nil
+	}
+	return t.Context.FullLoadV2States[tableKey]
+}
+
+// ClearFullLoadV2States 清空所有 V2 表级状态(新一轮全量开始时调用)。
+func (t *SyncTask) ClearFullLoadV2States() {
+	t.Context.FullLoadV2States = nil
+	t.Context.FullLoadRunID = ""
+	t.Context.FullLoadExpectedTables = 0
+}
+
+// InitFullLoadV2Manifest 在全量开始前一次性写入完整表清单为 PENDING，并设置 runID/预期表数。
+// 已存在且 Phase=PUBLISHED 的条目在恢复模式下应跳过调用方过滤；此方法用于全新全量。
+func (t *SyncTask) InitFullLoadV2Manifest(runID string, tableKeys []string) {
+	t.Context.FullLoadRunID = runID
+	t.Context.FullLoadExpectedTables = len(tableKeys)
+	t.Context.FullLoadV2States = make(map[string]*FullLoadV2TableState, len(tableKeys))
+	now := time.Now()
+	for _, key := range tableKeys {
+		if key == "" {
+			continue
+		}
+		t.Context.FullLoadV2States[key] = &FullLoadV2TableState{
+			Phase:     "PENDING",
+			AttemptID: 0,
+			UpdatedAt: now,
+		}
+	}
+	t.Context.LastUpdateTime = now
+}
+
+// AllFullLoadV2TablesPublished 检查所有 V2 表是否都已 PUBLISHED(全量完成)。
+// states 为空时返回 false(无状态,不是恢复场景)。
+// 若设置了 FullLoadExpectedTables，map 条目数不足时也返回 false，防止崩溃后不完整 map 被误判完成。
+func (t *SyncTask) AllFullLoadV2TablesPublished() bool {
+	if len(t.Context.FullLoadV2States) == 0 {
+		return false
+	}
+	if t.Context.FullLoadExpectedTables > 0 && len(t.Context.FullLoadV2States) < t.Context.FullLoadExpectedTables {
+		return false
+	}
+	for _, s := range t.Context.FullLoadV2States {
+		if s == nil || s.Phase != "PUBLISHED" {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateFullLoadOptions 校验 V2 全量相关配置（创建/更新任务时 fail-closed）。
+func (c *TaskConfig) ValidateFullLoadOptions() error {
+	if c == nil {
+		return nil
+	}
+	if c.FullLoadReadRetryTimes > 0 && !c.FullLoadEnableStaging {
+		return fmt.Errorf("full_load_read_retry_times=%d requires full_load_enable_staging=true (retry without staging would duplicate or conflict on the final table)", c.FullLoadReadRetryTimes)
+	}
+	if c.FullLoadReadRetryTimes < 0 {
+		return fmt.Errorf("full_load_read_retry_times must be >= 0")
+	}
+	if c.FullLoadReadRetryTimes > 10 {
+		return fmt.Errorf("full_load_read_retry_times must be <= 10")
+	}
+	return nil
 }
 
 // HasFullSyncEverCompleted 返回是否曾经完成过一次全量（含 INCREMENTAL_STARTED 阶段）。
@@ -353,12 +731,24 @@ func (t *SyncTask) HasFullSyncEverCompleted() bool {
 
 // FullSyncIncomplete 返回全量是否处于"开始过但未完成"的中间态（崩溃/暂停/失败留下的不一致快照）。
 // 该状态下不允许直接接增量；未开启 destructive rebuild 时也不允许继续全量续传。
+//
+// P3 例外: V2 引擎 + 有持久化表级状态(FullLoadV2States)时,允许续传。
+// 重启恢复逻辑会根据每张表的 Phase 决策: PUBLISHED 跳过, 未完成的重新开始。
 func (t *SyncTask) FullSyncIncomplete() bool {
-	return t.Context.SyncPhase == SyncPhaseFullStarted ||
-		t.Context.SyncPhase == SyncPhaseFullFailed
+	if t.Context.SyncPhase == SyncPhaseFullStarted ||
+		t.Context.SyncPhase == SyncPhaseFullFailed {
+		// V2 + 有持久化状态:不算 incomplete(可恢复)
+		if t.Config.UsesFullLoadV2() && len(t.Context.FullLoadV2States) > 0 {
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // ResetFullSyncResume 清空所有表的历史全量断点（全新一轮全量开始时调用）。
+// 不清理 TableBinlogHWMs：全量完成后 clearFullSyncResume 也会调用本方法，
+// 表级 HWM 必须保留到增量阶段；HWM 仅由 ClearTableBinlogHWMs / ResetSyncPhase / 新一轮全量开始时清空。
 func (t *SyncTask) ResetFullSyncResume() {
 	t.Context.FullSyncResume = nil
 }
@@ -489,6 +879,12 @@ func EffectiveIndexRestoreWorkers(configured, workerCount, hardMax int) int {
 	return n
 }
 
+// UsesFullLoadV2 返回该任务是否使用全量 V2 任务级流水线引擎。
+// full_load_engine 大小写不敏感，等于 "v2" 时启用；其余（含空值）保持 V1 行为。
+func (c *TaskConfig) UsesFullLoadV2() bool {
+	return strings.EqualFold(strings.TrimSpace(c.FullLoadEngine), "v2")
+}
+
 // EncryptPasswords 将任务中 SourceDB/TargetDB 的密码加密（存储前调用）
 // key 为空时不做任何加密操作
 func (t *SyncTask) EncryptPasswords(key string) error {
@@ -509,6 +905,9 @@ func (t *SyncTask) EncryptPasswords(key string) error {
 			return err
 		}
 		t.Config.TargetDB.Password = enc
+	}
+	if err := sink.EncryptSinkSecrets(t.Config.SinkConfigs, key); err != nil {
+		return err
 	}
 	return nil
 }
@@ -533,6 +932,9 @@ func (t *SyncTask) DecryptPasswords(key string) error {
 			return err
 		}
 		t.Config.TargetDB.Password = dec
+	}
+	if err := sink.DecryptSinkSecrets(t.Config.SinkConfigs, key); err != nil {
+		return err
 	}
 	return nil
 }

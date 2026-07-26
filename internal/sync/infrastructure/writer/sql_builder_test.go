@@ -662,3 +662,101 @@ func TestSQLBuilder_BuildBatchUpsert_EmptyRowsReturnsEmpty(t *testing.T) {
 		t.Errorf("empty rows must return empty query, got query=%q args=%v", query, args)
 	}
 }
+
+// === PK/UK identity 变更检测 ===
+
+func TestSQLBuilder_IdentityChanged(t *testing.T) {
+	tests := []struct {
+		name        string
+		strategy    entity.IdentityStrategy
+		columns     []entity.ColumnMeta
+		identifyCols []string
+		before      map[string]interface{}
+		after       map[string]interface{}
+		want        bool
+	}{
+		{
+			name:         "PK unchanged",
+			strategy:     entity.PKStrategy,
+			columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name", IsPrimaryKey: false}},
+			identifyCols: []string{"id"},
+			before:       map[string]interface{}{"id": 1, "name": "old"},
+			after:        map[string]interface{}{"id": 1, "name": "new"},
+			want:         false,
+		},
+		{
+			name:         "PK changed",
+			strategy:     entity.PKStrategy,
+			columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}, {Name: "name", IsPrimaryKey: false}},
+			identifyCols: []string{"id"},
+			before:       map[string]interface{}{"id": 1, "name": "x"},
+			after:        map[string]interface{}{"id": 2, "name": "x"},
+			want:         true,
+		},
+		{
+			name:         "composite PK partially changed",
+			strategy:     entity.PKStrategy,
+			columns:      []entity.ColumnMeta{{Name: "user_id", IsPrimaryKey: true}, {Name: "role_id", IsPrimaryKey: true}, {Name: "ts", IsPrimaryKey: false}},
+			identifyCols: []string{"user_id", "role_id"},
+			before:       map[string]interface{}{"user_id": 1, "role_id": 2, "ts": "2024-01-01"},
+			after:        map[string]interface{}{"user_id": 1, "role_id": 3, "ts": "2024-01-02"},
+			want:         true,
+		},
+		{
+			name:         "composite PK all unchanged",
+			strategy:     entity.PKStrategy,
+			columns:      []entity.ColumnMeta{{Name: "user_id", IsPrimaryKey: true}, {Name: "role_id", IsPrimaryKey: true}, {Name: "ts", IsPrimaryKey: false}},
+			identifyCols: []string{"user_id", "role_id"},
+			before:       map[string]interface{}{"user_id": 1, "role_id": 2, "ts": "2024-01-01"},
+			after:        map[string]interface{}{"user_id": 1, "role_id": 2, "ts": "2024-01-02"},
+			want:         false,
+		},
+		{
+			name:         "UK changed",
+			strategy:     entity.UKStrategy,
+			columns:      []entity.ColumnMeta{{Name: "email", IsPrimaryKey: false, IsUnique: true}, {Name: "name", IsPrimaryKey: false}},
+			identifyCols: []string{"email"},
+			before:       map[string]interface{}{"email": "old@x.com", "name": "a"},
+			after:        map[string]interface{}{"email": "new@x.com", "name": "a"},
+			want:         true,
+		},
+		{
+			name:         "UK unchanged, non-identity column changed",
+			strategy:     entity.UKStrategy,
+			columns:      []entity.ColumnMeta{{Name: "email", IsPrimaryKey: false, IsUnique: true}, {Name: "name", IsPrimaryKey: false}},
+			identifyCols: []string{"email"},
+			before:       map[string]interface{}{"email": "same@x.com", "name": "old"},
+			after:        map[string]interface{}{"email": "same@x.com", "name": "new"},
+			want:         false,
+		},
+		{
+			name:         "type mismatch int32 vs int64 same value",
+			strategy:     entity.PKStrategy,
+			columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}},
+			identifyCols: []string{"id"},
+			before:       map[string]interface{}{"id": int32(1)},
+			after:        map[string]interface{}{"id": int64(1)},
+			want:         false,
+		},
+		{
+			name:         "identity column missing from after",
+			strategy:     entity.PKStrategy,
+			columns:      []entity.ColumnMeta{{Name: "id", IsPrimaryKey: true}},
+			identifyCols: []string{"id"},
+			before:       map[string]interface{}{"id": 1},
+			after:        map[string]interface{}{},
+			want:         true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			identity := createTestIdentity(tt.strategy, "test", tt.columns, tt.identifyCols)
+			builder := NewSQLBuilder(identity)
+			got := builder.IdentityChanged(tt.before, tt.after)
+			if got != tt.want {
+				t.Errorf("IdentityChanged() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

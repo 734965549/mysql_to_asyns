@@ -16,7 +16,7 @@
 
 - 决策位置：[`task_service.go:2246-2255`](../../internal/task/application/service/task_service.go#L2246-L2255)
 - 串行实现：[`task_service.go:6576-6592`](../../internal/task/application/service/task_service.go#L6576-L6592) `restorePendingIndexes`
-- 单表内索引同样串行：[`task_service.go:6595-6669`](../../internal/task/application/service/task_service.go#L6595-L6669) `restoreIndexes`
+- 单表内索引合并回放：[`task_service.go`](../../internal/task/application/service/task_service.go) `restoreIndexes`（按 BTREE / FULLTEXT / SPATIAL 分批，每批一条 `ALTER TABLE`）
 
 表现形式：
 
@@ -47,8 +47,10 @@ sequenceDiagram
     Caller->>R: pending[N tables]
     loop 串行遍历每张表
         R->>R: restoreIndexes(table)
-        loop 串行遍历该表每个索引
-            R->>DB: CREATE INDEX ... (阻塞至完成)
+        loop 同表按类型分批 ALTER TABLE
+            R->>DB: ALTER TABLE ... ADD INDEX ... (BTREE 一批)
+            DB-->>R: ok
+            R->>DB: ALTER TABLE ... ADD FULLTEXT/SPATIAL ... (如有)
             DB-->>R: ok
         end
     end
@@ -63,14 +65,14 @@ sequenceDiagram
 | 2 | 恢复期间不响应暂停，`restorePendingIndexes` 内无 `isTaskStopped` 检查 | 大表回放期间暂停不被尊重 | [`task_service.go:6579-6592`](../../internal/task/application/service/task_service.go#L6579-L6592) |
 | 3 | `restoreIndexes` 用 `targetDB.Exec`，无 context | 无法被取消，并发后无法中断在途 DDL | [`task_service.go:6652`](../../internal/task/application/service/task_service.go#L6652) |
 | 4 | 测试硬断言顺序，sqlmock 默认按序匹配 | 并发后顺序不确定，测试会失败 | [`task_service_test.go:118-152`](../../internal/task/application/service/task_service_test.go#L118-L152) |
-| 5 | 并发后每条 `CREATE INDEX` 占一条目标库连接，可能挤占连接池 | 并发度 > `target_max_open_conns` 时 goroutine 阻塞 | [`config.go:32`](../../internal/config/config.go#L32) |
+| 5 | 并发后每条 `ALTER TABLE` 占一条目标库连接，可能挤占连接池 | 并发度 > `target_max_open_conns` 时 goroutine 阻塞 | [`config.go:32`](../../internal/config/config.go#L32) |
 
 ## 3. 设计决策
 
 | 决策点 | 选择 | 理由 |
 |--------|------|------|
-| 并发粒度 | **表级并发**，单表内索引仍串行 | 不同表互不影响；同表 `CREATE INDEX` 互加 MDL，并行会抖动甚至死锁 |
-| 并发度配置 | 新增 `index_restore_worker_count`，默认回退 `min(worker_count,4)`，硬上限 16 | 独立可调；`CREATE INDEX` 是 CPU/IO/临时空间密集型，默认保守取 4 |
+| 并发粒度 | **表级并发**，单表内索引按类型合并 `ALTER TABLE` | 不同表互不影响；同表 BTREE/FULLTEXT/SPATIAL 分批合并，每批一次扫描建齐，避免逐条 `CREATE INDEX` 重复扫表 |
+| 并发度配置 | 新增 `index_restore_worker_count`，默认回退 `min(worker_count,4)`，硬上限 16 | 独立可调；索引回放 DDL（`ALTER TABLE ... ADD INDEX`）是 CPU/IO/临时空间密集型，默认保守取 4 |
 | 错误策略 | fail-fast：首个错误通过 context 取消其余在途任务 | 与全量数据同步的 `WaitGroup + errChan` 模式一致 |
 | 暂停响应 | 恢复期间持续检查 `isTaskStopped`，触发后返回 `errFullSyncStoppedByUser` | 与现有全量停止语义一致 |
 | context 传播 | `restoreIndexes` 改用 `ExecContext` | 支持取消在途 DDL（DDL 本身不可中断，但可在下一条索引/下一张表前生效） |
@@ -85,14 +87,14 @@ sequenceDiagram
     participant DB as targetDB
     Caller->>R: pending[N], ctx, workers
     R->>Pool: 派发 N 个表任务(信号量限流)
-    par 表A(串行其索引)
-        Pool->>DB: CREATE INDEX ...
+    par 表A(同表合并 ALTER)
+        Pool->>DB: ALTER TABLE ... ADD INDEX ...
         DB-->>Pool: ok
-    and 表B(串行其索引)
-        Pool->>DB: CREATE INDEX ...
+    and 表B(同表合并 ALTER)
+        Pool->>DB: ALTER TABLE ... ADD INDEX ...
         DB-->>Pool: ok
     and 表C ...
-        Pool->>DB: CREATE INDEX ...
+        Pool->>DB: ALTER TABLE ... ADD INDEX ...
     end
     Note over R: 任一出错/暂停 -> ctx.Cancel -> 其余尽快退出
     R-->>Caller: nil / first error / stopped
@@ -109,7 +111,7 @@ sequenceDiagram
 ```go
 OptimizeIndex            bool `json:"optimize_index"`               // 索引优化：先删除非主键索引，数据迁移完成后再重建
 // IndexRestoreWorkerCount 阶段3索引回放的表级并发度；0 表示按 min(worker_count,4) 推导。
-// 单表内多个索引仍串行重建，避免同表 MDL 锁竞争。建议 ≤ target_max_open_conns。
+// 单表内多个索引按类型合并为 ALTER TABLE（BTREE 一批、FULLTEXT/SPATIAL 各一批）。建议 ≤ target_max_open_conns。
 IndexRestoreWorkerCount  int  `json:"index_restore_worker_count"`   // 索引回放并发度；0=自动推导
 ```
 
@@ -124,7 +126,7 @@ IndexRestoreWorkerCount  int  `json:"index_restore_worker_count"`   // 索引回
 //   - hardMax: 全局硬上限（来自 config.Sync.IndexRestoreHardMax，<=0 用内置 16）
 //
 // 推导规则：configured<=0 时取 min(workerCount,4)；再受 hardMax 封顶；最低 1。
-// 单表内多个索引不并发，仅表间并发。
+// 单表内多个索引按类型合并 ALTER TABLE，仅表间并发。
 func EffectiveIndexRestoreWorkers(configured, workerCount, hardMax int) int {
 	const defaultCap = 4
 	const builtinHardMax = 16
@@ -172,7 +174,7 @@ IndexRestoreHardMax int `toml:"index_restore_hard_max" json:"index_restore_hard_
 
 ```go
 // restorePendingIndexes 在所有表数据同步完成后，按表级并发恢复全量同步期间移除的索引。
-// 单表内多个索引仍串行重建（避免同表 MDL 锁竞争）；不同表之间按 workers 并发。
+// 单表内待建索引按类型（BTREE / FULLTEXT / SPATIAL）分批合并 ALTER TABLE；不同表之间按 workers 并发。
 // 任一表失败或任务被停止时，通过 context 取消其余在途任务并尽快返回。
 func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRuntime, taskID string, pending []pendingIndexRestore, workers int) error {
 	if len(pending) == 0 {
@@ -241,33 +243,32 @@ func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRu
 
 > 说明：`sync` 包已在文件上方导入（项目内广泛使用 `sync.WaitGroup`），无需新增 import。
 
-### 步骤 5 — `restoreIndexes` 支持 context
+### 步骤 5 — `restoreIndexes` 支持 context 与同表 ALTER 合并
 
-文件：[`internal/task/application/service/task_service.go`](../../internal/task/application/service/task_service.go)，调整 [`L6595-6669`](../../internal/task/application/service/task_service.go#L6595-L6669)。
+文件：[`internal/task/application/service/task_service.go`](../../internal/task/application/service/task_service.go)，`restoreIndexes`。
 
-签名改为：
+签名：
 
 ```go
 func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string, indexes []map[string]interface{}) error
 ```
 
-两处改动：
+行为要点：
 
-1. 索引循环开头加取消检查（保持单表内串行）：
-```go
-for _, indexInfo := range indexes {
-    select {
-    case <-ctx.Done():
-        return ctx.Err()
-    default:
-    }
-    // ...原逻辑...
-}
-```
+1. 循环开头加取消检查；
+2. 逐个 `targetIndexExists`：已存在且定义一致则跳过，冲突则 fail-fast；
+3. 待建索引按类型分组（BTREE / FULLTEXT / SPATIAL），同组合并为一条 `ALTER TABLE ... ADD INDEX ...`；
+4. 每批使用 `ExecContext` + 连接类错误重试。
 
-2. [`L6652`](../../internal/task/application/service/task_service.go#L6652) 的 `targetDB.Exec(createSQL)` 改为：
-```go
-_, err := targetDB.ExecContext(ctx, createSQL)
+示例（同表 3 个 BTREE + 1 个 FULLTEXT → 两条 DDL）：
+
+```sql
+ALTER TABLE `db`.`t`
+  ADD INDEX `idx_a` (`a`),
+  ADD UNIQUE INDEX `uk_b` (`b`);
+
+ALTER TABLE `db`.`t`
+  ADD FULLTEXT INDEX `ft_c` (`c`);
 ```
 
 ### 步骤 6 — 更新调用方
@@ -315,9 +316,9 @@ func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	defer targetDB.Close()
 
 	mock.MatchExpectationsInOrder(false)
-	mock.ExpectExec("CREATE INDEX `idx_users_name` ON `target_db`.`users` \\(`name`\\)").
+	mock.ExpectExec("ALTER TABLE `target_db`.`users` ADD INDEX `idx_users_name` \\(`name`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("CREATE UNIQUE INDEX `uk_orders_no` ON `target_db`.`orders` \\(`order_no`\\)").
+	mock.ExpectExec("ALTER TABLE `target_db`.`orders` ADD UNIQUE INDEX `uk_orders_no` \\(`order_no`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{}
@@ -344,7 +345,7 @@ func TestRestorePendingIndexes_RespectsStopSignal(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	// 不期望任何 CREATE INDEX 被执行
+	// 不期望任何 ALTER TABLE ... ADD INDEX 被执行
 	ts := &TaskService{
 		tasks: map[string]*taskEntity.SyncTask{
 			"task-stop": {Context: taskEntity.SyncContext{Status: taskEntity.TaskStatusPaused}},
@@ -373,10 +374,10 @@ func TestRestorePendingIndexes_FailsFastOnFirstError(t *testing.T) {
 
 	mock.MatchExpectationsInOrder(false)
 	// 第一张表索引报错
-	mock.ExpectExec("CREATE INDEX `idx_a` ON `db`.`a` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`a` ADD INDEX `idx_a` \\(`c`\\)").
 		WillReturnError(fmt.Errorf("DDL failed"))
 	// 第二张表可能因 ctx 取消而不执行；用 AnyTimes 容错
-	mock.ExpectExec("CREATE INDEX `idx_b` ON `db`.`b` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`b` ADD INDEX `idx_b` \\(`c`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0)).Maybe()
 
 	ts := &TaskService{}
@@ -435,8 +436,8 @@ index_restore_hard_max = 16
 - 默认：0（自动推导为 min(worker_count, 4)）
 - 建议值：4（保守）；目标库 CPU/IO/临时空间充足可调高
 - 注意：
-  - 单表内多个索引仍串行重建，避免同表 MDL 锁竞争
-  - 并发度建议 ≤ `target_max_open_conns - 2`，每条 CREATE INDEX 会占用一条目标库连接
+  - 单表内多个索引按类型合并为 `ALTER TABLE`（BTREE 一批、FULLTEXT/SPATIAL 各一批），避免逐条 `CREATE INDEX` 重复扫表
+  - 并发度建议 ≤ `target_max_open_conns - 2`，每条 `ALTER TABLE` 会占用一条目标库连接
   - 并发回放期间目标实例 CPU、磁盘 IO、临时表空间负载会上升，需确保资源充足
 ```
 
@@ -476,14 +477,50 @@ go test ./...
 | 项 | 说明 |
 |----|------|
 | 正确性 | 仅改阶段3回放路径，数据同步与历史 `full_sync_resume` 存档结构不受影响 |
-| 同表并发 | 方案刻意**不**对同表多个索引并发，避免 MDL 死锁/抖动 |
-| 连接池 | 每条 `CREATE INDEX` 占一条 `targetDB` 连接；并发度需 ≤ `target_max_open_conns - 2`，文档已注明 |
-| 暂停语义 | MySQL 单条 `CREATE INDEX` 不可中断，context 只能在下一条索引/下一张表前生效；暂停后可能仍有 1 个在建索引完成，文档需说明 |
+| 同表并发 | 方案不对同表多个索引做 goroutine 并行；同表待建索引按类型合并 `ALTER TABLE`，每批一次扫描 |
+| 连接池 | 每条 `ALTER TABLE` 占一条 `targetDB` 连接；并发度需 ≤ `target_max_open_conns - 2`，文档已注明 |
+| 连接重试幂等 | 已补充失败后回查：若 `ALTER TABLE` 返回错误但目标索引均已存在且定义一致，则按成功处理，避免“服务端已成功、客户端断链”导致误失败 |
+| 暂停语义 | MySQL 单条 `ALTER TABLE` 不可中断，context 只能在下一批/下一张表前生效；暂停后可能仍有 1 个在建 DDL 完成，文档需说明 |
 | 目标库负载 | 并发回放期间 CPU/IO/临时空间负载上升，`innodb_online_alter_log_max_size` 与临时表空间需充足；默认并发度 4 正是为此保守取值 |
 | 向后兼容 | `index_restore_worker_count=0` 时行为退化为"自动推导"，旧任务无需修改配置；未开启 `optimize_index` 的任务完全不受影响 |
 | 测试 | 现有顺序断言测试需改造为乱序匹配；新增并发/停止/fail-fast 覆盖 |
 
-## 6. 回滚方案
+## 8. 后续优化：同表索引合并 ALTER TABLE
+
+> 状态：**已完成 / 已实施**（在表级并发方案之上叠加）
+
+### 8.1 动机
+
+表级并发无法解决「单张大表、索引很多」的场景：原先单表内对每个索引逐条 `CREATE INDEX`，InnoDB 建二级索引通常需扫表，10 个索引 ≈ 扫表 10 次。
+
+### 8.2 实现
+
+`restoreIndexes` 将同表待建索引按类型分组后，每组合并为一条 DDL：
+
+| 批次 | 包含索引类型 | 示例 |
+|------|-------------|------|
+| BTREE | 普通索引、唯一索引（`non_unique=0`） | `ADD INDEX` / `ADD UNIQUE INDEX` |
+| FULLTEXT | 全文索引 | `ADD FULLTEXT INDEX` |
+| SPATIAL | 空间索引 | `ADD SPATIAL INDEX` |
+
+FULLTEXT/SPATIAL 与 BTREE 分开执行，兼容部分 MySQL 版本拒绝同句混加的情况；纯 BTREE 表仍只有一条 `ALTER TABLE`。
+
+关键函数：`buildAddIndexClause`、`buildAlterAddIndexesSQL`、`groupIndexRestoreBatches`、`execAlterAddIndexes`。
+
+### 8.3 行为不变项
+
+- 跨表并发、`fail-fast`、停止信号、连接重试语义与表级并发方案一致；
+- `dropNonPrimaryKeyIndexes` 仍为逐条 `DROP INDEX`（成本远低于建索引）。
+
+### 8.4 连接重试幂等补偿（已修复）
+
+在索引批次执行中，已补充“失败后状态回查”：
+
+- 当 `execAlterAddIndexes` 的 `ALTER TABLE ... ADD INDEX ...` 返回错误时，会逐个回查该批次目标索引；
+- 若索引均已存在且定义一致（唯一性、索引类型、列顺序/前缀长度一致），则视为本批次已成功并继续流程；
+- 该补偿用于覆盖“服务端已成功提交 DDL，但客户端因断链/网络抖动收到错误”的场景，避免误报失败。
+
+## 9. 回滚方案
 
 改动集中在：
 - `restorePendingIndexes` / `restoreIndexes` 签名与实现
@@ -494,13 +531,13 @@ go test ./...
 
 如需回滚，将 `restorePendingIndexes` 恢复为串行 `for` 循环、`restoreIndexes` 改回 `Exec` 即可；新增配置字段保留不影响旧逻辑（值为 0 即自动推导）。
 
-## 7. 验收清单
+## 10. 验收清单
 
 - [x] `TaskConfig.IndexRestoreWorkerCount` 字段已添加
 - [x] `EffectiveIndexRestoreWorkers` 推导函数及单测已添加
 - [x] `SyncTuneConfig.IndexRestoreHardMax` 已添加
 - [x] `restorePendingIndexes` 改为表级并发 + context + 停止检查
-- [x] `restoreIndexes` 改为 `ExecContext` + 循环内取消检查
+- [x] `restoreIndexes` 改为 `ExecContext` + 同表按类型合并 `ALTER TABLE`
 - [x] 调用方传入 `ctx` 与 `workers`
 - [x] 现有顺序测试改造为乱序匹配
 - [x] 新增停止信号 / fail-fast / 推导函数测试

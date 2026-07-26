@@ -11,6 +11,14 @@
 
 全量阶段写入使用普通 `INSERT`。为了避免暂停/失败后重复写入已落库数据，全量未完成时不再使用 `full_sync_resume` 续传。
 
+## V2 写事务 Commit 未知恢复（与全量断点无关）
+
+`full_load_engine=v2` 的进程内写入恢复**不**依赖 `full_sync_resume`，也不根据业务行是否存在猜测 Commit 结果。
+
+每个目标 schema 会自动创建系统表 `__mts_fl_tx`（InnoDB，表/列带注释，含 `run_id`）。写事务在 `Commit` 前插入唯一 UUID，与业务数据同事务提交；客户端遇到连接类 Commit 错误时，换连后对该 UUID 做锁定当前读（`SELECT ... FOR UPDATE`）：命中则只推进进度，无行则整事务重放，无法判定则 fail-closed。启动前还会：在首次目标端 DDL 前对目标 schema 获取 `GET_LOCK` 互斥（持有至任务级收尾；MySQL ≥ 5.7.5；`target_max_open_conns` ≥ 2）；拒绝业务目标表占用保留名 `__mts_fl_tx`；校验目标业务表为 InnoDB；并对已存在 marker 表做结构 fail-closed 校验（含完整唯一索引 / `SUB_PART`）。数据流水线成功后按本趟 `run_id` 删除本任务 marker 行（不 `DROP` 共享表；独立短超时）；失败/暂停不清理。目标账号需具备对 marker 表的 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DELETE`，以及 `GET_LOCK`/`RELEASE_LOCK`。
+
+详见 `docs/CONFIGURATION.md`「写事务提交标记表（`__mts_fl_tx`）」与 `docs/design/shejiwendang.md`「V2 写事务提交与 `__mts_fl_tx`」。
+
 ## 全量未完成时
 
 当 `sync_phase` 为 `FULL_STARTED` 或 `FULL_FAILED` 时，表示全量阶段已经开始但没有完整完成。

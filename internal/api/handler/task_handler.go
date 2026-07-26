@@ -22,6 +22,7 @@ import (
 	"mysql-to-sync/internal/metadata/domain/service"
 	metadataService "mysql-to-sync/internal/metadata/domain/service"
 	"mysql-to-sync/internal/metadata/infrastructure"
+	sink "mysql-to-sync/internal/sync/domain/sink"
 	taskService "mysql-to-sync/internal/task/application/service"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 	"mysql-to-sync/pkg/logger"
@@ -113,28 +114,58 @@ type DatabaseConfigRequest struct { // 定义数据库配置请求结构体
 	Password string `json:"password"` // 密码
 }
 
+// SinkConfigRequest 增量目标端配置请求结构体
+type SinkConfigRequest struct {
+	Type    string                 `json:"type"`
+	Options map[string]interface{} `json:"options"`
+}
+
+const secretMask = "******"
+
 // CreateTaskRequest 创建任务请求结构体
 type CreateTaskRequest struct { // 定义创建任务请求结构体
-	Name                     string                 `json:"name" binding:"required"`      // 任务名称，必填
-	SyncLevel                string                 `json:"sync_level"`                   // 同步级别: DATABASE 或 TABLE
-	SourceSchema             string                 `json:"source_schema"`                // 源模式名
-	TargetSchema             string                 `json:"target_schema"`                // 目标模式名
-	SourceDatabases          []string               `json:"source_databases"`             // 源数据库列表（库级别同步时使用）
-	TargetDatabase           string                 `json:"target_database"`              // 目标数据库（库级别同步时，所有库同步到此库）
-	TargetDatabases          []string               `json:"target_databases"`             // 目标数据库列表（与 SourceDatabases 一一对应）
-	Tables                   []string               `json:"tables"`                       // 源表列表
-	TargetTables             []string               `json:"target_tables"`                // 目标表列表（与 Tables 一一对应；空则沿用源表名）
-	Mode                     string                 `json:"mode" binding:"required"`      // 同步模式，必填
-	BatchSize                int                    `json:"batch_size"`                   // 批处理大小
-	WorkerCount              int                    `json:"worker_count"`                 // 工作线程数
-	IntraTableWorkerCount    int                    `json:"intra_table_worker_count"`     // 表内工作线程数
-	EnableLimitOne           bool                   `json:"enable_limit_one"`             // 是否启用LIMIT 1优化
-	OptimizeIndex            bool                   `json:"optimize_index"`               // 索引优化：先删后建
-	EnableReadOnly           bool                   `json:"enable_read_only"`             // 同步前关闭目标只读，同步后恢复
-	EnableDropTableBeforeDDL bool                   `json:"enable_drop_table_before_ddl"` // 同步DDL前先执行 DROP TABLE IF EXISTS
-	TxCommitEveryNParallel   int                    `json:"tx_commit_every_n_parallel"`   // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5
-	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
-	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
+	Name                       string   `json:"name" binding:"required"`                   // 任务名称，必填
+	SyncLevel                  string   `json:"sync_level"`                                // 同步级别: DATABASE 或 TABLE
+	SourceSchema               string   `json:"source_schema"`                             // 源模式名
+	TargetSchema               string   `json:"target_schema"`                             // 目标模式名
+	SourceDatabases            []string `json:"source_databases"`                          // 源数据库列表（库级别同步时使用）
+	TargetDatabase             string   `json:"target_database"`                           // 目标数据库（库级别同步时，所有库同步到此库）
+	TargetDatabases            []string `json:"target_databases"`                          // 目标数据库列表（与 SourceDatabases 一一对应）
+	Tables                     []string `json:"tables"`                                    // 源表列表
+	TargetTables               []string `json:"target_tables"`                             // 目标表列表（与 Tables 一一对应；空则沿用源表名）
+	Mode                       string   `json:"mode" binding:"required"`                   // 同步模式，必填
+	BatchSize                  int      `json:"batch_size"`                                // 批处理大小
+	WorkerCount                int      `json:"worker_count"`                              // 工作线程数
+	IntraTableWorkerCount      int      `json:"intra_table_worker_count"`                  // 表内工作线程数
+	IndexRestoreWorkerCount    int      `json:"index_restore_worker_count"`                // 索引回放并发度；0=自动推导
+	EnableLimitOne             bool     `json:"enable_limit_one"`                          // 是否启用LIMIT 1优化
+	OptimizeIndex              bool     `json:"optimize_index"`                            // 索引优化：先删后建
+	EnableReadOnly             bool     `json:"enable_read_only"`                          // 同步前关闭目标只读，同步后恢复
+	EnableDropTableBeforeDDL   bool     `json:"enable_drop_table_before_ddl"`              // 同步DDL前先执行 DROP TABLE IF EXISTS
+	EnableSkipBinlog           bool     `json:"enable_skip_binlog"`                        // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
+	TxCommitEveryNParallel     int      `json:"tx_commit_every_n_parallel"`                // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5
+	FullLoadEngine             string   `json:"full_load_engine,omitempty"`                // 全量引擎：v1 / v2；空视为 v1
+	FullLoadReadWorkers        int      `json:"full_load_read_workers,omitempty"`          // V2 任务级源读取上限；0=自动
+	FullLoadWriteWorkers       int      `json:"full_load_write_workers,omitempty"`         // V2 任务级目标写入上限；0=自动
+	FullLoadBufferMB           int      `json:"full_load_buffer_mb,omitempty"`             // V2 队列上限(MiB)；0=128
+	FullLoadBatchBytesMB       int      `json:"full_load_batch_bytes_mb,omitempty"`        // V2 单条INSERT字节上限(MiB)；0=4
+	FullLoadCommitRows         int      `json:"full_load_commit_rows,omitempty"`           // V2 单事务行数上限；0=10000
+	FullLoadCommitBytesMB      int      `json:"full_load_commit_bytes_mb,omitempty"`       // V2 单事务字节上限(MiB)；0=32
+	FullLoadLockWaitTimeoutSec int      `json:"full_load_lock_wait_timeout_sec,omitempty"` // V2 取表锁等待秒数；0=10
+	// FullLoadDegradeOnAlignLockFail nil=默认降级单连接；false=对齐取锁失败 fail-closed
+	FullLoadDegradeOnAlignLockFail *bool `json:"full_load_degrade_on_align_lock_fail,omitempty"`
+	FullLoadQueryTimeoutSec        int   `json:"full_load_query_timeout_sec,omitempty"`      // V2 查询超时秒数；keyset绝对/stream打开；0=300
+	FullLoadStreamIdleTimeoutSec   int   `json:"full_load_stream_idle_timeout_sec,omitempty"` // V2 无主键流式无进展超时；0=300
+	FullLoadStreamMaxDurationSec   int   `json:"full_load_stream_max_duration_sec,omitempty"` // V2 无主键流式绝对最长时长；0=不限制
+	FullLoadSlowQueryWarnSec       int   `json:"full_load_slow_query_warn_sec,omitempty"`    // V2 慢查询告警秒数；0=30
+	FullLoadTableNoProgressSec     int   `json:"full_load_table_no_progress_sec,omitempty"` // V2 表无进展告警秒数；0=关闭
+	FullLoadReadRetryTimes         int   `json:"full_load_read_retry_times,omitempty"`      // V2 表级读取重试次数；0=不重试
+	FullLoadTwoPhaseRead           bool  `json:"full_load_two_phase_read,omitempty"`        // V2 单列PK两阶段读取；默认关
+	FullLoadEnableStaging          bool  `json:"full_load_enable_staging,omitempty"`        // V2 staging表隔离；默认关
+	SourceDB                       *DatabaseConfigRequest `json:"source_db,omitempty"`          // 源数据库配置（可选）
+	TargetDB                       *DatabaseConfigRequest `json:"target_db,omitempty"`          // 目标数据库配置（可选）
+	SinkConfigs                    []SinkConfigRequest    `json:"sink_configs,omitempty"`       // 增量目标端配置（可选，默认 MYSQL）
+	CloneFromTaskID                string                 `json:"clone_from_task_id,omitempty"` // 复制新建时沿用源任务密码等敏感字段
 }
 
 // CreateTask 创建任务方法
@@ -183,6 +214,24 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		}
 	}
 
+	sinkConfigs := sinkConfigsFromRequest(req.SinkConfigs, true)
+
+	if req.CloneFromTaskID != "" {
+		sourceTask, ok := h.taskService.GetTaskSnapshot(req.CloneFromTaskID)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "clone source task not found"})
+			return
+		}
+		preserveCloneSecrets(sourceTask, sourceDB, targetDB, sinkConfigs)
+	} else {
+		if sourceDB != nil && sourceDB.Password == secretMask {
+			sourceDB.Password = ""
+		}
+		if targetDB != nil && targetDB.Password == secretMask {
+			targetDB.Password = ""
+		}
+	}
+
 	// 设置同步级别（支持大小写不敏感）
 	syncLevel := taskEntity.SyncLevelTable            // 默认为表级别
 	if strings.ToUpper(req.SyncLevel) == "DATABASE" { // 如果是数据库级别
@@ -192,27 +241,47 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 	}
 
 	taskCfg := taskEntity.TaskConfig{ // 创建任务配置
-		ID:                       generateID(),                  // 生成任务ID
-		Name:                     req.Name,                      // 设置任务名称
-		SyncLevel:                syncLevel,                     // 设置同步级别
-		SourceSchema:             req.SourceSchema,              // 设置源模式
-		TargetSchema:             req.TargetSchema,              // 设置目标模式
-		SourceDatabases:          req.SourceDatabases,           // 设置源数据库列表
-		TargetDatabase:           req.TargetDatabase,            // 设置目标数据库
-		TargetDatabases:          req.TargetDatabases,           // 设置目标数据库列表
-		Tables:                   req.Tables,                    // 设置源表列表
-		TargetTables:             req.TargetTables,              // 设置目标表列表
-		Mode:                     taskEntity.SyncMode(req.Mode), // 设置同步模式
-		BatchSize:                req.BatchSize,                 // 设置批处理大小
-		WorkerCount:              req.WorkerCount,               // 设置工作线程数
-		IntraTableWorkerCount:    req.IntraTableWorkerCount,     // 设置表内工作线程数
-		EnableLimitOne:           req.EnableLimitOne,            // 设置LIMIT 1优化开关
-		OptimizeIndex:            req.OptimizeIndex,             // 设置索引优化开关
-		EnableReadOnly:           req.EnableReadOnly,            // 设置只读管理开关
-		EnableDropTableBeforeDDL: req.EnableDropTableBeforeDDL,  // 设置DDL前DROP TABLE开关
-		TxCommitEveryNParallel:   req.TxCommitEveryNParallel,    // 设置并行事务提交间隔
-		SourceDB:                 sourceDB,                      // 设置源数据库配置
-		TargetDB:                 targetDB,                      // 设置目标数据库配置
+		ID:                             generateID(),                       // 生成任务ID
+		Name:                           req.Name,                           // 设置任务名称
+		SyncLevel:                      syncLevel,                          // 设置同步级别
+		SourceSchema:                   req.SourceSchema,                   // 设置源模式
+		TargetSchema:                   req.TargetSchema,                   // 设置目标模式
+		SourceDatabases:                req.SourceDatabases,                // 设置源数据库列表
+		TargetDatabase:                 req.TargetDatabase,                 // 设置目标数据库
+		TargetDatabases:                req.TargetDatabases,                // 设置目标数据库列表
+		Tables:                         req.Tables,                         // 设置源表列表
+		TargetTables:                   req.TargetTables,                   // 设置目标表列表
+		Mode:                           taskEntity.SyncMode(req.Mode),      // 设置同步模式
+		BatchSize:                      req.BatchSize,                      // 设置批处理大小
+		WorkerCount:                    req.WorkerCount,                    // 设置工作线程数
+		IntraTableWorkerCount:          req.IntraTableWorkerCount,          // 设置表内工作线程数
+		IndexRestoreWorkerCount:        req.IndexRestoreWorkerCount,        // 设置索引回放并发度
+		EnableLimitOne:                 req.EnableLimitOne,                 // 设置LIMIT 1优化开关
+		OptimizeIndex:                  req.OptimizeIndex,                  // 设置索引优化开关
+		EnableReadOnly:                 req.EnableReadOnly,                 // 设置只读管理开关
+		EnableDropTableBeforeDDL:       req.EnableDropTableBeforeDDL,       // 设置DDL前DROP TABLE开关
+		EnableSkipBinlog:               req.EnableSkipBinlog,               // 设置全量写入前关闭binlog开关
+		TxCommitEveryNParallel:         req.TxCommitEveryNParallel,         // 设置并行事务提交间隔
+		FullLoadEngine:                 req.FullLoadEngine,                 // 设置全量引擎版本
+		FullLoadReadWorkers:            req.FullLoadReadWorkers,            // 设置V2源读取上限
+		FullLoadWriteWorkers:           req.FullLoadWriteWorkers,           // 设置V2目标写入上限
+		FullLoadBufferMB:               req.FullLoadBufferMB,               // 设置V2队列上限
+		FullLoadBatchBytesMB:           req.FullLoadBatchBytesMB,           // 设置V2单条INSERT字节上限
+		FullLoadCommitRows:             req.FullLoadCommitRows,             // 设置V2单事务行数上限
+		FullLoadCommitBytesMB:          req.FullLoadCommitBytesMB,          // 设置V2单事务字节上限
+		FullLoadLockWaitTimeoutSec:     req.FullLoadLockWaitTimeoutSec,     // 设置V2取表锁等待秒数
+		FullLoadDegradeOnAlignLockFail: req.FullLoadDegradeOnAlignLockFail, // 设置对齐取锁失败策略
+		FullLoadQueryTimeoutSec:      req.FullLoadQueryTimeoutSec,      // 设置V2查询超时秒数
+		FullLoadStreamIdleTimeoutSec: req.FullLoadStreamIdleTimeoutSec, // 设置V2流式无进展超时
+		FullLoadStreamMaxDurationSec: req.FullLoadStreamMaxDurationSec, // 设置V2流式最长时长
+		FullLoadSlowQueryWarnSec:     req.FullLoadSlowQueryWarnSec,     // 设置V2慢查询告警秒数
+		FullLoadTableNoProgressSec:     req.FullLoadTableNoProgressSec,     // 设置V2表无进展告警秒数
+		FullLoadReadRetryTimes:         req.FullLoadReadRetryTimes,         // 设置V2表级读取重试次数
+		FullLoadTwoPhaseRead:           req.FullLoadTwoPhaseRead,           // 设置V2单列PK两阶段读取
+		FullLoadEnableStaging:          req.FullLoadEnableStaging,          // 设置V2 staging表隔离
+		SourceDB:                       sourceDB,                           // 设置源数据库配置
+		TargetDB:                       targetDB,                           // 设置目标数据库配置
+		SinkConfigs:                    sinkConfigs,                        // 设置增量目标端配置
 	}
 	task, err := h.taskService.CreateTask(taskCfg) // 创建任务
 	if err != nil {                                // 如果创建失败
@@ -220,7 +289,7 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		return
 	}
 
-	c.JSON(http.StatusCreated, task) // 返回创建的任务
+	c.JSON(http.StatusCreated, taskForAPI(task)) // 返回创建的任务
 }
 
 // StartTaskRequest 启动任务请求结构体（可选）
@@ -356,17 +425,66 @@ func (h *TaskHandler) PauseTask(c *gin.Context) { // 暂停指定任务
 	c.JSON(http.StatusOK, gin.H{"message": "Task paused"}) // 返回成功消息
 }
 
+// EndTask 结束持续运行的 ALL 任务（用户在增量阶段点击"结束"，进入 STOPPED 终态）。
+// 返回：200 成功；404 任务不存在；409 模式/阶段/状态不允许结束。
+func (h *TaskHandler) EndTask(c *gin.Context) {
+	taskID := c.Param("id")
+
+	if err := h.taskService.EndTask(taskID); err != nil {
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "task not found"):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "cannot be ended"),
+			strings.Contains(errMsg, "only ALL mode"),
+			strings.Contains(errMsg, "not running"),
+			strings.Contains(errMsg, "incremental phase"):
+			c.JSON(http.StatusConflict, gin.H{"error": errMsg})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Task stopped"})
+}
+
+// RowCountComparison 启动行数对比后台任务。成功返回 202 Accepted。
+// 返回：202 已启动；404 任务不存在；409 不满足对比条件或已有核对进行中。
+func (h *TaskHandler) RowCountComparison(c *gin.Context) {
+	taskID := c.Param("id")
+
+	if err := h.taskService.StartRowCountComparison(taskID); err != nil {
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "task not found"):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "already in progress"),
+			strings.Contains(errMsg, "not in a comparable status"),
+			strings.Contains(errMsg, "does not support row count comparison"),
+			strings.Contains(errMsg, "has not completed yet"),
+			strings.Contains(errMsg, "requires MySQL target"):
+			c.JSON(http.StatusConflict, gin.H{"error": errMsg})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		}
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{"message": "Row count comparison started"})
+}
+
 // GetTask 获取任务详情方法
 func (h *TaskHandler) GetTask(c *gin.Context) { // 获取任务详情
 	taskID := c.Param("id") // 获取任务ID参数
 
-	task, exists := h.taskService.GetTask(taskID) // 获取任务
-	if !exists {                                  // 如果任务不存在
+	task, exists := h.taskService.GetTaskSnapshot(taskID) // 锁内快照，避免与后台行数核对并发读写
+	if !exists {                                          // 如果任务不存在
 		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"}) // 返回错误
 		return
 	}
 
-	c.JSON(http.StatusOK, task) // 返回任务详情
+	c.JSON(http.StatusOK, taskForAPI(task)) // 返回任务详情
 }
 
 // GetAllTasks 获取任务列表方法，支持分页/筛选/搜索/排序
@@ -392,6 +510,9 @@ func (h *TaskHandler) GetAllTasks(c *gin.Context) { // 获取所有任务列表
 	}
 
 	items, total, page, pageSize := h.taskService.GetTasksPage(page, pageSize, status, keyword, sortBy)
+	for i, task := range items {
+		items[i] = taskForAPI(task)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"total":     total,
 		"page":      page,
@@ -726,19 +847,13 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 		return
 	}
 
-	task, exists := h.taskService.GetTask(taskID) // 获取任务
-	if !exists {                                  // 如果任务不存在
+	task, exists := h.taskService.GetTaskSnapshot(taskID) // 锁内快照，避免与后台并发写竞态
+	if !exists {                                          // 如果任务不存在
 		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"}) // 返回错误
 		return
 	}
 
-	// 只允许更新非运行状态的任务
-	if task.Context.Status == taskEntity.TaskStatusRunning { // 如果任务正在运行
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot update running task"}) // 返回错误
-		return
-	}
-
-	// 更新任务配置
+	// 更新任务配置（写到快照；最终状态校验与合并在 UpdateTask 写锁内完成）
 	if req.Name != "" { // 如果提供了名称
 		task.Config.Name = req.Name // 更新名称
 	}
@@ -765,7 +880,7 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	// 表列表：允许清空（库级别同步时 tables 为空）
 	task.Config.Tables = req.Tables // 更新表列表
 	if req.Mode != "" {             // 如果提供了同步模式
-		task.Config.Mode = taskEntity.SyncMode(req.Mode) // 更新同步模式
+		task.Config.Mode = taskEntity.SyncMode(strings.ToUpper(req.Mode)) // 更新同步模式（归一化为大写）
 	}
 	if req.BatchSize > 0 { // 如果提供了批处理大小
 		task.Config.BatchSize = req.BatchSize // 更新批处理大小
@@ -775,6 +890,9 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	}
 	if req.IntraTableWorkerCount != nil { // 如果提供了表内工作线程数
 		task.Config.IntraTableWorkerCount = *req.IntraTableWorkerCount // 更新表内工作线程数
+	}
+	if req.IndexRestoreWorkerCount != nil { // 如果提供了索引回放并发度
+		task.Config.IndexRestoreWorkerCount = *req.IndexRestoreWorkerCount // 更新索引回放并发度
 	}
 	// enable_limit_one 是 bool 类型，直接赋值
 	task.Config.EnableLimitOne = req.EnableLimitOne // 更新LIMIT 1优化开关
@@ -787,56 +905,131 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.EnableDropTableBeforeDDL != nil { // 如果提供了DDL前DROP TABLE开关
 		task.Config.EnableDropTableBeforeDDL = *req.EnableDropTableBeforeDDL // 更新DDL前DROP TABLE开关
 	}
+	if req.EnableSkipBinlog != nil { // 如果提供了全量写入前关闭binlog开关
+		task.Config.EnableSkipBinlog = *req.EnableSkipBinlog // 更新全量写入前关闭binlog开关
+	}
 	if req.TxCommitEveryNParallel != nil { // 如果提供了并行事务提交间隔
 		task.Config.TxCommitEveryNParallel = *req.TxCommitEveryNParallel // 更新并行事务提交间隔
+	}
+	if req.FullLoadEngine != nil { // 如果提供了全量引擎版本
+		task.Config.FullLoadEngine = *req.FullLoadEngine
+	}
+	if req.FullLoadReadWorkers != nil {
+		task.Config.FullLoadReadWorkers = *req.FullLoadReadWorkers
+	}
+	if req.FullLoadWriteWorkers != nil {
+		task.Config.FullLoadWriteWorkers = *req.FullLoadWriteWorkers
+	}
+	if req.FullLoadBufferMB != nil {
+		task.Config.FullLoadBufferMB = *req.FullLoadBufferMB
+	}
+	if req.FullLoadBatchBytesMB != nil {
+		task.Config.FullLoadBatchBytesMB = *req.FullLoadBatchBytesMB
+	}
+	if req.FullLoadCommitRows != nil {
+		task.Config.FullLoadCommitRows = *req.FullLoadCommitRows
+	}
+	if req.FullLoadCommitBytesMB != nil {
+		task.Config.FullLoadCommitBytesMB = *req.FullLoadCommitBytesMB
+	}
+	if req.FullLoadLockWaitTimeoutSec != nil {
+		task.Config.FullLoadLockWaitTimeoutSec = *req.FullLoadLockWaitTimeoutSec
+	}
+	if req.FullLoadDegradeOnAlignLockFail != nil {
+		task.Config.FullLoadDegradeOnAlignLockFail = req.FullLoadDegradeOnAlignLockFail
+	}
+	if req.FullLoadQueryTimeoutSec != nil {
+		task.Config.FullLoadQueryTimeoutSec = *req.FullLoadQueryTimeoutSec
+	}
+	if req.FullLoadStreamIdleTimeoutSec != nil {
+		task.Config.FullLoadStreamIdleTimeoutSec = *req.FullLoadStreamIdleTimeoutSec
+	}
+	if req.FullLoadStreamMaxDurationSec != nil {
+		task.Config.FullLoadStreamMaxDurationSec = *req.FullLoadStreamMaxDurationSec
+	}
+	if req.FullLoadSlowQueryWarnSec != nil {
+		task.Config.FullLoadSlowQueryWarnSec = *req.FullLoadSlowQueryWarnSec
+	}
+	if req.FullLoadTableNoProgressSec != nil {
+		task.Config.FullLoadTableNoProgressSec = *req.FullLoadTableNoProgressSec
+	}
+	if req.FullLoadReadRetryTimes != nil {
+		task.Config.FullLoadReadRetryTimes = *req.FullLoadReadRetryTimes
+	}
+	if req.FullLoadTwoPhaseRead != nil {
+		task.Config.FullLoadTwoPhaseRead = *req.FullLoadTwoPhaseRead
+	}
+	if req.FullLoadEnableStaging != nil {
+		task.Config.FullLoadEnableStaging = *req.FullLoadEnableStaging
 	}
 
 	// 更新数据库配置
 	if req.SourceDB != nil { // 如果提供了源数据库配置
+		password := req.SourceDB.Password
+		if password == secretMask && task.Config.SourceDB != nil {
+			password = task.Config.SourceDB.Password
+		}
 		task.Config.SourceDB = &taskEntity.DatabaseConfig{ // 更新源数据库配置
 			Host:     req.SourceDB.Host,     // 设置主机
 			Port:     req.SourceDB.Port,     // 设置端口
 			Database: req.SourceDB.Database, // 设置数据库名
 			Username: req.SourceDB.Username, // 设置用户名
-			Password: req.SourceDB.Password, // 设置密码
+			Password: password,              // 设置密码
 		}
 	}
 	if req.TargetDB != nil { // 如果提供了目标数据库配置
+		password := req.TargetDB.Password
+		if password == secretMask && task.Config.TargetDB != nil {
+			password = task.Config.TargetDB.Password
+		}
 		task.Config.TargetDB = &taskEntity.DatabaseConfig{ // 更新目标数据库配置
 			Host:     req.TargetDB.Host,     // 设置主机
 			Port:     req.TargetDB.Port,     // 设置端口
 			Database: req.TargetDB.Database, // 设置数据库名
 			Username: req.TargetDB.Username, // 设置用户名
-			Password: req.TargetDB.Password, // 设置密码
+			Password: password,              // 设置密码
 		}
 	}
 
+	if req.SinkConfigs != nil {
+		sinkConfigs := sinkConfigsFromRequest(req.SinkConfigs, true)
+		preserveMaskedSinkSecrets(sinkConfigs, task.Config.SinkConfigs)
+		task.Config.SinkConfigs = sinkConfigs
+	}
+
 	if err := h.taskService.UpdateTask(task); err != nil { // 更新任务
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}) // 返回错误
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "task not found"):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "cannot update running"):
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "stopped and cannot be edited"):
+			c.JSON(http.StatusConflict, gin.H{"error": errMsg})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		}
 		return
 	}
 
-	c.JSON(http.StatusOK, task) // 返回更新后的任务
+	updated, _ := h.taskService.GetTaskSnapshot(taskID)
+	c.JSON(http.StatusOK, taskForAPI(updated)) // 返回更新后的任务快照
 }
 
 // DeleteTask 删除任务方法
 func (h *TaskHandler) DeleteTask(c *gin.Context) { // 删除任务
 	taskID := c.Param("id") // 获取任务ID参数
 
-	task, exists := h.taskService.GetTask(taskID) // 获取任务
-	if !exists {                                  // 如果任务不存在
-		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"}) // 返回错误
-		return
-	}
-
-	// 只允许删除非运行状态的任务
-	if task.Context.Status == taskEntity.TaskStatusRunning { // 如果任务正在运行
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot delete running task"}) // 返回错误
-		return
-	}
-
-	if err := h.taskService.DeleteTask(taskID); err != nil { // 删除任务
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}) // 返回错误
+	if err := h.taskService.DeleteTask(taskID); err != nil { // 删除任务（写锁内复核状态）
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "task not found"):
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case strings.Contains(errMsg, "cannot delete running"):
+			c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+		}
 		return
 	}
 
@@ -845,25 +1038,216 @@ func (h *TaskHandler) DeleteTask(c *gin.Context) { // 删除任务
 
 // UpdateTaskRequest 更新任务请求结构体
 type UpdateTaskRequest struct { // 定义更新任务请求结构体
-	Name                     string                 `json:"name"`                                   // 任务名称
-	SyncLevel                string                 `json:"sync_level"`                             // 同步级别
-	SourceSchema             string                 `json:"source_schema"`                          // 源模式名
-	TargetSchema             string                 `json:"target_schema"`                          // 目标模式名
-	SourceDatabases          []string               `json:"source_databases"`                       // 源数据库列表
-	TargetDatabases          []string               `json:"target_databases"`                       // 目标数据库列表
-	Tables                   []string               `json:"tables"`                                 // 源表列表
-	TargetTables             []string               `json:"target_tables"`                          // 目标表列表（与 Tables 一一对应；空则沿用源表名）
-	Mode                     string                 `json:"mode"`                                   // 同步模式
-	BatchSize                int                    `json:"batch_size"`                             // 批处理大小
-	WorkerCount              int                    `json:"worker_count"`                           // 工作线程数
-	IntraTableWorkerCount    *int                   `json:"intra_table_worker_count,omitempty"`     // 表内工作线程数（可选）
-	EnableLimitOne           bool                   `json:"enable_limit_one"`                       // 是否启用LIMIT 1优化
-	OptimizeIndex            *bool                  `json:"optimize_index,omitempty"`               // 索引优化（可选）
-	EnableReadOnly           *bool                  `json:"enable_read_only,omitempty"`             // 只读管理（可选）
-	EnableDropTableBeforeDDL *bool                  `json:"enable_drop_table_before_ddl,omitempty"` // DDL前是否先DROP TABLE（可选）
-	TxCommitEveryNParallel   *int                   `json:"tx_commit_every_n_parallel,omitempty"`   // 并行 worker 每 N 批提交一次事务（可选）
-	SourceDB                 *DatabaseConfigRequest `json:"source_db,omitempty"`                    // 源数据库配置（可选）
-	TargetDB                 *DatabaseConfigRequest `json:"target_db,omitempty"`                    // 目标数据库配置（可选）
+	Name                           string                 `json:"name"`                                           // 任务名称
+	SyncLevel                      string                 `json:"sync_level"`                                     // 同步级别
+	SourceSchema                   string                 `json:"source_schema"`                                  // 源模式名
+	TargetSchema                   string                 `json:"target_schema"`                                  // 目标模式名
+	SourceDatabases                []string               `json:"source_databases"`                               // 源数据库列表
+	TargetDatabases                []string               `json:"target_databases"`                               // 目标数据库列表
+	Tables                         []string               `json:"tables"`                                         // 源表列表
+	TargetTables                   []string               `json:"target_tables"`                                  // 目标表列表（与 Tables 一一对应；空则沿用源表名）
+	Mode                           string                 `json:"mode"`                                           // 同步模式
+	BatchSize                      int                    `json:"batch_size"`                                     // 批处理大小
+	WorkerCount                    int                    `json:"worker_count"`                                   // 工作线程数
+	IntraTableWorkerCount          *int                   `json:"intra_table_worker_count,omitempty"`             // 表内工作线程数（可选）
+	IndexRestoreWorkerCount        *int                   `json:"index_restore_worker_count,omitempty"`           // 索引回放并发度（可选）
+	EnableLimitOne                 bool                   `json:"enable_limit_one"`                               // 是否启用LIMIT 1优化
+	OptimizeIndex                  *bool                  `json:"optimize_index,omitempty"`                       // 索引优化（可选）
+	EnableReadOnly                 *bool                  `json:"enable_read_only,omitempty"`                     // 只读管理（可选）
+	EnableDropTableBeforeDDL       *bool                  `json:"enable_drop_table_before_ddl,omitempty"`         // DDL前是否先DROP TABLE（可选）
+	EnableSkipBinlog               *bool                  `json:"enable_skip_binlog,omitempty"`                   // 全量写入前关闭binlog（可选）
+	TxCommitEveryNParallel         *int                   `json:"tx_commit_every_n_parallel,omitempty"`           // 并行 worker 每 N 批提交一次事务（可选）
+	FullLoadEngine                 *string                `json:"full_load_engine,omitempty"`                     // 全量引擎：v1 / v2（可选）
+	FullLoadReadWorkers            *int                   `json:"full_load_read_workers,omitempty"`               // V2 源读取上限（可选）
+	FullLoadWriteWorkers           *int                   `json:"full_load_write_workers,omitempty"`              // V2 目标写入上限（可选）
+	FullLoadBufferMB               *int                   `json:"full_load_buffer_mb,omitempty"`                  // V2 队列上限MiB（可选）
+	FullLoadBatchBytesMB           *int                   `json:"full_load_batch_bytes_mb,omitempty"`             // V2 单条INSERT字节上限MiB（可选）
+	FullLoadCommitRows             *int                   `json:"full_load_commit_rows,omitempty"`                // V2 单事务行数上限（可选）
+	FullLoadCommitBytesMB          *int                   `json:"full_load_commit_bytes_mb,omitempty"`            // V2 单事务字节上限MiB（可选）
+	FullLoadLockWaitTimeoutSec     *int                   `json:"full_load_lock_wait_timeout_sec,omitempty"`      // V2 取表锁等待秒数（可选）
+	FullLoadDegradeOnAlignLockFail *bool                  `json:"full_load_degrade_on_align_lock_fail,omitempty"` // 对齐取锁失败是否降级（可选）
+	FullLoadQueryTimeoutSec        *int                   `json:"full_load_query_timeout_sec,omitempty"`           // V2 查询超时秒数（可选）
+	FullLoadStreamIdleTimeoutSec   *int                   `json:"full_load_stream_idle_timeout_sec,omitempty"`  // V2 流式无进展超时（可选）
+	FullLoadStreamMaxDurationSec   *int                   `json:"full_load_stream_max_duration_sec,omitempty"`  // V2 流式最长时长（可选）
+	FullLoadSlowQueryWarnSec       *int                   `json:"full_load_slow_query_warn_sec,omitempty"`         // V2 慢查询告警秒数（可选）
+	FullLoadTableNoProgressSec     *int                   `json:"full_load_table_no_progress_sec,omitempty"`      // V2 表无进展告警秒数（可选）
+	FullLoadReadRetryTimes         *int                   `json:"full_load_read_retry_times,omitempty"`           // V2 表级重试次数（可选）
+	FullLoadTwoPhaseRead           *bool                  `json:"full_load_two_phase_read,omitempty"`             // V2 单列PK两阶段读取（可选）
+	FullLoadEnableStaging          *bool                  `json:"full_load_enable_staging,omitempty"`             // V2 staging表隔离（可选）
+	SourceDB                       *DatabaseConfigRequest `json:"source_db,omitempty"`                            // 源数据库配置（可选）
+	TargetDB                       *DatabaseConfigRequest `json:"target_db,omitempty"`                            // 目标数据库配置（可选）
+	SinkConfigs                    []SinkConfigRequest    `json:"sink_configs,omitempty"`                         // 增量目标端配置（可选）
+}
+
+func sinkConfigsFromRequest(requests []SinkConfigRequest, defaultMySQL bool) []sink.SinkConfig {
+	if len(requests) == 0 && defaultMySQL {
+		return []sink.SinkConfig{{Type: sink.SinkTypeMYSQL, Options: map[string]interface{}{}}}
+	}
+	configs := make([]sink.SinkConfig, 0, len(requests))
+	for _, request := range requests {
+		configs = append(configs, sink.SinkConfig{
+			Type:    sink.SinkType(strings.ToUpper(strings.TrimSpace(request.Type))),
+			Options: request.Options,
+		})
+	}
+	return configs
+}
+
+// taskForAPI creates a response-only copy. Runtime tasks keep plaintext secrets,
+// while every task-returning API endpoint exposes placeholders only.
+func taskForAPI(task *taskEntity.SyncTask) *taskEntity.SyncTask {
+	if task == nil {
+		return nil
+	}
+	cloned := *task
+	cloned.Context = task.Context.CloneForRead()
+	cloned.Config = task.Config
+	if task.Config.SourceDB != nil {
+		sourceDB := *task.Config.SourceDB
+		if sourceDB.Password != "" {
+			sourceDB.Password = secretMask
+		}
+		cloned.Config.SourceDB = &sourceDB
+	}
+	if task.Config.TargetDB != nil {
+		targetDB := *task.Config.TargetDB
+		if targetDB.Password != "" {
+			targetDB.Password = secretMask
+		}
+		cloned.Config.TargetDB = &targetDB
+	}
+	cloned.Config.SinkConfigs = sink.CloneConfigs(task.Config.SinkConfigs)
+	redactSinkSecrets(cloned.Config.SinkConfigs)
+	return &cloned
+}
+
+func redactSinkSecrets(configs []sink.SinkConfig) {
+	for i := range configs {
+		switch configs[i].Type {
+		case sink.SinkTypeKAFKA:
+			security, _ := configs[i].Options["security"].(map[string]interface{})
+			if password, ok := security["sasl_password"].(string); ok && password != "" {
+				security["sasl_password"] = secretMask
+			}
+		case sink.SinkTypeHTTPWebhook:
+			maskHeaderValues(configs[i].Options)
+		}
+	}
+}
+
+func maskHeaderValues(options map[string]interface{}) {
+	switch headers := options["headers"].(type) {
+	case map[string]interface{}:
+		for key := range headers {
+			headers[key] = secretMask
+		}
+	case map[string]string:
+		for key := range headers {
+			headers[key] = secretMask
+		}
+	case string:
+		if headers != "" {
+			options["headers"] = secretMask
+		}
+	}
+}
+
+func preserveMaskedSinkSecrets(incoming, existing []sink.SinkConfig) {
+	for i := range incoming {
+		if i >= len(existing) || incoming[i].Type != existing[i].Type {
+			continue
+		}
+		switch incoming[i].Type {
+		case sink.SinkTypeKAFKA:
+			incomingSecurity, _ := incoming[i].Options["security"].(map[string]interface{})
+			existingSecurity, _ := existing[i].Options["security"].(map[string]interface{})
+			if incomingSecurity["sasl_password"] == secretMask {
+				if password, ok := existingSecurity["sasl_password"]; ok {
+					incomingSecurity["sasl_password"] = password
+				}
+			}
+		case sink.SinkTypeHTTPWebhook:
+			preserveMaskedHeaders(incoming[i].Options, existing[i].Options)
+		}
+	}
+}
+
+func preserveMaskedHeaders(incoming, existing map[string]interface{}) {
+	existingHeaders := headerValues(existing["headers"])
+	switch headers := incoming["headers"].(type) {
+	case map[string]interface{}:
+		for key, value := range headers {
+			if value == secretMask {
+				if original, ok := existingHeaders[key]; ok {
+					headers[key] = original
+				}
+			}
+		}
+	case map[string]string:
+		for key, value := range headers {
+			if value == secretMask {
+				if original, ok := existingHeaders[key]; ok {
+					headers[key] = original
+				}
+			}
+		}
+	}
+}
+
+func preserveCloneSecrets(sourceTask *taskEntity.SyncTask, sourceDB, targetDB *taskEntity.DatabaseConfig, sinkConfigs []sink.SinkConfig) {
+	if sourceTask == nil {
+		return
+	}
+	if sourceDB != nil && sourceTask.Config.SourceDB != nil {
+		if sourceDB.Password == "" || sourceDB.Password == secretMask {
+			sourceDB.Password = sourceTask.Config.SourceDB.Password
+		}
+	}
+	if targetDB != nil && sourceTask.Config.TargetDB != nil {
+		if targetDB.Password == "" || targetDB.Password == secretMask {
+			targetDB.Password = sourceTask.Config.TargetDB.Password
+		}
+	}
+	preserveMaskedSinkSecrets(sinkConfigs, sourceTask.Config.SinkConfigs)
+	preserveCloneMySQLSinkPasswords(sinkConfigs, sourceTask.Config.SinkConfigs)
+}
+
+func preserveCloneMySQLSinkPasswords(incoming, existing []sink.SinkConfig) {
+	for i := range incoming {
+		if i >= len(existing) || incoming[i].Type != existing[i].Type {
+			continue
+		}
+		if incoming[i].Type != sink.SinkTypeMYSQL {
+			continue
+		}
+		if incoming[i].Options == nil {
+			continue
+		}
+		password, _ := incoming[i].Options["password"].(string)
+		if password != "" && password != secretMask {
+			continue
+		}
+		if existingPassword, ok := existing[i].Options["password"].(string); ok && existingPassword != "" {
+			incoming[i].Options["password"] = existingPassword
+		}
+	}
+}
+
+func headerValues(value interface{}) map[string]string {
+	result := make(map[string]string)
+	switch headers := value.(type) {
+	case map[string]interface{}:
+		for key, value := range headers {
+			if text, ok := value.(string); ok {
+				result[key] = text
+			}
+		}
+	case map[string]string:
+		for key, value := range headers {
+			result[key] = value
+		}
+	}
+	return result
 }
 
 // generateID 生成唯一ID函数

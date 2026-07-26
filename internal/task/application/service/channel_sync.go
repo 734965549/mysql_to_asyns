@@ -301,10 +301,10 @@ func (cse *ChannelSyncExecutor) processBatchTask(ctx context.Context, task *task
 	defer conn.Close()
 
 	writeSessionLabel := fmt.Sprintf("%s.%s worker %d", targetSchema, tableName, batchTask.WorkerID)
-	if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel); err != nil {
+	if err := disableFullSyncWriteSession(ctx, conn, writeSessionLabel, task.Config.EnableSkipBinlog); err != nil {
 		return err
 	}
-	defer restoreFullSyncWriteSession(conn, writeSessionLabel)
+	defer restoreFullSyncWriteSession(conn, writeSessionLabel, task.Config.EnableSkipBinlog)
 
 	var curTx *sql.Tx
 	var txW *writer.BatchWriter

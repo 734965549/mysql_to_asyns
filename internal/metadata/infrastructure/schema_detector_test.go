@@ -159,6 +159,22 @@ func TestSchemaDetector_GetPrimaryKeyColumns(t *testing.T) {
 			expectErr: true,
 			expected:  nil,
 		},
+		{
+			name:      "遍历中途连接断开返回错误",
+			schema:    "test_db",
+			tableName: "conn_drop_pk",
+			setupMock: func(mock sqlmock.Sqlmock) {
+				rows := sqlmock.NewRows([]string{"COLUMN_NAME"}).
+					AddRow("order_id").
+					AddRow("item_id")
+				rows.RowError(1, sql.ErrConnDone)
+				mock.ExpectQuery("SELECT(.+)FROM information_schema.KEY_COLUMN_USAGE").
+					WithArgs("test_db", "conn_drop_pk").
+					WillReturnRows(rows)
+			},
+			expectErr: true,
+			expected:  nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -191,28 +207,59 @@ func TestSchemaDetector_GetUniqueKeyColumns(t *testing.T) {
 		tableName string
 		setupMock func(mock sqlmock.Sqlmock)
 		expectErr bool
-		expected  []string
+		expected  [][]string
 	}{
 		{
 			name:      "成功获取唯一键列",
 			schema:    "test_db",
 			tableName: "users",
 			setupMock: func(mock sqlmock.Sqlmock) {
-				rows := sqlmock.NewRows([]string{"COLUMN_NAME"}).
-					AddRow("email")
+				rows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "IS_NULLABLE"}).
+					AddRow("uk_email", "email", "NO")
 				mock.ExpectQuery("SELECT(.+)FROM information_schema.STATISTICS").
 					WithArgs("test_db", "users").
 					WillReturnRows(rows)
 			},
 			expectErr: false,
-			expected:  []string{"email"},
+			expected:  [][]string{{"email"}},
+		},
+		{
+			name:      "多个唯一索引按 INDEX_NAME 分组",
+			schema:    "test_db",
+			tableName: "multi_uk",
+			setupMock: func(mock sqlmock.Sqlmock) {
+				rows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "IS_NULLABLE"}).
+					AddRow("uk_a", "col_a", "NO").
+					AddRow("uk_b", "col_b", "NO").
+					AddRow("uk_b", "col_c", "NO")
+				mock.ExpectQuery("SELECT(.+)FROM information_schema.STATISTICS").
+					WithArgs("test_db", "multi_uk").
+					WillReturnRows(rows)
+			},
+			expectErr: false,
+			expected:  [][]string{{"col_a"}, {"col_b", "col_c"}},
+		},
+		{
+			name:      "排除含 nullable 列的唯一索引",
+			schema:    "test_db",
+			tableName: "nullable_uk",
+			setupMock: func(mock sqlmock.Sqlmock) {
+				rows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "IS_NULLABLE"}).
+					AddRow("uk_nullable", "email", "YES").
+					AddRow("uk_safe", "phone", "NO")
+				mock.ExpectQuery("SELECT(.+)FROM information_schema.STATISTICS").
+					WithArgs("test_db", "nullable_uk").
+					WillReturnRows(rows)
+			},
+			expectErr: false,
+			expected:  [][]string{{"phone"}},
 		},
 		{
 			name:      "无唯一键返回空切片",
 			schema:    "test_db",
 			tableName: "no_uk_table",
 			setupMock: func(mock sqlmock.Sqlmock) {
-				rows := sqlmock.NewRows([]string{"COLUMN_NAME"})
+				rows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "IS_NULLABLE"})
 				mock.ExpectQuery("SELECT(.+)FROM information_schema.STATISTICS").
 					WithArgs("test_db", "no_uk_table").
 					WillReturnRows(rows)
@@ -230,6 +277,55 @@ func TestSchemaDetector_GetUniqueKeyColumns(t *testing.T) {
 					WillReturnError(sql.ErrConnDone)
 			},
 			expectErr: true,
+			expected:  nil,
+		},
+		{
+			name:      "遍历中途连接断开返回错误",
+			schema:    "test_db",
+			tableName: "conn_drop_uk",
+			setupMock: func(mock sqlmock.Sqlmock) {
+				rows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "IS_NULLABLE"}).
+					AddRow("uk_composite", "col_a", "NO").
+					AddRow("uk_composite", "col_b", "NO")
+				rows.RowError(1, sql.ErrConnDone)
+				mock.ExpectQuery("SELECT(.+)FROM information_schema.STATISTICS").
+					WithArgs("test_db", "conn_drop_uk").
+					WillReturnRows(rows)
+			},
+			expectErr: true,
+			expected:  nil,
+		},
+		{
+			name:      "混合函数表达式列的复合唯一索引被排除",
+			schema:    "test_db",
+			tableName: "func_idx_mixed",
+			setupMock: func(mock sqlmock.Sqlmock) {
+				// UNIQUE(col_a, (LOWER(col_b))) — col_b 是表达式，COLUMN_NAME 为 NULL
+				// 同时存在一个正常的单列唯一索引，应只返回后者
+				rows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "IS_NULLABLE"}).
+					AddRow("uk_mixed", "col_a", "NO").
+					AddRow("uk_mixed", nil, nil). // 表达式列：COLUMN_NAME 和 IS_NULLABLE 均为 NULL
+					AddRow("uk_safe", "col_c", "NO")
+				mock.ExpectQuery("SELECT(.+)FROM information_schema.STATISTICS").
+					WithArgs("test_db", "func_idx_mixed").
+					WillReturnRows(rows)
+			},
+			expectErr: false,
+			expected:  [][]string{{"col_c"}},
+		},
+		{
+			name:      "纯函数索引被排除",
+			schema:    "test_db",
+			tableName: "func_idx_pure",
+			setupMock: func(mock sqlmock.Sqlmock) {
+				// UNIQUE((LOWER(email))) — 所有 key part 都是表达式
+				rows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "IS_NULLABLE"}).
+					AddRow("uk_func", nil, nil)
+				mock.ExpectQuery("SELECT(.+)FROM information_schema.STATISTICS").
+					WithArgs("test_db", "func_idx_pure").
+					WillReturnRows(rows)
+			},
+			expectErr: false,
 			expected:  nil,
 		},
 	}

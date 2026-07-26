@@ -36,5 +36,7 @@ INSERT INTO orders (user_id, amount, status) VALUES  -- 向订单表插入测试
 
 -- 授予同步用户权限 - 授予复制权限，用于增量同步
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'sync_user'@'%'; -- 授予sync_user从所有数据库复制和复制客户端权限
+-- ALL 模式全量开始前短暂 FLUSH TABLES WITH READ LOCK 捕获 binlog 位点，需要 RELOAD（或 FLUSH_TABLES）
+GRANT RELOAD ON *.* TO 'sync_user'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE ON source_db.* TO 'sync_user'@'%'; -- 授予sync_user对source_db数据库的增删改查权限
 FLUSH PRIVILEGES; -- 刷新权限，使权限生效

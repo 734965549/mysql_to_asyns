@@ -65,6 +65,8 @@ func SetupRouter(taskSvc *taskService.TaskService, analyzer service.IdentityAnal
 			tasks.DELETE("/:id", taskHandler.DeleteTask)                   // 删除任务路由：DELETE /api/tasks/:id
 			tasks.POST("/:id/start", taskHandler.StartTask)                // 启动任务路由：POST /api/tasks/:id/start
 			tasks.POST("/:id/pause", taskHandler.PauseTask)                // 暂停任务路由：POST /api/tasks/:id/pause
+			tasks.POST("/:id/end", taskHandler.EndTask)                    // 结束 ALL 任务路由（增量阶段手动结束，进入 STOPPED 终态）：POST /api/tasks/:id/end
+			tasks.POST("/:id/row-count-comparison", taskHandler.RowCountComparison) // 行数对比路由（后台核对源/目标端 COUNT(*)）：POST /api/tasks/:id/row-count-comparison
 			tasks.GET("/:id/metrics", taskHandler.GetTaskMetrics)          // 获取任务指标路由：GET /api/tasks/:id/metrics
 			tasks.GET("/:id/progress", taskHandler.GetTaskProgress)        // 获取任务运行时进度路由：GET /api/tasks/:id/progress
 			tasks.POST("/:id/skip", taskHandler.SkipError)                 // 跳过错误路由：POST /api/tasks/:id/skip
