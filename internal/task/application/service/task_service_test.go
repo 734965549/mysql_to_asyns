@@ -268,6 +268,83 @@ func TestDropDeferredIndexes_SchemaLockLost_RestoresWithCleanupContext(t *testin
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestDropDeferredIndexes_SingleIndexCancelAfterDrop_Restores(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	// 唯一待删索引 DROP 后立即取消：无下一轮循环，依赖 return 前检查触发回滚。
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	afterDeferredIndexDropped = func() { cancel() }
+	defer func() { afterDeferredIndexDropped = nil }()
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		ctx,
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.ErrorIs(t, dropErr, context.Canceled)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDropDeferredIndexes_SingleIndexSchemaLockLostAfterDrop_Restores(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	afterDeferredIndexDropped = func() { cancel(fullload.ErrSchemaLockLost) }
+	defer func() { afterDeferredIndexDropped = nil }()
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		ctx,
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.ErrorIs(t, dropErr, fullload.ErrSchemaLockLost)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestMergePendingIndexRestores_MergesIndexesForSameTable(t *testing.T) {
 	base := []pendingIndexRestore{{
 		targetSchema: "db",

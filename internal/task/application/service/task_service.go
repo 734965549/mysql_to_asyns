@@ -8071,6 +8071,14 @@ func (s *TaskService) dropDeferredIndexes(ctx context.Context, runtime *taskRunt
 
 	}
 
+	// 最后一次 DROP 成功后也可能立刻取消/丢锁：循环内检查不会再跑一轮，必须在返回前收口。
+	if err := fullload.SchemaLockLostError(ctx); err != nil {
+		return rollbackDropped(err)
+	}
+	if err := context.Cause(ctx); err != nil {
+		return rollbackDropped(err)
+	}
+
 	return dropped, nil
 
 }
