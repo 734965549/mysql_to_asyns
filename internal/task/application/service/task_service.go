@@ -2090,6 +2090,8 @@ const (
 	taskStopReasonOther
 )
 
+// taskStopReason 依据内存中 live task 的 Status 映射到停止原因种类，供 worker 级与编排级共用。
+// 任务不在内存表时返回 taskStopReasonMissing（通常意味着服务重启/shutdown 后任务未恢复）。
 func (s *TaskService) taskStopReason(taskID string) taskStopReasonKind {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -2111,6 +2113,9 @@ func (s *TaskService) taskStopReason(taskID string) taskStopReasonKind {
 	}
 }
 
+// isUserFullSyncStop 判断全量是否因用户/服务侧主动停止而中断。
+// taskStopReasonMissing（任务不在内存表，通常为服务 shutdown）也视为非失败停止，
+// 避免服务重启时把未恢复的任务误判为 FAILED（32c51b6 修复点）。
 func (s *TaskService) isUserFullSyncStop(taskID string) bool {
 	switch s.taskStopReason(taskID) {
 	case taskStopReasonPaused, taskStopReasonStopped, taskStopReasonMissing:
@@ -2120,6 +2125,9 @@ func (s *TaskService) isUserFullSyncStop(taskID string) bool {
 	}
 }
 
+// fullLoadStopCause 将 live task 的停止状态映射为具名 cause error，供 WithCancelCause 传播到全量引擎。
+// 与 isUserFullSyncStop 的分工：本方法返回具体 error（ErrUserPaused/ErrUserStopped/ErrServiceShutdown），
+// 后者仅返回 bool；Missing 映射为 ErrServiceShutdown。
 func (s *TaskService) fullLoadStopCause(taskID string) error {
 	switch s.taskStopReason(taskID) {
 	case taskStopReasonPaused:
@@ -5421,6 +5429,9 @@ func stripIndexesByNameFromCreateSQL(createSQL string, dropNames map[string]stru
 	return strings.Join(filtered, "\n")
 }
 
+// secondaryIndexNameFromDefinitionLine 从 CREATE TABLE 的索引定义行解析索引名。
+// 识别前缀 UNIQUE KEY/INDEX、FULLTEXT KEY/INDEX、SPATIAL KEY/INDEX、KEY、INDEX，
+// 并提取反引号包裹的索引名；无名索引返回空串。
 func secondaryIndexNameFromDefinitionLine(line string) string {
 	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
 	upper := strings.ToUpper(trimmed)
@@ -5446,6 +5457,7 @@ func secondaryIndexNameFromDefinitionLine(line string) string {
 	return ""
 }
 
+// indexNamesSet 把索引列表（[]map[string]interface{}）转为以 "name" 键值为准的名字集合。
 func indexNamesSet(indexes []map[string]interface{}) map[string]struct{} {
 	out := make(map[string]struct{}, len(indexes))
 	for _, idx := range indexes {
@@ -5457,6 +5469,8 @@ func indexNamesSet(indexes []map[string]interface{}) map[string]struct{} {
 	return out
 }
 
+// parseIndexColumnNames 解析 information_schema.STATISTICS 拼接的列名字符串（如 "`a`,`b`(10)"）。
+// 输入格式假设：列名以反引号包裹、列间逗号分隔，可能带 (N) 前缀长度；返回纯列名列表。
 func parseIndexColumnNames(columns string) []string {
 	if strings.TrimSpace(columns) == "" {
 		return nil
@@ -5481,6 +5495,8 @@ func parseIndexColumnNames(columns string) []string {
 	return out
 }
 
+// indexMatchesIdentifyCols 判断索引列是否与 identity 列完全匹配（顺序敏感，大小写不敏感）。
+// 是 shouldDeferIndex 保留 identity UK 的核心判断：identity 索引不延迟。
 func indexMatchesIdentifyCols(idx map[string]interface{}, identifyCols []string) bool {
 	if len(identifyCols) == 0 {
 		return false
@@ -5498,6 +5514,8 @@ func indexMatchesIdentifyCols(idx map[string]interface{}, identifyCols []string)
 	return true
 }
 
+// indexNonUnique 读取 idx["non_unique"] 并转为 int，处理 interface{} 类型断言（int/int64/float64）；
+// 默认返回 1（视为非唯一），保证无法判断时保守延迟。
 func indexNonUnique(idx map[string]interface{}) int {
 	switch v := idx["non_unique"].(type) {
 	case int:
@@ -5529,6 +5547,7 @@ func shouldDeferIndex(idx map[string]interface{}, identity *entity.TableIdentity
 	return optimizeIndex
 }
 
+// selectDeferredIndexes 按 shouldDeferIndex 过滤索引列表，返回需延迟创建的索引子集。
 func selectDeferredIndexes(indexes []map[string]interface{}, identity *entity.TableIdentity, mode taskEntity.SyncMode, optimizeIndex bool) []map[string]interface{} {
 	if len(indexes) == 0 {
 		return nil
@@ -5545,6 +5564,9 @@ func selectDeferredIndexes(indexes []map[string]interface{}, identity *entity.Ta
 	return out
 }
 
+// mergePendingIndexRestores 将 extra 合并到 base，同一 schema.table 的索引按名称去重（8830199 修复点）。
+// 旧版按表去重会导致 resume 与 PUBLISHED 跳过路径重复入队同一索引，使 ALTER TABLE 重建同名索引失败；
+// 现改为同表按索引名合并，保证每个索引只恢复一次。
 func mergePendingIndexRestores(base, extra []pendingIndexRestore) []pendingIndexRestore {
 	if len(extra) == 0 {
 		return base
@@ -6487,6 +6509,10 @@ type fullLoadV2ResumeState struct {
 	endPos       string
 }
 
+// detectFullLoadV2Resume 判定进入 executeFullSync 时是否为 V2 resume。
+// 仅当引擎为 V2、存在持久化 FullLoadV2States、且 SyncPhase 为 FullStarted/FullFailed 时才视为 resume；
+// resume 保留原 P0/checkpoint，禁止库级重建，已 PUBLISHED 的表跳过基线扫描。
+// 必须在捕获 P0 之前调用：resume 复用旧 P0，非 resume 才捕获新 P0。
 func detectFullLoadV2Resume(task *taskEntity.SyncTask) fullLoadV2ResumeState {
 	var st fullLoadV2ResumeState
 	if task == nil || !task.Config.UsesFullLoadV2() || len(task.Context.FullLoadV2States) == 0 {
@@ -7907,6 +7933,8 @@ func loadNonPrimaryKeyIndexes(db *sql.DB, schema, tableName string) ([]map[strin
 
 }
 
+// scanNonPrimaryKeyIndexes 从 information_schema.STATISTICS 的查询结果扫描非主键索引并组装为 map 列表。
+// 每个 map 的键名约定（name/columns/non_unique/type）是下游 shouldDeferIndex/restoreIndexes 依赖的隐式契约。
 func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) {
 
 	cols, err := rows.Columns()
@@ -8027,8 +8055,6 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 
 }
 
-// dropNonPrimaryKeyIndexes 删除非主键索引（兼容旧调用：等价于 FULL + optimize_index=true）。
-
 // deferredIndexRollbackTimeout 限制 DROP 失败/取消/丢锁后的索引回滚最长耗时，避免 cleanup 无限挂起。
 const deferredIndexRollbackTimeout = 5 * time.Minute
 
@@ -8043,6 +8069,7 @@ func deferredIndexRollbackContext(parent context.Context) (context.Context, cont
 	return context.WithTimeout(context.WithoutCancel(parent), deferredIndexRollbackTimeout)
 }
 
+// dropNonPrimaryKeyIndexes 删除非主键索引（兼容旧调用：等价于 FULL + optimize_index=true）。
 func (s *TaskService) dropNonPrimaryKeyIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string) ([]map[string]interface{}, error) {
 	return s.dropDeferredIndexes(ctx, runtime, schema, tableName, nil, taskEntity.SyncModeFull, true)
 }
@@ -8332,6 +8359,7 @@ type indexRestoreBatch struct {
 	items   []indexRestoreItem
 }
 
+// indexRestoreItem 是 restoreIndexes 内部使用的索引恢复项，记录单个索引的恢复所需信息。
 type indexRestoreItem struct {
 	name      string
 	nonUnique int

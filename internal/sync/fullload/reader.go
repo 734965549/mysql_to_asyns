@@ -833,14 +833,19 @@ func runTableReaders(ctx context.Context, db *sql.DB, jobs []*tableReadJob, q *b
 
 	var wg sync.WaitGroup
 	var firstErr error
-	var errOnce sync.Once
+	var errMu sync.Mutex
 	setErr := func(err error) {
-		if err != nil {
-			errOnce.Do(func() {
-				firstErr = err
-				cancel()
-			})
+		if err == nil {
+			return
 		}
+
+		// 一个表的真实读取错误会取消 workerCtx；其他并发表随后通常更快地
+		// 返回 wrapped context.Canceled。取消错误只能作为兜底，不能覆盖稍后
+		// 完成清理并返回的真实根因。
+		errMu.Lock()
+		firstErr = preferReaderError(firstErr, err)
+		errMu.Unlock()
+		cancel()
 	}
 
 	jobCh := make(chan *tableReadJob, len(jobs))
@@ -877,6 +882,16 @@ func runTableReaders(ctx context.Context, db *sql.DB, jobs []*tableReadJob, q *b
 
 	wg.Wait()
 	return firstErr
+}
+
+func preferReaderError(current, candidate error) error {
+	if candidate == nil {
+		return current
+	}
+	if current == nil || (isCancelError(current) && !isCancelError(candidate)) {
+		return candidate
+	}
+	return current
 }
 
 type tableReadJob struct {

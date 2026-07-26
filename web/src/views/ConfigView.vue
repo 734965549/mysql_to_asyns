@@ -114,6 +114,8 @@ onMounted(() => {
           <a-row :gutter="16" class="config-summary-row">
             <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="HTTP 端口" :value="configForm.http.port" /></a-card></a-col>
             <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="Redis DB" :value="configForm.redis.db" /></a-card></a-col>
+            <!-- 日志级别用 #value 插槽而非 :value 绑定：a-statistic 的 :value 会对字符串做数值化/格式化解析，
+                 对 "INFO"/"WARN" 等非数字字符串显示异常，改用插槽直接输出原始文本 -->
             <a-col :span="8"><a-card class="config-summary-card" :bordered="false"><a-statistic title="日志级别"><template #value>{{ configForm.log.level?.toUpperCase() || '-' }}</template></a-statistic></a-card></a-col>
           </a-row>
 

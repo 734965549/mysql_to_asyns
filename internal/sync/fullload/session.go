@@ -47,6 +47,10 @@ func setupWriteSession(ctx context.Context, conn *sql.Conn, skipBinlog bool) err
 	return nil
 }
 
+// restoreWriteSession 在 writer 连接归还前恢复会话变量（FK_CHECKS/UNIQUE_CHECKS/lock_wait_timeout/sql_log_bin）。
+// skipRestore=true 时直接返回：父 ctx 已取消（流水线停止/失败），连接将被 forceCloseWriterConn 强制关闭，
+// 无需也无法在已取消的 ctx 上恢复会话。使用独立 context.Background()+5s 超时，不继承已取消的父 ctx，
+// 确保归还连接前能完成恢复；ctx.Err()==nil 判断避免在超时后打印误导性告警。
 func restoreWriteSession(conn *sql.Conn, skipBinlog bool, taskID string, writerID int, skipRestore bool) {
 	if conn == nil || skipRestore {
 		return

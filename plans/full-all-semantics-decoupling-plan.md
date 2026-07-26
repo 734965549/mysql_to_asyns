@@ -1,17 +1,13 @@
 # FULL / ALL 语义拆分与 FullLoadV2 去长事务改造方案（草案）
 
-> 状态：Completed — 阶段 0/1/2/3 均已落地
->
-> 已完成摘要：
-> - 阶段 0：禁用并行失败自动降级
-> - 阶段 1：FULL 普通短查询
-> - 阶段 2：ALL 无锁 P0/P1 + bounded catch-up + allow_nopk_all
-> - 阶段 3：删除 aligned snapshot/limiter/HWM 运行时与快照指标；废弃配置仅兼容接收
+> 状态：Completed - 阶段 0/1/2/3 均已落地
 >
 > 已完成摘要：
 > - 阶段 0：禁用并行失败自动降级；`full_load_degrade_on_align_lock_fail` 仅兼容占位
 > - 阶段 1：FULL V2 普通短查询路径
 > - 阶段 2：ALL 无锁 P0/P1 + bounded catch-up；索引恢复在 catch-up 之后；`allow_nopk_all`；旧 HWM ALL 要求 fresh run
+> - 阶段 3：删除 aligned snapshot/limiter/HWM 运行时与快照指标；废弃配置仅兼容接收
+>
 > 核心原则：`FULL` 只负责一次性基线拷贝；`ALL` 才负责覆盖全量期间发生的增量变更。
 > 并发原则：并发度由用户在任务启动前决定；运行时不得把失败的并行任务自动降级为单线程。
 

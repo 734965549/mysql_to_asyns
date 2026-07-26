@@ -20,6 +20,21 @@ func TestSelectPipelineError_WriterFailsFirst(t *testing.T) {
 	}
 }
 
+func TestPreferReaderError_RealErrorReplacesCancellationRace(t *testing.T) {
+	cancelErr := fmt.Errorf("reader[1] chunk s.t#14: read chunk s.t#14: %w", context.Canceled)
+	rootErr := errors.New("reader[0] chunk s.other#3: source query failed")
+
+	got := preferReaderError(cancelErr, rootErr)
+	if !errors.Is(got, rootErr) {
+		t.Fatalf("expected real reader error to replace cancellation, got %v", got)
+	}
+
+	got = preferReaderError(rootErr, cancelErr)
+	if !errors.Is(got, rootErr) {
+		t.Fatalf("expected later cancellation not to replace real reader error, got %v", got)
+	}
+}
+
 func TestSelectPipelineError_ReaderFailsFirst(t *testing.T) {
 	parent := context.Background()
 	pipeline, pipelineCancel := context.WithCancelCause(parent)

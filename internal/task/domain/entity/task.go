@@ -191,10 +191,10 @@ type ProcessContext struct { // 定义处理上下文结构体
 	// 当前全量使用普通 INSERT，暂停/失败后不再续传；进入新一轮全量前会清空。
 	FullSyncResume map[string]*TableSyncProgress `json:"full_sync_resume,omitempty"`
 
-	// TableBinlogHWMs 记录 ALL + full_load_engine=v2 下无 PK/UK 表在表级一致性快照窗口内捕获的 binlog 高水位。
+	// TableBinlogHWMs 是历史兼容字段（legacy）：旧版 V2 ALL 在表级一致性快照窗口内为无 PK/UK 表捕获的 binlog 高水位。
+	// 新版本已下线该机制（改为无锁 P0/P1 + 有界追平），不再生成 HWM，仅保留用于读取旧任务存档。
 	// key = "schema.table"，value = "file:pos"（与 SHOW MASTER STATUS / canal OnXID 同语义：下一事件起始位置）。
-	// 有 PK/UK 表不写此字段，增量从 FullSyncStartPosition 重放并依赖 upsert 幂等。
-	// V1 全量不写入此字段；V1 ALL 增量不强校验 HWM，无 PK/UK 表存在重复行风险。
+	// 新一轮全量开始时由 MarkFullSyncStarted 清空（见 ResetSyncPhase 中 t.Context.TableBinlogHWMs = nil）。
 	TableBinlogHWMs map[string]string `json:"table_binlog_hwms,omitempty"`
 
 	// FullLoadV2States 记录 V2 引擎每张表的加载状态(P3 持久化,用于进程重启恢复)。
@@ -652,7 +652,9 @@ func (t *SyncTask) ResetSyncPhase() {
 	t.Context.LastUpdateTime = time.Now()
 }
 
-// SetTableBinlogHWM 持久化单表 binlog 高水位（ALL + 无 PK/UK）。pos 形如 "file:pos"。
+// SetTableBinlogHWM 持久化单表 binlog 高水位。
+// Deprecated: legacy 方法。新版本已下线表级 HWM 机制（改为无锁 P0/P1 + 有界追平），
+// 不再调用此方法；仅保留用于读取旧任务存档兼容。pos 形如 "file:pos"。
 func (t *SyncTask) SetTableBinlogHWM(tableKey, pos string) {
 	if tableKey == "" || pos == "" {
 		return
@@ -782,8 +784,8 @@ func (t *SyncTask) FullSyncIncomplete() bool {
 }
 
 // ResetFullSyncResume 清空所有表的历史全量断点（全新一轮全量开始时调用）。
-// 不清理 TableBinlogHWMs：全量完成后 clearFullSyncResume 也会调用本方法，
-// 表级 HWM 必须保留到增量阶段；HWM 仅由 ClearTableBinlogHWMs / ResetSyncPhase / 新一轮全量开始时清空。
+// 注意：legacy 表级 HWM（TableBinlogHWMs）已下线，不再需要"保留到增量阶段"；
+// 新一轮全量开始时由 MarkFullSyncStarted/ResetSyncPhase 统一清空 TableBinlogHWMs。
 func (t *SyncTask) ResetFullSyncResume() {
 	t.Context.FullSyncResume = nil
 }

@@ -8,4 +8,4 @@
 - `internal/audit`, `internal/metrics`: cross-cutting audit and Prometheus.
 - `pkg/binlog`, `pkg/crypto`, `pkg/logger`, `pkg/storage`: shared technical packages.
 - Full sync bulk write uses plain INSERT; target must be empty or explicit drop-before-DDL. Incremental PK/UK insert uses upsert; no-PK does not.
-- ALL mode captures a short-FTWRL binlog position before full scan; do not restore long global snapshots or `enable_consistent_snapshot`.
+- ALL mode captures an unlocked binlog position P0 (via `SHOW MASTER STATUS`, no FTWRL) before full scan, then captures P1 after the baseline scan and runs a bounded catch-up from P0 to P1; do not restore FTWRL, long global snapshots, table-level long-lived RR snapshots, or `enable_consistent_snapshot`.

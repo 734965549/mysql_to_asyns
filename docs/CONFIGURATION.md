@@ -492,6 +492,9 @@ chunk 边界规划与读取共用同一连接池，改善负载均衡。开启
   含无 PK/UK 表时需提交 `allow_nopk_all=true`（best-effort）。
 - V2 运行期指标（读/写/提交行数与字节、队列水位、活跃 worker、事务重放与锁重试次数）
   通过 Prometheus `mysql_sync_full_load_*` 指标与任务详情接口暴露。
+  以下旧版指标已在 aligned snapshot 架构移除后下线，dashboard 需相应清理：
+  `mysql_sync_full_load_snapshot_groups`、`mysql_sync_full_load_snapshot_txns`、
+  `mysql_sync_full_load_oldest_snapshot_age_millis`、`mysql_sync_full_load_snapshot_align_degrades_total`。
 - `full_load_read_workers` 同时约束并发表数与单表内并行读连接数上限（`TableParallelReaders`
   默认等于该值）；`CapBySourcePool` 会用真实源库连接池上限进一步约束两者，避免超过
   `source_max_open_conns`。源库写入频繁、并行读连接数较大时会放大 undo / history list，

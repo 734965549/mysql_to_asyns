@@ -113,22 +113,22 @@ StartTask
   -> MarkFullSyncCompleted
 ```
 
-全量起点位点通过短暂 `FLUSH TABLES WITH READ LOCK` 捕获，随后立即 `UNLOCK TABLES`。不要重新引入长事务全局快照或 `enable_consistent_snapshot`。
+全量起点位点通过无锁 `SHOW MASTER STATUS` 捕获（不再使用 `FLUSH TABLES WITH READ LOCK`）。基线扫描完成后再捕获 P1，从 P0 做有界追平到 P1。不要重新引入长事务全局快照、表级长生命周期 RR 快照或 `enable_consistent_snapshot`。
 
-### 短锁起点与增量追平
+### 无锁起点与增量追平
 
 本项目不依赖“全量期间一直持锁”来保证一致性，而是使用“起点位点 + 空目标全量写 + 增量追平”：
 
 ```text
-1. 全量开始前短锁拿到 binlog 位点 P0。
-2. 立即解锁，并把 P0 保存为增量 checkpoint。
+1. 全量开始前以无锁 `SHOW MASTER STATUS` 拿到 binlog 位点 P0。
+2. 把 P0 保存为增量 checkpoint。
 3. 全量阶段执行普通短查询，目标端使用普通 INSERT 写入；目标表必须为空，或通过 `enable_drop_table_before_ddl=true` 在全量前重建为空。
    - 「DDL 前删除目标」按 `sync_level` 分支：DATABASE 级别在 `MarkFullSyncStarted` 后、任何目标表 DDL/数据写入前，对去重后的唯一目标库执行 `DROP DATABASE IF EXISTS` + `CREATE DATABASE IF NOT EXISTS`（utf8mb4/utf8mb4_unicode_ci），任一步失败终止全量；之后建表不再逐表 `DROP TABLE`。TABLE 级别保持每张表建表前 `DROP TABLE IF EXISTS`。两种级别均使用用户配置的目标库名/目标表名，仅在全量阶段执行一次，增量阶段不执行。
-4. ALL 模式全量完成后，增量从 P0 开始回放。
+4. ALL 模式全量基线扫描完成后捕获 P1，增量从 P0 开始回放，做有界追平到 P1。
 5. P0 之后发生的变更会再次应用到目标库，用于追平全量读取期间的时间差。
 ```
 
-> **重要限制**：上述"短锁位点 + 非快照全量 + binlog 回放"的严格收敛保证**仅适用于有可靠非空 PK/UK 的表**。无 PK/UK 的表无法保证收敛，原因如下：
+> **重要限制**：上述"无锁位点 + 非快照全量 + binlog 回放"的严格收敛保证**仅适用于有可靠非空 PK/UK 的表**。无 PK/UK 的表无法保证收敛，原因如下：
 > 1. P0 之后源库插入了一行新数据；
 > 2. 全量扫描也读取到了该行并写入目标表；
 > 3. 随后增量 binlog 回放再次 INSERT 该行；

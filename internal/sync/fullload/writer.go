@@ -94,6 +94,8 @@ func writerLoop(ctx context.Context, taskID string, id int, targetDB *sql.DB, q 
 			stmtCache.Close()
 		}
 		if conn != nil {
+			// ctx 已取消（流水线停止/失败）时跳过 restoreWriteSession：连接即将被 forceCloseWriterConn
+			// 强制关闭，此时在独立 ctx 上执行 SET FK_CHECKS=1 等恢复语句既无意义又会产生告警噪音/阻塞。
 			skipRestore := ctx.Err() != nil
 			restoreWriteSession(conn, opt.SkipBinlog, taskID, id, skipRestore)
 			forceCloseWriterConn(conn)

@@ -52,6 +52,7 @@ const detailPageMetrics = ref({});
 const detailPageProgress = ref(null);
 const detailPageLoading = ref(false);
 const detailPageActiveTab = ref("runtime");
+// 表列表默认折叠：表数量大时一次性渲染会造成卡顿，用户按需展开。
 const isTablesCollapsed = ref(true);
 
 let detailPageRefreshInterval = null;
@@ -67,6 +68,7 @@ function getMySQLSinkDisplay(sink, config) {
 const detailPageResumeTables = computed(() => resumeTableList(detailPageTask.value));
 const detailPageRowMeta = computed(() => getRowCountMeta(detailPageTask.value));
 
+// 拉取任务详情。silent=true 时跳过 loading 状态切换，用于定时轮询避免全屏 loading 闪烁。
 async function fetchTaskDetailPage(taskId, silent = false) {
   if (!taskId) return;
   if (!silent) {
@@ -331,6 +333,7 @@ onUnmounted(() => {
             </a-col>
           </a-row>
 
+          <!-- lazy-load: 延迟渲染非活动 tab，减少首屏渲染负担 -->
           <a-tabs v-model:active-key="detailPageActiveTab" class="detail-tabs" lazy-load>
             <!-- 实时进度 -->
             <a-tab-pane key="runtime" title="实时进度">

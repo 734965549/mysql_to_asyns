@@ -47,6 +47,7 @@ const expandedTableDatabaseKeys = ref([]);
 const expandedTargetTableDatabaseKeys = ref([]);
 
 const editingTaskId = ref(null);
+// 复制任务时携带的源任务 ID；提交时作为 clone_from_task_id 传给后端，供后端克隆增量位点/配置。
 const cloneFromTaskId = ref(null);
 
 const useCustomSourceDB = ref(false);
@@ -94,6 +95,8 @@ function getSinkTypeLabel(type) {
   return SINK_TYPES.find((t) => t.value === type)?.label || type;
 }
 
+// 将后端结构化 sink options 规范化为表单编辑格式：
+// MYSQL/KAFKA 密码脱敏清空（unmaskSecret）；KAFKA brokers 数组转逗号串；WEBHOOK headers 对象转 "k: v\n" 文本。
 function normalizeSinkOptionsForForm(type, options) {
   const opts = { ...(options || {}) };
   if (type === "MYSQL") {
@@ -515,6 +518,8 @@ function fillTaskFormFromTask(task) {
   }
 
   if (hasExplicitSinkConfigs(task.config.sink_configs)) {
+    // 单个显式 MYSQL sink 等价于自定义目标端：回退为 MYSQL 单目标形态（避免误进 MULTI 编辑），
+    // 仅当任务自身无 target_db 时才从 sink options 回填 customTargetDB。
     if (isSingleExplicitMySQLSink(task.config.sink_configs)) {
       targetType.value = "MYSQL";
       sinkConfigs.value = [];

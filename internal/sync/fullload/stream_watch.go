@@ -102,6 +102,7 @@ func (w *streamWatch) stop() {
 	}
 }
 
+// fire 以默认 idleTimeout 触发看门狗取消；用于读取无进展（idle）超时场景。
 func (w *streamWatch) fire() {
 	limit := time.Duration(0)
 	if w != nil {
@@ -110,6 +111,7 @@ func (w *streamWatch) fire() {
 	w.fireWith(limit)
 }
 
+// fireWith 以指定 limit 触发看门狗取消并记录限额；用于打开阶段强制上报 openTimeout（区别于 fire 的 idle 默认值）。
 func (w *streamWatch) fireWith(limit time.Duration) {
 	if w == nil {
 		return
@@ -128,6 +130,7 @@ func (w *streamWatch) fireWith(limit time.Duration) {
 	}
 }
 
+// wasFired 返回看门狗是否已触发取消（用于判断超时原因）。
 func (w *streamWatch) wasFired() bool {
 	if w == nil {
 		return false
@@ -137,6 +140,7 @@ func (w *streamWatch) wasFired() bool {
 	return w.fired
 }
 
+// limitOnFire 返回触发时记录的限额（idleTimeout 或 openTimeout），供调用方区分超时类型。
 func (w *streamWatch) limitOnFire() time.Duration {
 	if w == nil {
 		return 0
