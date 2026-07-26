@@ -8170,8 +8170,8 @@ func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRu
 		if len(item.indexes) == 0 {
 			continue
 		}
-	// 停止信号快速退出
-		if s.isUserFullSyncStop(taskID) {
+		// 停止信号快速退出
+		if s.isTaskStopped(taskID) {
 			cancel()
 			break
 		}
@@ -8202,9 +8202,15 @@ func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRu
 	}
 	wg.Wait()
 
-	// 停止信号优先于普通错误返回，与全量同步停止语义一致
-	if s.isUserFullSyncStop(taskID) {
-		return errFullSyncStoppedByUser
+	// worker 级停止判断保留宽语义；编排层在 executeFullSync 中再区分用户停止与失败。
+	if s.isTaskStopped(taskID) {
+		if s.isUserFullSyncStop(taskID) {
+			return errFullSyncStoppedByUser
+		}
+		if firstErr != nil {
+			return firstErr
+		}
+		return context.Canceled
 	}
 	if firstErr == nil && ctx.Err() != nil {
 		return ctx.Err()

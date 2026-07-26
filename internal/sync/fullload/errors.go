@@ -52,6 +52,18 @@ func selectPipelineError(parentCtx, pipelineCtx context.Context, readerErr, writ
 	return nil
 }
 
+// preferPipelineStopCause 把父 ctx 的普通取消细化为任务侧具名停止原因。
+// 仅覆盖普通取消，避免掩盖真实流水线错误或 ErrSchemaLockLost 等具名 cause。
+func preferPipelineStopCause(err error, stopCause func() error) error {
+	if !isCancelError(err) || stopCause == nil {
+		return err
+	}
+	if cause := stopCause(); cause != nil {
+		return cause
+	}
+	return err
+}
+
 func formatPipelineErr(err error) string {
 	if err == nil {
 		return "<nil>"

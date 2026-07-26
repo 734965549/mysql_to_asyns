@@ -128,13 +128,8 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 				case <-cctx.Done():
 					return
 				case <-ticker.C:
-					if e.StopCause != nil {
-						if cause := e.StopCause(); cause != nil {
-							cancel(cause)
-							return
-						}
-					} else if e.IsStopped != nil && e.IsStopped() {
-						cancel(ErrUserPaused)
+					if cause := currentEngineStopCause(e.StopCause, e.IsStopped); cause != nil {
+						cancel(cause)
 						return
 					}
 				}
@@ -206,7 +201,11 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 
 	snap := e.Stats.Snapshot()
 	pipelineErr := selectPipelineError(ctx, cctx, readerErr, writerErr)
-	logPipelineOutcome(e.TaskID, snap, readerErr, writerErr, pipelineErr, ctx)
+	// PauseTask/EndTask 会先更新任务状态再取消父 ctx；父取消可能早于轮询器取到
+	// 具名 cause。仅在仲裁结果仍是普通取消时补取一次，真实 reader/writer 错误和
+	// ErrSchemaLockLost 等具名 cause 的优先级不受影响。
+	pipelineErr = preferPipelineStopCause(pipelineErr, e.StopCause)
+	logPipelineOutcome(e.TaskID, snap, readerErr, writerErr, pipelineErr, cctx)
 
 	if pipelineErr != nil {
 		return pipelineErr
@@ -219,7 +218,26 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	return nil
 }
 
-func logPipelineOutcome(taskID string, snap StatsSnapshot, readerErr, writerErr, pipelineErr error, parentCtx context.Context) {
+func currentEngineStopCause(stopCause func() error, isStopped func() bool) error {
+	var cause error
+	if stopCause != nil {
+		cause = stopCause()
+	}
+	if cause != nil || isStopped == nil || !isStopped() {
+		return cause
+	}
+	// StopCause 与 IsStopped 分两次读取；再取一次可覆盖恰好发生在
+	// 两次检查之间的暂停/停止，同时保留 FAILED 等宽停止语义。
+	if stopCause != nil {
+		cause = stopCause()
+	}
+	if cause != nil {
+		return cause
+	}
+	return context.Canceled
+}
+
+func logPipelineOutcome(taskID string, snap StatsSnapshot, readerErr, writerErr, pipelineErr error, pipelineCtx context.Context) {
 	chunks := fmt.Sprintf("chunks=%d/%d", snap.ChunksDone, snap.ChunksTotal)
 	if pipelineErr == nil {
 		logger.Info("[Task %s] FullLoadV2 finished: %s committed_rows=%d committed_bytes=%d commits=%d tx_replays=%d lock_retries=%d",
@@ -234,7 +252,7 @@ func logPipelineOutcome(taskID string, snap StatsSnapshot, readerErr, writerErr,
 		logger.Info("[Task %s] FullLoadV2 stopped by user: %s", taskID, chunks)
 		return
 	}
-	cancelCause := context.Cause(parentCtx)
+	cancelCause := context.Cause(pipelineCtx)
 	logger.Error("[Task %s] FullLoadV2 failed: %s reader_err=%s writer_err=%s cancel_cause=%s err=%s",
 		taskID, chunks,
 		formatPipelineErr(readerErr),
