@@ -321,6 +321,86 @@ func TestResetResumeIfFresh_V2ResumeWithoutLegacyHWMKeepsStates(t *testing.T) {
 	assert.Equal(t, "COPYING", live.Context.FullLoadV2States["s.t"].Phase)
 }
 
+func TestDetectFullLoadV2Resume_PreservesPostBaseline(t *testing.T) {
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:             "v2_post_base",
+		Mode:           taskEntity.SyncModeAll,
+		FullLoadEngine: "v2",
+	})
+	task.Context.SyncPhase = taskEntity.SyncPhaseFullFailed
+	task.Context.FullSyncStartPosition = "mysql-bin.000001:100"
+	task.Context.FullSyncEndPosition = "mysql-bin.000001:500"
+	task.Context.FullSyncSubphase = "CATCH_UP"
+	task.Context.FullLoadExpectedTables = 1
+	task.Context.FullLoadV2States = map[string]*taskEntity.FullLoadV2TableState{
+		"s.t": {Phase: "PUBLISHED"},
+	}
+
+	st := detectFullLoadV2Resume(task)
+	require.True(t, st.active)
+	assert.True(t, st.baselineDone)
+	assert.Equal(t, "mysql-bin.000001:100", st.startPos)
+	assert.Equal(t, "CATCH_UP", st.subphase)
+	assert.Equal(t, "mysql-bin.000001:500", st.endPos)
+}
+
+func TestRecoverFullLoadV2States_ALLAllPublishedKeepsPhase(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{
+		ID:             "recover_all_pub",
+		Name:           "recover",
+		Mode:           taskEntity.SyncModeAll,
+		FullLoadEngine: "v2",
+	})
+	require.NoError(t, err)
+	task.Context.SyncPhase = taskEntity.SyncPhaseFullStarted
+	task.Context.FullSyncSubphase = "CATCH_UP"
+	task.Context.FullSyncStartPosition = "mysql-bin.000001:10"
+	task.Context.FullLoadExpectedTables = 1
+	task.Context.FullLoadV2States = map[string]*taskEntity.FullLoadV2TableState{
+		"s.t": {Phase: "PUBLISHED"},
+	}
+	require.NoError(t, ts.storage.Save(task))
+
+	ts.recoverFullLoadV2States()
+
+	live, ok := ts.GetTask("recover_all_pub")
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.SyncPhaseFullStarted, live.Context.SyncPhase,
+		"ALL must not auto-complete when only baseline is PUBLISHED")
+	assert.Equal(t, "CATCH_UP", live.Context.FullSyncSubphase)
+}
+
+func TestResetResumeIfFresh_KeepsAllPublishedManifestWhenFullFailed(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{
+		ID:             "v2_all_pub_keep",
+		Name:           "keep",
+		Mode:           taskEntity.SyncModeAll,
+		FullLoadEngine: "v2",
+	})
+	require.NoError(t, err)
+	task.Context.SyncPhase = taskEntity.SyncPhaseFullFailed
+	task.Context.FullSyncStartPosition = "mysql-bin.000001:100"
+	task.Context.FullLoadExpectedTables = 1
+	task.Context.FullLoadV2States = map[string]*taskEntity.FullLoadV2TableState{
+		"s.t": {Phase: "PUBLISHED"},
+	}
+	require.NoError(t, ts.storage.Save(task))
+
+	ts.resetResumeIfFresh("v2_all_pub_keep")
+
+	live, ok := ts.GetTask("v2_all_pub_keep")
+	require.True(t, ok)
+	require.NotNil(t, live.Context.FullLoadV2States)
+	assert.Equal(t, "PUBLISHED", live.Context.FullLoadV2States["s.t"].Phase)
+	assert.Equal(t, "mysql-bin.000001:100", live.Context.FullSyncStartPosition)
+}
+
 func TestClearFullSyncResume(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
 	defer ts.Close()

@@ -76,6 +76,9 @@ type tableEntry struct {
 	identity *entity.TableIdentity
 }
 
+// schemaPair 源库 -> 目标库映射。
+type schemaPair struct{ src, dst string }
+
 // TaskService 任务服务结构体
 
 // TaskService is the application boundary for task lifecycle and sync
@@ -979,7 +982,8 @@ func (s *TaskService) initFullLoadV2Manifest(taskID, runID string, tableKeys []s
 // recoverFullLoadV2States 扫描所有 V2 任务的持久化表级状态,进行恢复决策(P3.5)。
 //
 // 恢复策略:
-//   - 全部表 PUBLISHED: 标记全量完成(SyncPhaseFullCompleted),允许接增量
+//   - FULL 且全部表 PUBLISHED: 标记全量完成(SyncPhaseFullCompleted),允许接增量
+//   - ALL 且全部表 PUBLISHED: 仅表示基线完成，保留阶段供 catch-up/索引 resume，不得标完成
 //   - 有表未完成: 保持当前状态(Paused),用户手动 StartTask 时 V2 引擎会跳过 PUBLISHED 表、重新处理未完成表
 //   - 无 V2 状态: 跳过(非 V2 任务或全新任务)
 //
@@ -997,24 +1001,7 @@ func (s *TaskService) recoverFullLoadV2States() {
 			continue
 		}
 
-		// 检查是否所有表都已 PUBLISHED
-		if task.AllFullLoadV2TablesPublished() {
-			// 全量已完成,修正 SyncPhase
-			if task.Context.SyncPhase == taskEntity.SyncPhaseFullStarted ||
-				task.Context.SyncPhase == taskEntity.SyncPhaseFullFailed {
-				now := time.Now()
-				task.Context.SyncPhase = taskEntity.SyncPhaseFullCompleted
-				task.Context.FullSyncCompletedAt = &now
-				task.Context.FullSyncFailedReason = ""
-				if err := s.storage.Save(task); err != nil {
-					logger.Warn("[Task %s] recoverFullLoadV2: failed to save recovered state: %v", taskID, err)
-				} else {
-					logger.Info("[Task %s] recoverFullLoadV2: all tables PUBLISHED, marked full sync completed", taskID)
-					recovered++
-				}
-			}
-		} else {
-			// 有未完成的表,记录日志供排查
+		if !task.AllFullLoadV2TablesPublished() {
 			published := 0
 			pending := 0
 			for _, st := range task.Context.FullLoadV2States {
@@ -1026,6 +1013,29 @@ func (s *TaskService) recoverFullLoadV2States() {
 			}
 			logger.Info("[Task %s] recoverFullLoadV2: %d published, %d pending; task remains paused for manual restart",
 				taskID, published, pending)
+			continue
+		}
+
+		// ALL：全部 PUBLISHED 只表示基线完成，catch-up/索引恢复仍可能未完成，不得标 FULL_COMPLETED。
+		if task.Config.Mode == taskEntity.SyncModeAll {
+			logger.Info("[Task %s] recoverFullLoadV2: all tables PUBLISHED but ALL post-baseline may be pending (subphase=%q); keep phase for resume",
+				taskID, task.Context.FullSyncSubphase)
+			continue
+		}
+
+		// FULL：全部 PUBLISHED 即全量完成。
+		if task.Context.SyncPhase == taskEntity.SyncPhaseFullStarted ||
+			task.Context.SyncPhase == taskEntity.SyncPhaseFullFailed {
+			now := time.Now()
+			task.Context.SyncPhase = taskEntity.SyncPhaseFullCompleted
+			task.Context.FullSyncCompletedAt = &now
+			task.Context.FullSyncFailedReason = ""
+			if err := s.storage.Save(task); err != nil {
+				logger.Warn("[Task %s] recoverFullLoadV2: failed to save recovered state: %v", taskID, err)
+			} else {
+				logger.Info("[Task %s] recoverFullLoadV2: all tables PUBLISHED, marked full sync completed", taskID)
+				recovered++
+			}
 		}
 	}
 	if recovered > 0 {
@@ -2495,9 +2505,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 	// 构建 (sourceSchema, targetSchema) 对列表
 
-	type dbPair struct{ src, dst string }
-
-	var pairs []dbPair
+	var pairs []schemaPair
 
 	if len(task.Config.SourceDatabases) > 0 {
 
@@ -2515,7 +2523,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 			}
 
-			pairs = append(pairs, dbPair{src, dst})
+			pairs = append(pairs, schemaPair{src, dst})
 
 		}
 
@@ -2539,7 +2547,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 		}
 
-		pairs = append(pairs, dbPair{resolvedSourceSchema, dst})
+		pairs = append(pairs, schemaPair{resolvedSourceSchema, dst})
 
 	}
 
@@ -2661,6 +2669,14 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	// 初始化运行时进度追踪（供前端实时展示）
 	s.initRunningProgress(taskID, allTableEntries, "full")
 
+	// 必须在捕获 P0 前判定 V2 resume，避免覆盖原 P0/checkpoint 导致 PUBLISHED 跳过窗口静默漏数。
+	s.mu.RLock()
+	liveForResume := s.tasks[taskID]
+	v2Resume := detectFullLoadV2Resume(liveForResume)
+	s.mu.RUnlock()
+	isV2Resume := v2Resume.active
+	v2BaselineDone := v2Resume.baselineDone
+
 	// === Binlog 增量起点：仅 ALL 模式需要 ===
 	// FULL 模式不捕获 binlog 位点、不保存增量 checkpoint：只做一次无缝全表遍历，
 	// 同步期间发生的变化不进行追平。如需覆盖同步期间的变化，请使用 ALL 模式。
@@ -2678,59 +2694,109 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			logger.Warn("[Task %s] ALL mode no-PK/UK tables acknowledged: %v (consistency=best_effort)", taskID, nopkTables)
 		}
 
-		// 增量起点 P0 必须早于所有全量读取；无锁读取 SHOW MASTER STATUS。
-		// 基线用普通短查询，一致性由后续 P0..P1 catch-up 收敛。
-		// P0 fail-closed：位点捕获或保存失败时必须终止任务。
-		logger.Info("[Task %s] ALL mode: capturing unlocked binlog start position P0 before full scan", taskID)
+		if isV2Resume {
+			startPosStr = v2Resume.startPos
+			if startPosStr == "" {
+				errMsg := "V2 resume requires persisted FullSyncStartPosition (P0); refusing to capture a new P0 that would skip changes for already-PUBLISHED tables"
+				logger.Error("[Task %s] %s", taskID, errMsg)
+				s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+					t.MarkFullSyncFailed(errMsg)
+				})
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			curPos, cpErr := s.checkpointManager.GetPosition(ctx, taskID)
+			if cpErr != nil {
+				errMsg := fmt.Sprintf("Failed to read checkpoint during V2 resume: %v", cpErr)
+				s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+					t.MarkFullSyncFailed(errMsg)
+				})
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			if curPos.Name == "" {
+				// checkpoint 丢失时回退到原 P0（可重放，不可前移）。
+				p0, parseErr := parseBinlogPosition(startPosStr)
+				if parseErr != nil {
+					errMsg := fmt.Sprintf("V2 resume: invalid persisted P0 %q: %v", startPosStr, parseErr)
+					s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+						t.MarkFullSyncFailed(errMsg)
+					})
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+					return fmt.Errorf("%s", errMsg)
+				}
+				if err := s.checkpointManager.SavePosition(ctx, taskID, p0); err != nil {
+					errMsg := fmt.Sprintf("V2 resume: failed to restore checkpoint from P0: %v", err)
+					s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+						t.MarkFullSyncFailed(errMsg)
+					})
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+					return fmt.Errorf("%s", errMsg)
+				}
+				logger.Info("[Task %s] V2 resume: restored checkpoint from persisted P0=%s", taskID, startPosStr)
+			} else {
+				logger.Info("[Task %s] V2 resume: preserving P0=%s checkpoint=%s (baseline_done=%v subphase=%q)",
+					taskID, startPosStr, formatBinlogPosition(curPos), v2BaselineDone, v2Resume.subphase)
+			}
+		} else {
+			// fresh run：增量起点 P0 必须早于所有全量读取；无锁读取 SHOW MASTER STATUS。
+			logger.Info("[Task %s] ALL mode: capturing unlocked binlog start position P0 before full scan", taskID)
 
-		binlogPos, posErr := s.captureFullSyncStartPosition(ctx, runtime)
-		startPosStr = formatBinlogPosition(binlogPos)
-		if posErr != nil {
-			errMsg := fmt.Sprintf("Failed to capture full-sync start binlog position: %v. "+
-				"Without a start position, incremental sync would fall back to current master position and miss all changes during full sync. "+
-				"Task failed to prevent silent data loss.", posErr)
-			logger.Error("[Task %s] %s", taskID, errMsg)
-			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-				t.MarkFullSyncFailed(errMsg)
-			})
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
+			binlogPos, posErr := s.captureFullSyncStartPosition(ctx, runtime)
+			startPosStr = formatBinlogPosition(binlogPos)
+			if posErr != nil {
+				errMsg := fmt.Sprintf("Failed to capture full-sync start binlog position: %v. "+
+					"Without a start position, incremental sync would fall back to current master position and miss all changes during full sync. "+
+					"Task failed to prevent silent data loss.", posErr)
+				logger.Error("[Task %s] %s", taskID, errMsg)
+				s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+					t.MarkFullSyncFailed(errMsg)
+				})
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			if binlogPos.Name == "" {
+				errMsg := "Captured empty binlog start position (file name is empty). " +
+					"Incremental sync cannot be seeded correctly; task failed to prevent silent data loss."
+				logger.Error("[Task %s] %s", taskID, errMsg)
+				s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+					t.MarkFullSyncFailed(errMsg)
+				})
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			if err := s.checkpointManager.SavePosition(ctx, taskID, binlogPos); err != nil {
+				errMsg := fmt.Sprintf("Failed to save binlog start position for incremental sync: %v. "+
+					"Without a persisted checkpoint, incremental sync would fall back to current master position and miss all changes during full sync. "+
+					"Task failed to prevent silent data loss.", err)
+				logger.Error("[Task %s] %s", taskID, errMsg)
+				s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+					t.MarkFullSyncFailed(errMsg)
+				})
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			logger.Info("[Task %s] Full-sync start binlog position saved (will be incremental catch-up start point): %s",
+				taskID, startPosStr)
 		}
-		if binlogPos.Name == "" {
-			errMsg := "Captured empty binlog start position (file name is empty). " +
-				"Incremental sync cannot be seeded correctly; task failed to prevent silent data loss."
-			logger.Error("[Task %s] %s", taskID, errMsg)
-			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-				t.MarkFullSyncFailed(errMsg)
-			})
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
-		}
-		if err := s.checkpointManager.SavePosition(ctx, taskID, binlogPos); err != nil {
-			errMsg := fmt.Sprintf("Failed to save binlog start position for incremental sync: %v. "+
-				"Without a persisted checkpoint, incremental sync would fall back to current master position and miss all changes during full sync. "+
-				"Task failed to prevent silent data loss.", err)
-			logger.Error("[Task %s] %s", taskID, errMsg)
-			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-				t.MarkFullSyncFailed(errMsg)
-			})
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
-		}
-		logger.Info("[Task %s] Full-sync start binlog position saved (will be incremental catch-up start point): %s",
-			taskID, startPosStr)
 	} else {
 		logger.Info("[Task %s] FULL mode: skipping binlog position capture and incremental checkpoint (no change catch-up)", taskID)
 	}
 
-	// 进入"全量已开始"阶段，持久化到任务存档。
-	// 失败/暂停后恢复时，根据这个标志决定是不是要重跑全量。
-	// FULL 模式 startPosStr 为空，ALL 模式包含实际 binlog 位点。
-	// 新一轮全量开始时清空旧表级 HWM，避免沿用上一轮快照边界。
-	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-		t.ClearTableBinlogHWMs()
-		t.MarkFullSyncStarted(startPosStr)
-	})
+	// 进入"全量已开始"阶段。resume 不得重置 P0/P1/subphase。
+	if isV2Resume {
+		s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+			t.ClearTableBinlogHWMs()
+			t.Context.SyncPhase = taskEntity.SyncPhaseFullStarted
+			t.Context.FullSyncFailedReason = ""
+			t.Context.LastUpdateTime = time.Now()
+		})
+	} else {
+		s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+			t.ClearTableBinlogHWMs()
+			t.MarkFullSyncStarted(startPosStr)
+		})
+	}
 
 	// [P1] 在首次目标端 DDL 前获取所有目标 schema 锁，覆盖完整生命周期
 	// （库级重建 → 表结构准备 → 数据写入 → 索引恢复），直到任务级收尾完成才释放。
@@ -2781,15 +2847,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		s.cleanupStaleStagingTablesForTask(ctx, runtime.targetDB, task)
 	}
 
-	// V2 恢复模式：已有未完成的 FullLoadV2States 时，禁止库级重建，避免已 PUBLISHED 表被删后跳过复制导致丢数。
-	isV2Resume := false
-	if task.Config.UsesFullLoadV2() {
-		s.mu.RLock()
-		live := s.tasks[taskID]
-		isV2Resume = live != nil && len(live.Context.FullLoadV2States) > 0 && !live.AllFullLoadV2TablesPublished()
-		s.mu.RUnlock()
-	}
-
+	// isV2Resume / v2BaselineDone 已在捕获 P0 前判定。
 	// 全新 V2 全量：在任何 destructive DDL 前持久化完整表清单（全部 PENDING）+ runID。
 	if task.Config.UsesFullLoadV2() && !isV2Resume {
 		tableKeys := make([]string, 0, len(allTableEntries))
@@ -2850,77 +2908,129 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	// 必须等所有库、所有表的数据同步完成后再统一串行执行。
 	var pendingIndexRestores []pendingIndexRestore
 
-	for _, p := range pairs {
+	if isV2Resume && v2BaselineDone {
+		logger.Info("[Task %s] FullLoadV2 resume: baseline already PUBLISHED; skip table copy and resume post-baseline phases (subphase=%q)",
+			taskID, v2Resume.subphase)
+	} else {
+		for _, p := range pairs {
 
-		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
-			return err
-		}
-
-		if task.Config.SyncLevel == taskEntity.SyncLevelTable && len(task.Config.Tables) > 0 && len(tablesBySource[p.src]) == 0 {
-
-			continue
-
-		}
-
-		// full_load_engine=v2 时使用任务级流水线引擎；否则保持 V1 内联逐表调度。
-		var pairErr error
-		if task.Config.UsesFullLoadV2() {
-			pairErr = s.syncDatabasePairV2(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt, schemaLocks)
-		} else {
-			pairErr = s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt)
-		}
-		if pairErr != nil {
-
-			// 一并区分"被停止"和"真实失败"：库级 err 时再核查一次任务状态。
 			if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
-				logger.Info("[Task %s] Full sync stopped during pair %s->%s: %v", taskID, p.src, p.dst, pairErr)
 				return err
 			}
-			return pairErr
+
+			if task.Config.SyncLevel == taskEntity.SyncLevelTable && len(task.Config.Tables) > 0 && len(tablesBySource[p.src]) == 0 {
+
+				continue
+
+			}
+
+			// full_load_engine=v2 时使用任务级流水线引擎；否则保持 V1 内联逐表调度。
+			var pairErr error
+			if task.Config.UsesFullLoadV2() {
+				pairErr = s.syncDatabasePairV2(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt, schemaLocks)
+			} else {
+				pairErr = s.syncDatabasePair(ctx, task, runtime, p.src, p.dst, tablesBySource[p.src], &pendingIndexRestores, dbLevelRebuilt)
+			}
+			if pairErr != nil {
+
+				// 一并区分"被停止"和"真实失败"：库级 err 时再核查一次任务状态。
+				if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
+					logger.Info("[Task %s] Full sync stopped during pair %s->%s: %v", taskID, p.src, p.dst, pairErr)
+					return err
+				}
+				return pairErr
+
+			}
 
 		}
-
 	}
 
-	// ALL：基线结束后捕获 P1，先 bounded catch-up，再恢复非 identity 索引。
+	// PUBLISHED 跳过不会把延迟索引写入 pending；resume/部分完成后统一补齐缺失延迟索引。
+	if task.Config.Mode == taskEntity.SyncModeAll || task.Config.OptimizeIndex {
+		missing, missErr := s.collectMissingDeferredIndexes(ctx, task, runtime, pairs, tablesBySource)
+		if missErr != nil {
+			errMsg := fmt.Sprintf("Failed to collect deferred indexes for restore: %v", missErr)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		pendingIndexRestores = mergePendingIndexRestores(pendingIndexRestores, missing)
+	}
+
+	// ALL：基线结束后捕获/复用 P1，先 bounded catch-up，再恢复非 identity 索引。
 	if task.Config.Mode == taskEntity.SyncModeAll {
 		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
 			return err
 		}
-		logger.Info("[Task %s] ALL mode: capturing unlocked binlog end position P1 after baseline scan", taskID)
-		endPos, endErr := s.captureBinlogPosition(ctx, runtime)
-		if endErr != nil {
-			errMsg := fmt.Sprintf("Failed to capture full-sync end binlog position P1: %v", endErr)
-			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-				t.MarkFullSyncFailed(errMsg)
-			})
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
-		}
-		endPosStr := formatBinlogPosition(endPos)
-		s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-			t.Context.FullSyncEndPosition = endPosStr
-			t.Context.FullSyncSubphase = "CATCH_UP"
-			t.Context.LastUpdateTime = time.Now()
-		})
-		logger.Info("[Task %s] ALL mode: starting bounded catch-up P0=%q -> P1=%q", taskID, startPosStr, endPosStr)
-		if err := s.runBoundedCatchUp(ctx, task, runtime, endPos); err != nil {
-			if stopErr := s.abortFullSyncIfCancelled(ctx, taskID); stopErr != nil {
-				return stopErr
+		subphase := v2Resume.subphase
+		if !isV2Resume {
+			subphase = "BASE_SCAN"
+		} else {
+			s.mu.RLock()
+			if live := s.tasks[taskID]; live != nil {
+				subphase = live.Context.FullSyncSubphase
 			}
-			errMsg := fmt.Sprintf("bounded catch-up to P1 failed: %v", err)
-			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-				t.MarkFullSyncFailed(errMsg)
-			})
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
+			s.mu.RUnlock()
 		}
-		s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-			t.Context.FullSyncCatchupPosition = endPosStr
-			t.Context.FullSyncSubphase = "RESTORE_INDEX"
-			t.Context.LastUpdateTime = time.Now()
-		})
-		logger.Info("[Task %s] ALL mode: bounded catch-up completed at P1=%q", taskID, endPosStr)
+
+		if subphase != "RESTORE_INDEX" {
+			var endPos mysql.Position
+			var endPosStr string
+			if subphase == "CATCH_UP" && v2Resume.endPos != "" {
+				var parseErr error
+				endPos, parseErr = parseBinlogPosition(v2Resume.endPos)
+				if parseErr != nil {
+					errMsg := fmt.Sprintf("V2 resume: invalid persisted P1 %q: %v", v2Resume.endPos, parseErr)
+					s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+						t.MarkFullSyncFailed(errMsg)
+					})
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+					return fmt.Errorf("%s", errMsg)
+				}
+				endPosStr = v2Resume.endPos
+				logger.Info("[Task %s] ALL mode: resuming bounded catch-up with persisted P1=%q", taskID, endPosStr)
+			} else {
+				logger.Info("[Task %s] ALL mode: capturing unlocked binlog end position P1 after baseline scan", taskID)
+				var endErr error
+				endPos, endErr = s.captureBinlogPosition(ctx, runtime)
+				if endErr != nil {
+					errMsg := fmt.Sprintf("Failed to capture full-sync end binlog position P1: %v", endErr)
+					s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+						t.MarkFullSyncFailed(errMsg)
+					})
+					s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+					return fmt.Errorf("%s", errMsg)
+				}
+				endPosStr = formatBinlogPosition(endPos)
+				s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+					t.Context.FullSyncEndPosition = endPosStr
+					t.Context.FullSyncSubphase = "CATCH_UP"
+					t.Context.LastUpdateTime = time.Now()
+				})
+			}
+			logger.Info("[Task %s] ALL mode: starting bounded catch-up P0=%q -> P1=%q", taskID, startPosStr, endPosStr)
+			if err := s.runBoundedCatchUp(ctx, task, runtime, endPos); err != nil {
+				if stopErr := s.abortFullSyncIfCancelled(ctx, taskID); stopErr != nil {
+					return stopErr
+				}
+				errMsg := fmt.Sprintf("bounded catch-up to P1 failed: %v", err)
+				s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+					t.MarkFullSyncFailed(errMsg)
+				})
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.Context.FullSyncCatchupPosition = endPosStr
+				t.Context.FullSyncSubphase = "RESTORE_INDEX"
+				t.Context.LastUpdateTime = time.Now()
+			})
+			logger.Info("[Task %s] ALL mode: bounded catch-up completed at P1=%q", taskID, endPosStr)
+		} else {
+			logger.Info("[Task %s] ALL mode: subphase=RESTORE_INDEX; skip catch-up and resume index restore", taskID)
+		}
 	}
 
 	if len(pendingIndexRestores) > 0 {
@@ -3170,11 +3280,12 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			logger.Info("[Task %s] Dropping deferred indexes for target table %s.%s (mode=%s optimize_index=%v)...", taskID, targetSchema, targetTableName, task.Config.Mode, task.Config.OptimizeIndex)
 			indexes, dropErr := s.dropDeferredIndexes(ctx, runtime, targetSchema, targetTableName, identity, task.Config.Mode, task.Config.OptimizeIndex)
 			if dropErr != nil {
-				logger.Warn("[Task %s] Warning: Failed to drop indexes for %s.%s: %v", taskID, targetSchema, targetTableName, dropErr)
-			} else {
-				savedIndexes = indexes
-				logger.Info("[Task %s] Dropped %d deferred indexes from target table %s.%s", taskID, len(savedIndexes), targetSchema, targetTableName)
+				errMsg := fmt.Sprintf("Failed to drop deferred indexes for %s.%s: %v", targetSchema, targetTableName, dropErr)
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
+			savedIndexes = indexes
+			logger.Info("[Task %s] Dropped %d deferred indexes from target table %s.%s", taskID, len(savedIndexes), targetSchema, targetTableName)
 		}
 
 		logger.Info("[Task %s] Target table %s.%s is ready", taskID, targetSchema, targetTableName)
@@ -5379,6 +5490,92 @@ func selectDeferredIndexes(indexes []map[string]interface{}, identity *entity.Ta
 	return out
 }
 
+func mergePendingIndexRestores(base, extra []pendingIndexRestore) []pendingIndexRestore {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := make(map[string]struct{}, len(base))
+	for _, p := range base {
+		seen[p.targetSchema+"."+p.targetTable] = struct{}{}
+	}
+	out := append([]pendingIndexRestore(nil), base...)
+	for _, p := range extra {
+		key := p.targetSchema + "." + p.targetTable
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
+// collectMissingDeferredIndexes 对比源/目标，收集目标上缺失的延迟索引（供 resume 与 PUBLISHED 跳过路径补齐）。
+func (s *TaskService) collectMissingDeferredIndexes(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, pairs []schemaPair, tablesBySource map[string][]string) ([]pendingIndexRestore, error) {
+	if task == nil || runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil || runtime.analyzer == nil {
+		return nil, fmt.Errorf("task runtime is not initialized")
+	}
+	var pending []pendingIndexRestore
+	for _, p := range pairs {
+		tables := tablesBySource[p.src]
+		if task.Config.SyncLevel == taskEntity.SyncLevelTable && len(task.Config.Tables) > 0 && len(tables) == 0 {
+			continue
+		}
+		if len(tables) == 0 {
+			allTables, err := runtime.analyzer.GetAllTables(p.src)
+			if err != nil {
+				return nil, fmt.Errorf("list tables for %s: %w", p.src, err)
+			}
+			for _, t := range allTables {
+				tables = append(tables, t.TableName)
+			}
+		}
+		for i, tableName := range tables {
+			if err := fullload.SchemaLockLostError(ctx); err != nil {
+				return nil, err
+			}
+			targetTableName := s.resolveTableTargetName(task, p.src, tableName, i)
+			identity, err := runtime.analyzer.AnalyzeTable(p.src, tableName)
+			if err != nil {
+				return nil, fmt.Errorf("analyze %s.%s: %w", p.src, tableName, err)
+			}
+			sourceIndexes, err := loadNonPrimaryKeyIndexes(runtime.sourceDB, p.src, tableName)
+			if err != nil {
+				return nil, fmt.Errorf("load source indexes %s.%s: %w", p.src, tableName, err)
+			}
+			deferred := selectDeferredIndexes(sourceIndexes, identity, task.Config.Mode, task.Config.OptimizeIndex)
+			if len(deferred) == 0 {
+				continue
+			}
+			targetIndexes, err := loadNonPrimaryKeyIndexes(runtime.targetDB, p.dst, targetTableName)
+			if err != nil {
+				// 目标表可能尚未创建（不应在 baselineDone resume 出现）；按缺失全部延迟索引处理失败。
+				return nil, fmt.Errorf("load target indexes %s.%s: %w", p.dst, targetTableName, err)
+			}
+			present := indexNamesSet(targetIndexes)
+			missing := make([]map[string]interface{}, 0, len(deferred))
+			for _, idx := range deferred {
+				name, _ := idx["name"].(string)
+				if name == "" {
+					continue
+				}
+				if _, ok := present[name]; !ok {
+					missing = append(missing, idx)
+				}
+			}
+			if len(missing) == 0 {
+				continue
+			}
+			pending = append(pending, pendingIndexRestore{
+				targetSchema: p.dst,
+				targetTable:  targetTableName,
+				indexes:      missing,
+			})
+		}
+	}
+	return pending, nil
+}
+
 func extractAutoIncrementColumnsFromCreateSQL(lines []string) map[string]struct{} {
 
 	columns := make(map[string]struct{})
@@ -6178,6 +6375,33 @@ func resumeEnabled(task *taskEntity.SyncTask) bool {
 //
 // P3 例外: V2 引擎 + 有持久化表级状态(FullLoadV2States)时,保留 V2 状态用于恢复(跳过已 PUBLISHED 的表)。
 // 仅在全新全量(无 V2 状态或已全部完成)时清空 V2 状态。
+// fullLoadV2ResumeState 描述进入 executeFullSync 时的 V2 恢复判定（必须在捕获 P0 之前完成）。
+type fullLoadV2ResumeState struct {
+	active       bool // 是否 V2 resume（保留原 P0/checkpoint，禁止库级重建）
+	baselineDone bool // 全部表已 PUBLISHED：跳过基线，直接恢复 catch-up/索引
+	startPos     string
+	subphase     string
+	endPos       string
+}
+
+func detectFullLoadV2Resume(task *taskEntity.SyncTask) fullLoadV2ResumeState {
+	var st fullLoadV2ResumeState
+	if task == nil || !task.Config.UsesFullLoadV2() || len(task.Context.FullLoadV2States) == 0 {
+		return st
+	}
+	switch task.Context.SyncPhase {
+	case taskEntity.SyncPhaseFullStarted, taskEntity.SyncPhaseFullFailed:
+	default:
+		return st
+	}
+	st.active = true
+	st.baselineDone = task.AllFullLoadV2TablesPublished()
+	st.startPos = task.Context.FullSyncStartPosition
+	st.subphase = task.Context.FullSyncSubphase
+	st.endPos = task.Context.FullSyncEndPosition
+	return st
+}
+
 func (s *TaskService) resetResumeIfFresh(taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -6200,13 +6424,14 @@ func (s *TaskService) resetResumeIfFresh(taskID string) {
 		return
 	}
 
-	// V2 恢复场景:有未完成的表时保留 V2 状态,否则清空
+	// V2：全量未完成（含基线已 PUBLISHED 但 catch-up/索引未完成）时保留 manifest 供 resume。
 	if task.Config.UsesFullLoadV2() && len(task.Context.FullLoadV2States) > 0 {
-		if task.AllFullLoadV2TablesPublished() {
-			// 全部已完成,清空开始新一轮
+		if task.Context.SyncPhase == taskEntity.SyncPhaseFullStarted ||
+			task.Context.SyncPhase == taskEntity.SyncPhaseFullFailed {
+			// resume：保留 V2 状态与原 P0
+		} else {
 			task.ClearFullLoadV2States()
 		}
-		// 否则保留 V2 状态(恢复模式)
 	} else {
 		task.ClearFullLoadV2States()
 	}
@@ -7754,11 +7979,14 @@ func (s *TaskService) dropDeferredIndexes(ctx context.Context, runtime *taskRunt
 		_, err := targetDB.ExecContext(ctx, dropQuery)
 
 		if err != nil {
-
-			logger.Warn("Warning: failed to drop index %s: %v", name, err)
-
-			continue
-
+			// ALL 要求非 identity 唯一索引在 catch-up 前不存在：DROP 失败必须 fail-closed。
+			// 同时回滚本轮已成功删除的索引，避免目标表长期缺索引。
+			if len(dropped) > 0 {
+				if restoreErr := s.restoreIndexes(ctx, runtime, schema, tableName, dropped); restoreErr != nil {
+					return dropped, fmt.Errorf("failed to drop deferred index %s on %s.%s: %v; additionally failed to restore already-dropped indexes: %w", name, schema, tableName, err, restoreErr)
+				}
+			}
+			return nil, fmt.Errorf("failed to drop deferred index %s on %s.%s: %w", name, schema, tableName, err)
 		}
 
 		dropped = append(dropped, indexInfo)

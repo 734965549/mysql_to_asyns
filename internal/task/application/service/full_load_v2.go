@@ -118,10 +118,11 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		if needDefer {
 			indexes, dropErr := s.dropDeferredIndexes(ctx, runtime, targetSchema, targetTableName, identity, task.Config.Mode, task.Config.OptimizeIndex)
 			if dropErr != nil {
-				logger.Warn("[Task %s] FullLoadV2: drop deferred indexes for %s.%s failed: %v", taskID, targetSchema, targetTableName, dropErr)
-			} else {
-				savedIndexes = indexes
+				errMsg := fmt.Sprintf("Failed to drop deferred indexes for %s.%s: %v", targetSchema, targetTableName, dropErr)
+				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
+			savedIndexes = indexes
 		}
 
 		est, _ := reader.NewReader(runtime.sourceDB, sourceSchema, tableName, identity).GetEstimatedCount(ctx)

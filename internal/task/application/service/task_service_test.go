@@ -148,6 +148,43 @@ func TestSelectDeferredIndexes_ALLKeepsIdentityUK(t *testing.T) {
 	require.Len(t, deferred, 3)
 }
 
+func TestDropDeferredIndexes_FailClosedRestoresDropped(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	// SHOW INDEX: two unique indexes to defer
+	indexRows := sqlmock.NewRows([]string{
+		"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality",
+		"Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression",
+	}).
+		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
+		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
+	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_phone`").WillReturnError(fmt.Errorf("cannot drop"))
+	// rollback already-dropped uk_code
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("tgt", "users", "uk_code").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ts := &TaskService{}
+	dropped, dropErr := ts.dropDeferredIndexes(
+		context.Background(),
+		&taskRuntime{targetDB: targetDB},
+		"tgt",
+		"users",
+		&entity.TableIdentity{Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}},
+		taskEntity.SyncModeAll,
+		false,
+	)
+	require.Error(t, dropErr)
+	assert.Nil(t, dropped)
+	assert.Contains(t, dropErr.Error(), "failed to drop deferred index")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestStripIndexesByNameFromCreateSQL_KeepsIdentityUK(t *testing.T) {
 	createSQL := "CREATE TABLE `users` (\n" +
 		"  `id` bigint NOT NULL,\n" +
@@ -478,7 +515,7 @@ func TestFilterIndexesUsingAutoIncrementColumns_EmptyAutoIncrements(t *testing.T
 	assert.Equal(t, indexes, filtered)
 }
 
-func TestDropNonPrimaryKeyIndexes_SkipsFailedDrops(t *testing.T) {
+func TestDropNonPrimaryKeyIndexes_FailClosedRestoresDropped(t *testing.T) {
 	targetDB, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer targetDB.Close()
@@ -493,14 +530,18 @@ func TestDropNonPrimaryKeyIndexes_SkipsFailedDrops(t *testing.T) {
 	mock.ExpectQuery("SHOW INDEX FROM `db`.`t`").WillReturnRows(rows)
 	mock.ExpectExec("ALTER TABLE `db`.`t` DROP INDEX `idx_a`").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `db`.`t` DROP INDEX `idx_b`").WillReturnError(fmt.Errorf("lock wait timeout"))
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+		WithArgs("db", "t", "idx_a").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a`").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{}
 	runtime := &taskRuntime{targetDB: targetDB}
 	dropped, err := ts.dropNonPrimaryKeyIndexes(context.Background(), runtime, "db", "t")
 
-	require.NoError(t, err)
-	require.Len(t, dropped, 1)
-	assert.Equal(t, "idx_a", dropped[0]["name"])
+	require.Error(t, err)
+	assert.Nil(t, dropped)
+	assert.Contains(t, err.Error(), "failed to drop deferred index")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -3746,6 +3787,7 @@ func TestExecuteFullSync_ALLAnalyzeFailureIsFailClosedPreflight(t *testing.T) {
 	assert.Contains(t, err.Error(), "analyze table")
 	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
 }
+
 
 // TestFormatBinlogPosition ??????????????????
 func TestFormatBinlogPosition(t *testing.T) {
