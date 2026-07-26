@@ -2955,14 +2955,13 @@ func TestMin(t *testing.T) {
 
 // captureFullSyncStartPosition ????"?????"???
 // ??? FTWRL?SHOW MASTER STATUS ??????? UNLOCK?
-func TestCaptureFullSyncStartPosition_ShortReadLock(t *testing.T) {
+func TestCaptureFullSyncStartPosition_UnlockedMasterStatus(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
 
-	mock.ExpectExec("FLUSH TABLES WITH READ LOCK").WillReturnResult(sqlmock.NewResult(0, 0))
+	// 新语义：无 FTWRL / UNLOCK，仅 SHOW MASTER STATUS。
 	mock.ExpectQuery("SHOW MASTER STATUS").WillReturnRows(sqlmock.NewRows([]string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set"}).AddRow("mysql-bin.000123", 456, "", "", ""))
-	mock.ExpectExec("UNLOCK TABLES").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := newTestTaskService(t.TempDir())
 	pos, err := ts.captureFullSyncStartPosition(context.Background(), &taskRuntime{sourceDB: db})
@@ -3589,49 +3588,6 @@ type mysqlPositionLike struct {
 
 func (p mysqlPositionLike) toMysql() mysql.Position {
 	return mysql.Position{Name: p.Name, Pos: p.Pos}
-}
-
-func TestParseTableBinlogHWMs(t *testing.T) {
-	got := parseTableBinlogHWMs(map[string]string{
-		"db.a": "mysql-bin.000001:100",
-		"db.b": "bad",
-		"db.c": "mysql-bin.000002:200",
-	})
-	require.Len(t, got, 2)
-	assert.Equal(t, mysql.Position{Name: "mysql-bin.000001", Pos: 100}, got["db.a"])
-	assert.Equal(t, mysql.Position{Name: "mysql-bin.000002", Pos: 200}, got["db.c"])
-	assert.Nil(t, parseTableBinlogHWMs(map[string]string{"db.z": "mysql-bin.000001:0"}))
-	assert.Nil(t, parseTableBinlogHWMs(nil))
-}
-
-func TestPersistTableBinlogHWM_PersistsBeforeCompleted(t *testing.T) {
-	ts := newTestTaskService(t.TempDir())
-	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "hwm_persist", Mode: taskEntity.SyncModeAll})
-	ts.tasks[task.Config.ID] = task
-
-	err := ts.persistTableBinlogHWM(task.Config.ID, "src", "nopk", mysql.Position{Name: "mysql-bin.000003", Pos: 456})
-	require.NoError(t, err)
-	assert.Equal(t, "mysql-bin.000003:456", task.Context.TableBinlogHWMs["src.nopk"])
-
-	// clearFullSyncResume ???????? HWM????????
-	ts.clearFullSyncResume(task.Config.ID)
-	assert.Equal(t, "mysql-bin.000003:456", task.Context.TableBinlogHWMs["src.nopk"])
-
-	// ???????????
-	ts.updateSyncPhase(task.Config.ID, func(t *taskEntity.SyncTask) {
-		t.ClearTableBinlogHWMs()
-		t.MarkFullSyncStarted("mysql-bin.000004:1")
-	})
-	assert.Nil(t, task.Context.TableBinlogHWMs)
-}
-
-func TestPersistTableBinlogHWM_FailsClosedOnEmptyPosition(t *testing.T) {
-	ts := newTestTaskService(t.TempDir())
-	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "hwm_empty"})
-	ts.tasks[task.Config.ID] = task
-	err := ts.persistTableBinlogHWM(task.Config.ID, "s", "t", mysql.Position{})
-	require.Error(t, err)
-	assert.Nil(t, task.Context.TableBinlogHWMs)
 }
 
 // ==================== ??????? ====================

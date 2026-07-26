@@ -94,7 +94,7 @@ func retryBackoff(attempt int) time.Duration {
 	return wait
 }
 
-// readTableWithRetry 包装 readTableWithSnapshot，提供表级自动重试。
+// readTableWithRetry 包装 readTable，提供表级自动重试。
 //
 // 当 StagingEnabled=true 时，每次 attempt 创建独立 staging 表，读取完成后发布到最终表。
 // ReadRetryTimes 是额外重试次数：总 attempt = 1 + ReadRetryTimes。
@@ -107,7 +107,6 @@ func readTableWithRetry(
 	job *tableReadJob,
 	q *batchQueue,
 	eng *Engine,
-	lim *snapshotLimiter,
 	opt Options,
 	stats *Stats,
 	isStopped func() bool,
@@ -122,10 +121,10 @@ func readTableWithRetry(
 
 	maxRetries := opt.ReadRetryTimes
 	if maxRetries <= 0 && !opt.StagingEnabled {
-		return readTableWithSnapshot(ctx, db, job, q, eng, lim, opt, stats, isStopped, taskCancel, nil)
+		return readTable(ctx, db, job, q, eng, opt, stats, isStopped, taskCancel, nil)
 	}
 	if stateTracker == nil {
-		return readTableWithSnapshot(ctx, db, job, q, eng, lim, opt, stats, isStopped, taskCancel, nil)
+		return readTable(ctx, db, job, q, eng, opt, stats, isStopped, taskCancel, nil)
 	}
 	if maxRetries > 0 && !opt.StagingEnabled {
 		return fmt.Errorf("table %s.%s: read retry requires staging (fail-closed)", schema, table)
@@ -184,7 +183,7 @@ func readTableWithRetry(
 
 		// attempt 级子 context：并行 chunk 失败只取消本 attempt
 		attemptCtx, attemptCancel := context.WithCancel(ctx)
-		readErr := readTableWithSnapshot(attemptCtx, db, job, q, eng, lim, opt, stats, isStopped, taskCancel, attemptCancel)
+		readErr := readTable(attemptCtx, db, job, q, eng, opt, stats, isStopped, taskCancel, attemptCancel)
 		attemptCancel()
 
 		if readErr == nil {

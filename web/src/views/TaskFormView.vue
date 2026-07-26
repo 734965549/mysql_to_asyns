@@ -123,7 +123,8 @@ const taskForm = ref({
   full_load_engine: "v1",
   full_load_read_workers: 0, full_load_write_workers: 0, full_load_buffer_mb: 0,
   full_load_batch_bytes_mb: 0, full_load_commit_rows: 0, full_load_commit_bytes_mb: 0,
-  full_load_lock_wait_timeout_sec: 0, full_load_degrade_on_align_lock_fail: true,
+  full_load_lock_wait_timeout_sec: 0, full_load_degrade_on_align_lock_fail: false,
+  allow_nopk_all: false,
 });
 
 function applyFullLoadPreset(name) {
@@ -305,7 +306,8 @@ function resetForm() {
     full_load_engine: "v1", full_load_read_workers: 0, full_load_write_workers: 0,
     full_load_buffer_mb: 0, full_load_batch_bytes_mb: 0, full_load_commit_rows: 0,
     full_load_commit_bytes_mb: 0, full_load_lock_wait_timeout_sec: 0,
-    full_load_degrade_on_align_lock_fail: true,
+    full_load_degrade_on_align_lock_fail: false,
+    allow_nopk_all: false,
   };
   selectedSyncLevel.value = "database";
   selectedDatabases.value = [];
@@ -458,7 +460,8 @@ function fillTaskFormFromTask(task) {
     full_load_commit_rows: task.config.full_load_commit_rows ?? 0,
     full_load_commit_bytes_mb: task.config.full_load_commit_bytes_mb ?? 0,
     full_load_lock_wait_timeout_sec: task.config.full_load_lock_wait_timeout_sec ?? 0,
-    full_load_degrade_on_align_lock_fail: task.config.full_load_degrade_on_align_lock_fail !== false,
+    full_load_degrade_on_align_lock_fail: false,
+    allow_nopk_all: !!(task.config.allow_nopk_all || task.context?.nopk_all_risk_acknowledged_at),
   };
 
   if (task.config.sync_level === "DATABASE") {
@@ -1131,6 +1134,27 @@ onUnmounted(() => {
 
                         <a-option value="ALL">全量+增量</a-option>
                       </a-select>
+                      <a-alert
+                        v-if="taskForm.mode === 'FULL'"
+                        type="warning"
+                        style="margin-top: 8px"
+                        show-icon
+                      >
+                        FULL 是一次性基线拷贝，不捕获执行期间的增量；同表不同分片可能读到不同时间点。
+                        在线不停写迁移请选 ALL；需要严格静态副本请在 FULL 期间暂停源端写入。
+                      </a-alert>
+                      <div v-if="taskForm.mode === 'ALL'" style="margin-top: 8px">
+                        <a-alert type="warning" show-icon>
+                          ALL 会先做基线扫描再从 binlog 追平。若包含无主键/唯一键表，只能提供
+                          best-effort 一致性（可能重复 INSERT，UPDATE/DELETE 依赖 before image）。
+                        </a-alert>
+                        <a-checkbox
+                          v-model="taskForm.allow_nopk_all"
+                          style="margin-top: 8px"
+                        >
+                          我已理解无主键/唯一键表无法保证严格一致性，仍继续 ALL
+                        </a-checkbox>
+                      </div>
                     </a-form-item>
                   </a-col>
                 </a-row>
@@ -1504,6 +1528,12 @@ onUnmounted(() => {
                             style="width: 100%"
                             placeholder="0=自动(4)"
                           />
+                          <a-typography-text
+                            type="secondary"
+                            style="font-size: 12px"
+                          >
+                            1=显式单线程；&gt;1=并行读取。运行中失败不会自动降为单线程
+                          </a-typography-text>
                         </a-form-item>
                       </a-col>
                       <a-col :span="12">
@@ -1574,37 +1604,6 @@ onUnmounted(() => {
                       </a-col>
                     </a-row>
 
-                    <a-row :gutter="16">
-                      <a-col :span="12">
-                        <a-form-item label="对齐取锁等待 (秒)">
-                          <a-input-number
-                            :model-value="taskForm.full_load_lock_wait_timeout_sec"
-                            @change="(v) => (taskForm.full_load_lock_wait_timeout_sec = v ?? 0)"
-                            :min="0"
-                            :max="3600"
-                            style="width: 100%"
-                            placeholder="0=自动(10)"
-                          />
-                        </a-form-item>
-                      </a-col>
-                      <a-col :span="12">
-                        <a-form-item label="对齐取锁失败策略">
-                          <a-switch
-                            v-model="taskForm.full_load_degrade_on_align_lock_fail"
-                          />
-                          <a-typography-text
-                            type="secondary"
-                            style="margin-left: 8px; font-size: 12px"
-                          >
-                            {{
-                              taskForm.full_load_degrade_on_align_lock_fail
-                                ? "降级为单连接快照"
-                                : "fail-closed（任务失败）"
-                            }}
-                          </a-typography-text>
-                        </a-form-item>
-                      </a-col>
-                    </a-row>
                   </template>
 
                   <a-form-item v-if="targetType === 'MYSQL'">

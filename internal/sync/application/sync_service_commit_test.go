@@ -64,102 +64,34 @@ func TestSyncEventHandlerUsesCommitPositionForCheckpoint(t *testing.T) {
 	assert.Equal(t, commitPos, saved)
 }
 
-func TestSyncEventHandlerHWMSkipStillAdvancesCheckpoint(t *testing.T) {
+func TestBoundedCatchUpStopsAtUntilPosition(t *testing.T) {
 	recorder := &recordingSink{typeValue: sinkDomain.SinkTypeKAFKA}
 	handler, cp := newSinkEventHandler(recorder)
-	handler.service.identities["db.audit"] = &metadataEntity.TableIdentity{
-		TableName:    "audit",
-		Strategy:     metadataEntity.FullColumnsStrategy,
-		IdentifyCols: []string{"col_a", "col_b"},
-	}
-	handler.service.SetTableHWMs(map[string]mysql.Position{
-		"db.audit": {Name: "mysql-bin.000001", Pos: 600},
-	})
+	until := mysql.Position{Name: "mysql-bin.000001", Pos: 500}
+	handler.service.untilPosition = &until
 
-	commitPos := mysql.Position{Name: "mysql-bin.000001", Pos: 500}
-	err := applyAndCommit(t, handler, commitPos, binlogEventWithCommitPos(
-		"db", "audit", binlog.EventTypeInsert, commitPos,
-		map[string]interface{}{"col_a": "x", "col_b": "y"},
-	))
-	require.NoError(t, err)
-	assert.Empty(t, recorder.events, "HWM skip rolls back buffered writes")
-	assert.Equal(t, 0, recorder.flushes, "HWM skip must not flush")
-	assert.Equal(t, 0, recorder.commits)
-	assert.Equal(t, 1, recorder.rollbacks)
+	below := mysql.Position{Name: "mysql-bin.000001", Pos: 400}
+	require.NoError(t, handler.OnEvent(binlogEventWithCommitPos(
+		"db", "users", binlog.EventTypeInsert, below,
+		map[string]interface{}{"id": int64(1)},
+	)))
+	require.NoError(t, handler.OnTransactionCommit(below))
+	assert.False(t, handler.service.CatchUpCompleted())
+
+	canceled := false
+	handler.service.cancel = func() { canceled = true }
+	at := mysql.Position{Name: "mysql-bin.000001", Pos: 500}
+	require.NoError(t, handler.OnEvent(binlogEventWithCommitPos(
+		"db", "users", binlog.EventTypeInsert, at,
+		map[string]interface{}{"id": int64(2)},
+	)))
+	require.NoError(t, handler.OnTransactionCommit(at))
+	assert.True(t, handler.service.CatchUpCompleted())
+	assert.True(t, canceled)
 
 	saved, err := cp.GetPosition(context.Background(), "task-1")
 	require.NoError(t, err)
-	assert.Equal(t, commitPos, saved)
-}
-
-func TestSyncEventHandlerHWMDoesNotSkipAfterHWM(t *testing.T) {
-	recorder := &recordingSink{typeValue: sinkDomain.SinkTypeKAFKA}
-	handler, cp := newSinkEventHandler(recorder)
-	handler.service.identities["db.audit"] = &metadataEntity.TableIdentity{
-		TableName:    "audit",
-		Strategy:     metadataEntity.FullColumnsStrategy,
-		IdentifyCols: []string{"col_a", "col_b"},
-	}
-	handler.service.SetTableHWMs(map[string]mysql.Position{
-		"db.audit": {Name: "mysql-bin.000001", Pos: 400},
-	})
-
-	commitPos := mysql.Position{Name: "mysql-bin.000001", Pos: 500}
-	err := applyAndCommit(t, handler, commitPos, binlogEventWithCommitPos(
-		"db", "audit", binlog.EventTypeInsert, commitPos,
-		map[string]interface{}{"col_a": "x", "col_b": "y"},
-	))
-	require.NoError(t, err)
-	require.Len(t, recorder.events, 1)
-	assert.Equal(t, 1, recorder.flushes, "only flush on transaction commit")
-
-	saved, err := cp.GetPosition(context.Background(), "task-1")
-	require.NoError(t, err)
-	assert.Equal(t, commitPos, saved)
-}
-
-func TestSyncEventHandlerMissingHWMFailsClosed(t *testing.T) {
-	recorder := &recordingSink{typeValue: sinkDomain.SinkTypeKAFKA}
-	handler, _ := newSinkEventHandler(recorder)
-	handler.service.identities["db.audit"] = &metadataEntity.TableIdentity{
-		TableName:    "audit",
-		Strategy:     metadataEntity.FullColumnsStrategy,
-		IdentifyCols: []string{"col_a", "col_b"},
-	}
-	// 映射非空但缺少本表：不得静默应用。
-	handler.service.SetTableHWMs(map[string]mysql.Position{
-		"db.other": {Name: "mysql-bin.000001", Pos: 100},
-	})
-
-	commitPos := mysql.Position{Name: "mysql-bin.000001", Pos: 500}
-	err := handler.OnEvent(binlogEventWithCommitPos(
-		"db", "audit", binlog.EventTypeInsert, commitPos,
-		map[string]interface{}{"col_a": "x", "col_b": "y"},
-	))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "fail-closed")
-	assert.Empty(t, recorder.events)
-}
-
-func TestRequireNoPKTableHWMs_FailsClosedOnMissing(t *testing.T) {
-	svc := NewIncrementalSyncService(nil, nil, nil, nil)
-	svc.identities["db.nopk"] = &metadataEntity.TableIdentity{
-		TableName: "nopk",
-		Strategy:  metadataEntity.FullColumnsStrategy,
-	}
-	svc.identities["db.pk"] = &metadataEntity.TableIdentity{
-		TableName: "pk",
-		Strategy:  metadataEntity.PKStrategy,
-	}
-	err := svc.requireNoPKTableHWMs()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "db.nopk")
-	assert.Contains(t, err.Error(), "ALL+V2")
-
-	svc.SetTableHWMs(map[string]mysql.Position{
-		"db.nopk": {Name: "mysql-bin.000001", Pos: 10},
-	})
-	require.NoError(t, svc.requireNoPKTableHWMs())
+	assert.Equal(t, at, saved)
 }
 
 func TestSyncEventHandlerSameTransactionEventsShareCommitPosition(t *testing.T) {
@@ -225,55 +157,6 @@ func TestSyncEventHandlerMidTransactionFailureDoesNotAdvanceCheckpoint(t *testin
 	assert.Equal(t, 0, failing.flushes, "partial transaction must not flush or commit")
 	assert.Equal(t, 0, failing.commits)
 	assert.Equal(t, 1, failing.rollbacks)
-}
-
-func TestSyncEventHandlerHWMCrossTableTxnFiltersByTable(t *testing.T) {
-	recorder := &recordingSink{typeValue: sinkDomain.SinkTypeKAFKA}
-	handler, cp := newSinkEventHandler(recorder)
-	handler.service.identities["db.audit"] = &metadataEntity.TableIdentity{
-		TableName: "audit", Strategy: metadataEntity.FullColumnsStrategy, IdentifyCols: []string{"a"},
-	}
-	handler.service.identities["db.ledger"] = &metadataEntity.TableIdentity{
-		TableName: "ledger", Strategy: metadataEntity.FullColumnsStrategy, IdentifyCols: []string{"b"},
-	}
-	handler.service.SetTableHWMs(map[string]mysql.Position{
-		"db.audit":  {Name: "mysql-bin.000001", Pos: 600},
-		"db.ledger": {Name: "mysql-bin.000001", Pos: 400},
-	})
-	commitPos := mysql.Position{Name: "mysql-bin.000001", Pos: 500}
-	err := applyAndCommit(t, handler, commitPos,
-		binlogEventWithCommitPos("db", "audit", binlog.EventTypeInsert, commitPos, map[string]interface{}{"a": "x"}),
-		binlogEventWithCommitPos("db", "ledger", binlog.EventTypeInsert, commitPos, map[string]interface{}{"b": "y"}),
-	)
-	require.NoError(t, err)
-	require.Len(t, recorder.events, 1, "only ledger above HWM should be applied")
-	assert.Equal(t, "ledger", recorder.events[0].SourceTable)
-	saved, err := cp.GetPosition(context.Background(), "task-1")
-	require.NoError(t, err)
-	assert.Equal(t, commitPos, saved)
-}
-
-func TestSyncEventHandlerHWMCrossTableTxnFiltersNoPKBelowHWMWithPKTable(t *testing.T) {
-	recorder := &recordingSink{typeValue: sinkDomain.SinkTypeKAFKA}
-	handler, cp := newSinkEventHandler(recorder)
-	handler.service.identities["db.users"] = handler.service.identities["db.users"]
-	handler.service.identities["db.audit"] = &metadataEntity.TableIdentity{
-		TableName: "audit", Strategy: metadataEntity.FullColumnsStrategy, IdentifyCols: []string{"a"},
-	}
-	handler.service.SetTableHWMs(map[string]mysql.Position{
-		"db.audit": {Name: "mysql-bin.000001", Pos: 600},
-	})
-	commitPos := mysql.Position{Name: "mysql-bin.000001", Pos: 500}
-	err := applyAndCommit(t, handler, commitPos,
-		binlogEventWithCommitPos("db", "audit", binlog.EventTypeInsert, commitPos, map[string]interface{}{"a": "x"}),
-		binlogEventWithCommitPos("db", "users", binlog.EventTypeInsert, commitPos, map[string]interface{}{"id": int64(1)}),
-	)
-	require.NoError(t, err)
-	require.Len(t, recorder.events, 1, "no-PK rows at/below HWM must be filtered while PK rows apply")
-	assert.Equal(t, "users", recorder.events[0].SourceTable)
-	saved, err := cp.GetPosition(context.Background(), "task-1")
-	require.NoError(t, err)
-	assert.Equal(t, commitPos, saved)
 }
 
 func TestSyncEventHandlerMultiSinkReplayOnlyMissingSink(t *testing.T) {

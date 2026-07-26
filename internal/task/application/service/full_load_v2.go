@@ -11,8 +11,6 @@ import (
 	"mysql-to-sync/internal/sync/infrastructure/reader"
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
 	"mysql-to-sync/pkg/logger"
-
-	"github.com/go-mysql-org/go-mysql/mysql"
 )
 
 // fullLoadStatsStore 保存每个任务最近一次 V2 引擎运行的统计快照指针，供任务详情接口读取。
@@ -160,8 +158,6 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		BatchSize:                    task.Config.BatchSize,
 		LegacyTxCommitEveryNParallel: task.Config.TxCommitEveryNParallel,
 		SkipBinlog:                   task.Config.EnableSkipBinlog,
-		LockWaitTimeoutSec:           task.Config.FullLoadLockWaitTimeoutSec,
-		DegradeOnAlignLockFail:       task.Config.FullLoadDegradeOnAlignLockFail,
 		QueryTimeoutSec:              task.Config.FullLoadQueryTimeoutSec,
 		StreamIdleTimeoutSec:         task.Config.FullLoadStreamIdleTimeoutSec,
 		StreamMaxDurationSec:         task.Config.FullLoadStreamMaxDurationSec,
@@ -186,22 +182,13 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	}
 
 	engine := &fullload.Engine{
-		SourceDB:        runtime.sourceDB,
-		TargetDB:        runtime.targetDB,
-		Options:         opt,
-		Stats:           stats,
-		TaskID:          taskID,
-		SchemaLocks:     schemaLocks,
-		IsStopped:       func() bool { return s.isTaskStopped(taskID) },
-		CaptureTableHWM: task.Config.Mode == taskEntity.SyncModeAll,
-		OnTableSnapshotReady: func(schema, table string, pos mysql.Position) error {
-			if err := s.persistTableBinlogHWM(taskID, schema, table, pos); err != nil {
-				return err
-			}
-			logger.Info("[Task %s] FullLoadV2: persisted table binlog HWM for %s.%s at %s:%d",
-				taskID, schema, table, pos.Name, pos.Pos)
-			return nil
-		},
+		SourceDB:    runtime.sourceDB,
+		TargetDB:    runtime.targetDB,
+		Options:     opt,
+		Stats:       stats,
+		TaskID:      taskID,
+		SchemaLocks: schemaLocks,
+		IsStopped:   func() bool { return s.isTaskStopped(taskID) },
 		OnCommit: func(schema, table string, rows, bytes int64) {
 			mark := schema + "." + table
 			taskTotalRows := s.incrementTaskProgress(taskID, rows, mark)

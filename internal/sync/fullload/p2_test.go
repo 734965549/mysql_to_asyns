@@ -556,7 +556,7 @@ func TestCaptureHWMConditionWithRetry(t *testing.T) {
 		t.Fatalf("expected ReadRetryTimes=2, got %d", optWithRetry.ReadRetryTimes)
 	}
 
-	// 验证条件: captureHWM := eng.CaptureTableHWM && (isNoPKSpec(job.spec) || opt.ReadRetryTimes > 0)
+	// 历史注释：旧 CaptureTableHWM 条件已删除；现仅验证 isNoPKSpec / ReadRetryTimes 组合逻辑。
 	// 场景1: NO-PK 表 + 无重试
 	// isNoPKSpec=true, ReadRetryTimes=0 -> true || false = true
 	captureNoPKNoRetry := true && (true || optNoRetry.ReadRetryTimes > 0)

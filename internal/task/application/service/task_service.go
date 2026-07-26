@@ -1046,6 +1046,9 @@ func (s *TaskService) CreateTask(config taskEntity.TaskConfig) (*taskEntity.Sync
 	defer s.mu.Unlock() // 延迟释放写锁
 
 	task := taskEntity.NewSyncTask(config) // 创建同步任务
+	if config.AllowNopkAll {
+		task.AcknowledgeNopkAllRisk(time.Now())
+	}
 
 	s.tasks[config.ID] = task // 添加到任务映射
 
@@ -1544,12 +1547,41 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 
 }
 
+func collectNoPKTableNames(entries []tableEntry) []string {
+	out := make([]string, 0)
+	for _, e := range entries {
+		if e.identity == nil {
+			continue
+		}
+		if e.identity.Strategy == entity.FullColumnsStrategy {
+			out = append(out, e.schema+"."+e.table)
+		}
+	}
+	return out
+}
+
 func fullSyncRestartBlockedError(task *taskEntity.SyncTask) error {
-	if task == nil || task.Config.EnableDropTableBeforeDDL || !task.FullSyncIncomplete() {
+	if task == nil {
 		return nil
 	}
 
 	mode := strings.ToUpper(string(task.Config.Mode))
+	// 旧 snapshot/HWM 语义下未完成的 ALL：禁止混合恢复。
+	// 仅当 enable_drop_table_before_ddl=true（可重建目标）时允许作为 fresh run 启动。
+	if mode == "ALL" && len(task.Context.TableBinlogHWMs) > 0 && !task.Config.EnableDropTableBeforeDDL {
+		switch task.Context.SyncPhase {
+		case taskEntity.SyncPhaseFullStarted, taskEntity.SyncPhaseFullFailed:
+			return fmt.Errorf(
+				"legacy ALL task with table_binlog_hwms cannot resume under new P0/P1 catch-up semantics (phase=%q); enable enable_drop_table_before_ddl to rebuild the target for a fresh run, or create a new task",
+				task.Context.SyncPhase,
+			)
+		}
+	}
+
+	if task.Config.EnableDropTableBeforeDDL || !task.FullSyncIncomplete() {
+		return nil
+	}
+
 	switch mode {
 	case "FULL", "ALL":
 	default:
@@ -2062,29 +2094,6 @@ func formatBinlogPosition(pos mysql.Position) string {
 	return fmt.Sprintf("%s:%d", pos.Name, pos.Pos)
 }
 
-// persistTableBinlogHWM 在 MarkFullSyncCompleted 之前同步落盘单表 HWM（fail-closed）。
-func (s *TaskService) persistTableBinlogHWM(taskID, schema, table string, pos mysql.Position) error {
-	posStr := formatBinlogPosition(pos)
-	if posStr == "" {
-		return fmt.Errorf("empty table binlog HWM for %s.%s", schema, table)
-	}
-	if _, err := parseBinlogPosition(posStr); err != nil {
-		return fmt.Errorf("invalid table binlog HWM for %s.%s: %w", schema, table, err)
-	}
-	tableKey := schema + "." + table
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	task, exists := s.tasks[taskID]
-	if !exists {
-		return fmt.Errorf("task %s not found while persisting table HWM for %s", taskID, tableKey)
-	}
-	task.SetTableBinlogHWM(tableKey, posStr)
-	if err := s.storage.Save(task); err != nil {
-		return fmt.Errorf("persist table binlog HWM for %s: %w", tableKey, err)
-	}
-	return nil
-}
-
 // persistFullLoadV2TableState 持久化单表 V2 加载状态(P3)。
 // 由 fullload.Engine 的表级状态机在状态转换时通过 OnTableStateChange 回调触发。
 // 持久化失败必须返回错误（fail-closed），由引擎中止以免重启后状态与目标不一致。
@@ -2216,29 +2225,6 @@ func splitSourceTableKey(key string) (schema, table string, ok bool) {
 		return "", "", false
 	}
 	return key[:idx], key[idx+1:], true
-}
-
-// parseTableBinlogHWMs 将任务存档中的 "schema.table" -> "file:pos" 解析为增量过滤用位点图。
-// 非法条目跳过并打日志；ALL + full_load_engine=v2 由 IncrementalSyncService.RequireNoPKTableHWM
-// 在启动时对每张 FullColumnsStrategy 表做 fail-closed 校验（缺项/非法都会拒绝接管）。
-// V1 ALL 不生成表级 HWM，也不强校验，存在无 PK/UK 表增量重复行风险。
-func parseTableBinlogHWMs(raw map[string]string) map[string]mysql.Position {
-	if len(raw) == 0 {
-		return nil
-	}
-	out := make(map[string]mysql.Position, len(raw))
-	for key, val := range raw {
-		pos, err := parseBinlogPosition(val)
-		if err != nil {
-			logger.Warn("skip invalid table binlog HWM %s=%q: %v", key, val, err)
-			continue
-		}
-		out[key] = pos
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 // parseBinlogPosition 解析 "file:pos"；与 formatBinlogPosition 互逆。
@@ -2648,13 +2634,26 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	// 同步期间发生的变化不进行追平。如需覆盖同步期间的变化，请使用 ALL 模式。
 	var startPosStr string
 	if task.Config.Mode == taskEntity.SyncModeAll {
-		// 参照云厂商 DTS/DRS 的常见做法：增量起点必须早于所有全量读取，确保全量期间的变更
-		// 都能通过 binlog 追平；全量读取本身使用普通短查询，避免长事务长期持有源库 MDL_SHARED_READ。
-		// 仅在取位点时短暂 FTWRL，取到位点后立即 UNLOCK，整个过程毫秒级。
-		//
-		// P0 fail-closed：位点捕获或保存失败时必须终止任务。若继续全量，增量同步会因
-		// checkpoint 为空而回退到主库当前位置，直接漏掉全量期间的所有变更。
-		logger.Info("[Task %s] ALL mode: capturing binlog start position before full scan (short-lock-position, non-snapshot)", taskID)
+		nopkTables := collectNoPKTableNames(allTableEntries)
+		if len(nopkTables) > 0 && !task.HasNopkAllRiskAcknowledgement() {
+			errMsg := fmt.Sprintf(
+				"ALL mode includes no-PK/UK tables and requires user confirmation (allow_nopk_all=true): %v; consistency=best_effort reason=no_primary_or_unique_key",
+				nopkTables,
+			)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		if len(nopkTables) > 0 {
+			logger.Warn("[Task %s] ALL mode no-PK/UK tables acknowledged: %v (consistency=best_effort)", taskID, nopkTables)
+		}
+
+		// 增量起点 P0 必须早于所有全量读取；无锁读取 SHOW MASTER STATUS。
+		// 基线用普通短查询，一致性由后续 P0..P1 catch-up 收敛。
+		// P0 fail-closed：位点捕获或保存失败时必须终止任务。
+		logger.Info("[Task %s] ALL mode: capturing unlocked binlog start position P0 before full scan", taskID)
 
 		binlogPos, posErr := s.captureFullSyncStartPosition(ctx, runtime)
 		startPosStr = formatBinlogPosition(binlogPos)
@@ -2855,6 +2854,47 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 
 	}
 
+	// ALL：基线结束后捕获 P1，先 bounded catch-up，再恢复非 identity 索引。
+	if task.Config.Mode == taskEntity.SyncModeAll {
+		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
+			return err
+		}
+		logger.Info("[Task %s] ALL mode: capturing unlocked binlog end position P1 after baseline scan", taskID)
+		endPos, endErr := s.captureBinlogPosition(ctx, runtime)
+		if endErr != nil {
+			errMsg := fmt.Sprintf("Failed to capture full-sync end binlog position P1: %v", endErr)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		endPosStr := formatBinlogPosition(endPos)
+		s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+			t.Context.FullSyncEndPosition = endPosStr
+			t.Context.FullSyncSubphase = "CATCH_UP"
+			t.Context.LastUpdateTime = time.Now()
+		})
+		logger.Info("[Task %s] ALL mode: starting bounded catch-up P0=%q -> P1=%q", taskID, startPosStr, endPosStr)
+		if err := s.runBoundedCatchUp(ctx, task, runtime, endPos); err != nil {
+			if stopErr := s.abortFullSyncIfCancelled(ctx, taskID); stopErr != nil {
+				return stopErr
+			}
+			errMsg := fmt.Sprintf("bounded catch-up to P1 failed: %v", err)
+			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+				t.MarkFullSyncFailed(errMsg)
+			})
+			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
+			t.Context.FullSyncCatchupPosition = endPosStr
+			t.Context.FullSyncSubphase = "RESTORE_INDEX"
+			t.Context.LastUpdateTime = time.Now()
+		})
+		logger.Info("[Task %s] ALL mode: bounded catch-up completed at P1=%q", taskID, endPosStr)
+	}
+
 	if task.Config.OptimizeIndex && len(pendingIndexRestores) > 0 {
 		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
 			return err
@@ -2879,6 +2919,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	// === 修复 4：标记"全量已完成"，是后续 INCREMENTAL/ALL 模式跳过全量的唯一依据 ===
 	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
 		t.MarkFullSyncCompleted()
+		if t.Config.Mode == taskEntity.SyncModeAll {
+			t.Context.FullSyncSubphase = "STREAMING"
+		}
 	})
 
 	// 全量整体完成，历史断点已无意义，清空以释放存档体积。
@@ -4429,6 +4472,91 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 // executeIncrementalSync 执行增量同步
 
+// runBoundedCatchUp 从已持久化的 checkpoint（P0）回放到 until（P1），成功落盘后返回。
+// checkpoint 保存失败不会标记 catch-up 完成；binlog 不可用时 fail-closed。
+func (s *TaskService) runBoundedCatchUp(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime, until mysql.Position) error {
+	if task == nil || runtime == nil {
+		return fmt.Errorf("nil task/runtime for bounded catch-up")
+	}
+	if until.Name == "" {
+		return fmt.Errorf("empty until position for bounded catch-up")
+	}
+	taskID := task.Config.ID
+
+	cfg := s.config
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+	resolvedSourceSchema := s.resolveSourceSchema(task)
+	sourceHost := cfg.Datasource.Host
+	sourcePort := cfg.Datasource.Port
+	sourceUsername := cfg.Datasource.Username
+	sourcePassword := cfg.Datasource.Password
+	if task.Config.SourceDB != nil {
+		sourceHost = task.Config.SourceDB.Host
+		sourcePort = task.Config.SourceDB.Port
+		sourceUsername = task.Config.SourceDB.Username
+		sourcePassword = task.Config.SourceDB.Password
+	}
+	targetSchema := task.Config.TargetSchema
+	if targetSchema == "" {
+		targetSchema = resolvedSourceSchema
+	}
+
+	syncConfig := &syncApp.SyncConfig{
+		TaskID:          taskID,
+		SourceHost:      sourceHost,
+		SourcePort:      sourcePort,
+		SourceUsername:  sourceUsername,
+		SourcePassword:  sourcePassword,
+		SourceSchema:    resolvedSourceSchema,
+		TargetSchema:    targetSchema,
+		SourceDatabases: task.Config.SourceDatabases,
+		TargetDatabases: task.Config.TargetDatabases,
+		Tables:          task.Config.Tables,
+		BatchSize:       task.Config.BatchSize,
+		ServerID:        generateServerID(taskID + ":catchup"),
+		SinkConfigs:     task.Config.SinkConfigs,
+		UntilPosition:   &until,
+	}
+
+	incrSync := syncApp.NewIncrementalSyncService(runtime.sourceDB, runtime.targetDB, runtime.analyzer, s.checkpointManager)
+	incrSync.SetPositionPersister(func(id string, pos mysql.Position) {
+		s.updateSyncPhase(id, func(t *taskEntity.SyncTask) {
+			t.Context.FullSyncCatchupPosition = formatBinlogPosition(pos)
+			t.Context.LastIncrementalPosition = formatBinlogPosition(pos)
+			t.Context.LastUpdateTime = time.Now()
+		})
+	})
+
+	s.mu.Lock()
+	s.incrementalSyncs[taskID] = incrSync
+	s.mu.Unlock()
+	defer func() {
+		incrSync.Stop()
+		s.mu.Lock()
+		if cur, ok := s.incrementalSyncs[taskID]; ok && cur == incrSync {
+			delete(s.incrementalSyncs, taskID)
+		}
+		s.mu.Unlock()
+	}()
+
+	if err := incrSync.Start(ctx, taskID, syncConfig); err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if s.isTaskStopped(taskID) {
+		return fmt.Errorf("task stopped during bounded catch-up")
+	}
+	if !incrSync.CatchUpCompleted() {
+		// Start 在 ctx cancel 时也可能返回 nil；未达 P1 不得继续。
+		return fmt.Errorf("bounded catch-up exited before reaching P1 %s", formatBinlogPosition(until))
+	}
+	return nil
+}
+
 func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEntity.SyncTask, runtime *taskRuntime) {
 
 	taskID := task.Config.ID
@@ -4540,9 +4668,6 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 		ServerID: generateServerID(taskID),
 
 		SinkConfigs: task.Config.SinkConfigs,
-		// 表级 HWM 仅由 full_load_engine=v2 的 syncDatabasePairV2 生成。
-		// 默认 V1 全量不会落盘 HWM；若对所有 ALL 任务强校验，会在 FULL_COMPLETED 后永久卡死增量启动。
-		RequireNoPKTableHWM: task.Config.Mode == taskEntity.SyncModeAll && task.Config.UsesFullLoadV2(),
 	}
 
 	// 创建增量同步服务
@@ -4562,16 +4687,9 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 	// 5 秒间隔足够把"任务存档里的位点"控制在合理新鲜度，又不会被每事件存储 IO 拖垮。
 	incrSync.SetPositionPersister(s.makeThrottledIncrementalPositionPersister(5 * time.Second))
 
-	// ALL + V1：无表级 HWM，增量可能对无 PK/UK 表重复 INSERT；明确记录风险，避免静默误用。
-	if task.Config.Mode == taskEntity.SyncModeAll && !task.Config.UsesFullLoadV2() {
-		logger.Warn("[Task %s] full_load_engine=v1 ALL mode does not capture table-level binlog HWM; no-PK/UK tables may receive duplicate rows during incremental takeover (set full_load_engine=v2 for fail-closed HWM filtering)", taskID)
-	}
-
-	// ALL + V2 无 PK/UK 表级 HWM：从任务存档注入增量过滤边界（CommitPosition <= HWM 跳过写 Sink）。
-	// 非法条目会被跳过；随后 Start 在 RequireNoPKTableHWM 下对每张无 PK 表 fail-closed 校验。
-	if hwms := parseTableBinlogHWMs(task.Context.TableBinlogHWMs); len(hwms) > 0 {
-		incrSync.SetTableHWMs(hwms)
-		logger.Info("[Task %s] Injected %d table binlog HWM(s) into incremental sync", taskID, len(hwms))
+	// ALL 无 PK/UK：best-effort；基线与增量重叠窗口可能重复 INSERT。
+	if task.Config.Mode == taskEntity.SyncModeAll {
+		logger.Warn("[Task %s] ALL mode no-PK/UK tables use best-effort consistency (consistency=best_effort reason=no_primary_or_unique_key)", taskID)
 	}
 
 	// 保存到映射中
@@ -5400,75 +5518,37 @@ func readKeysetStepLastPK(ctx context.Context, readSource sourceQueryer, query s
 // 派生自己的超时，确保 UNLOCK 路径总能跑完，避免源库长期持锁。
 const shortLockStepTimeout = 5 * time.Second
 
-// captureFullSyncStartPosition 用"短锁取位点"获取全量同步的 binlog 起点。
-//
-// 修复 6：执行路径稳健性
-//   - 整个过程绑定一条专用连接（lockConn），确保 FTWRL 与 UNLOCK 落在同一会话；
-//   - **不依赖上层 ctx**：上层 ctx 可能因任务超时被 cancel，进而把"释放锁"也连带 cancel；
-//     这里为每一步用 context.Background() 派生独立的 shortLockStepTimeout，使解锁路径永远不会
-//     因上层取消而失败；
-//   - defer 中的 UNLOCK 兜底仍用 context.Background()，确保任何 panic / 提前 return 也能放锁；
-//   - 显式 UNLOCK 与 defer 兜底之间用 `locked` 标志去重，避免重复 UNLOCK 噪音。
-//
-// 修复 7：日志与命名明确——"start position" 表示**全量起点**，不是完成点；外层据此命名 checkpoint。
-func (s *TaskService) captureFullSyncStartPosition(_ context.Context, runtime *taskRuntime) (mysql.Position, error) {
+// captureBinlogPosition 无锁读取当前 binlog 位点（SHOW MASTER STATUS / 等价接口）。
+// ALL 的 P0/P1 均走此路径；不再使用 FTWRL。
+func (s *TaskService) captureBinlogPosition(_ context.Context, runtime *taskRuntime) (mysql.Position, error) {
 	if runtime == nil || runtime.sourceDB == nil {
 		return mysql.Position{}, fmt.Errorf("task runtime source db is not initialized")
 	}
 
-	// 步骤 1：获取连接（独立超时，与上层 ctx 解绑）
 	connCtx, connCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
 	defer connCancel()
-	lockConn, err := runtime.sourceDB.Conn(connCtx)
+	conn, err := runtime.sourceDB.Conn(connCtx)
 	if err != nil {
-		return mysql.Position{}, fmt.Errorf("get lock connection failed: %w", err)
+		return mysql.Position{}, fmt.Errorf("get position connection failed: %w", err)
 	}
-	defer lockConn.Close()
+	defer conn.Close()
 
-	// 步骤 2：FTWRL（独立超时）
-	lockCtx, lockCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
-	defer lockCancel()
-	if _, err := lockConn.ExecContext(lockCtx, "FLUSH TABLES WITH READ LOCK"); err != nil {
-		return mysql.Position{}, fmt.Errorf("acquire global read lock failed: %w", err)
-	}
-	locked := true
-
-	// defer 兜底：无论后面出什么错都尝试 UNLOCK 一次。
-	// 用 background ctx + 独立超时，避免因上层 ctx 取消导致锁无法释放。
-	defer func() {
-		if !locked {
-			return
-		}
-		bgCtx, bgCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
-		defer bgCancel()
-		if _, unlockErr := lockConn.ExecContext(bgCtx, "UNLOCK TABLES"); unlockErr != nil {
-			logger.Warn("[LowLockStartPosition] Defer UNLOCK TABLES failed (lock may still be held by session, but conn.Close will release it): %v", unlockErr)
-		} else {
-			logger.Info("[LowLockStartPosition] Defer UNLOCK TABLES succeeded as a safety net")
-		}
-	}()
-
-	// 步骤 3：读位点（独立超时）
 	posCtx, posCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
 	defer posCancel()
-	pos, err := queryMasterPosition(posCtx, lockConn)
+	pos, err := queryMasterPosition(posCtx, conn)
 	if err != nil {
 		return mysql.Position{}, err
 	}
-
-	// 步骤 4：显式 UNLOCK（独立超时，失败也不阻塞返回 —— defer 会再尝试一次）
-	unlockCtx, unlockCancel := context.WithTimeout(context.Background(), shortLockStepTimeout)
-	defer unlockCancel()
-	if _, err := lockConn.ExecContext(unlockCtx, "UNLOCK TABLES"); err != nil {
-		// 显式 UNLOCK 失败：记录后返回 nil，等 defer 再试一次；不向上层抛错避免上层把位点丢掉。
-		logger.Warn("[LowLockStartPosition] Explicit UNLOCK TABLES failed (will retry in defer): %v", err)
-		return pos, nil
+	if pos.Name == "" {
+		return mysql.Position{}, fmt.Errorf("captured empty binlog position (file name is empty)")
 	}
-	locked = false
-
-	logger.Info("[LowLockStartPosition] Captured full-sync START position (this is the binlog point BEFORE any full read, not the completion point): %s:%d",
-		pos.Name, pos.Pos)
+	logger.Info("[BinlogPosition] Captured unlocked master position: %s:%d", pos.Name, pos.Pos)
 	return pos, nil
+}
+
+// captureFullSyncStartPosition 兼容旧名：现为无锁位点捕获（P0）。
+func (s *TaskService) captureFullSyncStartPosition(ctx context.Context, runtime *taskRuntime) (mysql.Position, error) {
+	return s.captureBinlogPosition(ctx, runtime)
 }
 
 func queryMasterPosition(ctx context.Context, db sourceQueryer) (mysql.Position, error) {

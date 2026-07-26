@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"mysql-to-sync/internal/metrics"
@@ -26,16 +25,11 @@ type Engine struct {
 	// 非 nil 时 Engine 不再内部获取/释放锁，由调用层负责生命周期管理。
 	SchemaLocks *SchemaLocks
 
-	// CaptureTableHWM 为 true 时，无 PK/UK 表在打开快照时短锁表并捕获 binlog HWM（ALL 模式）。
-	CaptureTableHWM bool
-	// OnTableSnapshotReady 在表级快照就绪且 HWM 捕获完成后调用；由集成层持久化 table_binlog_hwms。
-	OnTableSnapshotReady TableSnapshotCallback
 	// OnTableDataReady 在表数据全部提交后调用；用于逐表重建索引（P2）。
 	OnTableDataReady TableDataReadyCallback
 	// OnTableStateChange 在表级状态变更时调用(P3 持久化);由集成层落盘到任务存档。
 	OnTableStateChange TableStateCallback
 
-	limiter      *snapshotLimiter
 	tracker      *tableCompletionTracker
 	stateTracker *tableStateTracker // P2.5: 表级重试状态跟踪
 	reported     StatsSnapshot      // 已上报到 Prometheus 的累计快照（仅 reportLoop / pushFinalMetrics 访问）
@@ -63,14 +57,15 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		return err
 	}
 
-	// 快照连接预算不得超过真实源池上限（默认 source_max_open_conns=32）。
+	// 读取并发预算不得超过真实源池上限（默认 source_max_open_conns=32）。
 	poolMax := e.SourceDB.Stats().MaxOpenConnections
-	beforeConns := opt.MaxSnapshotConns
+	beforeReadWorkers := opt.ReadWorkers
+	beforeTableParallel := opt.TableParallelReaders
 	opt.CapBySourcePool(poolMax)
 	e.Options = opt
-	if poolMax > 0 && opt.MaxSnapshotConns != beforeConns {
-		logger.Info("[Task %s] FullLoadV2: capped MaxSnapshotConns %d -> %d by source pool max_open=%d",
-			e.TaskID, beforeConns, opt.MaxSnapshotConns, poolMax)
+	if poolMax > 0 && (opt.ReadWorkers != beforeReadWorkers || opt.TableParallelReaders != beforeTableParallel) {
+		logger.Info("[Task %s] FullLoadV2: capped read_workers %d -> %d table_parallel_readers %d -> %d by source pool max_open=%d",
+			e.TaskID, beforeReadWorkers, opt.ReadWorkers, beforeTableParallel, opt.TableParallelReaders, poolMax)
 	}
 
 	// [P2] 目标连接池容量校验：锁连接占用 1 个池槽，写路径至少需要 1 个额外连接。
@@ -147,7 +142,6 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		jobs = append(jobs, &tableReadJob{spec: spec})
 	}
 	e.tracker = newTableCompletionTracker(specs, e.OnTableDataReady)
-	e.limiter = newSnapshotLimiter(opt.MaxSnapshotGroups, opt.MaxSnapshotConns)
 	// P2.5: 启用重试或 staging 时创建表级状态跟踪器
 	if opt.ReadRetryTimes > 0 || opt.StagingEnabled {
 		e.stateTracker = newTableStateTracker(specs)
@@ -159,7 +153,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	q.watchContext(cctx)
 	e.reported = e.Stats.Snapshot()
 
-	logger.Info("[Task %s] FullLoadV2: %d table(s), read_workers=%d write_workers=%d buffer=%dMiB commit_rows=%d commit_bytes=%dMiB (plan-in-snapshot)",
+	logger.Info("[Task %s] FullLoadV2: %d table(s), read_workers=%d write_workers=%d buffer=%dMiB commit_rows=%d commit_bytes=%dMiB (plain-short-query)",
 		e.TaskID, len(specs), opt.ReadWorkers, opt.WriteWorkers,
 		opt.BufferBytes/1024/1024, opt.CommitRows, opt.CommitBytes/1024/1024)
 
@@ -237,17 +231,11 @@ func (e *Engine) reportLoop(ctx context.Context, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			if e.limiter != nil {
-				g, _, age := e.limiter.snapshot()
-				atomic.StoreInt64(&e.Stats.ActiveSnapshotGroups, g)
-				atomic.StoreInt64(&e.Stats.OldestSnapshotAgeMillis, age.Milliseconds())
-			}
 			cur := e.Stats.Snapshot()
 			e.pushMetrics(e.reported, cur)
-			logger.Info("[Task %s] FullLoadV2 progress: read=%d rows write=%d rows commit=%d rows queue=%d/%d bytes readers=%d writers=%d replays=%d snap_groups=%d snap_txns=%d oldest_snap=%dms align_degrades=%d",
+			logger.Info("[Task %s] FullLoadV2 progress: read=%d rows write=%d rows commit=%d rows queue=%d/%d bytes readers=%d writers=%d replays=%d",
 				e.TaskID, cur.ReadRows, cur.WrittenRows, cur.CommittedRows,
-				cur.QueueBytes, cur.QueueCap, cur.ActiveReaders, cur.ActiveWriters, cur.TxReplays,
-				cur.ActiveSnapshotGroups, cur.ActiveSnapshotTxns, cur.OldestSnapshotAgeMillis, cur.SnapshotAlignDegrades)
+				cur.QueueBytes, cur.QueueCap, cur.ActiveReaders, cur.ActiveWriters, cur.TxReplays)
 			e.reported = cur
 		}
 	}
@@ -262,33 +250,15 @@ func (e *Engine) pushMetrics(prev, cur StatsSnapshot) {
 	m.AddFullLoadLockRetries(cur.LockRetries - prev.LockRetries)
 	m.AddFullLoadQueueBytes(cur.QueueBytes - prev.QueueBytes)
 	m.AddFullLoadActiveWorkers(cur.ActiveReaders-prev.ActiveReaders, cur.ActiveWriters-prev.ActiveWriters)
-	m.AddFullLoadSnapshotGroups(cur.ActiveSnapshotGroups - prev.ActiveSnapshotGroups)
-	m.AddFullLoadSnapshotTxns(cur.ActiveSnapshotTxns - prev.ActiveSnapshotTxns)
-	m.AddFullLoadSnapshotAlignDegrades(cur.SnapshotAlignDegrades - prev.SnapshotAlignDegrades)
 	// P3.6: P0/P2 可观测性指标
 	m.AddFullLoadQueryTimeouts(cur.QueryTimeouts - prev.QueryTimeouts)
 	m.AddFullLoadSlowQueries(cur.SlowQueries - prev.SlowQueries)
 	m.AddFullLoadTableRetries(cur.TableRetries - prev.TableRetries)
 	m.AddFullLoadTableRetryExhausted(cur.TableRetryExhausted - prev.TableRetryExhausted)
 	m.AddFullLoadActiveStagingTables(cur.ActiveStagingTables - prev.ActiveStagingTables)
-	taskID := e.TaskID
-	if taskID == "" {
-		taskID = "_unknown"
-	}
-	m.SetTaskFullLoadOldestSnapshotAgeMillis(taskID, cur.OldestSnapshotAgeMillis)
 }
 
 func (e *Engine) pushFinalMetrics() {
-	// 结束时从 limiter 刷新瞬时 gauge，避免最后一次 5s 采样残留非零活跃组/最老快照时长。
-	// ActiveSnapshotTxns 由 reader 路径实时维护，语义是快照事务数（不含协调锁连接），不在此用 limiter.conn 覆盖。
-	if e.limiter != nil {
-		g, _, age := e.limiter.snapshot()
-		atomic.StoreInt64(&e.Stats.ActiveSnapshotGroups, g)
-		atomic.StoreInt64(&e.Stats.OldestSnapshotAgeMillis, age.Milliseconds())
-	} else {
-		atomic.StoreInt64(&e.Stats.ActiveSnapshotGroups, 0)
-		atomic.StoreInt64(&e.Stats.OldestSnapshotAgeMillis, 0)
-	}
 	// 结束时补一次增量（reportLoop 已在 reportWG.Wait() 后停止，无并发访问 e.reported）。
 	cur := e.Stats.Snapshot()
 	e.pushMetrics(e.reported, cur)

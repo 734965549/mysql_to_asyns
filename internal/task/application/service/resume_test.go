@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	taskEntity "mysql-to-sync/internal/task/domain/entity"
@@ -319,6 +320,27 @@ func TestFullSyncRestartBlockedError(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "legacy ALL with table_binlog_hwms + FULL_STARTED + no drop_ddl -> blocked",
+			task: func() *taskEntity.SyncTask {
+				t := makeTask(taskEntity.SyncModeAll, false, taskEntity.SyncPhaseFullStarted)
+				t.Context.TableBinlogHWMs = map[string]string{"s.t": "mysql-bin.000001:100"}
+				t.Context.FullLoadV2States = map[string]*taskEntity.FullLoadV2TableState{
+					"s.t": {Phase: "COPYING"},
+				}
+				return t
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "legacy ALL with table_binlog_hwms + drop_ddl -> allowed fresh run",
+			task: func() *taskEntity.SyncTask {
+				t := makeTask(taskEntity.SyncModeAll, true, taskEntity.SyncPhaseFullStarted)
+				t.Context.TableBinlogHWMs = map[string]string{"s.t": "mysql-bin.000001:100"}
+				return t
+			}(),
+			wantErr: false,
+		},
+		{
 			name:    "drop_ddl false + FULL_COMPLETED -> allowed (already completed)",
 			task:    makeTask(taskEntity.SyncModeFull, false, taskEntity.SyncPhaseFullCompleted),
 			wantErr: false,
@@ -350,10 +372,14 @@ func TestFullSyncRestartBlockedError(t *testing.T) {
 			err := fullSyncRestartBlockedError(tt.task)
 			if tt.wantErr {
 				require.Error(t, err, "expected restart to be blocked")
-				assert.Contains(t, err.Error(), "enable_drop_table_before_ddl=false",
-					"error message should explain the drop_ddl condition")
-				assert.Contains(t, err.Error(), "full sync was interrupted",
-					"error message should explain the interruption")
+				if strings.Contains(err.Error(), "table_binlog_hwms") {
+					assert.Contains(t, err.Error(), "fresh run")
+				} else {
+					assert.Contains(t, err.Error(), "enable_drop_table_before_ddl=false",
+						"error message should explain the drop_ddl condition")
+					assert.Contains(t, err.Error(), "full sync was interrupted",
+						"error message should explain the interruption")
+				}
 			} else {
 				assert.NoError(t, err, "expected restart to be allowed")
 			}
