@@ -966,10 +966,8 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 		task.Config.FullLoadEnableStaging = *req.FullLoadEnableStaging
 	}
 	if req.AllowNopkAll != nil {
+		// 仅写入配置开关；确认时间戳由 TaskService.UpdateTask 在 live 任务上原子维护。
 		task.Config.AllowNopkAll = *req.AllowNopkAll
-		if *req.AllowNopkAll {
-			task.AcknowledgeNopkAllRisk(time.Now())
-		}
 	}
 
 	// 更新数据库配置

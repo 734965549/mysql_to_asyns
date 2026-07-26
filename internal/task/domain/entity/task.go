@@ -603,6 +603,13 @@ func (t *SyncTask) HasNopkAllRiskAcknowledgement() bool {
 	return t != nil && t.Context.NopkAllRiskAcknowledgedAt != nil && !t.Context.NopkAllRiskAcknowledgedAt.IsZero()
 }
 
+// ClearNopkAllRiskAcknowledgement 撤销 ALL 无 PK/UK 风险确认（编辑任务取消勾选时）。
+func (t *SyncTask) ClearNopkAllRiskAcknowledgement() {
+	t.Config.AllowNopkAll = false
+	t.Context.NopkAllRiskAcknowledgedAt = nil
+	t.Context.LastUpdateTime = time.Now()
+}
+
 // MarkFullSyncCompleted 标记全量同步完成。完成后才允许增量直接接管。
 func (t *SyncTask) MarkFullSyncCompleted() {
 	now := time.Now()

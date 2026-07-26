@@ -1334,6 +1334,18 @@ func (s *TaskService) UpdateTask(task *taskEntity.SyncTask) error {
 
 	existing.Config = task.Config
 
+	// AllowNopkAll 只是配置开关；真正生效的确认时间戳必须在服务层原子写入 live Context。
+	// handler 拿到的是快照，不能依赖快照上的 AcknowledgeNopkAllRisk。
+	if task.Config.AllowNopkAll {
+		if !existing.HasNopkAllRiskAcknowledgement() {
+			existing.AcknowledgeNopkAllRisk(time.Now())
+		} else {
+			existing.Config.AllowNopkAll = true
+		}
+	} else {
+		existing.ClearNopkAllRiskAcknowledgement()
+	}
+
 	// 保存到存储
 
 	if err := s.storage.Save(existing); err != nil {
@@ -2056,6 +2068,10 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 // 上层 executeSync 据此区分"应当标 FAILED"还是"应当保留当前阶段并退出"。
 var errFullSyncStoppedByUser = errors.New("full sync stopped by user")
 
+// errFullSyncPreflight 表示全量尚未进入 FULL_STARTED 前的可修正校验失败。
+// 不得 MarkFullSyncFailed，否则会把未启动任务污染成不可恢复的 FULL_FAILED。
+var errFullSyncPreflight = errors.New("full sync preflight failed")
+
 // abortFullSyncIfCancelled 在阶段边界检查丢锁 cause 与用户停止信号。
 // 丢锁优先于用户停止：必须 fail-closed，不能误标 FULL_COMPLETED。
 func (s *TaskService) abortFullSyncIfCancelled(ctx context.Context, taskID string) error {
@@ -2366,6 +2382,12 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 				logger.Info("[Task %s] Full sync interrupted by user; phase remains %q", taskID, task.Context.SyncPhase)
 				return
 			}
+			if errors.Is(err, errFullSyncPreflight) {
+				// 启动前校验失败：保持原 SyncPhase，允许用户修正后重试。
+				logger.Error("[Task %s] Full sync preflight failed (phase unchanged=%q): %v", taskID, task.Context.SyncPhase, err)
+				s.failTaskUnlessCancelled(ctx, taskID, err.Error())
+				return
+			}
 
 			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
 				t.MarkFullSyncFailed(err.Error())
@@ -2421,6 +2443,12 @@ func (s *TaskService) executeSync(ctx context.Context, taskID string, runtime *t
 
 			logger.Info("[Task %s] Full sync interrupted by user during ALL mode; not starting incremental, phase remains %q",
 				taskID, task.Context.SyncPhase)
+			return
+
+		} else if errors.Is(err, errFullSyncPreflight) {
+
+			logger.Error("[Task %s] ALL full sync preflight failed (phase unchanged=%q): %v", taskID, task.Context.SyncPhase, err)
+			s.failTaskUnlessCancelled(ctx, taskID, err.Error())
 			return
 
 		} else {
@@ -2580,7 +2608,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			if err != nil {
 
 				logger.Error("[Task %s] Failed to get tables for %s: %v", taskID, p.src, err)
-
+				if task.Config.Mode == taskEntity.SyncModeAll {
+					return fmt.Errorf("%w: list tables for %s: %v", errFullSyncPreflight, p.src, err)
+				}
 				continue
 
 			}
@@ -2598,7 +2628,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			identity, err := runtime.analyzer.AnalyzeTable(p.src, tableName)
 
 			if err != nil {
-
+				if task.Config.Mode == taskEntity.SyncModeAll {
+					return fmt.Errorf("%w: analyze table %s.%s: %v", errFullSyncPreflight, p.src, tableName, err)
+				}
 				continue
 
 			}
@@ -2636,15 +2668,11 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	if task.Config.Mode == taskEntity.SyncModeAll {
 		nopkTables := collectNoPKTableNames(allTableEntries)
 		if len(nopkTables) > 0 && !task.HasNopkAllRiskAcknowledgement() {
-			errMsg := fmt.Sprintf(
-				"ALL mode includes no-PK/UK tables and requires user confirmation (allow_nopk_all=true): %v; consistency=best_effort reason=no_primary_or_unique_key",
+			return fmt.Errorf(
+				"%w: ALL mode includes no-PK/UK tables and requires user confirmation (allow_nopk_all=true): %v; consistency=best_effort reason=no_primary_or_unique_key",
+				errFullSyncPreflight,
 				nopkTables,
 			)
-			s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
-				t.MarkFullSyncFailed(errMsg)
-			})
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
 		}
 		if len(nopkTables) > 0 {
 			logger.Warn("[Task %s] ALL mode no-PK/UK tables acknowledged: %v (consistency=best_effort)", taskID, nopkTables)
@@ -2895,7 +2923,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		logger.Info("[Task %s] ALL mode: bounded catch-up completed at P1=%q", taskID, endPosStr)
 	}
 
-	if task.Config.OptimizeIndex && len(pendingIndexRestores) > 0 {
+	if len(pendingIndexRestores) > 0 {
 		if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
 			return err
 		}
@@ -2904,7 +2932,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			task.Config.WorkerCount,
 			s.config.Sync.IndexRestoreHardMax,
 		)
-		logger.Info("[Task %s] 阶段3: 所有表数据同步完成，并发恢复 %d 张表索引 (workers=%d)...", taskID, len(pendingIndexRestores), workers)
+		logger.Info("[Task %s] 阶段3: 所有表数据同步完成，并发恢复 %d 张表非 identity/延迟索引 (workers=%d)...", taskID, len(pendingIndexRestores), workers)
 		if err := s.restorePendingIndexes(ctx, runtime, taskID, pendingIndexRestores, workers); err != nil {
 			return err
 		}
@@ -3123,7 +3151,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 		// 库级别重建已清空整个目标库，逐表 DROP TABLE 不再需要；表级别保持原有删除行为。
 		effectiveDropBeforeDDL := task.Config.EnableDropTableBeforeDDL && !dbLevelRebuilt
-		savedIndexes, err := s.ensureTargetTable(ctx, runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL)
+		savedIndexes, err := s.ensureTargetTable(ctx, runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL, identity, task.Config.Mode)
 
 		if err != nil {
 
@@ -3136,16 +3164,16 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 		}
 
 		// 对已存在且未重建的目标表，ensureTargetTable 不会返回索引定义。
-		// 在串行结构准备阶段统一删除并保存索引，避免各表数据 goroutine
-		// 并发执行 ALTER TABLE，也确保后续能集中恢复。
-		if task.Config.OptimizeIndex && len(savedIndexes) == 0 {
-			logger.Info("[Task %s] Dropping non-primary indexes for target table %s.%s...", taskID, targetSchema, targetTableName)
-			indexes, dropErr := s.dropNonPrimaryKeyIndexes(ctx, runtime, targetSchema, targetTableName)
+		// ALL 即使 optimize_index=false 也要延迟非 identity 唯一索引；FULL 仍仅在 optimize_index 时处理。
+		needDefer := (task.Config.OptimizeIndex || task.Config.Mode == taskEntity.SyncModeAll) && len(savedIndexes) == 0
+		if needDefer {
+			logger.Info("[Task %s] Dropping deferred indexes for target table %s.%s (mode=%s optimize_index=%v)...", taskID, targetSchema, targetTableName, task.Config.Mode, task.Config.OptimizeIndex)
+			indexes, dropErr := s.dropDeferredIndexes(ctx, runtime, targetSchema, targetTableName, identity, task.Config.Mode, task.Config.OptimizeIndex)
 			if dropErr != nil {
 				logger.Warn("[Task %s] Warning: Failed to drop indexes for %s.%s: %v", taskID, targetSchema, targetTableName, dropErr)
 			} else {
 				savedIndexes = indexes
-				logger.Info("[Task %s] Dropped %d indexes from target table %s.%s", taskID, len(savedIndexes), targetSchema, targetTableName)
+				logger.Info("[Task %s] Dropped %d deferred indexes from target table %s.%s", taskID, len(savedIndexes), targetSchema, targetTableName)
 			}
 		}
 
@@ -4453,7 +4481,7 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 	}
 
-	if pending != nil && task.Config.OptimizeIndex {
+	if pending != nil {
 		for _, r := range ready {
 			if len(r.savedIndexes) == 0 {
 				continue
@@ -4909,7 +4937,7 @@ func (s *TaskService) rebuildTargetDatabases(ctx context.Context, runtime *taskR
 
 // ensureTargetTable 确保目标表存在
 
-func (s *TaskService) ensureTargetTable(ctx context.Context, runtime *taskRuntime, sourceSchema, targetSchema, sourceTableName, targetTableName string, optimizeIndex bool, dropBeforeDDL bool) ([]map[string]interface{}, error) {
+func (s *TaskService) ensureTargetTable(ctx context.Context, runtime *taskRuntime, sourceSchema, targetSchema, sourceTableName, targetTableName string, optimizeIndex bool, dropBeforeDDL bool, identity *entity.TableIdentity, mode taskEntity.SyncMode) ([]map[string]interface{}, error) {
 
 	if runtime == nil || runtime.sourceDB == nil || runtime.targetDB == nil {
 
@@ -5004,9 +5032,10 @@ func (s *TaskService) ensureTargetTable(ctx context.Context, runtime *taskRuntim
 		return nil, preferSchemaLockLost(ctx, err, "failed to disable FOREIGN_KEY_CHECKS for DDL")
 	}
 
-	// 方法1：尝试在已禁用外键检查的目标连接上用 CREATE TABLE ... LIKE 创建表（源和目标在同一服务器时有效）
-
-	if sourceDB != nil && !optimizeIndex {
+	// 方法1：尝试在已禁用外键检查的目标连接上用 CREATE TABLE ... LIKE 创建表（源和目标在同一服务器时有效）。
+	// ALL 即使 optimize_index=false 也需要后续剥离非 identity 唯一索引，因此跳过 LIKE，走 SHOW CREATE 路径。
+	useCreateLike := sourceDB != nil && !optimizeIndex && mode != taskEntity.SyncModeAll
+	if useCreateLike {
 
 		tryErr := s.withDDL(runtime, func() error {
 
@@ -5074,7 +5103,11 @@ func (s *TaskService) ensureTargetTable(ctx context.Context, runtime *taskRuntim
 
 	var savedIndexes []map[string]interface{}
 
-	if optimizeIndex {
+	// FULL：optimize_index=true 时剥离全部非 PK 二级索引。
+	// ALL：始终按 TableIdentity 保留 identity UK，并至少延迟其他唯一索引；
+	//      非唯一索引仍由 optimize_index 控制。
+	deferIndexes := optimizeIndex || mode == taskEntity.SyncModeAll
+	if deferIndexes {
 
 		savedIndexes, err = loadNonPrimaryKeyIndexes(sourceDB, sourceSchema, sourceTableName)
 
@@ -5093,8 +5126,9 @@ func (s *TaskService) ensureTargetTable(ctx context.Context, runtime *taskRuntim
 		autoIncrementColumns := extractAutoIncrementColumnsFromCreateSQL(strings.Split(createSQL, "\n"))
 
 		savedIndexes = filterIndexesUsingAutoIncrementColumns(savedIndexes, autoIncrementColumns)
+		savedIndexes = selectDeferredIndexes(savedIndexes, identity, mode, optimizeIndex)
 
-		createSQL = stripNonPrimaryIndexesFromCreateSQL(createSQL)
+		createSQL = stripIndexesByNameFromCreateSQL(createSQL, indexNamesSet(savedIndexes))
 
 	}
 
@@ -5190,6 +5224,159 @@ func stripNonPrimaryIndexesFromCreateSQL(createSQL string) string {
 
 	return strings.Join(filtered, "\n")
 
+}
+
+// stripIndexesByNameFromCreateSQL 从 CREATE TABLE 中剥离指定名称的二级索引定义。
+// 自增列相关索引仍始终保留（与 stripNonPrimaryIndexesFromCreateSQL 一致）。
+func stripIndexesByNameFromCreateSQL(createSQL string, dropNames map[string]struct{}) string {
+	if len(dropNames) == 0 {
+		return createSQL
+	}
+	lines := strings.Split(createSQL, "\n")
+	autoIncrementColumns := extractAutoIncrementColumnsFromCreateSQL(lines)
+	filtered := make([]string, 0, len(lines))
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if i > 0 && i < len(lines)-1 && isSecondaryIndexDefinitionLine(trimmed) &&
+			!indexDefinitionUsesAnyColumn(trimmed, autoIncrementColumns) {
+			if name := secondaryIndexNameFromDefinitionLine(trimmed); name != "" {
+				if _, drop := dropNames[name]; drop {
+					continue
+				}
+			}
+		}
+		filtered = append(filtered, line)
+	}
+	for i := 1; i < len(filtered); i++ {
+		if strings.HasPrefix(strings.TrimSpace(filtered[i]), ")") {
+			filtered[i-1] = trimTrailingComma(filtered[i-1])
+		}
+	}
+	return strings.Join(filtered, "\n")
+}
+
+func secondaryIndexNameFromDefinitionLine(line string) string {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
+	upper := strings.ToUpper(trimmed)
+	prefixes := []string{
+		"UNIQUE KEY ", "UNIQUE INDEX ",
+		"FULLTEXT KEY ", "FULLTEXT INDEX ",
+		"SPATIAL KEY ", "SPATIAL INDEX ",
+		"KEY ", "INDEX ",
+	}
+	for _, p := range prefixes {
+		if !strings.HasPrefix(upper, p) {
+			continue
+		}
+		rest := strings.TrimSpace(trimmed[len(p):])
+		if strings.HasPrefix(rest, "`") {
+			end := strings.Index(rest[1:], "`")
+			if end >= 0 {
+				return rest[1 : 1+end]
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+func indexNamesSet(indexes []map[string]interface{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(indexes))
+	for _, idx := range indexes {
+		name, _ := idx["name"].(string)
+		if name != "" {
+			out[name] = struct{}{}
+		}
+	}
+	return out
+}
+
+func parseIndexColumnNames(columns string) []string {
+	if strings.TrimSpace(columns) == "" {
+		return nil
+	}
+	parts := strings.Split(columns, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// `col` or `col`(N)
+		if i := strings.Index(p, "`"); i >= 0 {
+			rest := p[i+1:]
+			if j := strings.Index(rest, "`"); j >= 0 {
+				out = append(out, rest[:j])
+				continue
+			}
+		}
+		out = append(out, strings.TrimSpace(strings.Split(p, "(")[0]))
+	}
+	return out
+}
+
+func indexMatchesIdentifyCols(idx map[string]interface{}, identifyCols []string) bool {
+	if len(identifyCols) == 0 {
+		return false
+	}
+	cols, _ := idx["columns"].(string)
+	got := parseIndexColumnNames(cols)
+	if len(got) != len(identifyCols) {
+		return false
+	}
+	for i := range identifyCols {
+		if !strings.EqualFold(got[i], identifyCols[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func indexNonUnique(idx map[string]interface{}) int {
+	switch v := idx["non_unique"].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 1
+	}
+}
+
+// shouldDeferIndex 判断索引是否应在基线/catch-up 期间延迟创建。
+// ALL：始终保留 identity UK；始终延迟其他唯一索引；非唯一索引跟随 optimize_index。
+// FULL：保持原 optimize_index 语义（true 时延迟全部非 PK 二级索引）。
+func shouldDeferIndex(idx map[string]interface{}, identity *entity.TableIdentity, mode taskEntity.SyncMode, optimizeIndex bool) bool {
+	isUnique := indexNonUnique(idx) == 0
+	if mode == taskEntity.SyncModeAll {
+		if isUnique && identity != nil && identity.Strategy == entity.UKStrategy &&
+			indexMatchesIdentifyCols(idx, identity.IdentifyCols) {
+			return false
+		}
+		if isUnique {
+			return true
+		}
+		return optimizeIndex
+	}
+	return optimizeIndex
+}
+
+func selectDeferredIndexes(indexes []map[string]interface{}, identity *entity.TableIdentity, mode taskEntity.SyncMode, optimizeIndex bool) []map[string]interface{} {
+	if len(indexes) == 0 {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(indexes))
+	for _, idx := range indexes {
+		if shouldDeferIndex(idx, identity, mode, optimizeIndex) {
+			out = append(out, idx)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func extractAutoIncrementColumnsFromCreateSQL(lines []string) map[string]struct{} {
@@ -6000,6 +6187,19 @@ func (s *TaskService) resetResumeIfFresh(taskID string) {
 	}
 	task.ResetFullSyncResume()
 	task.ResetFullSyncCounters()
+
+	// 旧 ALL 表级 HWM + drop_ddl 被放行的 fresh run：必须清空旧 V2 manifest/run，
+	// 禁止与 PUBLISHED 跳过混合，避免失败窗口变更既不被基线也不被 P0..P1 catch-up 覆盖。
+	legacyHWMFresh := strings.EqualFold(string(task.Config.Mode), "ALL") &&
+		len(task.Context.TableBinlogHWMs) > 0 &&
+		task.Config.EnableDropTableBeforeDDL
+	if legacyHWMFresh {
+		task.ClearTableBinlogHWMs()
+		task.ClearFullLoadV2States()
+		s.storage.Save(task)
+		return
+	}
+
 	// V2 恢复场景:有未完成的表时保留 V2 状态,否则清空
 	if task.Config.UsesFullLoadV2() && len(task.Context.FullLoadV2States) > 0 {
 		if task.AllFullLoadV2TablesPublished() {
@@ -7495,9 +7695,14 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 
 }
 
-// dropNonPrimaryKeyIndexes 删除非主键索引
+// dropNonPrimaryKeyIndexes 删除非主键索引（兼容旧调用：等价于 FULL + optimize_index=true）。
 
 func (s *TaskService) dropNonPrimaryKeyIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string) ([]map[string]interface{}, error) {
+	return s.dropDeferredIndexes(ctx, runtime, schema, tableName, nil, taskEntity.SyncModeFull, true)
+}
+
+// dropDeferredIndexes 按模式/identity 删除应延迟恢复的索引，并返回成功删除的列表。
+func (s *TaskService) dropDeferredIndexes(ctx context.Context, runtime *taskRuntime, schema, tableName string, identity *entity.TableIdentity, mode taskEntity.SyncMode, optimizeIndex bool) ([]map[string]interface{}, error) {
 
 	if runtime == nil || runtime.targetDB == nil {
 
@@ -7518,6 +7723,7 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(ctx context.Context, runtime *tas
 		return nil, err
 
 	}
+	savedIndexes = selectDeferredIndexes(savedIndexes, identity, mode, optimizeIndex)
 
 	if len(savedIndexes) == 0 {
 
@@ -7525,7 +7731,7 @@ func (s *TaskService) dropNonPrimaryKeyIndexes(ctx context.Context, runtime *tas
 
 	}
 
-	// 删除非主键索引；只有成功删除的索引才需要恢复，避免恢复阶段再次创建失败。
+	// 只有成功删除的索引才需要恢复，避免恢复阶段再次创建失败。
 
 	dropped := make([]map[string]interface{}, 0, len(savedIndexes))
 

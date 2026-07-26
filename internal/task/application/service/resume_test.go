@@ -264,6 +264,63 @@ func TestResetResumeIfFresh(t *testing.T) {
 	assert.Nil(t, ts.getTableProgress("fresh_task", key))
 }
 
+func TestResetResumeIfFresh_LegacyHWMWithDropDDLClearsV2States(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{
+		ID:                       "legacy_hwm_fresh",
+		Name:                     "Legacy HWM Fresh",
+		Mode:                     taskEntity.SyncModeAll,
+		FullLoadEngine:           "v2",
+		EnableDropTableBeforeDDL: true,
+	})
+	require.NoError(t, err)
+	task.Context.SyncPhase = taskEntity.SyncPhaseFullStarted
+	task.Context.TableBinlogHWMs = map[string]string{"s.t": "mysql-bin.000001:100"}
+	task.Context.FullLoadRunID = "old-run"
+	task.Context.FullLoadExpectedTables = 2
+	task.Context.FullLoadV2States = map[string]*taskEntity.FullLoadV2TableState{
+		"s.t":  {Phase: "PUBLISHED"},
+		"s.t2": {Phase: "COPYING"},
+	}
+	require.NoError(t, ts.storage.Save(task))
+
+	ts.resetResumeIfFresh("legacy_hwm_fresh")
+
+	live, ok := ts.GetTask("legacy_hwm_fresh")
+	require.True(t, ok)
+	assert.Nil(t, live.Context.TableBinlogHWMs, "legacy HWM must be cleared for fresh run")
+	assert.Nil(t, live.Context.FullLoadV2States, "old V2 manifest must not mix-resume")
+	assert.Empty(t, live.Context.FullLoadRunID)
+	assert.Zero(t, live.Context.FullLoadExpectedTables)
+}
+
+func TestResetResumeIfFresh_V2ResumeWithoutLegacyHWMKeepsStates(t *testing.T) {
+	ts := newTestTaskService(t.TempDir())
+	defer ts.Close()
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{
+		ID:             "v2_resume_keep",
+		Name:           "V2 Resume Keep",
+		Mode:           taskEntity.SyncModeAll,
+		FullLoadEngine: "v2",
+	})
+	require.NoError(t, err)
+	task.Context.SyncPhase = taskEntity.SyncPhaseFullStarted
+	task.Context.FullLoadV2States = map[string]*taskEntity.FullLoadV2TableState{
+		"s.t": {Phase: "COPYING"},
+	}
+	require.NoError(t, ts.storage.Save(task))
+
+	ts.resetResumeIfFresh("v2_resume_keep")
+
+	live, ok := ts.GetTask("v2_resume_keep")
+	require.True(t, ok)
+	require.NotNil(t, live.Context.FullLoadV2States)
+	assert.Equal(t, "COPYING", live.Context.FullLoadV2States["s.t"].Phase)
+}
+
 func TestClearFullSyncResume(t *testing.T) {
 	ts := newTestTaskService(t.TempDir())
 	defer ts.Close()

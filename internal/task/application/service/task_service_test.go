@@ -119,6 +119,54 @@ func TestStripNonPrimaryIndexesFromCreateSQL_KeepsAutoIncrementKey(t *testing.T)
 	assert.False(t, strings.Contains(stripped, ",\n) ENGINE"))
 }
 
+func TestSelectDeferredIndexes_ALLKeepsIdentityUK(t *testing.T) {
+	ukIdentity := &entity.TableIdentity{
+		TableName:    "users",
+		Strategy:     entity.UKStrategy,
+		HasUK:        true,
+		IdentifyCols: []string{"email"},
+	}
+	indexes := []map[string]interface{}{
+		{"name": "uk_email", "non_unique": 0, "columns": "`email`"},
+		{"name": "uk_phone", "non_unique": 0, "columns": "`phone`"},
+		{"name": "idx_name", "non_unique": 1, "columns": "`name`"},
+	}
+
+	// optimize_index=true：保留 identity UK，延迟其他唯一+非唯一
+	deferred := selectDeferredIndexes(indexes, ukIdentity, taskEntity.SyncModeAll, true)
+	require.Len(t, deferred, 2)
+	assert.Equal(t, "uk_phone", deferred[0]["name"])
+	assert.Equal(t, "idx_name", deferred[1]["name"])
+
+	// optimize_index=false：仍延迟非 identity 唯一索引，但保留普通二级索引
+	deferred = selectDeferredIndexes(indexes, ukIdentity, taskEntity.SyncModeAll, false)
+	require.Len(t, deferred, 1)
+	assert.Equal(t, "uk_phone", deferred[0]["name"])
+
+	// FULL + optimize：延迟全部非 PK（含 identity UK）
+	deferred = selectDeferredIndexes(indexes, ukIdentity, taskEntity.SyncModeFull, true)
+	require.Len(t, deferred, 3)
+}
+
+func TestStripIndexesByNameFromCreateSQL_KeepsIdentityUK(t *testing.T) {
+	createSQL := "CREATE TABLE `users` (\n" +
+		"  `id` bigint NOT NULL,\n" +
+		"  `email` varchar(255) NOT NULL,\n" +
+		"  `phone` varchar(32) DEFAULT NULL,\n" +
+		"  UNIQUE KEY `uk_email` (`email`),\n" +
+		"  UNIQUE KEY `uk_phone` (`phone`),\n" +
+		"  KEY `idx_phone` (`phone`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+	stripped := stripIndexesByNameFromCreateSQL(createSQL, map[string]struct{}{
+		"uk_phone":  {},
+		"idx_phone": {},
+	})
+	assert.Contains(t, stripped, "UNIQUE KEY `uk_email` (`email`)")
+	assert.NotContains(t, stripped, "UNIQUE KEY `uk_phone`")
+	assert.NotContains(t, stripped, "KEY `idx_phone`")
+}
+
 func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	targetDB, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -1160,6 +1208,43 @@ func TestUpdateTask_PreservesLiveContextFromSnapshot(t *testing.T) {
 	assert.Equal(t, "renamed", live.Config.Name)
 	assert.Equal(t, int64(42), live.Context.TotalRows)
 	assert.InDelta(t, 12.5, live.Context.ProgressPercent, 0.01)
+}
+
+func TestUpdateTask_PersistsNopkAllRiskAcknowledgement(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newTestTaskService(dataDir)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "nopk_ack_upd", Name: "orig", Mode: taskEntity.SyncModeAll})
+	require.NoError(t, err)
+	assert.False(t, task.HasNopkAllRiskAcknowledgement())
+
+	snap, ok := ts.GetTaskSnapshot("nopk_ack_upd")
+	require.True(t, ok)
+	snap.Config.AllowNopkAll = true
+	// 模拟 handler：只改 Config，不碰 live Context。
+	require.NoError(t, ts.UpdateTask(snap))
+
+	live, _ := ts.GetTask("nopk_ack_upd")
+	require.True(t, live.HasNopkAllRiskAcknowledgement())
+	assert.True(t, live.Config.AllowNopkAll)
+	firstAck := *live.Context.NopkAllRiskAcknowledgedAt
+
+	// 再次勾选不应覆盖已有确认时间。
+	snap2, ok := ts.GetTaskSnapshot("nopk_ack_upd")
+	require.True(t, ok)
+	snap2.Config.AllowNopkAll = true
+	require.NoError(t, ts.UpdateTask(snap2))
+	live2, _ := ts.GetTask("nopk_ack_upd")
+	assert.Equal(t, firstAck, *live2.Context.NopkAllRiskAcknowledgedAt)
+
+	// 取消勾选必须清除服务端时间戳。
+	snap3, ok := ts.GetTaskSnapshot("nopk_ack_upd")
+	require.True(t, ok)
+	snap3.Config.AllowNopkAll = false
+	require.NoError(t, ts.UpdateTask(snap3))
+	live3, _ := ts.GetTask("nopk_ack_upd")
+	assert.False(t, live3.HasNopkAllRiskAcknowledgement())
+	assert.False(t, live3.Config.AllowNopkAll)
 }
 
 func TestDeleteTask_RejectsRunning(t *testing.T) {
@@ -2934,7 +3019,7 @@ func TestEnsureTargetTable_DropBeforeDDLRecreatesExistingTable(t *testing.T) {
 		runtime.targetDB = targetDB
 
 		// ensureTargetTable ??? CREATE TABLE LIKE ???????? DROP????????????
-		_, err = ts.ensureTargetTable(context.Background(), runtime, "source_db", "target_db", "users", "users", false, true)
+		_, err = ts.ensureTargetTable(context.Background(), runtime, "source_db", "target_db", "users", "users", false, true, pkUsersIdentity(), taskEntity.SyncModeFull)
 		require.NoError(t, err)
 	})
 
@@ -3559,6 +3644,107 @@ func TestErrFullSyncStoppedByUser_IsSentinel(t *testing.T) {
 
 	other := fmt.Errorf("something else")
 	assert.False(t, errors.Is(other, errFullSyncStoppedByUser))
+}
+
+func TestErrFullSyncPreflight_IsSentinel(t *testing.T) {
+	wrapped := fmt.Errorf("%w: need allow_nopk_all", errFullSyncPreflight)
+	assert.True(t, errors.Is(wrapped, errFullSyncPreflight))
+	assert.False(t, errors.Is(fmt.Errorf("other"), errFullSyncPreflight))
+}
+
+type nopkIdentityAnalyzer struct{}
+
+func (a *nopkIdentityAnalyzer) AnalyzeTable(_, tableName string) (*entity.TableIdentity, error) {
+	return &entity.TableIdentity{
+		TableName:    tableName,
+		Strategy:     entity.FullColumnsStrategy,
+		IdentifyCols: []string{"a", "b"},
+	}, nil
+}
+func (a *nopkIdentityAnalyzer) GetAllTables(string) ([]entity.TableInfo, error) {
+	return nil, nil
+}
+func (a *nopkIdentityAnalyzer) GetAllDatabases() ([]string, error) { return nil, nil }
+
+type failingAnalyzeAnalyzer struct{ err error }
+
+func (a *failingAnalyzeAnalyzer) AnalyzeTable(_, _ string) (*entity.TableIdentity, error) {
+	return nil, a.err
+}
+func (a *failingAnalyzeAnalyzer) GetAllTables(string) ([]entity.TableInfo, error) {
+	return nil, nil
+}
+func (a *failingAnalyzeAnalyzer) GetAllDatabases() ([]string, error) { return nil, nil }
+
+func TestExecuteSync_ALLMissingNopkAckDoesNotMarkFullFailed(t *testing.T) {
+	sourceDB, sourceMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer sourceDB.Close()
+	targetDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+	sourceMock.MatchExpectationsInOrder(false)
+	// 估算行数允许失败；确认门禁只依赖 AnalyzeTable。
+	sourceMock.ExpectQuery("SELECT TABLE_ROWS").WillReturnError(fmt.Errorf("skip estimate"))
+
+	ts := newTestTaskService(t.TempDir())
+	ts.checkpointManager = checkpoint.NewMemoryCheckpointManager()
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:           "all_nopk_no_ack",
+		Name:         "ALL No Ack",
+		Mode:         taskEntity.SyncModeAll,
+		SourceSchema: "src",
+		Tables:       []string{"audit"},
+	})
+	task.Start()
+	ts.tasks[task.Config.ID] = task
+	phaseBefore := task.Context.SyncPhase
+
+	runtime := &taskRuntime{
+		sourceDB: sourceDB,
+		targetDB: targetDB,
+		analyzer: &nopkIdentityAnalyzer{},
+	}
+	ts.runtimes[task.Config.ID] = runtime
+	ts.executeSync(context.Background(), task.Config.ID, runtime)
+
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Equal(t, phaseBefore, task.Context.SyncPhase, "missing ack must not pollute SyncPhase to FULL_FAILED")
+	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
+	assert.Contains(t, task.Context.ErrorStack, "allow_nopk_all")
+}
+
+func TestExecuteFullSync_ALLAnalyzeFailureIsFailClosedPreflight(t *testing.T) {
+	sourceDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer sourceDB.Close()
+	targetDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:           "all_meta_fail",
+		Name:         "ALL Meta Fail",
+		Mode:         taskEntity.SyncModeAll,
+		SourceSchema: "src",
+		Tables:       []string{"t1"},
+		AllowNopkAll: true,
+	})
+	task.AcknowledgeNopkAllRisk(time.Now())
+	task.Start()
+	ts.tasks[task.Config.ID] = task
+
+	runtime := &taskRuntime{
+		sourceDB: sourceDB,
+		targetDB: targetDB,
+		analyzer: &failingAnalyzeAnalyzer{err: fmt.Errorf("metadata unavailable")},
+	}
+	err = ts.executeFullSync(context.Background(), task, runtime)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errFullSyncPreflight)
+	assert.Contains(t, err.Error(), "analyze table")
+	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
 }
 
 // TestFormatBinlogPosition ??????????????????
