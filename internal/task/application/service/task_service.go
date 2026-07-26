@@ -2078,6 +2078,61 @@ func (s *TaskService) initDatabaseConnections(task *taskEntity.SyncTask) (*taskR
 // 上层 executeSync 据此区分"应当标 FAILED"还是"应当保留当前阶段并退出"。
 var errFullSyncStoppedByUser = errors.New("full sync stopped by user")
 
+// taskStopReasonKind 区分任务非 RUNNING 的具体原因；与 isTaskStopped（worker 级宽语义）分离。
+type taskStopReasonKind int
+
+const (
+	taskStopReasonRunning taskStopReasonKind = iota
+	taskStopReasonPaused
+	taskStopReasonStopped
+	taskStopReasonFailed
+	taskStopReasonMissing
+	taskStopReasonOther
+)
+
+func (s *TaskService) taskStopReason(taskID string) taskStopReasonKind {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	task, exists := s.tasks[taskID]
+	if !exists {
+		return taskStopReasonMissing
+	}
+	switch task.Context.Status {
+	case taskEntity.TaskStatusRunning:
+		return taskStopReasonRunning
+	case taskEntity.TaskStatusPaused:
+		return taskStopReasonPaused
+	case taskEntity.TaskStatusStopped:
+		return taskStopReasonStopped
+	case taskEntity.TaskStatusFailed:
+		return taskStopReasonFailed
+	default:
+		return taskStopReasonOther
+	}
+}
+
+func (s *TaskService) isUserFullSyncStop(taskID string) bool {
+	switch s.taskStopReason(taskID) {
+	case taskStopReasonPaused, taskStopReasonStopped, taskStopReasonMissing:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *TaskService) fullLoadStopCause(taskID string) error {
+	switch s.taskStopReason(taskID) {
+	case taskStopReasonPaused:
+		return fullload.ErrUserPaused
+	case taskStopReasonStopped:
+		return fullload.ErrUserStopped
+	case taskStopReasonMissing:
+		return fullload.ErrServiceShutdown
+	default:
+		return nil
+	}
+}
+
 // errFullSyncPreflight 表示全量尚未进入 FULL_STARTED 前的可修正校验失败。
 // 不得 MarkFullSyncFailed，否则会把未启动任务污染成不可恢复的 FULL_FAILED。
 var errFullSyncPreflight = errors.New("full sync preflight failed")
@@ -2089,8 +2144,8 @@ func (s *TaskService) abortFullSyncIfCancelled(ctx context.Context, taskID strin
 		logger.Error("[Task %s] Full sync aborted after schema lock lost", taskID)
 		return err
 	}
-	if s.isTaskStopped(taskID) {
-		logger.Info("[Task %s] Full sync detected stop signal; aborting without marking completed", taskID)
+	if s.isUserFullSyncStop(taskID) {
+		logger.Info("[Task %s] Full sync detected user stop signal; aborting without marking completed", taskID)
 		return errFullSyncStoppedByUser
 	}
 	return nil
@@ -2493,7 +2548,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 	// 修复 1d：早期停止检查。任务在到达此处之前可能已被暂停/停止（例如用户调用 PauseTask
 	// 后又立刻触发新一轮 executeSync 调度的极端时序），此处一次性返回 sentinel，避免后续
 	// 还去拿 FTWRL / 跑全量。
-	if s.isTaskStopped(taskID) {
+	if s.isUserFullSyncStop(taskID) {
 		logger.Info("[Task %s] Full sync skipped: task already stopped before any work was done", taskID)
 		return errFullSyncStoppedByUser
 	}
@@ -6894,8 +6949,12 @@ func (s *TaskService) updateTaskStatus(taskID string, status taskEntity.TaskStat
 // failTaskUnlessCancelled 仅当不是主动取消/暂停时才标记 FAILED。
 // 暂停或停止会先 cancel ctx，DB 调用返回 context.Canceled 属于正常中断，不应记为失败。
 func (s *TaskService) failTaskUnlessCancelled(ctx context.Context, taskID, errMsg string) {
-	if ctx.Err() != nil || s.isTaskStopped(taskID) {
+	if ctx.Err() != nil {
 		logger.Info("[Task %s] Ignoring error during shutdown: %s", taskID, errMsg)
+		return
+	}
+	if s.isUserFullSyncStop(taskID) {
+		logger.Info("[Task %s] Ignoring error during user stop: %s", taskID, errMsg)
 		return
 	}
 	s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
@@ -8111,8 +8170,8 @@ func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRu
 		if len(item.indexes) == 0 {
 			continue
 		}
-		// 停止信号快速退出
-		if s.isTaskStopped(taskID) {
+	// 停止信号快速退出
+		if s.isUserFullSyncStop(taskID) {
 			cancel()
 			break
 		}
@@ -8144,7 +8203,7 @@ func (s *TaskService) restorePendingIndexes(ctx context.Context, runtime *taskRu
 	wg.Wait()
 
 	// 停止信号优先于普通错误返回，与全量同步停止语义一致
-	if s.isTaskStopped(taskID) {
+	if s.isUserFullSyncStop(taskID) {
 		return errFullSyncStoppedByUser
 	}
 	if firstErr == nil && ctx.Err() != nil {

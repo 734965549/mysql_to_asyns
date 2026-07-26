@@ -24,7 +24,7 @@ func TestWriteSessionSkipBinlogAndRestore(t *testing.T) {
 	if err := setupWriteSession(context.Background(), conn, true); err != nil {
 		t.Fatal(err)
 	}
-	restoreWriteSession(conn, true)
+	restoreWriteSession(conn, true, "", -1, false)
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}

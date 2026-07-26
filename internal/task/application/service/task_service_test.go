@@ -3062,16 +3062,19 @@ func TestFailTaskUnlessCancelled(t *testing.T) {
 		assert.Empty(t, task.Context.ErrorStack)
 	})
 
-	t.Run("ignores error when task already stopped", func(t *testing.T) {
+	t.Run("ignores error when task paused by user", func(t *testing.T) {
 		ts := newTestTaskService(t.TempDir())
-		ts.CreateTask(taskEntity.TaskConfig{ID: "ft3", Name: "T3"})
-		// task is in Pending status (not running), so isTaskStopped returns true
+		task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "ft3", Name: "T3"})
+		task.Start()
+		task.Pause()
+		ts.tasks["ft3"] = task
 
 		ctx := context.Background()
 		ts.failTaskUnlessCancelled(ctx, "ft3", "should be ignored")
 
-		task, _ := ts.GetTask("ft3")
-		assert.Equal(t, taskEntity.TaskStatusPending, task.Context.Status)
+		task, _ = ts.GetTask("ft3")
+		assert.Equal(t, taskEntity.TaskStatusPaused, task.Context.Status)
+		assert.Empty(t, task.Context.ErrorStack)
 	})
 }
 

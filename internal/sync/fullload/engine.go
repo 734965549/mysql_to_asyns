@@ -3,6 +3,7 @@ package fullload
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ type Engine struct {
 	Stats     *Stats
 	OnCommit  CommitCallback // 事务提交后按表回调，用于推进进度
 	IsStopped func() bool    // 返回 true 时引擎尽快停止（用户暂停/取消）
+	StopCause func() error   // 非 nil 时表示用户/服务侧停止原因，用于 WithCancelCause
 	TaskID    string
 
 	// SchemaLocks 由调用层预先获取的 schema 级互斥锁。
@@ -112,10 +114,10 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		return fmt.Errorf("allocate full-load run_id: %w", err)
 	}
 
-	cctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	cctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	stopWatchDone := make(chan struct{})
-	if e.IsStopped != nil {
+	if e.IsStopped != nil || e.StopCause != nil {
 		go func() {
 			ticker := time.NewTicker(100 * time.Millisecond)
 			defer ticker.Stop()
@@ -126,8 +128,13 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 				case <-cctx.Done():
 					return
 				case <-ticker.C:
-					if e.IsStopped() {
-						cancel()
+					if e.StopCause != nil {
+						if cause := e.StopCause(); cause != nil {
+							cancel(cause)
+							return
+						}
+					} else if e.IsStopped != nil && e.IsStopped() {
+						cancel(ErrUserPaused)
 						return
 					}
 				}
@@ -175,9 +182,9 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		writerErr = runWriters(cctx, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.stateTracker, e.IsStopped, runID)
+		writerErr = runWriters(cctx, e.TaskID, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.stateTracker, e.IsStopped, runID)
 		if writerErr != nil {
-			cancel()
+			cancel(writerErr)
 		}
 	}()
 
@@ -188,7 +195,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		// 读取全部完成（或出错）后关闭队列，写入 worker 排空后退出。
 		q.Close()
 		if readerErr != nil {
-			cancel()
+			cancel(readerErr)
 		}
 	}()
 
@@ -198,20 +205,11 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	e.pushFinalMetrics()
 
 	snap := e.Stats.Snapshot()
-	logger.Info("[Task %s] FullLoadV2 finished: committed_rows=%d committed_bytes=%d commits=%d tx_replays=%d lock_retries=%d chunks=%d/%d",
-		e.TaskID, snap.CommittedRows, snap.CommittedBytes, snap.Commits, snap.TxReplays, snap.LockRetries, snap.ChunksDone, snap.ChunksTotal)
+	pipelineErr := selectPipelineError(ctx, cctx, readerErr, writerErr)
+	logPipelineOutcome(e.TaskID, snap, readerErr, writerErr, pipelineErr, ctx)
 
-	if readerErr != nil {
-		return readerErr
-	}
-	if writerErr != nil {
-		return writerErr
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if cctx.Err() != nil {
-		return context.Canceled
+	if pipelineErr != nil {
+		return pipelineErr
 	}
 	// 数据流水线成功后按 run_id 删除本任务 marker 行（不 DROP 共享表）。
 	// 注意：此处早于可能存在的索引恢复等任务级收尾；清理失败只告警。
@@ -219,6 +217,30 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		logger.Warn("[Task %s] FullLoadV2: cleanup tx marker rows after pipeline success failed (sync already committed): %v", e.TaskID, err)
 	}
 	return nil
+}
+
+func logPipelineOutcome(taskID string, snap StatsSnapshot, readerErr, writerErr, pipelineErr error, parentCtx context.Context) {
+	chunks := fmt.Sprintf("chunks=%d/%d", snap.ChunksDone, snap.ChunksTotal)
+	if pipelineErr == nil {
+		logger.Info("[Task %s] FullLoadV2 finished: %s committed_rows=%d committed_bytes=%d commits=%d tx_replays=%d lock_retries=%d",
+			taskID, chunks, snap.CommittedRows, snap.CommittedBytes, snap.Commits, snap.TxReplays, snap.LockRetries)
+		return
+	}
+	if errors.Is(pipelineErr, ErrUserPaused) {
+		logger.Info("[Task %s] FullLoadV2 paused by user: %s", taskID, chunks)
+		return
+	}
+	if errors.Is(pipelineErr, ErrUserStopped) {
+		logger.Info("[Task %s] FullLoadV2 stopped by user: %s", taskID, chunks)
+		return
+	}
+	cancelCause := context.Cause(parentCtx)
+	logger.Error("[Task %s] FullLoadV2 failed: %s reader_err=%s writer_err=%s cancel_cause=%s err=%s",
+		taskID, chunks,
+		formatPipelineErr(readerErr),
+		formatPipelineErr(writerErr),
+		formatPipelineErr(cancelCause),
+		formatPipelineErr(pipelineErr))
 }
 
 func (e *Engine) reportLoop(ctx context.Context, stop <-chan struct{}) {

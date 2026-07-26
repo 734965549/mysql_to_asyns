@@ -47,7 +47,7 @@ type CommitCallback func(schema, table string, rows, bytes int64)
 // P0 正确性：一个事务内可能已成功写入若干批次，后续批次遇到可重试锁错误时，
 // 回滚整个事务并重放全部未提交批次，而不是只重试当前批次；只有事务提交成功后
 // 才通过 onCommit 推进进度，避免静默缺数。
-func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string) error {
+func runWriters(ctx context.Context, taskID string, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string) error {
 	if runID == "" {
 		return fmt.Errorf("runWriters: run_id is required")
 	}
@@ -73,7 +73,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 			defer wg.Done()
 			atomic.AddInt64(&stats.ActiveWriters, 1)
 			defer atomic.AddInt64(&stats.ActiveWriters, -1)
-			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, tracker, stateTracker, isStopped, runID); err != nil {
+			if err := writerLoop(workerCtx, taskID, id, targetDB, q, opt, stats, onCommit, tracker, stateTracker, isStopped, runID); err != nil {
 				setErr(err)
 			}
 		}(w)
@@ -83,7 +83,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 	return firstErr
 }
 
-func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string) error {
+func writerLoop(ctx context.Context, taskID string, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string) error {
 	conn, err := targetDB.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("writer %d get conn: %w", id, err)
@@ -94,7 +94,8 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			stmtCache.Close()
 		}
 		if conn != nil {
-			restoreWriteSession(conn, opt.SkipBinlog)
+			skipRestore := ctx.Err() != nil
+			restoreWriteSession(conn, opt.SkipBinlog, taskID, id, skipRestore)
 			forceCloseWriterConn(conn)
 		}
 	}()
@@ -108,7 +109,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	// 未提交事务会随断连被服务端回滚，因此可安全重放；Commit 失败仍禁止重放。
 	// 调用方须先结束当前 *sql.Tx（Rollback），否则 Conn.Close 会与 awaitDone 死锁。
 	reconnect := func(cause error) error {
-		logger.Warn("[FullLoadV2] writer %d reconnecting after connection error: %v", id, cause)
+		logger.Warn("[Task %s] FullLoadV2 writer %d reconnecting after connection error: %v", taskID, id, cause)
 		oldCache := stmtCache
 		oldConn := conn
 		stmtCache = nil
@@ -224,7 +225,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 				return fmt.Errorf("writer %d commit (outcome unknown; recover exhausted): %w", id, cErr)
 			}
 			commitRecoveries++
-			logger.Warn("[FullLoadV2] writer %d commit connection error (outcome unknown), verifying marker: %v", id, cErr)
+			logger.Warn("[Task %s] FullLoadV2 writer %d commit connection error (outcome unknown), verifying marker: %v", taskID, id, cErr)
 			buf = nil
 			txRows, txBytes = 0, 0
 			if rErr := reconnect(cErr); rErr != nil {
@@ -237,14 +238,14 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 				return fmt.Errorf("writer %d commit (outcome unknown; verify failed): %w", id, vErr)
 			}
 			if applied {
-				logger.Warn("[FullLoadV2] writer %d commit verified applied via tx marker after connection error", id)
+				logger.Warn("[Task %s] FullLoadV2 writer %d commit verified applied via tx marker after connection error", taskID, id)
 				rows, bytes := sumBuf(pending)
 				stats.addCommit(rows, bytes, time.Since(cs))
 				commitRecoveries = 0
 				clearTxMarker()
 				return reportCommitted(pending, onCommit, tracker, stateTracker)
 			}
-			logger.Warn("[FullLoadV2] writer %d commit verified rolled back via tx marker; replaying %d batches", id, len(pending))
+			logger.Warn("[Task %s] FullLoadV2 writer %d commit verified rolled back via tx marker; replaying %d batches", taskID, id, len(pending))
 			clearTxMarker()
 			newTx, rErr := replayInFreshTx(ctx, conn, pending, opt, stmtCache, stats)
 			if rErr != nil {

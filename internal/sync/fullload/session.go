@@ -3,6 +3,7 @@ package fullload
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"mysql-to-sync/pkg/logger"
@@ -17,7 +18,7 @@ func setupWriteSession(ctx context.Context, conn *sql.Conn, skipBinlog bool) err
 	configured := false
 	defer func() {
 		if !configured {
-			restoreWriteSession(conn, false)
+			restoreWriteSession(conn, false, "", -1, false)
 		}
 	}()
 	if _, err := conn.ExecContext(ctx, "SET @@SESSION.UNIQUE_CHECKS=0"); err != nil {
@@ -46,26 +47,45 @@ func setupWriteSession(ctx context.Context, conn *sql.Conn, skipBinlog bool) err
 	return nil
 }
 
-func restoreWriteSession(conn *sql.Conn, skipBinlog bool) {
-	if conn == nil {
+func restoreWriteSession(conn *sql.Conn, skipBinlog bool, taskID string, writerID int, skipRestore bool) {
+	if conn == nil || skipRestore {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	prefix := sessionLogPrefix(taskID, writerID)
 	if _, err := conn.ExecContext(ctx, "SET @@SESSION.FOREIGN_KEY_CHECKS=1"); err != nil {
-		logger.Warn("[FullLoadV2] restore foreign key checks failed: %v", err)
+		if ctx.Err() == nil {
+			logger.Warn("%s restore foreign key checks failed: %v", prefix, err)
+		}
 	}
 	if _, err := conn.ExecContext(ctx, "SET @@SESSION.UNIQUE_CHECKS=1"); err != nil {
-		logger.Warn("[FullLoadV2] restore unique checks failed: %v", err)
+		if ctx.Err() == nil {
+			logger.Warn("%s restore unique checks failed: %v", prefix, err)
+		}
 	}
 	if _, err := conn.ExecContext(ctx, "SET SESSION innodb_lock_wait_timeout=50"); err != nil {
-		logger.Warn("[FullLoadV2] restore lock wait timeout failed: %v", err)
+		if ctx.Err() == nil {
+			logger.Warn("%s restore lock wait timeout failed: %v", prefix, err)
+		}
 	}
 	if skipBinlog {
 		if _, err := conn.ExecContext(ctx, "SET SESSION sql_log_bin=1"); err != nil {
-			logger.Warn("[FullLoadV2] restore sql_log_bin failed: %v", err)
+			if ctx.Err() == nil {
+				logger.Warn("%s restore sql_log_bin failed: %v", prefix, err)
+			}
 		}
 	}
+}
+
+func sessionLogPrefix(taskID string, writerID int) string {
+	if taskID == "" && writerID < 0 {
+		return "[FullLoadV2]"
+	}
+	if writerID < 0 {
+		return fmt.Sprintf("[Task %s] FullLoadV2", taskID)
+	}
+	return fmt.Sprintf("[Task %s] FullLoadV2 writer %d", taskID, writerID)
 }
 
 type sessionError string

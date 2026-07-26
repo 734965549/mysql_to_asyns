@@ -65,18 +65,14 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 	taskID := task.Config.ID
 
 	if err := task.Config.ValidateFullLoadOptions(); err != nil {
-		errMsg := fmt.Sprintf("invalid full-load options: %v", err)
-		s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-		return fmt.Errorf("%s", errMsg)
+		return fmt.Errorf("invalid full-load options: %v", err)
 	}
 
 	tables := append([]string{}, specifiedTables...)
 	if len(tables) == 0 {
 		allTables, err := runtime.analyzer.GetAllTables(sourceSchema)
 		if err != nil {
-			errMsg := fmt.Sprintf("Failed to get tables for database %s: %v", sourceSchema, err)
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
+			return fmt.Errorf("Failed to get tables for database %s: %v", sourceSchema, err)
 		}
 		for _, t := range allTables {
 			tables = append(tables, t.TableName)
@@ -102,25 +98,19 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		targetTableName := s.resolveTableTargetName(task, sourceSchema, tableName, i)
 		identity, err := runtime.analyzer.AnalyzeTable(sourceSchema, tableName)
 		if err != nil {
-			errMsg := fmt.Sprintf("Failed to analyze table %s: %v", tableName, err)
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
+			return fmt.Errorf("Failed to analyze table %s: %v", tableName, err)
 		}
 
 		effectiveDropBeforeDDL := task.Config.EnableDropTableBeforeDDL && !dbLevelRebuilt
 		savedIndexes, err := s.ensureTargetTable(ctx, runtime, sourceSchema, targetSchema, tableName, targetTableName, task.Config.OptimizeIndex, effectiveDropBeforeDDL, identity, task.Config.Mode)
 		if err != nil {
-			errMsg := fmt.Sprintf("Failed to ensure target table %s.%s -> %s.%s: %v", sourceSchema, tableName, targetSchema, targetTableName, err)
-			s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-			return fmt.Errorf("%s", errMsg)
+			return fmt.Errorf("Failed to ensure target table %s.%s -> %s.%s: %v", sourceSchema, tableName, targetSchema, targetTableName, err)
 		}
 		needDefer := (task.Config.OptimizeIndex || task.Config.Mode == taskEntity.SyncModeAll) && len(savedIndexes) == 0
 		if needDefer {
 			indexes, dropErr := s.dropDeferredIndexes(ctx, runtime, targetSchema, targetTableName, identity, task.Config.Mode, task.Config.OptimizeIndex)
 			if dropErr != nil {
-				errMsg := fmt.Sprintf("Failed to drop deferred indexes for %s.%s: %v", targetSchema, targetTableName, dropErr)
-				s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-				return fmt.Errorf("%s", errMsg)
+				return fmt.Errorf("Failed to drop deferred indexes for %s.%s: %v", targetSchema, targetTableName, dropErr)
 			}
 			savedIndexes = indexes
 		}
@@ -170,9 +160,7 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		EnableStaging:                task.Config.FullLoadEnableStaging,
 	})
 	if err := opt.Validate(); err != nil {
-		errMsg := fmt.Sprintf("invalid full-load options: %v", err)
-		s.failTaskUnlessCancelled(ctx, taskID, errMsg)
-		return fmt.Errorf("%s", errMsg)
+		return fmt.Errorf("invalid full-load options: %v", err)
 	}
 
 	stats := &fullload.Stats{}
@@ -191,6 +179,7 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		TaskID:      taskID,
 		SchemaLocks: schemaLocks,
 		IsStopped:   func() bool { return s.isTaskStopped(taskID) },
+		StopCause:   func() error { return s.fullLoadStopCause(taskID) },
 		OnCommit: func(schema, table string, rows, bytes int64) {
 			mark := schema + "." + table
 			taskTotalRows := s.incrementTaskProgress(taskID, rows, mark)
@@ -215,7 +204,6 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		return err
 	}
 	if runErr != nil {
-		s.failTaskUnlessCancelled(ctx, taskID, runErr.Error())
 		return runErr
 	}
 
