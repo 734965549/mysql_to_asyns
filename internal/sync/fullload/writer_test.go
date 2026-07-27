@@ -41,6 +41,38 @@ func TestIsRetryableTxConflict(t *testing.T) {
 	}
 }
 
+// TestWriterReconnectBackoffGrowsAndCaps 验证换连接退避随尝试次数指数增长且封顶，
+// 累计等待时间足以覆盖目标库短暂重启/网络抖动（此前固定 25~150ms 极短退避，
+// 遇到 "connection refused" 几乎在 1 秒内耗尽 5 次重试即失败，参见线上工单）。
+func TestWriterReconnectBackoffGrowsAndCaps(t *testing.T) {
+	var total time.Duration
+	var prev time.Duration
+	for attempt := 1; attempt <= writeConnMaxRetries; attempt++ {
+		got := writerReconnectBackoff(attempt)
+		if got <= 0 {
+			t.Fatalf("attempt %d: backoff must be positive, got %v", attempt, got)
+		}
+		if got > writerReconnectBackoffCap {
+			t.Fatalf("attempt %d: backoff %v exceeds cap %v", attempt, got, writerReconnectBackoffCap)
+		}
+		if attempt > 1 && got < prev {
+			t.Fatalf("attempt %d: backoff %v should not shrink from previous %v", attempt, got, prev)
+		}
+		prev = got
+		total += got
+	}
+	if total < 20*time.Second {
+		t.Fatalf("total backoff across %d attempts too short to tolerate a brief target outage: %v", writeConnMaxRetries, total)
+	}
+	// 越界 attempt 也应被封顶保护，不能无限增长或返回非正值。
+	if got := writerReconnectBackoff(0); got != writerReconnectBackoffBase {
+		t.Fatalf("attempt 0 should clamp to base, got %v", got)
+	}
+	if got := writerReconnectBackoff(100); got != writerReconnectBackoffCap {
+		t.Fatalf("large attempt should clamp to cap, got %v", got)
+	}
+}
+
 func TestIsConnRetryable(t *testing.T) {
 	cases := map[string]bool{
 		"invalid connection":             true,

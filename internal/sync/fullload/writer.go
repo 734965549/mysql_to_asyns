@@ -20,6 +20,34 @@ const writeConnMaxRetries = 5
 
 const writerConnCloseTimeout = 3 * time.Second
 
+// writerReconnectBackoffBase/Cap 换连接重试的指数退避参数。
+// 目标库短暂重启或网络抖动通常需要数秒到数十秒才能恢复监听，
+// 早期版本仅用 25~150ms 的固定极短退避，遇到 "connection refused"
+// 这类整个 TCP 连接都建立不了的故障时，5 次重试几乎在 1 秒内就耗尽，
+// 导致全量任务被误判为不可恢复而直接失败。这里改为指数退避（含封顶），
+// 5 次重试总计可容忍约 27s 的目标库不可达时间。
+const writerReconnectBackoffBase = 300 * time.Millisecond
+const writerReconnectBackoffCap = 15 * time.Second
+
+// writerReconnectBackoff 计算第 attempt 次换连接重试前的等待时间（attempt 从 1 开始）。
+func writerReconnectBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	wait := writerReconnectBackoffBase
+	for i := 1; i < attempt; i++ {
+		wait *= 3
+		if wait >= writerReconnectBackoffCap {
+			wait = writerReconnectBackoffCap
+			break
+		}
+	}
+	if wait > writerReconnectBackoffCap {
+		wait = writerReconnectBackoffCap
+	}
+	return wait
+}
+
 const maxPreparedStatementsPerWriter = 128
 
 // forceCloseWriterConn 关闭 writer 持有的连接；若 Close 因残留事务等阻塞，超时后放弃等待，避免拖死整个写入循环。
@@ -123,19 +151,24 @@ func writerLoop(ctx context.Context, taskID string, id int, targetDB *sql.DB, q 
 
 		var lastErr error
 		for attempt := 1; attempt <= writeConnMaxRetries; attempt++ {
+			backoff := writerReconnectBackoff(attempt)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(25+attempt*25) * time.Millisecond):
+			case <-time.After(backoff):
 			}
 			c, cErr := targetDB.Conn(ctx)
 			if cErr != nil {
 				lastErr = cErr
+				logger.Warn("[Task %s] FullLoadV2 writer %d reconnect attempt %d/%d failed (retried in %s): %v",
+					taskID, id, attempt, writeConnMaxRetries, backoff, cErr)
 				continue
 			}
 			if sErr := setupWriteSession(ctx, c, opt.SkipBinlog); sErr != nil {
 				forceCloseWriterConn(c)
 				lastErr = sErr
+				logger.Warn("[Task %s] FullLoadV2 writer %d reconnect attempt %d/%d setup session failed (retried in %s): %v",
+					taskID, id, attempt, writeConnMaxRetries, backoff, sErr)
 				continue
 			}
 			conn = c
