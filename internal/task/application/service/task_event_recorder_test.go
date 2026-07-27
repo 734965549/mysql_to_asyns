@@ -82,7 +82,22 @@ func TestTaskEventRecorder_WarnEventsAggregate(t *testing.T) {
 	defer rec.Close()
 	rec.SetExecutionID("t1", "exec-1")
 
-	for i := 0; i < 3; i++ {
+	rec.Emit(taskEntity.TaskEvent{
+		TaskID:     "t1",
+		Severity:   taskEntity.EventSeverityWarn,
+		Visibility: taskEntity.EventVisibilityKey,
+		Category:   taskEntity.EventCategoryRetry,
+		Code:       taskEntity.EventCodeWriteLockRetry,
+		Message:    "write lock retry",
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	firstBatch, err := rec.ListEvents(port.TaskEventListFilter{TaskID: "t1", Limit: 50})
+	require.NoError(t, err)
+	require.NotEmpty(t, firstBatch, "first WARN should persist immediately")
+	assert.Equal(t, taskEntity.EventCodeWriteLockRetry, firstBatch[0].Code)
+
+	for i := 0; i < 2; i++ {
 		rec.Emit(taskEntity.TaskEvent{
 			TaskID:     "t1",
 			Severity:   taskEntity.EventSeverityWarn,
@@ -102,7 +117,7 @@ func TestTaskEventRecorder_WarnEventsAggregate(t *testing.T) {
 	for _, ev := range events {
 		if ev.Code == taskEntity.EventCodeWriteLockRetry+"_REPEATED" {
 			repeated = true
-			assert.GreaterOrEqual(t, ev.RepeatCount, 3)
+			assert.Equal(t, 2, ev.RepeatCount, "summary should count repeats after the first persisted WARN")
 		}
 	}
 	assert.True(t, repeated, "WARN events should aggregate into *_REPEATED")
@@ -150,7 +165,7 @@ func TestTaskEventRecorder_DeleteByTaskIgnoresQueuedEvents(t *testing.T) {
 		Category:    taskEntity.EventCategoryLifecycle,
 		Code:        taskEntity.EventCodeTaskStarted,
 		Message:     "queued after delete",
-	}}
+	}, gen: 0}
 	require.NoError(t, rec.DeleteByTask("t-del"))
 	rec.Close()
 

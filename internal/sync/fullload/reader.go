@@ -953,7 +953,6 @@ func readTablePlain(ctx context.Context, db *sql.DB, job *tableReadJob, q *batch
 	if attemptCancel == nil {
 		attemptCancel = taskCancel
 	}
-	_ = attemptCancel
 	if db == nil {
 		return fmt.Errorf("full read failed: table=%s.%s stage=connect cause=nil source db", job.spec.SourceSchema, job.spec.SourceTable)
 	}
@@ -971,10 +970,10 @@ func readTablePlain(ctx context.Context, db *sql.DB, job *tableReadJob, q *batch
 	if err := coord.acquirePlanBudget(ctx, schema, table, readers); err != nil {
 		return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=plan readers=%d cause=%w", schema, table, strategy, readers, err)
 	}
-	defer coord.releasePlanBudget(schema, table)
 
 	planConn, err := db.Conn(ctx)
 	if err != nil {
+		coord.releasePlanBudget(schema, table)
 		return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=connect readers=%d cause=%w", schema, table, strategy, readers, err)
 	}
 	planner := NewPlannerWithSink(planConn, nil)
@@ -985,6 +984,7 @@ func readTablePlain(ctx context.Context, db *sql.DB, job *tableReadJob, q *batch
 	}
 	chunks, planErr := planner.planTable(ctx, job.spec, targetChunks)
 	_ = planConn.Close()
+	coord.releasePlanBudget(schema, table)
 	if planErr != nil {
 		return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=plan readers=%d cause=%w", schema, table, strategy, readers, planErr)
 	}
@@ -1035,7 +1035,7 @@ func readTablePlain(ctx context.Context, db *sql.DB, job *tableReadJob, q *batch
 	if coord == nil {
 		return fmt.Errorf("full read failed: table=%s.%s internal=nil read coordinator", schema, table)
 	}
-	return coord.submitTable(ctx, schema, table, chunks, job.AttemptID)
+	return coord.submitTable(ctx, schema, table, chunks, job.AttemptID, attemptCancel)
 }
 
 // readChunksParallelPlain 用池连接并行读 chunk，不开一致性快照事务。

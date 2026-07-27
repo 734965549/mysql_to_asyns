@@ -166,7 +166,10 @@ export function useTaskEvents(taskIdRef, activeTabRef, taskStatusRef) {
     if (activeTabRef.value !== "logs") return;
     const status = taskStatusRef.value;
     if (status === "RUNNING") {
-      pollTimer = setInterval(() => fetchEvents(true), 3000);
+      pollTimer = setInterval(async () => {
+        await fetchExecutions();
+        await fetchEvents(true);
+      }, 3000);
     } else if (TERMINAL_STATUSES.has(status)) {
       tailTimer = setTimeout(() => fetchEvents(true), 30000);
     }

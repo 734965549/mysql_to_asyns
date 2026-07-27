@@ -14,7 +14,7 @@ func TestReadCoordinator_PrepareTableRetryClearsTableError(t *testing.T) {
 	stats := &Stats{}
 	coord := newReadCoordinator(ctx, nil, q, opt, stats, nil, nil, nil, nil, nil)
 
-	coord.setTableErr("s", "t", errors.New("boom"))
+	coord.setTableErr("s", "t", 1, errors.New("boom"))
 	coord.scheduler.addTable("s", "t", []*Chunk{{ID: "c1"}})
 	coord.prepareTableRetry("s", "t")
 
@@ -32,9 +32,53 @@ func TestReadCoordinator_TableErrorDoesNotAffectOtherTable(t *testing.T) {
 	opt := Options{GlobalReadBudget: 2, TableParallelReaders: 1}
 	coord := newReadCoordinator(ctx, nil, q, opt, &Stats{}, nil, nil, nil, nil, nil)
 
-	coord.setTableErr("s", "a", errors.New("table a failed"))
+	coord.setTableErr("s", "a", 1, errors.New("table a failed"))
 	if err := coord.tableErr("s", "b"); err != nil {
 		t.Fatalf("table b should not inherit table a error, got %v", err)
+	}
+}
+
+func TestReadCoordinator_StaleAttemptDoesNotCancelCurrentAttempt(t *testing.T) {
+	ctx := context.Background()
+	q := newBatchQueue(defaultBufferBytes, &Stats{})
+	opt := Options{GlobalReadBudget: 2, TableParallelReaders: 1}
+	coord := newReadCoordinator(ctx, nil, q, opt, &Stats{}, nil, nil, nil, nil, nil)
+
+	tableKey := tableKey("s", "t")
+	attemptCtx, attemptCancel := context.WithCancel(ctx)
+	coord.mu.Lock()
+	coord.attemptIDs[tableKey] = 2
+	coord.attemptCtxs[tableKey] = attemptCtx
+	coord.attemptCancels[tableKey] = attemptCancel
+	coord.mu.Unlock()
+
+	coord.scheduler.addTable("s", "t", []*Chunk{{ID: "c1"}, {ID: "c2"}})
+
+	accepted := coord.setTableErr("s", "t", 1, errors.New("stale"))
+	if accepted {
+		t.Fatal("expected stale attempt error to be rejected")
+	}
+	coord.cancelTableAttempt("s", "t", 1)
+	coord.markTableFailed("s", "t", 1)
+
+	if err := attemptCtx.Err(); err != nil {
+		t.Fatalf("current attempt context should remain active, got %v", err)
+	}
+	if pending := coord.scheduler.tablePending(tableKey); pending != 2 {
+		t.Fatalf("expected pending chunks untouched, got %d", pending)
+	}
+
+	if !coord.setTableErr("s", "t", 2, errors.New("current")) {
+		t.Fatal("expected current attempt error to be accepted")
+	}
+	coord.cancelTableAttempt("s", "t", 2)
+	coord.markTableFailed("s", "t", 2)
+
+	if err := attemptCtx.Err(); err == nil {
+		t.Fatal("expected current attempt to be cancelled after accepted failure")
+	}
+	if pending := coord.scheduler.tablePending(tableKey); pending != 0 {
+		t.Fatalf("expected failed attempt queue drained, got %d pending", pending)
 	}
 }
 

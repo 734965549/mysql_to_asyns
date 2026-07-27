@@ -29,10 +29,12 @@ type readCoordinator struct {
 	wg           sync.WaitGroup
 	workerCount  int
 
-	mu          sync.Mutex
-	firstErr    error
-	tableErrors map[string]error
-	attemptIDs  map[string]int
+	mu             sync.Mutex
+	firstErr       error
+	tableErrors    map[string]error
+	attemptIDs     map[string]int
+	attemptCtxs    map[string]context.Context
+	attemptCancels map[string]context.CancelFunc
 }
 
 func newReadCoordinator(
@@ -63,8 +65,10 @@ func newReadCoordinator(
 		parentCtx:    ctx,
 		workerCtx:    wctx,
 		workerCancel: wc,
-		attemptIDs:   make(map[string]int),
-		tableErrors:  make(map[string]error),
+		attemptIDs:     make(map[string]int),
+		attemptCtxs:    make(map[string]context.Context),
+		attemptCancels: make(map[string]context.CancelFunc),
+		tableErrors:    make(map[string]error),
 	}
 }
 
@@ -104,15 +108,19 @@ func (c *readCoordinator) workerLoop() {
 
 		c.mu.Lock()
 		attemptID := c.attemptIDs[tableKey]
+		chunkCtx := c.attemptCtxs[tableKey]
 		c.mu.Unlock()
+		if chunkCtx == nil {
+			chunkCtx = c.workerCtx
+		}
 
-		if err := c.budget.Acquire(c.workerCtx, tableKey, perTable); err != nil {
+		if err := c.budget.Acquire(chunkCtx, tableKey, perTable); err != nil {
 			return
 		}
 		if c.stats != nil {
 			c.stats.setReadBudgetInUse(int64(c.budget.InUse()))
 		}
-		err := readChunk(c.workerCtx, c.db, chunk, c.q, c.opt, c.stats, c.tracker, c.stateTracker, c.isStopped, c.taskCancel, attemptID, c.sink)
+		err := readChunk(chunkCtx, c.db, chunk, c.q, c.opt, c.stats, c.tracker, c.stateTracker, c.isStopped, c.taskCancel, attemptID, c.sink)
 		c.budget.Release(tableKey)
 		if c.stats != nil {
 			c.stats.setReadBudgetInUse(int64(c.budget.InUse()))
@@ -120,22 +128,70 @@ func (c *readCoordinator) workerLoop() {
 		c.scheduler.markDone(schema, table)
 
 		if err != nil {
-			c.setTableErr(schema, table, err)
-			c.scheduler.markTableFailed(schema, table)
+			if c.setTableErr(schema, table, attemptID, err) {
+				c.cancelTableAttempt(schema, table, attemptID)
+				c.markTableFailed(schema, table, attemptID)
+			}
 			continue
 		}
 	}
 }
 
-func (c *readCoordinator) setTableErr(schema, table string, err error) {
+func (c *readCoordinator) setTableErr(schema, table string, attemptID int, err error) bool {
 	if err == nil {
+		return false
+	}
+	key := tableKey(schema, table)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if current, ok := c.attemptIDs[key]; ok && current != attemptID {
+		return false
+	}
+	c.tableErrors[key] = preferReaderError(c.tableErrors[key], err)
+	c.firstErr = preferReaderError(c.firstErr, err)
+	return true
+}
+
+func (c *readCoordinator) cancelTableAttempt(schema, table string, attemptID int) {
+	if c == nil {
 		return
 	}
 	key := tableKey(schema, table)
 	c.mu.Lock()
-	c.tableErrors[key] = preferReaderError(c.tableErrors[key], err)
-	c.firstErr = preferReaderError(c.firstErr, err)
+	current, ok := c.attemptIDs[key]
+	cancel := c.attemptCancels[key]
 	c.mu.Unlock()
+	if !ok || current != attemptID || cancel == nil {
+		return
+	}
+	cancel()
+}
+
+func (c *readCoordinator) cancelCurrentTableAttempt(schema, table string) {
+	if c == nil {
+		return
+	}
+	key := tableKey(schema, table)
+	c.mu.Lock()
+	cancel := c.attemptCancels[key]
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (c *readCoordinator) markTableFailed(schema, table string, attemptID int) {
+	if c == nil || c.scheduler == nil {
+		return
+	}
+	key := tableKey(schema, table)
+	c.mu.Lock()
+	current := c.attemptIDs[key]
+	c.mu.Unlock()
+	if current != attemptID {
+		return
+	}
+	c.scheduler.markTableFailed(schema, table)
 }
 
 func (c *readCoordinator) tableErr(schema, table string) error {
@@ -152,7 +208,10 @@ func (c *readCoordinator) prepareTableRetry(schema, table string) {
 	}
 	c.scheduler.removeTable(schema, table)
 	tableKey := tableKey(schema, table)
+	c.cancelCurrentTableAttempt(schema, table)
 	c.mu.Lock()
+	delete(c.attemptCtxs, tableKey)
+	delete(c.attemptCancels, tableKey)
 	delete(c.tableErrors, tableKey)
 	c.firstErr = nil
 	for k := range c.tableErrors {
@@ -198,7 +257,7 @@ func (c *readCoordinator) releasePlanBudget(schema, table string) {
 }
 
 // submitTable 将表 chunk 注册到公平调度器并等待全部完成。
-func (c *readCoordinator) submitTable(ctx context.Context, schema, table string, chunks []*Chunk, attemptID int) error {
+func (c *readCoordinator) submitTable(ctx context.Context, schema, table string, chunks []*Chunk, attemptID int, attemptCancel context.CancelFunc) error {
 	if len(chunks) == 0 {
 		if c.tracker != nil {
 			return c.tracker.markReadDone(schema, table)
@@ -208,7 +267,15 @@ func (c *readCoordinator) submitTable(ctx context.Context, schema, table string,
 	tableKey := tableKey(schema, table)
 	c.mu.Lock()
 	c.attemptIDs[tableKey] = attemptID
+	c.attemptCtxs[tableKey] = ctx
+	c.attemptCancels[tableKey] = attemptCancel
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.attemptCtxs, tableKey)
+		delete(c.attemptCancels, tableKey)
+		c.mu.Unlock()
+	}()
 
 	c.scheduler.addTable(schema, table, chunks)
 

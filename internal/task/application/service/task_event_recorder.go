@@ -28,13 +28,15 @@ var eventAggWindow = eventAggregationWindow
 
 type pendingEmit struct {
 	event *taskEntity.TaskEvent
+	gen   uint64
 }
 
 type aggregateBucket struct {
-	first    *taskEntity.TaskEvent
-	lastAt   time.Time
-	count    int
-	flushAt  time.Time
+	first          *taskEntity.TaskEvent
+	lastAt         time.Time
+	count          int
+	flushAt        time.Time
+	firstPersisted bool
 }
 
 // TaskEventRecorder 统一事件 Emit 入口：持久化 + 日志镜像 + 指纹聚合。
@@ -47,6 +49,10 @@ type TaskEventRecorder struct {
 	executions   map[string]string
 	aggregating  map[string]*aggregateBucket
 	deletedTasks map[string]struct{}
+	taskGen      map[string]uint64
+
+	taskLocks   map[string]*sync.Mutex
+	taskLocksMu sync.Mutex
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -64,6 +70,8 @@ func NewTaskEventRecorder(store port.TaskEventStore) *TaskEventRecorder {
 		executions:   make(map[string]string),
 		aggregating:  make(map[string]*aggregateBucket),
 		deletedTasks: make(map[string]struct{}),
+		taskGen:      make(map[string]uint64),
+		taskLocks:    make(map[string]*sync.Mutex),
 		stopCh:       make(chan struct{}),
 	}
 	r.wg.Add(1)
@@ -153,6 +161,8 @@ func (r *TaskEventRecorder) fingerprint(ev taskEntity.TaskEvent) string {
 }
 
 func (r *TaskEventRecorder) tryAggregate(ev taskEntity.TaskEvent) bool {
+	persistFirst := ev.Severity == taskEntity.EventSeverityWarn || ev.Severity == taskEntity.EventSeverityError
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	fp := r.fingerprint(ev)
@@ -161,12 +171,13 @@ func (r *TaskEventRecorder) tryAggregate(ev taskEntity.TaskEvent) bool {
 	if !ok {
 		copyEv := ev
 		r.aggregating[fp] = &aggregateBucket{
-			first:   &copyEv,
-			lastAt:  now,
-			count:   1,
-			flushAt: now.Add(eventAggWindow),
+			first:          &copyEv,
+			lastAt:         now,
+			count:          1,
+			flushAt:        now.Add(eventAggWindow),
+			firstPersisted: persistFirst,
 		}
-		return true
+		return !persistFirst
 	}
 	b.count++
 	b.lastAt = now
@@ -190,69 +201,142 @@ func (r *TaskEventRecorder) flushAggregates(forceAll bool) {
 			continue
 		}
 		if b.count <= 1 {
-			flush = append(flush, b.first)
+			if !b.firstPersisted {
+				flush = append(flush, b.first)
+			}
 		} else {
+			repeatCount := b.count
+			if b.firstPersisted {
+				repeatCount = b.count - 1
+			}
+			if repeatCount <= 0 {
+				delete(r.aggregating, fp)
+				continue
+			}
 			summary := *b.first
 			summary.Code = b.first.Code + "_REPEATED"
-			summary.RepeatCount = b.count
+			summary.RepeatCount = repeatCount
 			firstAt := b.first.Timestamp
 			summary.FirstAt = &firstAt
 			lastAt := b.lastAt
 			summary.LastAt = &lastAt
-			summary.Message = fmt.Sprintf("%s (repeated %d times in %s)", b.first.Message, b.count, eventAggWindow)
+			if repeatCount == 1 {
+				summary.Message = fmt.Sprintf("%s (repeated once in %s)", b.first.Message, eventAggWindow)
+			} else {
+				summary.Message = fmt.Sprintf("%s (repeated %d times in %s)", b.first.Message, repeatCount, eventAggWindow)
+			}
 			flush = append(flush, &summary)
 		}
 		delete(r.aggregating, fp)
 	}
 	r.mu.Unlock()
 	for _, ev := range flush {
+		if forceAll {
+			if err := r.appendWithGuard(ev, 0); err != nil {
+				logger.Warn("[Task %s] flush task event append failed code=%s: %v", ev.TaskID, ev.Code, err)
+			}
+			continue
+		}
 		r.enqueue(*ev, ev.Severity == taskEntity.EventSeverityWarn || ev.Severity == taskEntity.EventSeverityError)
 	}
 }
 
-func (r *TaskEventRecorder) isTaskDeleted(taskID string) bool {
-	if r == nil || taskID == "" {
+func (r *TaskEventRecorder) captureTaskGen(taskID string) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, deleted := r.deletedTasks[taskID]; deleted {
+		return 0, false
+	}
+	return r.taskGen[taskID], true
+}
+
+func (r *TaskEventRecorder) shouldDropEmitLocked(taskID string, gen uint64) bool {
+	if _, deleted := r.deletedTasks[taskID]; !deleted {
 		return false
 	}
+	return gen <= r.taskGen[taskID]
+}
+
+func (r *TaskEventRecorder) shouldDropEmit(taskID string, gen uint64) bool {
 	r.mu.Lock()
-	_, deleted := r.deletedTasks[taskID]
+	defer r.mu.Unlock()
+	return r.shouldDropEmitLocked(taskID, gen)
+}
+
+func (r *TaskEventRecorder) taskLock(taskID string) *sync.Mutex {
+	r.taskLocksMu.Lock()
+	defer r.taskLocksMu.Unlock()
+	if lock, ok := r.taskLocks[taskID]; ok {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	r.taskLocks[taskID] = lock
+	return lock
+}
+
+func (r *TaskEventRecorder) appendWithGuard(ev *taskEntity.TaskEvent, gen uint64) error {
+	r.mu.Lock()
+	drop := r.shouldDropEmitLocked(ev.TaskID, gen)
 	r.mu.Unlock()
-	return deleted
+	if drop {
+		return nil
+	}
+
+	lock := r.taskLock(ev.TaskID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	r.mu.Lock()
+	drop = r.shouldDropEmitLocked(ev.TaskID, gen)
+	r.mu.Unlock()
+	if drop {
+		return nil
+	}
+	return r.store.Append(ev)
 }
 
 func (r *TaskEventRecorder) enqueue(ev taskEntity.TaskEvent, critical bool) {
-	if r.isTaskDeleted(ev.TaskID) {
+	gen, ok := r.captureTaskGen(ev.TaskID)
+	if !ok {
 		return
 	}
 	evCopy := ev
 	select {
-	case r.queue <- pendingEmit{event: &evCopy}:
+	case r.queue <- pendingEmit{event: &evCopy, gen: gen}:
 		return
 	default:
 		if critical {
 			select {
-			case r.queue <- pendingEmit{event: &evCopy}:
+			case r.queue <- pendingEmit{event: &evCopy, gen: gen}:
 				return
 			default:
 			}
-			if err := r.store.Append(&evCopy); err != nil {
-				logger.Warn("[Task %s] sync task event append failed code=%s: %v", ev.TaskID, ev.Code, err)
-			}
+			r.persistDirect(evCopy, gen)
 			return
 		}
 		metrics.GetMetrics().IncrementTaskEventDropped()
 	}
 }
 
-func (r *TaskEventRecorder) syncAppendWithRetry(ev taskEntity.TaskEvent) {
-	if r.isTaskDeleted(ev.TaskID) {
+func (r *TaskEventRecorder) persistDirect(ev taskEntity.TaskEvent, gen uint64) {
+	if err := r.appendWithGuard(&ev, gen); err != nil {
+		logger.Warn("[Task %s] sync task event append failed code=%s: %v", ev.TaskID, ev.Code, err)
+	}
+}
+
+func (r *TaskEventRecorder) appendQueued(job pendingEmit) {
+	if job.event == nil {
 		return
 	}
+	if err := r.appendWithGuard(job.event, job.gen); err != nil {
+		logger.Warn("[Task %s] async task event append failed code=%s: %v", job.event.TaskID, job.event.Code, err)
+		go r.syncAppendWithRetry(*job.event, job.gen)
+	}
+}
+
+func (r *TaskEventRecorder) syncAppendWithRetry(ev taskEntity.TaskEvent, gen uint64) {
 	time.Sleep(eventSyncFallbackDelay)
-	if r.isTaskDeleted(ev.TaskID) {
-		return
-	}
-	if err := r.store.Append(&ev); err != nil {
+	if err := r.appendWithGuard(&ev, gen); err != nil {
 		logger.Warn("[Task %s] sync task event append failed code=%s: %v", ev.TaskID, ev.Code, err)
 	}
 }
@@ -268,23 +352,13 @@ func (r *TaskEventRecorder) worker() {
 			for {
 				select {
 				case job := <-r.queue:
-					if job.event != nil && !r.isTaskDeleted(job.event.TaskID) {
-						_ = r.store.Append(job.event)
-					}
+					r.appendQueued(job)
 				default:
 					return
 				}
 			}
 		case job := <-r.queue:
-			if job.event != nil {
-				if r.isTaskDeleted(job.event.TaskID) {
-					continue
-				}
-				if err := r.store.Append(job.event); err != nil {
-					logger.Warn("[Task %s] async task event append failed code=%s: %v", job.event.TaskID, job.event.Code, err)
-					go r.syncAppendWithRetry(*job.event)
-				}
-			}
+			r.appendQueued(job)
 		case <-ticker.C:
 			r.flushExpiredAggregates()
 		}
@@ -357,9 +431,14 @@ func (r *TaskEventRecorder) DeleteByTask(taskID string) error {
 	if r == nil || r.store == nil {
 		return nil
 	}
+	lock := r.taskLock(taskID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	r.mu.Lock()
 	delete(r.executions, taskID)
 	r.deletedTasks[taskID] = struct{}{}
+	r.taskGen[taskID]++
 	for fp, b := range r.aggregating {
 		if b.first != nil && b.first.TaskID == taskID {
 			delete(r.aggregating, fp)
