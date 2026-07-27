@@ -482,7 +482,7 @@ Content-Type: application/json
 
 - **V1 全量（默认 `full_load_engine=v1`）**：全量读取为普通短查询，不长期持有源库 MDL。ALL + 无 PK/UK 表为 best-effort，增量接管阶段存在重复 INSERT 风险，需显式确认 `allow_nopk_all=true`。
 
-- **V2 全量（`full_load_engine=v2`）**：全量读取同样为普通短查询，不持有表级 MDL，不再使用长生命周期 RR 快照事务；历史版本的表级 binlog HWM（`table_binlog_hwms`）已下线，仅保留用于读取旧任务存档，新一轮全量开始时清空。ALL + 无 PK/UK 表同样为 best-effort，依赖 P0..P1 有界追平收敛，不保证严格去重，需 `allow_nopk_all=true`。写入侧在每个目标 schema 自动创建 `__mts_fl_tx` 事务标记表（与业务 INSERT 同事务提交，含 `run_id`），用于 Commit 结果未知时的锁定探测，避免业务行存在性误判；启动前以 `GET_LOCK` 强制同 schema 单任务，并 fail-closed 校验目标业务表 InnoDB、marker 表结构（含完整唯一索引），拒绝业务表占用保留名 `__mts_fl_tx`；数据流水线成功后按 `run_id` 删除本任务 marker 行（不 `DROP` 共享表）；目标账号需对 marker 表具备 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DELETE`，以及 `GET_LOCK`/`RELEASE_LOCK`。
+- **V2 全量（`full_load_engine=v2`）**：全量读取同样为普通短查询，不持有表级 MDL，不再使用长生命周期 RR 快照事务；历史版本的表级 binlog HWM（`table_binlog_hwms`）已下线，仅保留用于读取旧任务存档，新一轮全量开始时清空。ALL + 无 PK/UK 表同样为 best-effort，依赖 P0..P1 有界追平收敛，不保证严格去重，需 `allow_nopk_all=true`。写入侧在每个目标 schema 自动创建 `__mts_fl_tx` 事务标记表（与业务 INSERT 同事务提交，含 `run_id`），用于 Commit 结果未知时的锁定探测，避免业务行存在性误判；启动前以 `GET_LOCK` 强制同 schema 单任务，并 fail-closed 校验目标业务表 InnoDB、marker 表结构（含完整唯一索引），拒绝业务表占用保留名 `__mts_fl_tx`；数据流水线成功后在仍持有 schema 互斥锁时执行 `DROP TABLE IF EXISTS __mts_fl_tx`；清理失败会让任务明确失败，失败/暂停路径保留 marker。目标账号需对 marker 表具备 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DROP`，以及 `GET_LOCK`/`RELEASE_LOCK`。
 
 - 历史版本曾提供 `enable_consistent_snapshot` 任务级字段，现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
 

@@ -225,28 +225,45 @@ func TestEnsureTxMarkerTablesOK(t *testing.T) {
 	}
 }
 
-func TestCleanupTxMarkerRowsDedupesSchemas(t *testing.T) {
+func TestDropTxMarkerTablesDedupesSchemas(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM `db`.`__mts_fl_tx` WHERE `run_id` = ?")).
-		WithArgs("run-abc").
-		WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM `other`.`__mts_fl_tx` WHERE `run_id` = ?")).
-		WithArgs("run-abc").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS `db`.`__mts_fl_tx`")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS `other`.`__mts_fl_tx`")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	err = cleanupTxMarkerRows(context.Background(), db, []*TableSpec{
+	err = dropTxMarkerTables(context.Background(), db, []*TableSpec{
 		{TargetSchema: "db", TargetTable: "t1"},
 		{TargetSchema: "db", TargetTable: "t2"},
 		{TargetSchema: "other", TargetTable: "t3"},
 		nil,
-	}, "run-abc")
+	})
 	if err != nil {
-		t.Fatalf("cleanup: %v", err)
+		t.Fatalf("drop marker tables: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDropTxMarkerTablesReturnsError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS `db`.`__mts_fl_tx`")).
+		WillReturnError(errors.New("drop denied"))
+
+	err = dropTxMarkerTables(context.Background(), db, []*TableSpec{{TargetSchema: "db"}})
+	if err == nil || !strings.Contains(err.Error(), "drop denied") {
+		t.Fatalf("expected cleanup failure, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

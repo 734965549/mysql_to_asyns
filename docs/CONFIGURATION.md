@@ -425,9 +425,9 @@ Commit 错误、服务端结果未知时，writer 换连后对该 UUID 做 `SELE
 |---|---|
 | 表注释 | `mysql-to-sync 全量V2写事务提交标记表；与业务INSERT同事务提交，用于Commit结果未知时的锁定探测，请勿手工删除或改名` |
 | `id` | 写事务唯一标记 UUID（`PRIMARY KEY`） |
-| `run_id` | 本趟全量数据流水线运行 ID；成功收尾时按此删除本任务行 |
+| `run_id` | 本趟全量数据流水线运行 ID；失败路径保留 marker 表时用于定位所属运行 |
 | `created_at` | 标记行写入时间（服务端时钟） |
-| `idx_run_id` | 非唯一索引，加速按 `run_id` 清理 |
+| `idx_run_id` | 非唯一索引，便于失败残留场景按 `run_id` 定位 marker |
 
 建表后会 **fail-closed** 校验已有 marker 表：必须是 `BASE TABLE`、`ENGINE=InnoDB`；`id` 为可保存 UUID 的 `NOT NULL` 列，并具备 `PRIMARY KEY(id)` 或等价单列唯一索引，且索引须覆盖完整列（`STATISTICS.SUB_PART` 为 `NULL`）或前缀长度 ≥ 36（拒绝 `UNIQUE(id(1))` 等短前缀）；`run_id` 为可保存至少 64 字符的 `NOT NULL` 列。若同名表是 MyISAM 等非事务引擎，marker 会在业务事务 `Commit` 前永久落库，回滚后探测仍会误判已提交并造成静默少数据。早期版本若缺少 `run_id` 列，需手工 `ALTER` 补齐或删表后由下次 V2 重建。
 
@@ -435,12 +435,12 @@ Commit 错误、服务端结果未知时，writer 换连后对该 UUID 做 `SELE
 
 - 目标账号对每个目标 schema 具备 `CREATE TABLE`（首次自动建 `__mts_fl_tx`）。
 - 目标账号对 `__mts_fl_tx` 具备 `INSERT`（写事务提交前插入 marker）与 `SELECT`（含 `SELECT ... FOR UPDATE` 锁定探测）。
-- 目标账号对 `__mts_fl_tx` 具备 `DELETE`：数据流水线成功后会按本趟 `run_id` 删除本任务 marker 行（**不** `DROP` 共享表）；清理使用独立短超时，失败只打告警，不回滚已成功的同步结果。失败/暂停/取消**不**清理本趟行，便于排查。
+- 目标账号对 `__mts_fl_tx` 具备 `DROP`：数据流水线确认成功后，在 writer 全部退出且仍持有目标 schema 互斥锁时执行 `DROP TABLE IF EXISTS`。清理使用独立短超时；DROP 失败会返回“数据已提交但 marker 清理失败”，任务不会被标记为正常成功。失败/暂停/取消路径不删除 marker 表，保留 Commit 未知时的恢复证据。
 - 目标账号需能执行 `GET_LOCK`/`RELEASE_LOCK`：任务进入全量 V2 后、**首次目标端 DDL 之前**即对每个目标 schema 获取名为 `mts_fl_v2:{schema}` 的顾问锁，并持有至索引恢复与任务级收尾完成；同一 schema 上并发 V2 会 **fail-closed**。
 - 锁连接会占用目标连接池 1 个槽位，因此 **`target_max_open_conns` 必须 ≥ 2**（在 `AcquireSchemaLocks` 前 fail-fast）；写路径与 DDL 另需可用连接。
 - 锁会话会读取并必要时抬高 `@@SESSION.wait_timeout`（至少 60s），心跳间隔严格小于该值（默认 15s，取 `wait_timeout/3` 的较小者），避免 MySQL 先关闭空闲会话并隐式释放 `GET_LOCK`。心跳失败以 `ErrSchemaLockLost` 取消派生 context，库重建/建表/删索引等破坏性 DDL 与 `MarkFullSyncCompleted` 前都会检查该 cause。
 - 多 schema 任务在同一锁连接上连续 `GET_LOCK`，要求 **MySQL ≥ 5.7.5**（更早版本第二次 `GET_LOCK` 会释放旧锁）。
-- 业务 `TargetTable` **不得**占用保留名 `__mts_fl_tx`（大小写不敏感比较，兼容 `lower_case_table_names`）；否则启动 fail-closed。
+- 业务 `TargetTable` **不得**占用保留名 `__mts_fl_tx`（大小写不敏感比较，兼容 `lower_case_table_names`）；否则启动 fail-closed。源端出现 `__mts_fl_tx` 时仍按保留名冲突 fail-closed 报错，禁止静默跳过，以便显式发现和处理旧版本残留。
 - 启动 writers 前会 **fail-closed** 校验所有目标业务表为 InnoDB（复用既有表且为 MyISAM 等非事务引擎时直接失败）。
 - 请勿手工删除、改名或清空**正在运行**任务使用的 `__mts_fl_tx`。同一目标 schema 上不得并发跑多个 V2 全量（代码以 `GET_LOCK` 强制互斥）。
 - 若早期版本已创建无注释或不兼容结构的同名表，应手工修正（`ALTER`/`ENGINE=InnoDB`/`PRIMARY KEY`/补 `run_id`）或删表后由下次 V2 全量重建；不符合结构时任务会直接失败。

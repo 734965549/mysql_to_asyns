@@ -57,9 +57,8 @@ func TestEngine_NoPKEndToEnd(t *testing.T) {
 	dstMock.ExpectExec("SET @@SESSION.FOREIGN_KEY_CHECKS=1").WillReturnResult(sqlmock.NewResult(0, 0))
 	dstMock.ExpectExec("SET @@SESSION.UNIQUE_CHECKS=1").WillReturnResult(sqlmock.NewResult(0, 0))
 	dstMock.ExpectExec("SET SESSION innodb_lock_wait_timeout=50").WillReturnResult(sqlmock.NewResult(0, 0))
-	dstMock.ExpectExec(regexp.QuoteMeta("DELETE FROM `s`.`__mts_fl_tx` WHERE `run_id` = ?")).
-		WithArgs(sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	dstMock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS `s`.`__mts_fl_tx`")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectTxMarkerSchemaUnlock(dstMock, "s")
 
 	spec := &TableSpec{

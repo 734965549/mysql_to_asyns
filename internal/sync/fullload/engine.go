@@ -210,10 +210,11 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	if pipelineErr != nil {
 		return pipelineErr
 	}
-	// 数据流水线成功后按 run_id 删除本任务 marker 行（不 DROP 共享表）。
-	// 注意：此处早于可能存在的索引恢复等任务级收尾；清理失败只告警。
-	if err := cleanupTxMarkerRows(ctx, e.TargetDB, specs, runID); err != nil {
-		logger.Warn("[Task %s] FullLoadV2: cleanup tx marker rows after pipeline success failed (sync already committed): %v", e.TaskID, err)
+	// 数据流水线确认成功后删除内部 marker 表。此时 writer 已全部退出，且目标 schema
+	// 互斥锁仍由 Engine/调用层持有，不会与同 schema 的另一趟 V2 共用该表。
+	// 失败或 Commit 状态未知的路径不会执行到这里，保留 marker 作为恢复证据。
+	if err := dropTxMarkerTables(ctx, e.TargetDB, specs); err != nil {
+		return fmt.Errorf("full-load data committed but tx marker cleanup failed: %w", err)
 	}
 	return nil
 }

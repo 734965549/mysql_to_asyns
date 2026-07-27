@@ -59,7 +59,7 @@ func ensureTxMarkerTables(ctx context.Context, db *sql.DB, specs []*TableSpec) e
 		ddl := fmt.Sprintf(
 			"CREATE TABLE IF NOT EXISTS %s.%s ("+
 				"`id` CHAR(36) NOT NULL COMMENT '写事务唯一标记 UUID，与业务数据同事务提交；Commit 结果未知时用锁定当前读探测',"+
-				"`run_id` VARCHAR(%d) NOT NULL COMMENT '本趟全量流水线运行 ID，成功收尾时按此删除本任务行，禁止 DROP 共享表',"+
+				"`run_id` VARCHAR(%d) NOT NULL COMMENT '本趟全量流水线运行 ID；失败路径保留表时用于定位所属运行',"+
 				"`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '标记行写入时间（服务端时钟）',"+
 				"PRIMARY KEY (`id`),"+
 				"KEY `idx_run_id` (`run_id`)"+
@@ -79,33 +79,22 @@ func ensureTxMarkerTables(ctx context.Context, db *sql.DB, specs []*TableSpec) e
 	return nil
 }
 
-// cleanupTxMarkerRows 在数据流水线成功后按 run_id 删除本任务写入的 marker 行。
-// 不 DROP 共享表，避免误删其他任务仍在使用的对象；使用独立短超时。
+// dropTxMarkerTables 仅在数据流水线确认成功后删除内部 marker 表。
+// 调用方必须仍持有目标 schema 互斥锁；使用独立短超时，避免父 context 已取消时遗留空表。
 // 使用 context.WithoutCancel 确保即使父 ctx 已取消也能获得完整的清理窗口。
-func cleanupTxMarkerRows(ctx context.Context, db *sql.DB, specs []*TableSpec, runID string) error {
+func dropTxMarkerTables(ctx context.Context, db *sql.DB, specs []*TableSpec) error {
 	if db == nil {
-		return fmt.Errorf("cleanup tx marker rows: target db is nil")
-	}
-	if runID == "" {
-		return fmt.Errorf("cleanup tx marker rows: run_id is required")
+		return fmt.Errorf("drop tx marker tables: target db is nil")
 	}
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), txMarkerCleanupTimeout)
 	defer cancel()
 
-	seen := make(map[string]struct{}, len(specs))
-	for _, spec := range specs {
-		if spec == nil || spec.TargetSchema == "" {
-			continue
-		}
-		if _, ok := seen[spec.TargetSchema]; ok {
-			continue
-		}
-		seen[spec.TargetSchema] = struct{}{}
-		q := fmt.Sprintf("DELETE FROM %s.%s WHERE `run_id` = ?",
-			quoteIdentifier(spec.TargetSchema), quoteIdentifier(txMarkerTableName))
-		if _, err := db.ExecContext(cctx, q, runID); err != nil {
-			return fmt.Errorf("cleanup tx marker rows %s.%s run_id=%s: %w",
-				spec.TargetSchema, txMarkerTableName, runID, err)
+	for _, schema := range extractTargetSchemas(specs) {
+		q := fmt.Sprintf("DROP TABLE IF EXISTS %s.%s",
+			quoteIdentifier(schema), quoteIdentifier(txMarkerTableName))
+		if _, err := db.ExecContext(cctx, q); err != nil {
+			return fmt.Errorf("drop tx marker table %s.%s after successful full load: %w",
+				schema, txMarkerTableName, err)
 		}
 	}
 	return nil

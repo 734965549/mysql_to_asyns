@@ -158,7 +158,7 @@ StartTask
 
 #### V2 写事务提交与 `__mts_fl_tx`
 
-`full_load_engine=v2` 时，写入侧在每个目标 schema 维护系统表 `__mts_fl_tx`（InnoDB，带表/列注释，含 `run_id`）。每个写事务提交前插入唯一 UUID marker，与业务行同事务提交。客户端遇到连接类 Commit 错误时，**不得**用业务行存在性推断结果（无主键跨事务相同行会误判；非锁定读可能与仍在处理的 COMMIT 竞态），而是对该 marker 做 `SELECT ... FOR UPDATE`：命中则只推进进度，无行则整事务重放；无法判定则 fail-closed。启动前还会：在首次目标端 DDL 前对目标 schema 获取 `GET_LOCK` 强制互斥（禁止同 schema 并发 V2；持有至任务级收尾；要求 MySQL ≥ 5.7.5 以支持同连接多锁；`target_max_open_conns` ≥ 2）；拒绝业务目标表占用保留名 `__mts_fl_tx`（大小写不敏感）；校验所有目标业务表为 InnoDB；并对已存在的 marker 表 fail-closed 校验 `BASE TABLE`/InnoDB/`id` 完整唯一键（`SUB_PART` NULL 或 ≥ 36）与 `run_id` 列。数据流水线成功后按本趟 `run_id` 删除本任务行（**不** `DROP` 共享表；清理独立短超时；失败/暂停保留行）。目标账号除 `CREATE TABLE` 外，还需对 marker 表具备 `INSERT`、`SELECT ... FOR UPDATE`、`DELETE`，以及 `GET_LOCK`/`RELEASE_LOCK`。详见 `docs/CONFIGURATION.md`「写事务提交标记表」。
+`full_load_engine=v2` 时，写入侧在每个目标 schema 维护系统表 `__mts_fl_tx`（InnoDB，带表/列注释，含 `run_id`）。每个写事务提交前插入唯一 UUID marker，与业务行同事务提交。客户端遇到连接类 Commit 错误时，**不得**用业务行存在性推断结果（无主键跨事务相同行会误判；非锁定读可能与仍在处理的 COMMIT 竞态），而是对该 marker 做 `SELECT ... FOR UPDATE`：命中则只推进进度，无行则整事务重放；无法判定则 fail-closed。启动前还会：在首次目标端 DDL 前对目标 schema 获取 `GET_LOCK` 强制互斥（禁止同 schema 并发 V2；持有至任务级收尾；要求 MySQL ≥ 5.7.5 以支持同连接多锁；`target_max_open_conns` ≥ 2）；拒绝业务目标表占用保留名 `__mts_fl_tx`（大小写不敏感）；校验所有目标业务表为 InnoDB；并对已存在的 marker 表 fail-closed 校验 `BASE TABLE`/InnoDB/`id` 完整唯一键（`SUB_PART` NULL 或 ≥ 36）与 `run_id` 列。数据流水线确认成功后，在 writer 全部退出且仍持有目标 schema 互斥锁时 `DROP TABLE IF EXISTS __mts_fl_tx`；清理使用独立短超时，失败会使任务明确失败；失败/暂停路径保留 marker 表。源端出现 `__mts_fl_tx` 时仍 fail-closed 报错，不静默跳过旧残留。目标账号除 `CREATE TABLE` 外，还需对 marker 表具备 `INSERT`、`SELECT ... FOR UPDATE`、`DROP`，以及 `GET_LOCK`/`RELEASE_LOCK`。详见 `docs/CONFIGURATION.md`「写事务提交标记表」。
 
 ## 4. 全量中断处理
 
