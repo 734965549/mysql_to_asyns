@@ -28,6 +28,7 @@ type readCoordinator struct {
 	workerCancel context.CancelFunc
 	wg           sync.WaitGroup
 	workerCount  int
+	activeWorkers atomic.Int32
 
 	mu             sync.Mutex
 	firstErr       error
@@ -81,6 +82,8 @@ func (c *readCoordinator) startWorkers(n int) {
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
+			c.activeWorkers.Add(1)
+			defer c.activeWorkers.Add(-1)
 			atomic.AddInt64(&c.stats.ActiveReaders, 1)
 			defer atomic.AddInt64(&c.stats.ActiveReaders, -1)
 			c.workerLoop()
@@ -115,7 +118,11 @@ func (c *readCoordinator) workerLoop() {
 		}
 
 		if err := c.budget.Acquire(chunkCtx, tableKey, perTable); err != nil {
-			return
+			c.scheduler.markDone(schema, table)
+			if c.workerCtx.Err() != nil {
+				return
+			}
+			continue
 		}
 		if c.stats != nil {
 			c.stats.setReadBudgetInUse(int64(c.budget.InUse()))

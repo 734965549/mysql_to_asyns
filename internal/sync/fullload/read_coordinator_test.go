@@ -82,6 +82,64 @@ func TestReadCoordinator_StaleAttemptDoesNotCancelCurrentAttempt(t *testing.T) {
 	}
 }
 
+func waitForWorkers(t *testing.T, coord *readCoordinator, want int32, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if coord.activeWorkers.Load() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected %d active workers, got %d", want, coord.activeWorkers.Load())
+}
+
+func TestReadCoordinator_WorkerCountStableAfterAttemptCancelDuringAcquire(t *testing.T) {
+	parentCtx := context.Background()
+	q := newBatchQueue(defaultBufferBytes, &Stats{})
+	opt := Options{GlobalReadBudget: 1, TableParallelReaders: 1}
+	coord := newReadCoordinator(parentCtx, nil, q, opt, &Stats{}, nil, nil, nil, nil, nil)
+	const workerN = 3
+	coord.startWorkers(workerN)
+	waitForWorkers(t, coord, workerN, time.Second)
+
+	attemptCtx, attemptCancel := context.WithCancel(parentCtx)
+	key := tableKey("s", "t")
+	coord.mu.Lock()
+	coord.attemptIDs[key] = 1
+	coord.attemptCtxs[key] = attemptCtx
+	coord.mu.Unlock()
+
+	holdCtx, holdCancel := context.WithCancel(parentCtx)
+	defer holdCancel()
+	acquired := make(chan struct{})
+	go func() {
+		if err := coord.budget.Acquire(holdCtx, "holder", 1); err != nil {
+			t.Errorf("holder acquire: %v", err)
+			return
+		}
+		close(acquired)
+		<-holdCtx.Done()
+		coord.budget.Release("holder")
+	}()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for budget holder")
+	}
+
+	coord.scheduler.addTable("s", "t", []*Chunk{{ID: "c1"}, {ID: "c2"}, {ID: "c3"}})
+	time.Sleep(100 * time.Millisecond)
+
+	attemptCancel()
+	time.Sleep(100 * time.Millisecond)
+	waitForWorkers(t, coord, workerN, time.Second)
+
+	holdCancel()
+	time.Sleep(50 * time.Millisecond)
+	waitForWorkers(t, coord, workerN, time.Second)
+}
+
 func TestBatchQueue_BlockedPutCountsForSoftLimit(t *testing.T) {
 	q := newBatchQueue(200, &Stats{})
 	ctx := context.Background()
