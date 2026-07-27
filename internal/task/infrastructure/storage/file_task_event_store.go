@@ -50,6 +50,58 @@ func (s *FileTaskEventStore) eventPath(taskID string) string {
 	return filepath.Join(s.baseDir, safeTaskEventBasename(taskID)+".jsonl")
 }
 
+func (s *FileTaskEventStore) eventDataPaths(taskID string) ([]string, error) {
+	base := s.eventPath(taskID)
+	var paths []string
+	if _, err := os.Stat(base); err == nil {
+		paths = append(paths, base)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	matches, err := filepath.Glob(base + ".*.bak")
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(matches)
+	paths = append(paths, matches...)
+	return paths, nil
+}
+
+func (s *FileTaskEventStore) removeBackupFiles(taskID string) {
+	pattern := s.eventPath(taskID) + ".*.bak"
+	matches, _ := filepath.Glob(pattern)
+	for _, p := range matches {
+		_ = os.Remove(p)
+	}
+}
+
+func (s *FileTaskEventStore) loadEventsFromPath(path string) ([]*taskEntity.TaskEvent, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []*taskEntity.TaskEvent
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var ev taskEntity.TaskEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		out = append(out, &ev)
+	}
+	return out, scanner.Err()
+}
+
 func (s *FileTaskEventStore) taskLock(taskID string) *sync.Mutex {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -63,35 +115,21 @@ func (s *FileTaskEventStore) recoverSeqLocked(taskID string) error {
 	if _, ok := s.seq[taskID]; ok {
 		return nil
 	}
-	path := s.eventPath(taskID)
-	f, err := os.Open(path)
+	paths, err := s.eventDataPaths(taskID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			s.seq[taskID] = 0
-			return nil
-		}
 		return err
 	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var maxSeq int64
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	for _, path := range paths {
+		events, err := s.loadEventsFromPath(path)
+		if err != nil {
+			return err
 		}
-		var ev taskEntity.TaskEvent
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
+		for _, ev := range events {
+			if ev.Seq > maxSeq {
+				maxSeq = ev.Seq
+			}
 		}
-		if ev.Seq > maxSeq {
-			maxSeq = ev.Seq
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
 	}
 	s.seq[taskID] = maxSeq
 	return nil
@@ -161,31 +199,19 @@ func (s *FileTaskEventStore) Append(event *taskEntity.TaskEvent) error {
 }
 
 func (s *FileTaskEventStore) loadAll(taskID string) ([]*taskEntity.TaskEvent, error) {
-	path := s.eventPath(taskID)
-	f, err := os.Open(path)
+	paths, err := s.eventDataPaths(taskID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	defer f.Close()
-
 	var out []*taskEntity.TaskEvent
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	for _, path := range paths {
+		events, err := s.loadEventsFromPath(path)
+		if err != nil {
+			return nil, err
 		}
-		var ev taskEntity.TaskEvent
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
-		}
-		out = append(out, &ev)
+		out = append(out, events...)
 	}
-	return out, scanner.Err()
+	return out, nil
 }
 
 func matchEventFilter(ev *taskEntity.TaskEvent, f port.TaskEventListFilter) bool {
@@ -372,6 +398,7 @@ func (s *FileTaskEventStore) Prune(taskID string, opts port.TaskEventPruneOption
 	s.mu.Lock()
 	s.seq[taskID] = maxSeq
 	s.mu.Unlock()
+	s.removeBackupFiles(taskID)
 	return removed, nil
 }
 

@@ -190,6 +190,10 @@ func readTableWithRetry(
 			return err
 		}
 
+		if attempt > 1 && coord != nil {
+			coord.prepareTableRetry(schema, table)
+		}
+
 		// attempt 级子 context：并行 chunk 失败只取消本 attempt
 		attemptCtx, attemptCancel := context.WithCancel(ctx)
 		readErr := readTable(attemptCtx, db, job, q, eng, opt, stats, isStopped, taskCancel, attemptCancel, coord)

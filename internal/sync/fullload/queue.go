@@ -30,9 +30,10 @@ type batchQueue struct {
 }
 
 type tableSubQueue struct {
-	key      string
-	items    []*RowBatch
-	curBytes int64
+	key        string
+	items      []*RowBatch
+	curBytes   int64
+	waitingPut int
 }
 
 func newBatchQueue(maxBytes int64, stats *Stats) *batchQueue {
@@ -75,7 +76,7 @@ func (q *batchQueue) ensurePollKeyLocked(key string) {
 func (q *batchQueue) waitingTableCount() int {
 	n := 0
 	for _, sq := range q.tables {
-		if len(sq.items) > 0 {
+		if sq != nil && (len(sq.items) > 0 || sq.waitingPut > 0) {
 			n++
 		}
 	}
@@ -134,6 +135,13 @@ func (q *batchQueue) Put(ctx context.Context, b *RowBatch) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	sq := q.subQueue(key)
+	sq.waitingPut++
+	defer func() {
+		sq.waitingPut--
+		if sq.waitingPut < 0 {
+			sq.waitingPut = 0
+		}
+	}()
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()

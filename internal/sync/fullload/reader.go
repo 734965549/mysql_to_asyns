@@ -681,7 +681,10 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 		return nil, err
 	}
 	if len(rowsData) == 0 {
-		r.done = true
+		// probe 到的键在 payload 查询前已全部删除/变更：跳过这批键继续扫描。
+		lastProbe := pkValues[len(pkValues)-1][0]
+		r.cursor = make([]any, 1)
+		r.cursor[0] = lastProbe
 		return nil, nil
 	}
 
@@ -964,6 +967,11 @@ func readTablePlain(ctx context.Context, db *sql.DB, job *tableReadJob, q *batch
 	if targetChunks < 1 {
 		targetChunks = 1
 	}
+
+	if err := coord.acquirePlanBudget(ctx, schema, table, readers); err != nil {
+		return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=plan readers=%d cause=%w", schema, table, strategy, readers, err)
+	}
+	defer coord.releasePlanBudget(schema, table)
 
 	planConn, err := db.Conn(ctx)
 	if err != nil {

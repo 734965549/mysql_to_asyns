@@ -124,6 +124,40 @@ func (s *chunkScheduler) markDone(schema, table string) {
 	}
 }
 
+// markTableFailed 跳过该表剩余 chunk，使 submitTable 尽快结束。
+func (s *chunkScheduler) markTableFailed(schema, table string) {
+	if s == nil {
+		return
+	}
+	key := tableKey(schema, table)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, tq := range s.tables {
+		if tq != nil && tq.key == key {
+			tq.next = len(tq.chunks)
+		}
+	}
+	delete(s.activePerTable, key)
+}
+
+// removeTable 移除调度器中该表的全部队列（表级重试前清理旧 attempt）。
+func (s *chunkScheduler) removeTable(schema, table string) {
+	if s == nil {
+		return
+	}
+	key := tableKey(schema, table)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.tables[:0]
+	for _, tq := range s.tables {
+		if tq == nil || tq.key != key {
+			kept = append(kept, tq)
+		}
+	}
+	s.tables = kept
+	delete(s.activePerTable, key)
+}
+
 func (s *chunkScheduler) tablePending(key string) int {
 	if s == nil {
 		return 0

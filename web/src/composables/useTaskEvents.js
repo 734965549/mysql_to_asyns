@@ -96,8 +96,23 @@ export function useTaskEvents(taskIdRef, activeTabRef, taskStatusRef) {
     if (!res.ok) return;
     const data = await res.json();
     executions.value = data.executions || [];
-    if (!currentExecutionId.value && executions.value.length > 0) {
-      currentExecutionId.value = executions.value[0].execution_id;
+    const latestId = executions.value[0]?.execution_id;
+    if (!latestId) return;
+
+    const status = taskStatusRef.value;
+    if (!currentExecutionId.value) {
+      currentExecutionId.value = latestId;
+      return;
+    }
+    if (latestId !== currentExecutionId.value) {
+      const currentKnown = executions.value.some(
+        (e) => e.execution_id === currentExecutionId.value
+      );
+      if (status === "RUNNING" || !currentKnown) {
+        currentExecutionId.value = latestId;
+        events.value = [];
+        lastSeq.value = 0;
+      }
     }
   }
 

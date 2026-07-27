@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -51,6 +52,29 @@ func TestFileTaskEventStore_AppendListDelete(t *testing.T) {
 
 	path := filepath.Join(dir, safeTaskEventBasename(taskID)+".jsonl")
 	require.NoFileExists(t, path)
+}
+
+func TestFileTaskEventStore_LoadAllIncludesRotatedBackup(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewFileTaskEventStore(dir)
+	require.NoError(t, err)
+
+	taskID := "task-rotate"
+	path := store.eventPath(taskID)
+	require.NoError(t, store.Append(sampleEvent(taskID, "exec-old", "OLD_EVENT")))
+	require.NoError(t, os.Rename(path, path+".20260101-120000.bak"))
+	require.NoError(t, store.Append(sampleEvent(taskID, "exec-new", "NEW_EVENT")))
+
+	events, err := store.List(port.TaskEventListFilter{TaskID: taskID, Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+
+	codes := map[string]struct{}{}
+	for _, ev := range events {
+		codes[ev.Code] = struct{}{}
+	}
+	require.Contains(t, codes, "OLD_EVENT")
+	require.Contains(t, codes, "NEW_EVENT")
 }
 
 func TestFileTaskEventStore_SeqRecoveryAfterRestart(t *testing.T) {

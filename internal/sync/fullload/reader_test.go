@@ -495,6 +495,66 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 	}
 }
 
+// TestChunkReaderTwoPhaseEmptyPayloadContinuesScan 验证 probe 有键但 payload 为空时不提前结束 chunk。
+func TestChunkReaderTwoPhaseEmptyPayloadContinuesScan(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload", DataType: "json"}},
+		},
+	}
+	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{0}, End: []any{100}}
+
+	mock.ExpectQuery("SELECT `id` FROM `s`.`t` WHERE").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow(int64(1)).AddRow(int64(2)).AddRow(int64(3)).AddRow(int64(4)).AddRow(int64(5)).
+			AddRow(int64(6)).AddRow(int64(7)).AddRow(int64(8)).AddRow(int64(9)).AddRow(int64(10)))
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE `id` IN").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}))
+	mock.ExpectQuery("SELECT `id` FROM `s`.`t` WHERE").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE `id` IN").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(11), "z"))
+
+	opt := Options{QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour, TwoPhaseRead: true}
+	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cr.close()
+
+	batch, err := cr.nextBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch != nil {
+		t.Fatalf("expected nil batch after deleted probe keys, got %+v", batch)
+	}
+	if cr.done {
+		t.Fatal("chunk should not be marked done when probe keys were skipped")
+	}
+	if len(cr.cursor) != 1 || cr.cursor[0].(int64) != 10 {
+		t.Fatalf("cursor should advance past deleted probe keys to 10, got %v", cr.cursor)
+	}
+
+	batch, err = cr.nextBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch == nil || len(batch.Rows) != 1 {
+		t.Fatalf("expected one row after continuing scan, got %+v", batch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReadChunksParallelPlainRetriesBadConnectionWithFreshPoolConn(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

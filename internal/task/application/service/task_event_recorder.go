@@ -43,9 +43,10 @@ type TaskEventRecorder struct {
 
 	queue chan pendingEmit
 
-	mu          sync.Mutex
-	executions  map[string]string
-	aggregating map[string]*aggregateBucket
+	mu           sync.Mutex
+	executions   map[string]string
+	aggregating  map[string]*aggregateBucket
+	deletedTasks map[string]struct{}
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -58,11 +59,12 @@ func NewTaskEventRecorder(store port.TaskEventStore) *TaskEventRecorder {
 		return nil
 	}
 	r := &TaskEventRecorder{
-		store:       store,
-		queue:       make(chan pendingEmit, defaultEventQueueSize),
-		executions:  make(map[string]string),
-		aggregating: make(map[string]*aggregateBucket),
-		stopCh:      make(chan struct{}),
+		store:        store,
+		queue:        make(chan pendingEmit, defaultEventQueueSize),
+		executions:   make(map[string]string),
+		aggregating:  make(map[string]*aggregateBucket),
+		deletedTasks: make(map[string]struct{}),
+		stopCh:       make(chan struct{}),
 	}
 	r.wg.Add(1)
 	go r.worker()
@@ -137,10 +139,6 @@ func (r *TaskEventRecorder) Emit(ev taskEntity.TaskEvent) {
 		r.enqueue(ev, true)
 		return
 	}
-	if ev.Severity == taskEntity.EventSeverityWarn || ev.Severity == taskEntity.EventSeverityError {
-		r.enqueue(ev, true)
-		return
-	}
 	if r.tryAggregate(ev) {
 		return
 	}
@@ -176,11 +174,19 @@ func (r *TaskEventRecorder) tryAggregate(ev taskEntity.TaskEvent) bool {
 }
 
 func (r *TaskEventRecorder) flushExpiredAggregates() {
+	r.flushAggregates(false)
+}
+
+func (r *TaskEventRecorder) flushAllAggregates() {
+	r.flushAggregates(true)
+}
+
+func (r *TaskEventRecorder) flushAggregates(forceAll bool) {
 	r.mu.Lock()
 	var flush []*taskEntity.TaskEvent
 	now := time.Now()
 	for fp, b := range r.aggregating {
-		if now.Before(b.flushAt) {
+		if !forceAll && now.Before(b.flushAt) {
 			continue
 		}
 		if b.count <= 1 {
@@ -204,25 +210,48 @@ func (r *TaskEventRecorder) flushExpiredAggregates() {
 	}
 }
 
+func (r *TaskEventRecorder) isTaskDeleted(taskID string) bool {
+	if r == nil || taskID == "" {
+		return false
+	}
+	r.mu.Lock()
+	_, deleted := r.deletedTasks[taskID]
+	r.mu.Unlock()
+	return deleted
+}
+
 func (r *TaskEventRecorder) enqueue(ev taskEntity.TaskEvent, critical bool) {
+	if r.isTaskDeleted(ev.TaskID) {
+		return
+	}
+	evCopy := ev
 	select {
-	case r.queue <- pendingEmit{event: &ev}:
+	case r.queue <- pendingEmit{event: &evCopy}:
 		return
 	default:
 		if critical {
 			select {
-			case r.queue <- pendingEmit{event: &ev}:
+			case r.queue <- pendingEmit{event: &evCopy}:
 				return
 			default:
 			}
+			if err := r.store.Append(&evCopy); err != nil {
+				logger.Warn("[Task %s] sync task event append failed code=%s: %v", ev.TaskID, ev.Code, err)
+			}
+			return
 		}
 		metrics.GetMetrics().IncrementTaskEventDropped()
-		go r.syncAppendWithRetry(ev)
 	}
 }
 
 func (r *TaskEventRecorder) syncAppendWithRetry(ev taskEntity.TaskEvent) {
+	if r.isTaskDeleted(ev.TaskID) {
+		return
+	}
 	time.Sleep(eventSyncFallbackDelay)
+	if r.isTaskDeleted(ev.TaskID) {
+		return
+	}
 	if err := r.store.Append(&ev); err != nil {
 		logger.Warn("[Task %s] sync task event append failed code=%s: %v", ev.TaskID, ev.Code, err)
 	}
@@ -235,11 +264,11 @@ func (r *TaskEventRecorder) worker() {
 	for {
 		select {
 		case <-r.stopCh:
-			r.flushExpiredAggregates()
+			r.flushAllAggregates()
 			for {
 				select {
 				case job := <-r.queue:
-					if job.event != nil {
+					if job.event != nil && !r.isTaskDeleted(job.event.TaskID) {
 						_ = r.store.Append(job.event)
 					}
 				default:
@@ -248,6 +277,9 @@ func (r *TaskEventRecorder) worker() {
 			}
 		case job := <-r.queue:
 			if job.event != nil {
+				if r.isTaskDeleted(job.event.TaskID) {
+					continue
+				}
 				if err := r.store.Append(job.event); err != nil {
 					logger.Warn("[Task %s] async task event append failed code=%s: %v", job.event.TaskID, job.event.Code, err)
 					go r.syncAppendWithRetry(*job.event)
@@ -327,6 +359,7 @@ func (r *TaskEventRecorder) DeleteByTask(taskID string) error {
 	}
 	r.mu.Lock()
 	delete(r.executions, taskID)
+	r.deletedTasks[taskID] = struct{}{}
 	for fp, b := range r.aggregating {
 		if b.first != nil && b.first.TaskID == taskID {
 			delete(r.aggregating, fp)

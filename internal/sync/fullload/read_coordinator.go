@@ -23,13 +23,16 @@ type readCoordinator struct {
 	isStopped    func() bool
 	taskCancel   context.CancelFunc
 
+	parentCtx    context.Context
 	workerCtx    context.Context
 	workerCancel context.CancelFunc
 	wg           sync.WaitGroup
+	workerCount  int
 
-	mu         sync.Mutex
-	firstErr   error
-	attemptIDs map[string]int
+	mu          sync.Mutex
+	firstErr    error
+	tableErrors map[string]error
+	attemptIDs  map[string]int
 }
 
 func newReadCoordinator(
@@ -57,9 +60,11 @@ func newReadCoordinator(
 		sink:         sink,
 		isStopped:    isStopped,
 		taskCancel:   taskCancel,
+		parentCtx:    ctx,
 		workerCtx:    wctx,
 		workerCancel: wc,
 		attemptIDs:   make(map[string]int),
+		tableErrors:  make(map[string]error),
 	}
 }
 
@@ -67,6 +72,7 @@ func (c *readCoordinator) startWorkers(n int) {
 	if n < 1 {
 		n = 1
 	}
+	c.workerCount = n
 	for i := 0; i < n; i++ {
 		c.wg.Add(1)
 		go func() {
@@ -114,20 +120,81 @@ func (c *readCoordinator) workerLoop() {
 		c.scheduler.markDone(schema, table)
 
 		if err != nil {
-			c.setErr(err)
-			return
+			c.setTableErr(schema, table, err)
+			c.scheduler.markTableFailed(schema, table)
+			continue
 		}
 	}
 }
 
-func (c *readCoordinator) setErr(err error) {
+func (c *readCoordinator) setTableErr(schema, table string, err error) {
 	if err == nil {
 		return
 	}
+	key := tableKey(schema, table)
 	c.mu.Lock()
+	c.tableErrors[key] = preferReaderError(c.tableErrors[key], err)
 	c.firstErr = preferReaderError(c.firstErr, err)
 	c.mu.Unlock()
-	c.workerCancel()
+}
+
+func (c *readCoordinator) tableErr(schema, table string) error {
+	key := tableKey(schema, table)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tableErrors[key]
+}
+
+// prepareTableRetry 在表级重试前清理失败状态并恢复 worker（若已退出）。
+func (c *readCoordinator) prepareTableRetry(schema, table string) {
+	if c == nil {
+		return
+	}
+	c.scheduler.removeTable(schema, table)
+	tableKey := tableKey(schema, table)
+	c.mu.Lock()
+	delete(c.tableErrors, tableKey)
+	c.firstErr = nil
+	for k := range c.tableErrors {
+		if c.tableErrors[k] != nil {
+			c.firstErr = preferReaderError(c.firstErr, c.tableErrors[k])
+		}
+	}
+	c.mu.Unlock()
+	if c.workerCtx.Err() != nil {
+		c.wg.Wait()
+		wctx, wc := context.WithCancel(c.parentCtx)
+		c.workerCtx = wctx
+		c.workerCancel = wc
+		c.startWorkers(c.workerCount)
+	}
+}
+
+// acquirePlanBudget 为 chunk 规划占用全局读取预算（与扫描共用同一令牌池）。
+func (c *readCoordinator) acquirePlanBudget(ctx context.Context, schema, table string, readers int) error {
+	if c == nil || c.budget == nil {
+		return nil
+	}
+	key := tableKey(schema, table)
+	waiting := c.scheduler.waitingTables() + 1
+	perTable := PerTableEffectiveLimit(readers, c.opt.GlobalReadBudget, waiting)
+	if err := c.budget.Acquire(ctx, key, perTable); err != nil {
+		return err
+	}
+	if c.stats != nil {
+		c.stats.setReadBudgetInUse(int64(c.budget.InUse()))
+	}
+	return nil
+}
+
+func (c *readCoordinator) releasePlanBudget(schema, table string) {
+	if c == nil || c.budget == nil {
+		return
+	}
+	c.budget.Release(tableKey(schema, table))
+	if c.stats != nil {
+		c.stats.setReadBudgetInUse(int64(c.budget.InUse()))
+	}
 }
 
 // submitTable 将表 chunk 注册到公平调度器并等待全部完成。
@@ -146,20 +213,14 @@ func (c *readCoordinator) submitTable(ctx context.Context, schema, table string,
 	c.scheduler.addTable(schema, table, chunks)
 
 	for c.scheduler.tablePending(tableKey) > 0 {
-		c.mu.Lock()
-		err := c.firstErr
-		c.mu.Unlock()
-		if err != nil {
+		if err := c.tableErr(schema, table); err != nil {
 			return err
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if c.workerCtx.Err() != nil {
-			c.mu.Lock()
-			err := c.firstErr
-			c.mu.Unlock()
-			if err != nil {
+			if err := c.tableErr(schema, table); err != nil {
 				return err
 			}
 			return c.workerCtx.Err()
