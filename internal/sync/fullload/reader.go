@@ -959,11 +959,6 @@ func readTablePlain(ctx context.Context, db *sql.DB, job *tableReadJob, q *batch
 	}
 
 	if readers <= 1 || len(chunks) == 1 {
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=connect chunk=%s readers=1 cause=%w", schema, table, strategy, chunks[0].ID, err)
-		}
-		defer conn.Close()
 		for _, chunk := range chunks {
 			if isStopped != nil && isStopped() {
 				if taskCancel != nil {
@@ -974,7 +969,9 @@ func readTablePlain(ctx context.Context, db *sql.DB, job *tableReadJob, q *batch
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err := readChunk(ctx, conn, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, job.AttemptID); err != nil {
+			// 普通短查询直接走连接池，让 database/sql 在每批 Rows.Close 后回收、
+			// 检查并轮换连接；不要把 *sql.Conn 固定占用到整张表读完。
+			if err := readChunk(ctx, db, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, job.AttemptID); err != nil {
 				return fmt.Errorf("full read failed: table=%s.%s strategy=%s stage=scan chunk=%s readers=1 cause=%w", schema, table, strategy, chunk.ID, err)
 			}
 		}
@@ -1023,12 +1020,6 @@ func readChunksParallelPlain(ctx context.Context, db *sql.DB, readers int, chunk
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			conn, err := db.Conn(ctx)
-			if err != nil {
-				setErr(fmt.Errorf("reader[%d] connect: %w", idx, err))
-				return
-			}
-			defer conn.Close()
 
 			for chunk := range chunkCh {
 				if isStopped != nil && isStopped() {
@@ -1040,7 +1031,8 @@ func readChunksParallelPlain(ctx context.Context, db *sql.DB, readers int, chunk
 				if ctx.Err() != nil {
 					return
 				}
-				if err := readChunk(ctx, conn, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, attemptID); err != nil {
+				// 每个短查询通过连接池获取连接，坏连接可由 database/sql 丢弃并替换。
+				if err := readChunk(ctx, db, chunk, q, opt, stats, tracker, stateTracker, isStopped, taskCancel, attemptID); err != nil {
 					setErr(fmt.Errorf("reader[%d] chunk %s: %w", idx, chunk.ID, err))
 					return
 				}
@@ -1051,6 +1043,21 @@ func readChunksParallelPlain(ctx context.Context, db *sql.DB, readers int, chunk
 	return firstErr
 }
 
+const maxKeysetBatchRetries = 3
+
+// keysetBatchRetryBackoff 仅用于未成功产出当前批次时的瞬时错误重试。
+// 时间保持较短，因为 database/sql 会在下一次查询时直接换掉坏连接。
+func keysetBatchRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	wait := 100 * time.Millisecond << (attempt - 1)
+	if wait > 2*time.Second {
+		wait = 2 * time.Second
+	}
+	return wait
+}
+
 func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *batchQueue, opt Options, stats *Stats, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, taskCancel context.CancelFunc, attemptID int) error {
 	batchRows := effectiveBatchRows(chunk.Spec, opt)
 	cr, err := newChunkReader(queryer, chunk, batchRows, opt.BatchBytes, opt, attemptID, stats)
@@ -1059,6 +1066,7 @@ func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *ba
 	}
 	defer cr.close()
 
+	transientRetries := 0
 	for {
 		if isStopped != nil && isStopped() {
 			if taskCancel != nil {
@@ -1072,8 +1080,25 @@ func readChunk(ctx context.Context, queryer snapshotQueryer, chunk *Chunk, q *ba
 		start := time.Now()
 		batch, err := cr.nextBatch(ctx)
 		if err != nil {
+			// PK/UK keyset 的游标只在一批完整扫描成功后推进。当前批次失败时尚未入队，
+			// 因而可在连接池换新连接后从原游标安全重试，不会重放已提交批次。
+			// 无主键 stream 已经持续推进结果集，不能用此路径重开查询，否则可能重复行。
+			if !chunk.NoPK && ctx.Err() == nil && isRetryableReadError(err) && transientRetries < maxKeysetBatchRetries {
+				transientRetries++
+				cr.finishQuery()
+				backoff := keysetBatchRetryBackoff(transientRetries)
+				logger.Warn("[FullLoadV2] retry keyset batch after transient read error: table=%s.%s chunk=%s attempt=%d/%d backoff=%s error=%v",
+					chunk.Spec.SourceSchema, chunk.Spec.SourceTable, chunk.ID, transientRetries, maxKeysetBatchRetries, backoff, err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				continue
+			}
 			return fmt.Errorf("read chunk %s: %w", chunk.ID, err)
 		}
+		transientRetries = 0
 		if batch == nil {
 			stats.incChunkDone()
 			return nil

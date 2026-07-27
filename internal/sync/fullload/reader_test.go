@@ -2,6 +2,7 @@ package fullload
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"testing"
 	"time"
@@ -477,6 +478,60 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 	}
 	if len(cr.cursor) != 1 || cr.cursor[0].(int64) != 2 {
 		t.Fatalf("cursor should advance to last pk=2, got %v", cr.cursor)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadChunksParallelPlainRetriesBadConnectionWithFreshPoolConn(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload"}},
+		},
+	}
+	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{0}, End: []any{100}}
+
+	// 第一次结果集在扫描时断线；该批次尚未完成，也没有推进 keyset 游标。
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).
+			AddRow(int64(1), "discarded").
+			RowError(0, driver.ErrBadConn))
+	// 重试必须经 *sql.DB 获取新连接，并从原游标重新读取完整批次。
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(1), "ok"))
+
+	opt := Options{
+		BatchRows:              10,
+		BatchBytes:             defaultBatchBytes,
+		QueryTimeout:           10 * time.Second,
+		SlowQueryWarnThreshold: time.Hour,
+	}
+	stats := &Stats{}
+	q := newBatchQueue(defaultBufferBytes, stats)
+
+	err = readChunksParallelPlain(context.Background(), db, 1, []*Chunk{chunk}, q, opt, stats, nil, nil, nil, nil, nil, 0)
+	if err != nil {
+		t.Fatalf("expected bad connection to recover through the pool, got %v", err)
+	}
+
+	batch, ok := q.Get(context.Background())
+	if !ok || batch == nil || len(batch.Rows) != 1 {
+		t.Fatalf("expected one recovered batch, got ok=%v batch=%+v", ok, batch)
+	}
+	if got := batch.Rows[0][1]; got != "ok" {
+		t.Fatalf("failed partial batch must be discarded, got payload %v", got)
+	}
+	if stats.ChunksDone != 1 {
+		t.Fatalf("expected one completed chunk, got %d", stats.ChunksDone)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
