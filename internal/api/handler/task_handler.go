@@ -145,8 +145,10 @@ type CreateTaskRequest struct { // 定义创建任务请求结构体
 	EnableSkipBinlog         bool     `json:"enable_skip_binlog"`                  // 全量同步写入前在目标端临时关闭 sql_log_bin，写入后恢复；需目标账号具备 SUPER 权限
 	TxCommitEveryNParallel   int      `json:"tx_commit_every_n_parallel"`          // 并行 worker 每 N 批提交一次事务；0 表示使用默认值 5
 	FullLoadEngine           string   `json:"full_load_engine,omitempty"`          // 全量引擎：v1 / v2；空视为 v1
-	FullLoadReadWorkers      int      `json:"full_load_read_workers,omitempty"`    // V2 任务级源读取上限；0=自动
-	FullLoadWriteWorkers     int      `json:"full_load_write_workers,omitempty"`   // V2 任务级目标写入上限；0=自动
+	FullLoadReadWorkers      int      `json:"full_load_read_workers,omitempty"`       // V2 全局源读取预算；0=自动
+	FullLoadTableWorkers     int      `json:"full_load_table_workers,omitempty"`      // V2 并发表调度；0=沿用 read_workers
+	FullLoadPerTableReaders  int      `json:"full_load_per_table_readers,omitempty"`  // V2 单表并行读；0=沿用 read_workers
+	FullLoadWriteWorkers     int      `json:"full_load_write_workers,omitempty"`      // V2 任务级目标写入上限；0=自动
 	FullLoadBufferMB         int      `json:"full_load_buffer_mb,omitempty"`       // V2 队列上限(MiB)；0=128
 	FullLoadBatchBytesMB     int      `json:"full_load_batch_bytes_mb,omitempty"`  // V2 单条INSERT字节上限(MiB)；0=4
 	FullLoadCommitRows       int      `json:"full_load_commit_rows,omitempty"`     // V2 单事务行数上限；0=10000
@@ -265,8 +267,10 @@ func (h *TaskHandler) CreateTask(c *gin.Context) { // 创建新任务
 		EnableSkipBinlog:               req.EnableSkipBinlog,               // 设置全量写入前关闭binlog开关
 		TxCommitEveryNParallel:         req.TxCommitEveryNParallel,         // 设置并行事务提交间隔
 		FullLoadEngine:                 req.FullLoadEngine,                 // 设置全量引擎版本
-		FullLoadReadWorkers:            req.FullLoadReadWorkers,            // 设置V2源读取上限
-		FullLoadWriteWorkers:           req.FullLoadWriteWorkers,           // 设置V2目标写入上限
+		FullLoadReadWorkers:            req.FullLoadReadWorkers,
+		FullLoadTableWorkers:           req.FullLoadTableWorkers,
+		FullLoadPerTableReaders:        req.FullLoadPerTableReaders,
+		FullLoadWriteWorkers:           req.FullLoadWriteWorkers,
 		FullLoadBufferMB:               req.FullLoadBufferMB,               // 设置V2队列上限
 		FullLoadBatchBytesMB:           req.FullLoadBatchBytesMB,           // 设置V2单条INSERT字节上限
 		FullLoadCommitRows:             req.FullLoadCommitRows,             // 设置V2单事务行数上限
@@ -920,6 +924,12 @@ func (h *TaskHandler) UpdateTask(c *gin.Context) { // 更新任务配置
 	if req.FullLoadReadWorkers != nil {
 		task.Config.FullLoadReadWorkers = *req.FullLoadReadWorkers
 	}
+	if req.FullLoadTableWorkers != nil {
+		task.Config.FullLoadTableWorkers = *req.FullLoadTableWorkers
+	}
+	if req.FullLoadPerTableReaders != nil {
+		task.Config.FullLoadPerTableReaders = *req.FullLoadPerTableReaders
+	}
 	if req.FullLoadWriteWorkers != nil {
 		task.Config.FullLoadWriteWorkers = *req.FullLoadWriteWorkers
 	}
@@ -1065,8 +1075,10 @@ type UpdateTaskRequest struct { // 定义更新任务请求结构体
 	EnableSkipBinlog               *bool                  `json:"enable_skip_binlog,omitempty"`                   // 全量写入前关闭binlog（可选）
 	TxCommitEveryNParallel         *int                   `json:"tx_commit_every_n_parallel,omitempty"`           // 并行 worker 每 N 批提交一次事务（可选）
 	FullLoadEngine                 *string                `json:"full_load_engine,omitempty"`                     // 全量引擎：v1 / v2（可选）
-	FullLoadReadWorkers            *int                   `json:"full_load_read_workers,omitempty"`               // V2 源读取上限（可选）
-	FullLoadWriteWorkers           *int                   `json:"full_load_write_workers,omitempty"`              // V2 目标写入上限（可选）
+	FullLoadReadWorkers            *int                   `json:"full_load_read_workers,omitempty"`                // V2 全局源读取预算（可选）
+	FullLoadTableWorkers           *int                   `json:"full_load_table_workers,omitempty"`               // V2 并发表调度（可选）
+	FullLoadPerTableReaders        *int                   `json:"full_load_per_table_readers,omitempty"`           // V2 单表并行读（可选）
+	FullLoadWriteWorkers           *int                   `json:"full_load_write_workers,omitempty"`               // V2 目标写入上限（可选）
 	FullLoadBufferMB               *int                   `json:"full_load_buffer_mb,omitempty"`                  // V2 队列上限MiB（可选）
 	FullLoadBatchBytesMB           *int                   `json:"full_load_batch_bytes_mb,omitempty"`             // V2 单条INSERT字节上限MiB（可选）
 	FullLoadCommitRows             *int                   `json:"full_load_commit_rows,omitempty"`                // V2 单事务行数上限（可选）

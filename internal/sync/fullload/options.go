@@ -52,8 +52,10 @@ const (
 
 // RawOptions 是从任务配置直接读取的原始参数（未经默认值推导）。
 type RawOptions struct {
-	ReadWorkers   int // full_load_read_workers
-	WriteWorkers  int // full_load_write_workers
+	ReadWorkers      int // full_load_read_workers：全局源库读取总预算
+	TableWorkers     int // full_load_table_workers：并发表规划/调度上限
+	PerTableReaders  int // full_load_per_table_readers：单表内并行读上限
+	WriteWorkers     int // full_load_write_workers
 	BufferMB      int // full_load_buffer_mb
 	BatchBytesMB  int // full_load_batch_bytes_mb
 	CommitRows    int // full_load_commit_rows
@@ -88,7 +90,9 @@ type RawOptions struct {
 
 // Options 是经过默认值推导后引擎实际使用的运行参数。
 type Options struct {
-	ReadWorkers    int
+	ReadWorkers    int // 用户配置的读取预算（Resolve 后仍保留，Cap 前）
+	GlobalReadBudget int // 经连接池裁剪后的全局读取令牌数
+	TableWorkers   int // 并发表调度上限
 	WriteWorkers   int
 	BufferBytes    int64
 	BatchRows      int
@@ -134,9 +138,24 @@ func (opt Options) Validate() error {
 
 // ResolveOptions 将原始配置推导为生效运行参数，应用 4C8G 平衡预设。
 func ResolveOptions(raw RawOptions) Options {
+	readBudget := clampInt(raw.ReadWorkers, defaultReadWorkers, 1, hardMaxWorkers)
+	tableWorkers := raw.TableWorkers
+	perTable := raw.PerTableReaders
+	// 旧任务兼容：仅配置 read_workers 时，表并发与单表并行仍沿用该值。
+	if tableWorkers <= 0 {
+		tableWorkers = readBudget
+	}
+	if perTable <= 0 {
+		perTable = readBudget
+	}
+	tableWorkers = clampInt(tableWorkers, defaultReadWorkers, 1, hardMaxWorkers)
+	perTable = clampInt(perTable, defaultReadWorkers, 1, hardMaxWorkers)
+
 	opt := Options{
-		ReadWorkers:    clampInt(raw.ReadWorkers, defaultReadWorkers, 1, hardMaxWorkers),
-		WriteWorkers:   clampInt(raw.WriteWorkers, defaultWriteWorkers, 1, hardMaxWorkers),
+		ReadWorkers:      readBudget,
+		GlobalReadBudget: readBudget,
+		TableWorkers:     tableWorkers,
+		WriteWorkers:     clampInt(raw.WriteWorkers, defaultWriteWorkers, 1, hardMaxWorkers),
 		BatchRows:      clampInt(raw.BatchSize, defaultBatchRows, 1, hardMaxBatchRow),
 		CommitInterval: defaultCommitInterval,
 		ChunkOvershoot: defaultChunkOvershoot,
@@ -185,24 +204,25 @@ func ResolveOptions(raw RawOptions) Options {
 		opt.CommitBytes = opt.BatchBytes
 	}
 
-	// 表级并行：默认单表内并行读连接数 = ReadWorkers。
-	opt.TableParallelReaders = opt.ReadWorkers
+	opt.TableParallelReaders = perTable
 
 	return opt
 }
 
-// CapBySourcePool 用真实源库连接池上限约束读取并发，避免 ReadWorkers/TableParallelReaders
-// 之和超过 pool 容量后阻塞于 db.Conn。maxOpen<=0 时不调整。
+// CapBySourcePool 用真实源库连接池上限约束全局读取预算。maxOpen<=0 时不调整。
 func (opt *Options) CapBySourcePool(maxOpen int) {
-	if opt == nil || maxOpen <= 0 {
+	if opt == nil {
 		return
 	}
-	if opt.ReadWorkers > maxOpen {
-		opt.ReadWorkers = maxOpen
+	before := opt.GlobalReadBudget
+	opt.GlobalReadBudget = ComputeGlobalReadBudget(opt.ReadWorkers, maxOpen)
+	if maxOpen > 0 && opt.TableParallelReaders > opt.GlobalReadBudget {
+		opt.TableParallelReaders = opt.GlobalReadBudget
 	}
-	if opt.TableParallelReaders > maxOpen {
-		opt.TableParallelReaders = maxOpen
+	if maxOpen > 0 && opt.TableWorkers > opt.GlobalReadBudget {
+		opt.TableWorkers = opt.GlobalReadBudget
 	}
+	_ = before
 }
 
 func mebibytes(valueMB int, defaultBytes int64, maxMB int) int64 {

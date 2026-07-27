@@ -57,6 +57,9 @@ type Metrics struct { // 定义Prometheus指标结构体
 	FullLoadTableRetriesTotal        prometheus.Counter // V2 表级重试次数
 	FullLoadTableRetryExhaustedTotal prometheus.Counter // V2 表级重试耗尽次数
 	FullLoadActiveStagingTables      prometheus.Gauge   // V2 当前活跃 staging 表数
+	FullLoadReadBudgetInUse          prometheus.Gauge   // V2 全局读取预算占用数
+
+	TaskEventDroppedTotal prometheus.Counter // 任务事件异步队列丢弃次数
 }
 
 var ( // 定义包级别变量
@@ -197,6 +200,14 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 				Name: "mysql_sync_full_load_staging_tables",
 				Help: "Current active staging tables in the full-load V2 engine",
 			}),
+			FullLoadReadBudgetInUse: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: "mysql_sync_full_load_read_budget_in_use",
+				Help: "Current in-use full-load V2 global source read budget tokens",
+			}),
+			TaskEventDroppedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "mysql_sync_task_event_dropped_total",
+				Help: "Total task events dropped due to async queue overflow",
+			}),
 		}
 
 		// 注册指标
@@ -232,6 +243,8 @@ func GetMetrics() *Metrics { // 获取Metrics单例实例
 		prometheus.MustRegister(instance.FullLoadTableRetriesTotal)
 		prometheus.MustRegister(instance.FullLoadTableRetryExhaustedTotal)
 		prometheus.MustRegister(instance.FullLoadActiveStagingTables)
+		prometheus.MustRegister(instance.FullLoadReadBudgetInUse)
+		prometheus.MustRegister(instance.TaskEventDroppedTotal)
 	})
 
 	return instance // 返回实例
@@ -329,9 +342,17 @@ func (m *Metrics) AddFullLoadTableRetryExhausted(n int64) {
 	addNonNegative(m.FullLoadTableRetryExhaustedTotal, n)
 }
 
+// SetFullLoadReadBudgetInUse 设置 V2 全局读取预算占用数。
+func (m *Metrics) SetFullLoadReadBudgetInUse(n int64) { m.FullLoadReadBudgetInUse.Set(float64(n)) }
+
 // AddFullLoadActiveStagingTables 按差值更新活跃 staging 表数(P3.6)。
 func (m *Metrics) AddFullLoadActiveStagingTables(delta int64) {
 	m.FullLoadActiveStagingTables.Add(float64(delta))
+}
+
+// IncrementTaskEventDropped 任务事件队列满时丢弃计数。
+func (m *Metrics) IncrementTaskEventDropped() {
+	m.TaskEventDroppedTotal.Inc()
 }
 
 // UpdateTaskMetrics 更新任务指标方法

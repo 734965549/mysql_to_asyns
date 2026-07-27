@@ -24,6 +24,7 @@ type Config struct { // 定义全局配置结构体
 	Storage    StorageConfig    `toml:"storage"     json:"storage"`    // 持久化配置
 	Sync       SyncTuneConfig   `toml:"sync"        json:"sync"`       // 同步调优配置
 	Security   SecurityConfig   `toml:"security"    json:"security"`   // 安全配置
+	TaskEvents TaskEventsConfig `toml:"task_events" json:"task_events"` // 任务事件保留策略
 }
 
 // SyncTuneConfig 同步调优配置结构体（全量同步并发与连接池，按实例 max_connections、CPU、磁盘调整；不设则使用内置默认池大小）
@@ -44,6 +45,14 @@ type SyncTuneConfig struct { // 定义同步调优配置结构体
 	APIDefaultWorkerCount int `toml:"api_default_worker_count" json:"api_default_worker_count"` // API默认工作线程数
 	// APIDefaultBatchSize 创建任务未传 batch_size 时的默认批量；<=0 则用 1000
 	APIDefaultBatchSize int `toml:"api_default_batch_size" json:"api_default_batch_size"` // API默认批处理大小
+}
+
+// TaskEventsConfig 任务关键事件保留配置。
+type TaskEventsConfig struct {
+	MaxKeyEvents   int `toml:"max_key_events"   json:"max_key_events"`   // 每任务保留 KEY 事件上限；<=0 默认 2000
+	RetainDays     int `toml:"retain_days"      json:"retain_days"`      // KEY 事件最长保留天数；<=0 默认 30
+	MinErrorEvents int `toml:"min_error_events" json:"min_error_events"` // ERROR 至少保留条数；<=0 默认 200
+	PruneHours     int `toml:"prune_hours"      json:"prune_hours"`      // 后台清理间隔（小时）；<=0 默认 24
 }
 
 // StorageConfig 持久化配置结构体

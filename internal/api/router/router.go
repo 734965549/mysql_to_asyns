@@ -49,6 +49,7 @@ func SetupRouter(taskSvc *taskService.TaskService, analyzer service.IdentityAnal
 
 	// 创建处理器
 	taskHandler := handler.NewTaskHandler(taskSvc, analyzer) // 创建任务处理器
+	taskEventHandler := handler.NewTaskEventHandler(taskSvc)
 	metadataHandler := handler.NewMetadataHandler(analyzer)  // 创建元数据处理器
 
 	// API分组
@@ -71,6 +72,8 @@ func SetupRouter(taskSvc *taskService.TaskService, analyzer service.IdentityAnal
 			tasks.GET("/:id/progress", taskHandler.GetTaskProgress)        // 获取任务运行时进度路由：GET /api/tasks/:id/progress
 			tasks.POST("/:id/skip", taskHandler.SkipError)                 // 跳过错误路由：POST /api/tasks/:id/skip
 			tasks.POST("/:id/cancel-schedule", taskHandler.CancelSchedule) // 取消定时启动路由：POST /api/tasks/:id/cancel-schedule
+			tasks.GET("/:id/events", taskEventHandler.ListTaskEvents)
+			tasks.GET("/:id/event-executions", taskEventHandler.ListTaskEventExecutions)
 		} // 分组结束
 
 		// 配置

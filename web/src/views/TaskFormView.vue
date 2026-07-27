@@ -124,7 +124,8 @@ const taskForm = ref({
   enable_drop_table_before_ddl: false, enable_skip_binlog: false,
   tx_commit_every_n_parallel: 0, index_restore_worker_count: 0,
   full_load_engine: "v1",
-  full_load_read_workers: 0, full_load_write_workers: 0, full_load_buffer_mb: 0,
+  full_load_read_workers: 0, full_load_table_workers: 0, full_load_per_table_readers: 0,
+  full_load_write_workers: 0, full_load_buffer_mb: 0,
   full_load_batch_bytes_mb: 0, full_load_commit_rows: 0, full_load_commit_bytes_mb: 0,
   full_load_lock_wait_timeout_sec: 0, full_load_degrade_on_align_lock_fail: false,
   allow_nopk_all: false,
@@ -153,6 +154,8 @@ const fullLoadEffective = computed(() => {
     : 10000;
   return {
     read: orDefault(f.full_load_read_workers, 4),
+    table: orDefault(f.full_load_table_workers, orDefault(f.full_load_read_workers, 4)),
+    perTable: orDefault(f.full_load_per_table_readers, orDefault(f.full_load_read_workers, 4)),
     write: orDefault(f.full_load_write_workers, 4),
     buffer: orDefault(f.full_load_buffer_mb, 128),
     commitRows: orDefault(f.full_load_commit_rows, legacyCommitRows),
@@ -306,7 +309,8 @@ function resetForm() {
     enable_limit_one: false, optimize_index: false, index_restore_worker_count: 0,
     enable_read_only: false, enable_drop_table_before_ddl: false,
     enable_skip_binlog: false, tx_commit_every_n_parallel: 0,
-    full_load_engine: "v1", full_load_read_workers: 0, full_load_write_workers: 0,
+    full_load_engine: "v1", full_load_read_workers: 0, full_load_table_workers: 0,
+    full_load_per_table_readers: 0, full_load_write_workers: 0,
     full_load_buffer_mb: 0, full_load_batch_bytes_mb: 0, full_load_commit_rows: 0,
     full_load_commit_bytes_mb: 0, full_load_lock_wait_timeout_sec: 0,
     full_load_degrade_on_align_lock_fail: false,
@@ -457,6 +461,8 @@ function fillTaskFormFromTask(task) {
     tx_commit_every_n_parallel: task.config.tx_commit_every_n_parallel ?? 0,
     full_load_engine: task.config.full_load_engine || "v1",
     full_load_read_workers: task.config.full_load_read_workers ?? 0,
+    full_load_table_workers: task.config.full_load_table_workers ?? 0,
+    full_load_per_table_readers: task.config.full_load_per_table_readers ?? 0,
     full_load_write_workers: task.config.full_load_write_workers ?? 0,
     full_load_buffer_mb: task.config.full_load_buffer_mb ?? 0,
     full_load_batch_bytes_mb: task.config.full_load_batch_bytes_mb ?? 0,
@@ -1513,7 +1519,9 @@ onUnmounted(() => {
                         type="secondary"
                         style="font-size: 12px; display: block; margin-top: 4px"
                       >
-                        当前生效：读 {{ fullLoadEffective.read }} / 写
+                        当前生效：全局读取预算 {{ fullLoadEffective.read }} / 表并发
+                        {{ fullLoadEffective.table }} / 单表并行
+                        {{ fullLoadEffective.perTable }}，写
                         {{ fullLoadEffective.write }} worker，队列
                         {{ fullLoadEffective.buffer }} MiB，单事务
                         {{ fullLoadEffective.commitRows }} 行 /
@@ -1524,7 +1532,7 @@ onUnmounted(() => {
 
                     <a-row :gutter="16">
                       <a-col :span="12">
-                        <a-form-item label="源读取并发 (read workers)">
+                        <a-form-item label="源读取总预算 (read workers)">
                           <a-input-number
                             :model-value="taskForm.full_load_read_workers"
                             @change="(v) => (taskForm.full_load_read_workers = v ?? 0)"
@@ -1537,8 +1545,35 @@ onUnmounted(() => {
                             type="secondary"
                             style="font-size: 12px"
                           >
-                            1=显式单线程；&gt;1=并行读取。运行中失败不会自动降为单线程
+                            全局源库并发连接上限；与表并发、单表并行解耦
                           </a-typography-text>
+                        </a-form-item>
+                      </a-col>
+                      <a-col :span="12">
+                        <a-form-item label="并发表调度 (table workers)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_table_workers"
+                            @change="(v) => (taskForm.full_load_table_workers = v ?? 0)"
+                            :min="0"
+                            :max="64"
+                            style="width: 100%"
+                            placeholder="0=沿用 read workers"
+                          />
+                        </a-form-item>
+                      </a-col>
+                    </a-row>
+
+                    <a-row :gutter="16">
+                      <a-col :span="12">
+                        <a-form-item label="单表并行读 (per-table readers)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_per_table_readers"
+                            @change="(v) => (taskForm.full_load_per_table_readers = v ?? 0)"
+                            :min="0"
+                            :max="64"
+                            style="width: 100%"
+                            placeholder="0=沿用 read workers"
+                          />
                         </a-form-item>
                       </a-col>
                       <a-col :span="12">

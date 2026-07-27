@@ -104,8 +104,10 @@ type TaskConfig struct { // 定义任务配置结构体
 	// full_load_engine=v1 时保持旧行为（内联 syncDatabasePair）；=v2 时使用任务级
 	// chunk 调度 + 读写解耦流水线。其余 full_load_* 字段 0 表示使用 4C8G 平衡预设自动值。
 	FullLoadEngine        string `json:"full_load_engine,omitempty"`          // v1 / v2；空视为 v1
-	FullLoadReadWorkers   int    `json:"full_load_read_workers,omitempty"`    // 任务级源读取上限；0=自动(4)
-	FullLoadWriteWorkers  int    `json:"full_load_write_workers,omitempty"`   // 任务级目标写入上限；0=自动(4)
+	FullLoadReadWorkers      int    `json:"full_load_read_workers,omitempty"`      // 全局源库读取总预算；0=自动(4)
+	FullLoadTableWorkers     int    `json:"full_load_table_workers,omitempty"`     // 并发表调度上限；0=沿用 read_workers
+	FullLoadPerTableReaders  int    `json:"full_load_per_table_readers,omitempty"` // 单表内并行读上限；0=沿用 read_workers
+	FullLoadWriteWorkers     int    `json:"full_load_write_workers,omitempty"`     // 任务级目标写入上限；0=自动(4)
 	FullLoadBufferMB      int    `json:"full_load_buffer_mb,omitempty"`       // 任务级数据队列上限(MiB)；0=128
 	FullLoadBatchBytesMB  int    `json:"full_load_batch_bytes_mb,omitempty"`  // 单条 INSERT 字节上限(MiB)；0=4
 	FullLoadCommitRows    int    `json:"full_load_commit_rows,omitempty"`     // 单事务行数上限；0=10000
@@ -201,7 +203,8 @@ type ProcessContext struct { // 定义处理上下文结构体
 	// key = "sourceSchema.sourceTable"。V1 任务不写入此字段。
 	// 重启后根据每张表的 Phase 决策: PUBLISHED 跳过, DATA_READY 发布, COPYING/RETRY_WAIT 重新开始, FAILED 保持失败。
 	FullLoadV2States map[string]*FullLoadV2TableState `json:"full_load_v2_states,omitempty"`
-	// FullLoadRunID 当前 V2 全量运行 ID(用于重启后识别是否同一轮全量)。
+	// FullLoadRunID 当前 V2 全量运行 ID（用于重启后识别是否同一轮全量 staging 恢复）。
+	// 与运行时 execution_id（任务详情事件轮次）职责分离：execution_id 每次 StartTask 生成，不持久化在存档中。
 	FullLoadRunID string `json:"full_load_run_id,omitempty"`
 	// FullLoadExpectedTables 本轮全量预期表数量；与 FullLoadV2States 一起用于防止不完整 map 被误判为全部完成。
 	FullLoadExpectedTables int `json:"full_load_expected_tables,omitempty"`

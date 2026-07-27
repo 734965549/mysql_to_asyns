@@ -142,6 +142,8 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 
 	opt := fullload.ResolveOptions(fullload.RawOptions{
 		ReadWorkers:                  task.Config.FullLoadReadWorkers,
+		TableWorkers:                 task.Config.FullLoadTableWorkers,
+		PerTableReaders:              task.Config.FullLoadPerTableReaders,
 		WriteWorkers:                 task.Config.FullLoadWriteWorkers,
 		BufferMB:                     task.Config.FullLoadBufferMB,
 		BatchBytesMB:                 task.Config.FullLoadBatchBytesMB,
@@ -196,6 +198,9 @@ func (s *TaskService) syncDatabasePairV2(ctx context.Context, task *taskEntity.S
 		OnTableStateChange: func(schema, table, phase string, attemptID int, stagingTable, errMsg string, committedRows int64) error {
 			return s.persistFullLoadV2TableState(taskID, schema, table, phase, attemptID, stagingTable, errMsg, committedRows)
 		},
+	}
+	if s.eventRecorder != nil {
+		engine.EventSink = &FullLoadEventSink{TaskID: taskID, Recorder: s.eventRecorder}
 	}
 
 	runErr := engine.Run(ctx, specs)

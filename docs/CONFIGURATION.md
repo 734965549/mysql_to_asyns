@@ -141,6 +141,21 @@ env:
   - 缺点：需要额外的数据库
   - 系统会自动创建 `sys_sync_tasks` 表
 
+#### [task_events] - 任务关键事件保留
+
+```toml
+[task_events]
+  max_key_events = 2000    # 每任务保留 KEY 事件上限
+  retain_days = 30         # KEY 事件最长保留天数
+  min_error_events = 200   # ERROR 至少保留条数
+  prune_hours = 24         # 后台清理间隔（小时）
+```
+
+**说明**：
+- 事件与任务存档独立存储：file 模式为 `data/task-events/*.jsonl`；mysql 模式为 `sys_sync_task_events` 表
+- 当前 execution 的事件不会被 Prune 清理
+- 普通 5 秒 V2 进度 INFO 不写入事件列表（仅 logger）
+
 #### [security] - 安全配置
 
 ```toml
@@ -466,7 +481,9 @@ chunk 边界规划与读取共用同一连接池，改善负载均衡。开启
 | 字段 | 含义 | 默认（0/未配置时） |
 |------|------|---------------------|
 | `full_load_engine` | 全量引擎，`v1` / `v2` | `v1` |
-| `full_load_read_workers` | 读取 worker 数 | 4（范围 1–64） |
+| `full_load_read_workers` | 全局源库读取总预算（并发连接令牌数） | 4（范围 1–64） |
+| `full_load_table_workers` | 并发表规划/调度上限 | 0=沿用 `read_workers` |
+| `full_load_per_table_readers` | 单表内并行读上限（超大表） | 0=沿用 `read_workers` |
 | `full_load_write_workers` | 写入 worker 数 | 4（范围 1–64） |
 | `full_load_buffer_mb` | RowBatch 队列容量（MiB），背压阈值 | 128（范围 1–4096） |
 | `full_load_batch_bytes_mb` | 单批目标字节数（MiB），达到即入队 | 4（范围 1–64） |
@@ -495,10 +512,11 @@ chunk 边界规划与读取共用同一连接池，改善负载均衡。开启
   以下旧版指标已在 aligned snapshot 架构移除后下线，dashboard 需相应清理：
   `mysql_sync_full_load_snapshot_groups`、`mysql_sync_full_load_snapshot_txns`、
   `mysql_sync_full_load_oldest_snapshot_age_millis`、`mysql_sync_full_load_snapshot_align_degrades_total`。
-- `full_load_read_workers` 同时约束并发表数与单表内并行读连接数上限（`TableParallelReaders`
-  默认等于该值）；`CapBySourcePool` 会用真实源库连接池上限进一步约束两者，避免超过
-  `source_max_open_conns`。源库写入频繁、并行读连接数较大时会放大 undo / history list，
-  请按源库承受能力保守设置 worker 数。
+- `full_load_read_workers` 表示**全局源库读取总预算**；`full_load_table_workers` 与
+  `full_load_per_table_readers` 分别控制并发表调度与单表并行读。旧任务未配置后两者时，
+  仍按 `read_workers` 推导以保持兼容。`ComputeGlobalReadBudget` / `CapBySourcePool` 会
+  用真实源库连接池上限（保留约 10% 或至少 2 条连接）进一步裁剪预算；chunk 按表公平
+  轮询派发（A1,B1,C1…），避免单表占满连接与队列。
 - `full_load_lock_wait_timeout_sec`、`full_load_degrade_on_align_lock_fail` 已废弃：
   aligned snapshot 架构移除后这两个字段不再产生任何执行语义，API/任务存档仍可接收、
   持久化并回显以兼容旧任务，Web UI 已隐藏对应控件。

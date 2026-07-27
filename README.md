@@ -802,9 +802,37 @@ DELETE /api/tasks/:id
 
 GET /api/tasks/:id/metrics
 
+GET /api/tasks/:id/events
+
+GET /api/tasks/:id/event-executions
+
 ```
 
+**任务事件 API**（`GET /api/tasks/:id/events`）支持查询参数：
 
+- `execution_id` / `after_seq` / `before_seq` / `limit`
+- `min_severity`（INFO/WARN/ERROR）/ `visibility`（KEY/DIAGNOSTIC）
+- `category` / `code` / `source_schema` / `source_table`
+
+任务详情页「日志与错误」页签默认展示当前 execution 的 KEY 事件（最新在前），运行中每 3 秒增量轮询。
+
+**关键事件码索引**（`visibility=KEY`，不含 5 秒 progress 等 DIAGNOSTIC 事件）：
+
+| 分类 | 事件码 | 说明 |
+|------|--------|------|
+| 生命周期 | `TASK_SCHEDULED` / `TASK_STARTED` / `TASK_RESUMED` / `TASK_PAUSED` / `TASK_STOPPED` / `TASK_COMPLETED` / `TASK_FAILED` | 任务调度与状态变更 |
+| 配置 | `TASK_CONFIG_EFFECTIVE` / `FULL_LOAD_CONFIG_EFFECTIVE` | 每轮启动/V2 池 cap 后的生效配置 |
+| 阶段 | `PHASE_DDL_PREP_*` / `PHASE_P0_CAPTURED` / `PHASE_BASE_SCAN_*` / `PHASE_P1_*` / `PHASE_CATCHUP_*` / `PHASE_INDEX_RESTORE_*` / `PHASE_INCREMENTAL_STARTED` | ALL/FULL 各阶段起止 |
+| 表规划 | `TABLE_PLAN_CREATED` / `TABLE_ESTIMATE_FAILED` / `TABLE_CHUNK_PLAN_FALLBACK` / `TABLE_PARALLELISM_REDUCED` / `NOPK_SEQUENTIAL_FALLBACK` | 分片规划与降级 |
+| 表进展 | `TABLE_NO_PROGRESS` / `TABLE_PROGRESS_RECOVERED` | 表长时间无读进展及恢复 |
+| 宽表/拆批 | `WIDE_TABLE_TWO_PHASE_ENABLED` / `ROW_EXCEEDS_BATCH_BYTES` | 宽表两阶段读、单行超 batch_bytes |
+| 连接池 | `SOURCE_POOL_BUDGET_CAPPED` / `SOURCE_POOL_WAIT_HIGH` / `TARGET_POOL_BUDGET_CAPPED` | 池上限裁剪与等待压力 |
+| 队列背压 | `QUEUE_BACKPRESSURE_HIGH` / `QUEUE_BACKPRESSURE_RECOVERED` | 写队列高水位与恢复 |
+| 重试 | `WRITE_LOCK_RETRY` / `TABLE_READ_RETRY*` / `TX_COMMIT_*` / `TX_REPLAY_*` | 写锁、读重试、提交不确定与重放 |
+| Staging | `STAGING_TABLE_CREATED` / `STAGING_TABLE_PUBLISHED` / `STAGING_TABLE_DROPPED` | V2 staging 表生命周期 |
+| 其它 | `SLOW_SOURCE_QUERY` / `SCHEMA_LOCK_LOST` / `INDEX_RESTORE_FAILED` / `CHECKPOINT_PERSIST_FAILED` | 慢查询与任务级故障 |
+
+同一 `(code, 表, details 指纹)` 在 60 秒内重复出现会聚合为 `*_REPEATED` 汇总事件（`repeat_count` / `first_at` / `last_at`）。删除任务会联动清理该任务全部事件。
 
 **响应示例：**
 

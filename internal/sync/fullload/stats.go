@@ -1,9 +1,42 @@
 package fullload
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 )
+
+type tableReadTracker struct {
+	mu   sync.Mutex
+	rows map[string]int64
+}
+
+func newTableReadTracker() *tableReadTracker {
+	return &tableReadTracker{rows: make(map[string]int64)}
+}
+
+func (t *tableReadTracker) add(schema, table string, n int64) {
+	if t == nil || n <= 0 {
+		return
+	}
+	key := tableKey(schema, table)
+	t.mu.Lock()
+	t.rows[key] += n
+	t.mu.Unlock()
+}
+
+func (t *tableReadTracker) snapshot() map[string]int64 {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]int64, len(t.rows))
+	for k, v := range t.rows {
+		out[k] = v
+	}
+	return out
+}
 
 // Stats 汇总 V2 引擎运行期的读、写、提交、队列、连接与重放观测数据。
 // 所有字段用原子操作访问，Snapshot 返回一致快照供任务详情接口与日志使用。
@@ -43,6 +76,15 @@ type Stats struct {
 	TableRetries        int64 // 表级重试次数(P2)
 	TableRetryExhausted int64 // 表级重试耗尽次数(P2)
 	ActiveStagingTables int64 // 当前活跃 staging 表数(P2)
+	ReadBudgetInUse     int64 // 全局读取预算占用数(B3)
+
+	tableReads *tableReadTracker // 表级已读行数（B3-T07 无进展检测）
+}
+
+func (s *Stats) ensureTableReads() {
+	if s != nil && s.tableReads == nil {
+		s.tableReads = newTableReadTracker()
+	}
 }
 
 func (s *Stats) addReadBatch(rows, bytes int64, dur time.Duration) {
@@ -50,6 +92,19 @@ func (s *Stats) addReadBatch(rows, bytes int64, dur time.Duration) {
 	atomic.AddInt64(&s.ReadBytes, bytes)
 	atomic.AddInt64(&s.ReadBatches, 1)
 	atomic.AddInt64(&s.ReadNanos, int64(dur))
+}
+
+func (s *Stats) addReadBatchForTable(schema, table string, rows, bytes int64, dur time.Duration) {
+	s.addReadBatch(rows, bytes, dur)
+	s.ensureTableReads()
+	s.tableReads.add(schema, table, rows)
+}
+
+func (s *Stats) tableReadSnapshot() map[string]int64 {
+	if s == nil || s.tableReads == nil {
+		return nil
+	}
+	return s.tableReads.snapshot()
 }
 
 func (s *Stats) addWriteBatch(rows, bytes int64, dur time.Duration) {
@@ -70,6 +125,7 @@ func (s *Stats) addEnqueueWait(dur time.Duration) { atomic.AddInt64(&s.EnqueueWa
 func (s *Stats) incTxReplays()                    { atomic.AddInt64(&s.TxReplays, 1) }
 func (s *Stats) incLockRetries()                  { atomic.AddInt64(&s.LockRetries, 1) }
 func (s *Stats) incChunkDone()                    { atomic.AddInt64(&s.ChunksDone, 1) }
+func (s *Stats) setReadBudgetInUse(n int64) { atomic.StoreInt64(&s.ReadBudgetInUse, n) }
 func (s *Stats) setQueue(bytes, cap int64) {
 	atomic.StoreInt64(&s.QueueBytes, bytes)
 	atomic.StoreInt64(&s.QueueCap, cap)
@@ -103,6 +159,7 @@ type StatsSnapshot struct {
 	TableRetries        int64 `json:"table_retries"`
 	TableRetryExhausted int64 `json:"table_retry_exhausted"`
 	ActiveStagingTables int64 `json:"active_staging_tables"`
+	ReadBudgetInUse     int64 `json:"read_budget_in_use"`
 }
 
 // Snapshot 返回当前统计的一致快照。
@@ -134,5 +191,6 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		TableRetries:        atomic.LoadInt64(&s.TableRetries),
 		TableRetryExhausted: atomic.LoadInt64(&s.TableRetryExhausted),
 		ActiveStagingTables: atomic.LoadInt64(&s.ActiveStagingTables),
+		ReadBudgetInUse:     atomic.LoadInt64(&s.ReadBudgetInUse),
 	}
 }

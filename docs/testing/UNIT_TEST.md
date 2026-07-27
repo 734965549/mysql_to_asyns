@@ -50,12 +50,18 @@ mysql-to-sync/
 │       ├── application/
 │       │   └── service/
 │       │       ├── task_service_test.go
+│       │       ├── task_event_recorder_test.go
 │       │       └── resume_test.go   # 历史全量断点字段与清理
+│       ├── infrastructure/
+│       │   └── storage/
+│       │       └── file_task_event_store_test.go
 │       └── domain/
 │           └── entity/
-│               └── task_test.go
+│               ├── task_test.go
+│               └── task_event_test.go
 └── pkg/
-    ├── logger/
+    ├── taskevent/
+    │   └── sanitize_test.go
     │   └── logger_test.go
     └── storage/
         └── storage_test.go
@@ -110,17 +116,21 @@ go test -v ./...
 # 示例 DSN（root，需具备 CREATE DATABASE）
 export TEST_MYSQL_DSN='root:root_password@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true'
 
-go test -tags=integration -count=1 -timeout=5m -v ./internal/sync/fullload/ -run TestIntegration
+go test -tags=integration -count=1 -timeout=10m -v ./internal/sync/fullload/ -run TestIntegration
 ```
 
-覆盖场景（`integration_mysql_test.go`）：
+覆盖场景：
 
-| 测试用例 | 描述 |
-|----------|------|
-| TestIntegration_SnapshotExcludesPostSnapshotPKSwap | 快照后删旧 PK + 新 PK 同唯一键重插，读结果不混入新版本 |
-| TestIntegration_SnapshotExcludesUniqueColumnRewrite | 快照后唯一列改写成另一行已有值，快照仍见旧版本且无重复 UK |
-| TestIntegration_SnapshotBoundaryCrossingPKMove | PK 跨 chunk 边界挪移，同表快照不漏不重 |
-| TestIntegration_EngineConcurrentPKSwap_NoDuplicateUKOnIndexRestore | Engine.Run 灌数中并发换 PK，目标无重复 UK 且 ADD UNIQUE 无 1062 |
+| 测试文件 | 用例 | 描述 |
+|----------|------|------|
+| `integration_b5_test.go` | `TestIntegration_B5_MultiTableFairness_*` | 8 小表 + 大 JSON 并行全量，行数一致 |
+| `integration_b5_test.go` | `TestIntegration_B5_Backpressure_*` | 慢目标写入触发器，小表仍可完整写入 |
+| `integration_b5_test.go` | `TestIntegration_B5_OversizedJSONRow_*` | 单行超 batch_bytes + `ROW_EXCEEDS_BATCH_BYTES` |
+| `integration_b5_test.go` | `TestIntegration_B5_NoPKLargeText_*` | 无 PK 大字段表行数一致 |
+| `integration_b5_test.go` | `TestIntegration_B5_ReadBudgetPeakWithinCap` | 读预算峰值不超过 cap |
+| `fault_injection_test.go` | `TestIntegration_FaultInjection_*` | 源查询超时 / 慢 writer barrier（需较长超时） |
+
+辅助：`integration_mysql_test.go` 提供 `openIntegrationMySQL` / `seedBillRows` 等 helper。
 
 未设置 `TEST_MYSQL_DSN` 时上述用例会 `Skip`。
 
@@ -161,7 +171,32 @@ go test -tags=integration -count=1 -timeout=5m -v ./internal/sync/fullload/ -run
 | TestCursorReader | 测试游标读取器 |
 | TestRangeShardingReader | 测试范围分片读取器 |
 
-### Metadata 模块
+### Fullload V2（B3/B4/B5）
+
+| 测试文件 / 用例 | 描述 |
+|-----------------|------|
+| `read_budget_test.go` | 全局读取预算、单表占用上限、Acquire/Release |
+| `chunk_scheduler_test.go` | 公平 chunk 轮询、单表 burst |
+| `queue_test.go` | 写队列公平出队、表级 soft limit、单事务单表 |
+| `stress_fairness_test.go` | 多表调度不饿死、读预算峰值、背压事件（B5-T02/T03） |
+| `table_progress_test.go` | 表无进展 / 恢复事件、表级读行快照（B3-T07） |
+| `events_test.go` | 背压状态机、EventSink nil 安全 |
+| `chunk_test.go` → `TestPlanKeysetBoundaries_EstimateFailedEmitsEvent` | TABLE_ROWS 失败 fallback + 事件 |
+| `reader_test.go` → `TestScanUpTo_BytesSplitAndOversizedRowCallback` | 字节拆批与超大单行回调 |
+| `fault_injection_test.go`（`//go:build integration`） | 源查询超时 → 表级重试 → staging 发布 |
+
+### TaskEvent（B1/B5）
+
+| 测试文件 / 用例 | 描述 |
+|-----------------|------|
+| `task_event_recorder_test.go` | 60s 指纹聚合、ERROR 不抑制 |
+| `task_event_lifecycle_test.go` | Start/Pause/Resume execution 轮次、Complete/Failed、DeleteTask 清事件（B5-T05） |
+| `file_task_event_store_test.go` / `mysql_task_event_store_test.go` | Append/List/Delete/seq 恢复 |
+| `task_event_store_contract_test.go` | 文件存储契约、Prune 保留 ERROR |
+| `task_event_handler_test.go` | GET `/events` 二次脱敏、参数校验 |
+| `pkg/taskevent/sanitize_test.go` | DSN/password/Bearer/嵌套 details 脱敏 |
+| `linttasklog/lint_test.go` | fullload 禁止 `[Task` 业务 Warn/Error |
+
 
 | 测试用例 | 描述 |
 |----------|------|

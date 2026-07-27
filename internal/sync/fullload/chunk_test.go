@@ -2,6 +2,7 @@ package fullload
 
 import (
 	"context"
+	"database/sql"
 	"math"
 	"testing"
 
@@ -263,5 +264,41 @@ func TestPlanIntegerRange_DenseNoFallback(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestPlanKeysetBoundaries_EstimateFailedEmitsEvent(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	sink := &recordingSink{}
+	p := NewPlannerWithSink(db, sink)
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t",
+		EstimatedRows: 0,
+		Identity: &entity.TableIdentity{
+			Strategy:     entity.PKStrategy,
+			IdentifyCols: []string{"id"},
+			CursorCols:   []string{"id"},
+			Columns:      []entity.ColumnMeta{{Name: "id", DataType: "bigint"}},
+		},
+	}
+	mock.ExpectQuery("SELECT TABLE_ROWS FROM information_schema.TABLES").
+		WithArgs("s", "t").
+		WillReturnError(sql.ErrNoRows)
+
+	chunks, err := p.planKeysetBoundaries(context.Background(), spec, []string{"id"}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("expected single-chunk fallback, got %d", len(chunks))
+	}
+	codes := sink.codes()
+	if len(codes) != 1 || codes[0] != EventCodeTableEstimateFailed {
+		t.Fatalf("expected TABLE_ESTIMATE_FAILED, got %v", codes)
 	}
 }

@@ -32,9 +32,14 @@ type Engine struct {
 	// OnTableStateChange 在表级状态变更时调用(P3 持久化);由集成层落盘到任务存档。
 	OnTableStateChange TableStateCallback
 
+	// EventSink 可选；用于上报关键过程事件（由 task 层注入，fullload 不依赖 internal/task）。
+	EventSink EventSink
+
 	tracker      *tableCompletionTracker
 	stateTracker *tableStateTracker // P2.5: 表级重试状态跟踪
 	reported     StatsSnapshot      // 已上报到 Prometheus 的累计快照（仅 reportLoop / pushFinalMetrics 访问）
+	queueBP       queueBackpressureState
+	tableProgress *tableProgressWatch
 }
 
 // TableStateCallback 表级状态变更回调(P3 持久化用)。
@@ -52,7 +57,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	if e.SourceDB == nil || e.TargetDB == nil {
 		return fmt.Errorf("full-load V2 requires non-nil source and target databases")
 	}
-	if opt.ReadWorkers < 1 || opt.WriteWorkers < 1 || opt.BatchRows < 1 || opt.BufferBytes < 1 {
+	if opt.GlobalReadBudget < 1 || opt.WriteWorkers < 1 || opt.BatchRows < 1 || opt.BufferBytes < 1 {
 		return fmt.Errorf("full-load V2 received unresolved or invalid options")
 	}
 	if err := opt.Validate(); err != nil {
@@ -61,13 +66,27 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 
 	// 读取并发预算不得超过真实源池上限（默认 source_max_open_conns=32）。
 	poolMax := e.SourceDB.Stats().MaxOpenConnections
-	beforeReadWorkers := opt.ReadWorkers
+	beforeBudget := opt.GlobalReadBudget
 	beforeTableParallel := opt.TableParallelReaders
+	beforeTableWorkers := opt.TableWorkers
 	opt.CapBySourcePool(poolMax)
 	e.Options = opt
-	if poolMax > 0 && (opt.ReadWorkers != beforeReadWorkers || opt.TableParallelReaders != beforeTableParallel) {
-		logger.Info("[Task %s] FullLoadV2: capped read_workers %d -> %d table_parallel_readers %d -> %d by source pool max_open=%d",
-			e.TaskID, beforeReadWorkers, opt.ReadWorkers, beforeTableParallel, opt.TableParallelReaders, poolMax)
+	if poolMax > 0 && (opt.GlobalReadBudget != beforeBudget || opt.TableParallelReaders != beforeTableParallel || opt.TableWorkers != beforeTableWorkers) {
+		logger.Info("[Task %s] FullLoadV2: capped global_read_budget %d -> %d table_parallel %d -> %d table_workers %d -> %d by source pool max_open=%d",
+			e.TaskID, beforeBudget, opt.GlobalReadBudget, beforeTableParallel, opt.TableParallelReaders, beforeTableWorkers, opt.TableWorkers, poolMax)
+		poolEvent(e.EventSink, EventCodeSourcePoolBudgetCapped,
+			fmt.Sprintf("capped global_read_budget %d->%d table_parallel %d->%d table_workers %d->%d by source pool max=%d",
+				beforeBudget, opt.GlobalReadBudget, beforeTableParallel, opt.TableParallelReaders, beforeTableWorkers, opt.TableWorkers, poolMax),
+			EventSeverityInfo,
+			map[string]interface{}{
+				"before_global_read_budget":     beforeBudget,
+				"after_global_read_budget":      opt.GlobalReadBudget,
+				"before_table_parallel_readers": beforeTableParallel,
+				"after_table_parallel_readers":  opt.TableParallelReaders,
+				"before_table_workers":          beforeTableWorkers,
+				"after_table_workers":           opt.TableWorkers,
+				"source_pool_max_open":          poolMax,
+			})
 	}
 
 	// [P2] 目标连接池容量校验：锁连接占用 1 个池槽，写路径至少需要 1 个额外连接。
@@ -78,12 +97,25 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		}
 		usable := targetPoolMax - 1
 		if opt.WriteWorkers > usable {
+			beforeWrite := opt.WriteWorkers
 			logger.Info("[Task %s] FullLoadV2: capping WriteWorkers %d -> %d (target pool %d minus 1 lock conn)",
 				e.TaskID, opt.WriteWorkers, usable, targetPoolMax)
 			opt.WriteWorkers = usable
 			e.Options = opt
+			poolEvent(e.EventSink, EventCodeTargetPoolBudgetCapped,
+				fmt.Sprintf("capped write_workers %d->%d (target pool %d minus lock conn)",
+					beforeWrite, usable, targetPoolMax),
+				EventSeverityInfo,
+				map[string]interface{}{
+					"before_write_workers": beforeWrite,
+					"after_write_workers":  usable,
+					"target_pool_max_open": targetPoolMax,
+				})
 		}
 	}
+
+	configEvent(e.EventSink, EventCodeFullLoadConfigEffective, optionsEffectiveMessage(opt),
+		optionsEventDetails(opt, poolMax, targetPoolMax))
 
 	// 目标端必须为 InnoDB：写事务原子性与 Commit 未知时的 marker 探测都依赖事务引擎。
 	if err := assertTargetTablesInnoDB(ctx, e.TargetDB, specs); err != nil {
@@ -101,7 +133,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		}
 		defer func() {
 			if rErr := schemaLocks.Release(context.Background()); rErr != nil {
-				logger.Warn("[Task %s] FullLoadV2: release tx marker schema locks: %v", e.TaskID, rErr)
+				logger.Warn("[FullLoadV2] task=%s release tx marker schema locks: %v", e.TaskID, rErr)
 			}
 		}()
 	}
@@ -116,6 +148,8 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 
 	cctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	stopPoolWatch := startSourcePoolWatcher(cctx, e.SourceDB, e.EventSink)
+	defer stopPoolWatch()
 	stopWatchDone := make(chan struct{})
 	if e.IsStopped != nil || e.StopCause != nil {
 		go func() {
@@ -144,6 +178,10 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 		jobs = append(jobs, &tableReadJob{spec: spec})
 	}
 	e.tracker = newTableCompletionTracker(specs, e.OnTableDataReady)
+	e.tableProgress = newTableProgressWatch(opt.TableNoProgressSec, e.EventSink)
+	if e.tableProgress != nil {
+		e.tableProgress.seed(specs)
+	}
 	// P2.5: 启用重试或 staging 时创建表级状态跟踪器
 	if opt.ReadRetryTimes > 0 || opt.StagingEnabled {
 		e.stateTracker = newTableStateTracker(specs)
@@ -155,8 +193,8 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	q.watchContext(cctx)
 	e.reported = e.Stats.Snapshot()
 
-	logger.Info("[Task %s] FullLoadV2: %d table(s), read_workers=%d write_workers=%d buffer=%dMiB commit_rows=%d commit_bytes=%dMiB (plain-short-query)",
-		e.TaskID, len(specs), opt.ReadWorkers, opt.WriteWorkers,
+	logger.Info("[Task %s] FullLoadV2: %d table(s), global_read_budget=%d table_workers=%d table_parallel=%d write_workers=%d buffer=%dMiB commit_rows=%d commit_bytes=%dMiB (plain-short-query)",
+		e.TaskID, len(specs), opt.GlobalReadBudget, opt.TableWorkers, opt.TableParallelReaders, opt.WriteWorkers,
 		opt.BufferBytes/1024/1024, opt.CommitRows, opt.CommitBytes/1024/1024)
 
 	// 周期性聚合日志与 Prometheus 上报。
@@ -177,7 +215,7 @@ func (e *Engine) Run(ctx context.Context, specs []*TableSpec) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		writerErr = runWriters(cctx, e.TaskID, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.stateTracker, e.IsStopped, runID)
+		writerErr = runWriters(cctx, e.TaskID, e.TargetDB, q, opt, e.Stats, e.OnCommit, e.tracker, e.stateTracker, e.IsStopped, runID, e.EventSink)
 		if writerErr != nil {
 			cancel(writerErr)
 		}
@@ -254,7 +292,7 @@ func logPipelineOutcome(taskID string, snap StatsSnapshot, readerErr, writerErr,
 		return
 	}
 	cancelCause := context.Cause(pipelineCtx)
-	logger.Error("[Task %s] FullLoadV2 failed: %s reader_err=%s writer_err=%s cancel_cause=%s err=%s",
+	logger.Error("[FullLoadV2] task=%s failed: %s reader_err=%s writer_err=%s cancel_cause=%s err=%s",
 		taskID, chunks,
 		formatPipelineErr(readerErr),
 		formatPipelineErr(writerErr),
@@ -274,6 +312,10 @@ func (e *Engine) reportLoop(ctx context.Context, stop <-chan struct{}) {
 		case <-ticker.C:
 			cur := e.Stats.Snapshot()
 			e.pushMetrics(e.reported, cur)
+			e.queueBP.observe(e.EventSink, cur.QueueBytes, cur.QueueCap)
+			if e.tableProgress != nil {
+				e.tableProgress.tick(e.Stats.tableReadSnapshot())
+			}
 			logger.Info("[Task %s] FullLoadV2 progress: read=%d rows write=%d rows commit=%d rows queue=%d/%d bytes readers=%d writers=%d replays=%d",
 				e.TaskID, cur.ReadRows, cur.WrittenRows, cur.CommittedRows,
 				cur.QueueBytes, cur.QueueCap, cur.ActiveReaders, cur.ActiveWriters, cur.TxReplays)
@@ -297,6 +339,7 @@ func (e *Engine) pushMetrics(prev, cur StatsSnapshot) {
 	m.AddFullLoadTableRetries(cur.TableRetries - prev.TableRetries)
 	m.AddFullLoadTableRetryExhausted(cur.TableRetryExhausted - prev.TableRetryExhausted)
 	m.AddFullLoadActiveStagingTables(cur.ActiveStagingTables - prev.ActiveStagingTables)
+	m.SetFullLoadReadBudgetInUse(cur.ReadBudgetInUse)
 }
 
 func (e *Engine) pushFinalMetrics() {

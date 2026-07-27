@@ -242,7 +242,7 @@ func TestWriterLoopReplaysWholeTransactionOnDeadlock(t *testing.T) {
 	var committed int64
 	err = writerLoop(context.Background(), "test", 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 10}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestWriterLoopReconnectsOnInvalidConnection(t *testing.T) {
 	var committed int64
 	err = writerLoop(context.Background(), "test", 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 10}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestWriterLoopRecoversUnknownCommitWhenRolledBack(t *testing.T) {
 	stats := &Stats{}
 	var committed int64
 	err = writerLoop(context.Background(), "test", 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestWriterLoopRecoversUnknownCommitWhenApplied(t *testing.T) {
 	stats := &Stats{}
 	var committed int64
 	err = writerLoop(context.Background(), "test", 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -436,7 +436,7 @@ func TestWriterLoopCommitNonConnErrorStillFails(t *testing.T) {
 		Rows:    [][]any{{int64(1)}}, ApproxBytes: 8,
 	})
 	q.Close()
-	err = writerLoop(context.Background(), "test", 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), &Stats{}, nil, nil, nil, nil, "run-1")
+	err = writerLoop(context.Background(), "test", 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), &Stats{}, nil, nil, nil, nil, "run-1", nil)
 	if err == nil || !strings.Contains(err.Error(), "disk full") || strings.Contains(err.Error(), "outcome unknown") {
 		t.Fatalf("expected plain commit error, got %v", err)
 	}
@@ -501,7 +501,7 @@ func TestWriterLoopFullColumnsIdenticalRowsAcrossTxUsesDistinctMarkers(t *testin
 	var committed int64
 	err = writerLoop(context.Background(), "test", 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 1}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -596,7 +596,7 @@ func TestWriterLoopCommitsOnIntervalWithoutNextBatch(t *testing.T) {
 	opt.CommitInterval = 20 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err = writerLoop(ctx, "test", 0, db, q, opt, &Stats{}, func(_, _ string, _, _ int64) { q.Close() }, nil, nil, nil, "run-1")
+	err = writerLoop(ctx, "test", 0, db, q, opt, &Stats{}, func(_, _ string, _, _ int64) { q.Close() }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}

@@ -72,8 +72,8 @@ func TestSampleBoundary_VarcharPK_3Workers(t *testing.T) {
 	defer targetDB.Close()
 	targetMock.MatchExpectationsInOrder(false)
 
-	// readLimit = syncReadBatchLimit(100) / (2+1 heavy) = 33
-	rl := int64(33)
+	// readLimit = syncReadBatchLimit(100)；宽列不再静态缩小 LIMIT（B4）。
+	rl := int64(100)
 
 	// === 源端 mock ===
 	// 1. information_schema.TABLE_ROWS 估算（step = 6/3 = 2）
@@ -171,7 +171,7 @@ func TestSampleBoundary_CompositePK_2Workers(t *testing.T) {
 	defer targetDB.Close()
 	targetMock.MatchExpectationsInOrder(false)
 
-	rl := int64(33)
+	rl := int64(100)
 
 	// === 源端 mock ===
 	// 1. TABLE_ROWS 估算（step = 4/2 = 2）

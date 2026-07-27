@@ -144,6 +144,10 @@ type TaskService struct {
 	comparisonCancels map[string]context.CancelFunc
 	comparisonWgs     map[string]*sync.WaitGroup
 	comparisonMu      sync.Mutex // 保护 comparisonCancels / comparisonWgs
+
+	eventRecorder    *TaskEventRecorder
+	eventStoreCloser func() error
+	pruneStop        chan struct{}
 }
 
 // taskRuntime contains resources that must not be shared across running tasks.
@@ -160,6 +164,9 @@ type taskRuntime struct {
 	readOnlyManager *readonly.ReadOnlyManager
 
 	cancel context.CancelFunc
+
+	// executionID 标识单次 StartTask→结束 的运行轮次，与 FullLoadRunID（V2 staging 恢复）职责分离。
+	executionID string
 }
 
 // pendingIndexRestore records indexes removed for full-sync bulk loading.
@@ -674,6 +681,8 @@ func NewTaskService(cfg *config.Config) *TaskService {
 	ts.storage = storage
 	ts.storageCloser = storageCloser
 	logger.Info("Using %s task storage", storageType)
+
+	initTaskEventInfrastructure(ts, cfg)
 
 	// 初始化位点管理器
 
@@ -1427,6 +1436,12 @@ func (s *TaskService) DeleteTask(taskID string) error {
 
 	}
 
+	if s.eventRecorder != nil {
+		if err := s.eventRecorder.DeleteByTask(taskID); err != nil {
+			logger.Warn("[Task %s] Failed to delete task events: %v", taskID, err)
+		}
+	}
+
 	// 删除位点信息
 
 	if s.checkpointManager != nil {
@@ -1495,6 +1510,7 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 	}
 
 	wasScheduled := task.Context.Status == taskEntity.TaskStatusScheduled
+	prevStatus := task.Context.Status
 
 	// 动态创建数据库连接（如果还没有创建或需要更新）
 
@@ -1524,10 +1540,24 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) error {
 
 	s.runtimes[taskID] = runtime
 
+	s.bindExecution(taskID, runtime)
+
 	task.Start()
 	if !wasScheduled {
 		task.ClearScheduleConfig()
 	}
+
+	startCode := taskEntity.EventCodeTaskStarted
+	startMsg := "任务已启动"
+	if prevStatus == taskEntity.TaskStatusPaused {
+		startCode = taskEntity.EventCodeTaskResumed
+		startMsg = "任务已从暂停恢复"
+	} else if wasScheduled {
+		startCode = taskEntity.EventCodeTaskStarted
+		startMsg = "定时任务已启动"
+	}
+	s.emitLifecycle(taskID, startCode, startMsg, taskEntity.EventSeverityInfo)
+	s.emitTaskConfigEffective(task)
 
 	// 记录审计日志
 
@@ -2150,6 +2180,9 @@ var errFullSyncPreflight = errors.New("full sync preflight failed")
 func (s *TaskService) abortFullSyncIfCancelled(ctx context.Context, taskID string) error {
 	if err := fullload.SchemaLockLostError(ctx); err != nil {
 		logger.Error("[Task %s] Full sync aborted after schema lock lost", taskID)
+		s.emitRetryEvent(taskID, taskEntity.EventCodeSchemaLockLost, "", "",
+			"target schema advisory lock lost; full sync aborted (fail-closed)",
+			taskEntity.EventSeverityError, nil)
 		return err
 	}
 	if s.isUserFullSyncStop(taskID) {
@@ -2790,6 +2823,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 				}
 				if err := s.checkpointManager.SavePosition(ctx, taskID, p0); err != nil {
 					errMsg := fmt.Sprintf("V2 resume: failed to restore checkpoint from P0: %v", err)
+					s.emitRetryEvent(taskID, taskEntity.EventCodeCheckpointPersistFailed, "", "",
+						errMsg, taskEntity.EventSeverityError,
+						map[string]interface{}{"stage": "v2_resume_p0", "error": err.Error()})
 					s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
 						t.MarkFullSyncFailed(errMsg)
 					})
@@ -2832,6 +2868,9 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 				errMsg := fmt.Sprintf("Failed to save binlog start position for incremental sync: %v. "+
 					"Without a persisted checkpoint, incremental sync would fall back to current master position and miss all changes during full sync. "+
 					"Task failed to prevent silent data loss.", err)
+				s.emitRetryEvent(taskID, taskEntity.EventCodeCheckpointPersistFailed, "", "",
+					"failed to persist P0 binlog checkpoint", taskEntity.EventSeverityError,
+					map[string]interface{}{"stage": "p0_save", "error": err.Error()})
 				logger.Error("[Task %s] %s", taskID, errMsg)
 				s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
 					t.MarkFullSyncFailed(errMsg)
@@ -2841,6 +2880,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			}
 			logger.Info("[Task %s] Full-sync start binlog position saved (will be incremental catch-up start point): %s",
 				taskID, startPosStr)
+			s.emitPhase(taskID, taskEntity.EventCodePhaseP0Captured, "P0",
+				fmt.Sprintf("已捕获全量起始 binlog 位点 P0=%s", startPosStr))
 		}
 	} else {
 		logger.Info("[Task %s] FULL mode: skipping binlog position capture and incremental checkpoint (no change catch-up)", taskID)
@@ -2860,6 +2901,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			t.MarkFullSyncStarted(startPosStr)
 		})
 	}
+
+	s.emitPhase(taskID, taskEntity.EventCodePhaseDDLPrepStarted, "DDL_PREP", "开始目标端 DDL 准备（schema 锁与表结构）")
 
 	// [P1] 在首次目标端 DDL 前获取所有目标 schema 锁，覆盖完整生命周期
 	// （库级重建 → 表结构准备 → 数据写入 → 索引恢复），直到任务级收尾完成才释放。
@@ -2890,6 +2933,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		lockCtx, lockCancel := context.WithCancelCause(ctx)
 		schemaLocks.StartHeartbeat(lockCtx, func() {
 			logger.Error("[Task %s] Schema lock heartbeat lost; cancelling full sync (fail-closed)", taskID)
+			s.emitRetryEvent(taskID, taskEntity.EventCodeSchemaLockLost, "", "",
+				"target schema advisory lock heartbeat lost (fail-closed)", taskEntity.EventSeverityError, nil)
 			lockCancel(fullload.ErrSchemaLockLost)
 		})
 		defer lockCancel(nil)
@@ -2900,6 +2945,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		}()
 		// 使用 lockCtx 替换后续操作的 ctx，确保锁失活可传播取消。
 		ctx = lockCtx
+		s.emitPhase(taskID, taskEntity.EventCodePhaseDDLPrepCompleted, "DDL_PREP", "目标端 schema 锁已获取，DDL 准备就绪")
 	}
 
 	// 崩溃恢复：必须在 GET_LOCK 成功且 heartbeat/派生 ctx 建立之后，再按持久化精确表名 DROP 遗留 staging。
@@ -2975,6 +3021,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 		logger.Info("[Task %s] FullLoadV2 resume: baseline already PUBLISHED; skip table copy and resume post-baseline phases (subphase=%q)",
 			taskID, v2Resume.subphase)
 	} else {
+		s.emitPhase(taskID, taskEntity.EventCodePhaseBaseScanStarted, "BASE_SCAN", "开始基线数据扫描")
 		for _, p := range pairs {
 
 			if err := s.abortFullSyncIfCancelled(ctx, taskID); err != nil {
@@ -3006,6 +3053,7 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			}
 
 		}
+		s.emitPhase(taskID, taskEntity.EventCodePhaseBaseScanCompleted, "BASE_SCAN", "基线数据扫描完成")
 	}
 
 	// PUBLISHED 跳过不会把延迟索引写入 pending；resume/部分完成后统一补齐缺失延迟索引。
@@ -3072,7 +3120,11 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 					t.Context.FullSyncSubphase = "CATCH_UP"
 					t.Context.LastUpdateTime = time.Now()
 				})
+				s.emitPhase(taskID, taskEntity.EventCodePhaseP1Captured, "P1",
+					fmt.Sprintf("已捕获基线结束 binlog 位点 P1=%s", endPosStr))
 			}
+			s.emitPhase(taskID, taskEntity.EventCodePhaseCatchupStarted, "CATCH_UP",
+				fmt.Sprintf("开始 bounded catch-up：P0=%s -> P1=%s", startPosStr, endPosStr))
 			logger.Info("[Task %s] ALL mode: starting bounded catch-up P0=%q -> P1=%q", taskID, startPosStr, endPosStr)
 			if err := s.runBoundedCatchUp(ctx, task, runtime, endPos); err != nil {
 				if stopErr := s.abortFullSyncIfCancelled(ctx, taskID); stopErr != nil {
@@ -3091,6 +3143,8 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 				t.Context.LastUpdateTime = time.Now()
 			})
 			logger.Info("[Task %s] ALL mode: bounded catch-up completed at P1=%q", taskID, endPosStr)
+			s.emitPhase(taskID, taskEntity.EventCodePhaseCatchupCompleted, "CATCH_UP",
+				fmt.Sprintf("bounded catch-up 已完成，位点=%s", endPosStr))
 		} else {
 			logger.Info("[Task %s] ALL mode: subphase=RESTORE_INDEX; skip catch-up and resume index restore", taskID)
 		}
@@ -3106,10 +3160,15 @@ func (s *TaskService) executeFullSync(ctx context.Context, task *taskEntity.Sync
 			s.config.Sync.IndexRestoreHardMax,
 		)
 		logger.Info("[Task %s] 阶段3: 所有表数据同步完成，并发恢复 %d 张表非 identity/延迟索引 (workers=%d)...", taskID, len(pendingIndexRestores), workers)
+		s.emitPhase(taskID, taskEntity.EventCodePhaseIndexRestoreStarted, "RESTORE_INDEX",
+			fmt.Sprintf("开始恢复 %d 张表的索引", len(pendingIndexRestores)))
 		if err := s.restorePendingIndexes(ctx, runtime, taskID, pendingIndexRestores, workers); err != nil {
+			s.emitTableEvent(taskID, taskEntity.EventCodeIndexRestoreFailed, "", "",
+				fmt.Sprintf("index restore failed: %v", err), taskEntity.EventSeverityError, nil)
 			return err
 		}
 		logger.Info("[Task %s] 阶段3完成：所有待恢复索引已并发处理", taskID)
+		s.emitPhase(taskID, taskEntity.EventCodePhaseIndexRestoreCompleted, "RESTORE_INDEX", "索引恢复完成")
 	}
 
 	// 完成前最后一次停止/丢锁检查：避免末尾竞态下误标 FULL_COMPLETED。
@@ -3160,82 +3219,6 @@ func syncReadBatchLimit(batchSize int) int64 {
 	}
 
 	return b
-
-}
-
-// adjustReadLimitForWideColumns 当表含 JSON/BLOB/TEXT 等大列时缩小单次 LIMIT，降低单轮结果集体积与驱动 Scan 耗时。
-
-func adjustReadLimitForWideColumns(base int64, identity *entity.TableIdentity) int64 {
-
-	if identity == nil || len(identity.Columns) == 0 {
-
-		return base
-
-	}
-
-	heavy := 0
-
-	for _, col := range identity.Columns {
-
-		dt := strings.ToLower(strings.TrimSpace(col.DataType))
-
-		if i := strings.IndexByte(dt, '('); i >= 0 {
-
-			dt = dt[:i]
-
-		}
-
-		dt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(dt, " unsigned"), " zerofill"))
-
-		switch dt {
-
-		case "json", "blob", "tinyblob", "mediumblob", "longblob",
-
-			"text", "tinytext", "mediumtext", "longtext":
-
-			heavy++
-
-		}
-
-	}
-
-	if heavy == 0 {
-
-		return base
-
-	}
-
-	const maxWideBatch int64 = 500
-
-	div := int64(2 + heavy)
-
-	if div < 2 {
-
-		div = 2
-
-	}
-
-	scaled := base / div
-
-	if scaled > maxWideBatch {
-
-		scaled = maxWideBatch
-
-	}
-
-	if scaled < 25 {
-
-		scaled = 25
-
-	}
-
-	if scaled > base {
-
-		return base
-
-	}
-
-	return scaled
 
 }
 
@@ -3435,18 +3418,6 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 
 			}
 
-			readLimitBefore := readLimit
-
-			readLimit = adjustReadLimitForWideColumns(readLimit, identity)
-
-			if readLimit != readLimitBefore {
-
-				logger.Info("[Task %s] Table %s.%s: wide columns (json/blob/text) detected, read batch %d -> %d rows per round-trip",
-
-					taskID, sourceSchema, tableName, readLimitBefore, readLimit)
-
-			}
-
 			const txCommitEveryN = 200 // 每 200 批 commit 一次，减少 fsync 频率、提高吞吐
 
 			txCommitEveryNParallel := task.Config.TxCommitEveryNParallel
@@ -3566,6 +3537,10 @@ func (s *TaskService) syncDatabasePair(ctx context.Context, task *taskEntity.Syn
 			// binlog 起点并由后续增量追平，FULL 模式不捕获位点、不启动增量。
 			noPK := identity.Strategy == entity.FullColumnsStrategy
 			if noPK {
+				s.emitTableEvent(taskID, taskEntity.EventCodeNOPKSequentialFallback, sourceSchema, tableName,
+					"no PK/UK table uses FullColumns strategy with single-worker streaming read (V1 path)",
+					taskEntity.EventSeverityWarn,
+					map[string]interface{}{"engine": "v1", "strategy": string(identity.Strategy)})
 				logger.Warn("[NoPK][Task %s] Table %s.%s will use FullColumns strategy (no primary key, no unique key); falling back to single-worker streaming read + INSERT IGNORE; idempotency on re-run is best-effort, recommend adding a primary or unique key",
 					taskID, sourceSchema, tableName)
 			}
@@ -4919,6 +4894,9 @@ func (s *TaskService) executeIncrementalSync(ctx context.Context, task *taskEnti
 	s.updateSyncPhase(taskID, func(t *taskEntity.SyncTask) {
 		t.MarkIncrementalStarted()
 	})
+
+	s.emitPhase(taskID, taskEntity.EventCodePhaseIncrementalStarted, "INCREMENTAL_STARTED",
+		"增量同步已接管，开始订阅 binlog")
 
 	logger.Info("[Task %s] Incremental sync taking over: subscribing binlog from saved checkpoint (phase=INCREMENTAL_STARTED)", taskID)
 
@@ -6983,6 +6961,7 @@ func (s *TaskService) failTaskUnlessCancelled(ctx context.Context, taskID, errMs
 		logger.Info("[Task %s] Ignoring error during user stop: %s", taskID, errMsg)
 		return
 	}
+	s.emitLifecycle(taskID, taskEntity.EventCodeTaskFailed, errMsg, taskEntity.EventSeverityError)
 	s.updateTaskStatus(taskID, taskEntity.TaskStatusFailed, errMsg)
 }
 
@@ -7001,6 +6980,8 @@ func (s *TaskService) completeTask(taskID string) {
 	if task, exists := s.tasks[taskID]; exists {
 
 		task.Complete()
+
+		s.emitLifecycle(taskID, taskEntity.EventCodeTaskCompleted, "任务已完成", taskEntity.EventSeverityInfo)
 
 		if task.Context.ScheduleMode == "cron" {
 			next, err := nextCronRun(task, time.Now())
@@ -7052,6 +7033,8 @@ func (s *TaskService) PauseTask(taskID string) error {
 	}
 
 	task.Pause()
+
+	s.emitLifecycle(taskID, taskEntity.EventCodeTaskPaused, "任务已暂停", taskEntity.EventSeverityInfo)
 
 	// 停止增量同步服务（如果存在）
 
@@ -7136,6 +7119,8 @@ func (s *TaskService) EndTask(taskID string) error {
 	// 原子地设置 STOPPED、记录 end_time、清除调度配置
 	task.Stop()
 
+	s.emitLifecycle(taskID, taskEntity.EventCodeTaskStopped, "任务已结束（增量阶段手动停止）", taskEntity.EventSeverityInfo)
+
 	// 从映射摘除增量服务和 runtime 引用（实际停止在释放锁后进行）
 	var incrSyncToStop *syncApp.IncrementalSyncService
 	if incrSync, exists := s.incrementalSyncs[taskID]; exists {
@@ -7201,6 +7186,10 @@ func (s *TaskService) ScheduleTask(taskID string, scheduledAt time.Time) error {
 	if err := s.storage.Save(task); err != nil {
 		return fmt.Errorf("failed to save scheduled task state: %w", err)
 	}
+
+	s.emitLifecycle(taskID, taskEntity.EventCodeTaskScheduled,
+		fmt.Sprintf("任务已计划启动：%s", scheduledAt.Format(time.RFC3339)),
+		taskEntity.EventSeverityInfo)
 
 	// 记录审计日志
 	if s.auditLogger != nil {
@@ -7892,6 +7881,13 @@ func (s *TaskService) Close() error {
 
 	closeResource(s.storageCloser, "task storage")
 	s.storageCloser = nil
+
+	if s.pruneStop != nil {
+		close(s.pruneStop)
+	}
+	if s.eventRecorder != nil {
+		s.eventRecorder.Close()
+	}
 
 	// 3. 关闭审计日志器
 
