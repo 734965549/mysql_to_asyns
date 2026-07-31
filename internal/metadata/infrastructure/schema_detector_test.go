@@ -635,3 +635,33 @@ func TestSchemaDetector_ColumnMetaFields(t *testing.T) {
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestSchemaDetector_GeneratedColumns(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	rows := sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "EXTRA"}).
+		AddRow("id", "bigint", "NO", "PRI", nil, "").
+		AddRow("sign_no", "varchar", "YES", "", nil, "").
+		AddRow("active_sign_no", "varchar", "YES", "", nil, "VIRTUAL GENERATED").
+		AddRow("hash_col", "varchar", "YES", "", nil, "STORED GENERATED")
+
+	mock.ExpectQuery("SELECT(.+)FROM information_schema.COLUMNS").
+		WithArgs("jg_cps", "cps_quick_sign_contract").
+		WillReturnRows(rows)
+
+	detector := NewSchemaDetector(db)
+	columns, err := detector.GetTableColumns("jg_cps", "cps_quick_sign_contract")
+
+	assert.NoError(t, err)
+	assert.Len(t, columns, 4)
+	assert.Equal(t, entity.GeneratedNone, columns[0].GeneratedKind)
+	assert.Equal(t, entity.GeneratedVirtual, columns[2].GeneratedKind)
+	assert.True(t, columns[2].IsGenerated())
+	assert.False(t, columns[2].IsWritable())
+	assert.Equal(t, entity.GeneratedStored, columns[3].GeneratedKind)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}

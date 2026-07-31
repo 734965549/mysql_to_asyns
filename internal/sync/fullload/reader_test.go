@@ -795,3 +795,62 @@ func TestScanUpTo_BytesSplitAndOversizedRowCallback(t *testing.T) {
 		t.Fatalf("expected oversized row callback, got %d", oversized)
 	}
 }
+
+func TestChunkReader_makeBatch_ExcludesGeneratedColumns(t *testing.T) {
+	spec := &TableSpec{
+		SourceSchema: "jg_cps",
+		SourceTable:  "cps_quick_sign_contract",
+		TargetSchema: "jg_cps",
+		TargetTable:  "cps_quick_sign_contract",
+		Identity: &entity.TableIdentity{
+			Strategy:     entity.PKStrategy,
+			IdentifyCols: []string{"id"},
+			CursorCols:   []string{"id"},
+			Columns: []entity.ColumnMeta{
+				{Name: "id", IsPrimaryKey: true},
+				{Name: "sign_no"},
+				{Name: "active_sign_no", GeneratedKind: entity.GeneratedVirtual},
+			},
+		},
+	}
+	chunk := &Chunk{ID: "c1", Spec: spec}
+	cr, err := newChunkReader(nil, chunk, 100, 0, Options{}, 1, nil, nil)
+	if err != nil {
+		t.Fatalf("newChunkReader: %v", err)
+	}
+	batch := cr.makeBatch([][]any{{int64(1), "S001", "computed"}}, 32)
+	if len(batch.Columns) != 2 || batch.Columns[0] != "id" || batch.Columns[1] != "sign_no" {
+		t.Fatalf("unexpected batch columns: %#v", batch.Columns)
+	}
+	if len(batch.Rows) != 1 || len(batch.Rows[0]) != 2 {
+		t.Fatalf("unexpected batch rows: %#v", batch.Rows)
+	}
+	if batch.Rows[0][1] != "S001" {
+		t.Fatalf("unexpected row values: %#v", batch.Rows[0])
+	}
+}
+
+func TestNewChunkReader_WritableColumnIndices(t *testing.T) {
+	spec := &TableSpec{
+		Identity: &entity.TableIdentity{
+			Strategy:     entity.PKStrategy,
+			IdentifyCols: []string{"id"},
+			CursorCols:   []string{"id"},
+			Columns: []entity.ColumnMeta{
+				{Name: "id", IsPrimaryKey: true},
+				{Name: "sign_no"},
+				{Name: "hash_col", GeneratedKind: entity.GeneratedStored},
+			},
+		},
+	}
+	cr, err := newChunkReader(nil, &Chunk{ID: "c1", Spec: spec}, 100, 0, Options{}, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newChunkReader: %v", err)
+	}
+	if len(cr.cols) != 3 || len(cr.writableCols) != 2 || len(cr.writableIdx) != 2 {
+		t.Fatalf("cols=%d writableCols=%d writableIdx=%d", len(cr.cols), len(cr.writableCols), len(cr.writableIdx))
+	}
+	if cr.writableIdx[0] != 0 || cr.writableIdx[1] != 1 {
+		t.Fatalf("unexpected writableIdx: %#v", cr.writableIdx)
+	}
+}

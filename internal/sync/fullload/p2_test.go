@@ -471,6 +471,27 @@ func TestInsertPrefix_NoStagingTable(t *testing.T) {
 	}
 }
 
+// TestInsertPrefix_GeneratedColumnsExcluded 验证 FullLoadV2 writer 的 INSERT 列清单不含生成列。
+func TestInsertPrefix_GeneratedColumnsExcluded(t *testing.T) {
+	batch := &RowBatch{
+		TargetSchema: "db",
+		TargetTable:  "cps_quick_sign_contract",
+		StagingTable: "__mts_staging_cps_quick_sign_contract_2",
+		Columns:      []string{"id", "sign_no"},
+	}
+	prefix := insertPrefix(batch)
+	if strings.Contains(prefix, "`active_sign_no`") {
+		t.Fatalf("prefix must not include generated column: %s", prefix)
+	}
+	if !strings.Contains(prefix, "`__mts_staging_cps_quick_sign_contract_2`") {
+		t.Fatalf("prefix should write to staging table: %s", prefix)
+	}
+	want := "INSERT INTO `db`.`__mts_staging_cps_quick_sign_contract_2` (`id`, `sign_no`) VALUES "
+	if prefix != want {
+		t.Fatalf("prefix=%q want=%q", prefix, want)
+	}
+}
+
 // TestStateTrackerConcurrency 验证 tableStateTracker 的并发安全。
 func TestStateTrackerConcurrency(t *testing.T) {
 	specs := []*TableSpec{

@@ -138,7 +138,7 @@ func (w *BatchWriter) WriteBatch(ctx context.Context, rows []map[string]interfac
 		return nil // 返回成功
 	}
 
-	nCols := len(w.sqlBuilder.identity.Columns) // 获取列数
+	nCols := w.sqlBuilder.identity.WritableColumnCount() // 获取可写入列数
 	if nCols == 0 {                             // 如果没有列
 		return fmt.Errorf("table %s has no columns in identity", w.sqlBuilder.identity.TableName) // 返回错误
 	}

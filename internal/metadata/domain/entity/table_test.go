@@ -98,6 +98,59 @@ func TestColumnMeta_Fields(t *testing.T) {
 	}
 }
 
+func TestColumnMeta_GeneratedKind(t *testing.T) {
+	virtual := ColumnMeta{Name: "active_sign_no", GeneratedKind: GeneratedVirtual}
+	if !virtual.IsGenerated() || virtual.IsWritable() {
+		t.Fatal("virtual generated column must not be writable")
+	}
+	stored := ColumnMeta{Name: "hash_col", GeneratedKind: GeneratedStored}
+	if !stored.IsGenerated() {
+		t.Fatal("stored generated column must be generated")
+	}
+	plain := ColumnMeta{Name: "name"}
+	if plain.IsGenerated() || !plain.IsWritable() {
+		t.Fatal("plain column must be writable")
+	}
+}
+
+func TestParseGeneratedKindFromExtra(t *testing.T) {
+	tests := []struct {
+		extra string
+		want  GeneratedKind
+	}{
+		{"VIRTUAL GENERATED", GeneratedVirtual},
+		{"STORED GENERATED", GeneratedStored},
+		{"auto_increment", GeneratedNone},
+		{"", GeneratedNone},
+	}
+	for _, tt := range tests {
+		if got := ParseGeneratedKindFromExtra(tt.extra); got != tt.want {
+			t.Errorf("ParseGeneratedKindFromExtra(%q) = %q, want %q", tt.extra, got, tt.want)
+		}
+	}
+}
+
+func TestWritableColumns(t *testing.T) {
+	cols := []ColumnMeta{
+		{Name: "id"},
+		{Name: "active_sign_no", GeneratedKind: GeneratedVirtual},
+		{Name: "hash_col", GeneratedKind: GeneratedStored},
+		{Name: "name"},
+	}
+	writable := WritableColumns(cols)
+	if len(writable) != 2 {
+		t.Fatalf("expected 2 writable columns, got %d", len(writable))
+	}
+	if writable[0].Name != "id" || writable[1].Name != "name" {
+		t.Fatalf("unexpected writable columns: %+v", writable)
+	}
+
+	identity := &TableIdentity{Columns: cols}
+	if identity.WritableColumnCount() != 2 {
+		t.Fatalf("WritableColumnCount = %d, want 2", identity.WritableColumnCount())
+	}
+}
+
 func TestColumnMeta_AllFields(t *testing.T) {
 	col := ColumnMeta{
 		Name:         "email",

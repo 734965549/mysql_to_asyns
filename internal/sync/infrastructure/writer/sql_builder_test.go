@@ -760,3 +760,56 @@ func TestSQLBuilder_IdentityChanged(t *testing.T) {
 		})
 	}
 }
+
+func TestSQLBuilder_GeneratedColumnsExcludedFromWrites(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "id", IsPrimaryKey: true},
+		{Name: "sign_no"},
+		{Name: "active_sign_no", GeneratedKind: entity.GeneratedVirtual},
+		{Name: "hash_col", GeneratedKind: entity.GeneratedStored},
+	}
+	identity := createTestIdentity(entity.PKStrategy, "cps_quick_sign_contract", columns, []string{"id"})
+	builder := NewSQLBuilder(identity)
+
+	row := map[string]interface{}{
+		"id":             1,
+		"sign_no":        "S001",
+		"active_sign_no": "computed",
+		"hash_col":       "stored-hash",
+	}
+
+	insertQuery, insertArgs := builder.BuildInsert(row)
+	if strings.Contains(insertQuery, "`active_sign_no`") || strings.Contains(insertQuery, "`hash_col`") {
+		t.Fatalf("INSERT must exclude generated columns: %s", insertQuery)
+	}
+	if len(insertArgs) != 2 {
+		t.Fatalf("expected 2 insert args, got %d: %v", len(insertArgs), insertArgs)
+	}
+
+	updateQuery, updateArgs := builder.BuildUpdate(row)
+	if strings.Contains(updateQuery, "`active_sign_no` = ?") || strings.Contains(updateQuery, "`hash_col` = ?") {
+		t.Fatalf("UPDATE SET must exclude generated columns: %s", updateQuery)
+	}
+	if len(updateArgs) != 2 {
+		t.Fatalf("expected 2 update args, got %d: %v", len(updateArgs), updateArgs)
+	}
+
+	upsertQuery, upsertArgs := builder.BuildBatchUpsert([]map[string]interface{}{row})
+	if strings.Contains(upsertQuery, "`active_sign_no` = VALUES") || strings.Contains(upsertQuery, "`hash_col` = VALUES") {
+		t.Fatalf("ON DUPLICATE KEY UPDATE must exclude generated columns: %s", upsertQuery)
+	}
+	if !strings.Contains(upsertQuery, "`sign_no` = VALUES(`sign_no`)") {
+		t.Fatalf("upsert should still update writable columns: %s", upsertQuery)
+	}
+	if len(upsertArgs) != 2 {
+		t.Fatalf("expected 2 upsert args, got %d: %v", len(upsertArgs), upsertArgs)
+	}
+
+	plainQuery, plainArgs := builder.BuildBatchInsertPlain([]map[string]interface{}{row})
+	if strings.Contains(plainQuery, "`active_sign_no`") {
+		t.Fatalf("plain batch INSERT must exclude generated columns: %s", plainQuery)
+	}
+	if len(plainArgs) != 2 {
+		t.Fatalf("expected 2 plain insert args, got %d", len(plainArgs))
+	}
+}

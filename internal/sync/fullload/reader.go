@@ -56,7 +56,9 @@ func decideTableReaders(job *tableReadJob, opt Options) int {
 type chunkReader struct {
 	queryer    snapshotQueryer
 	chunk      *Chunk
-	cols       []string // 固定列顺序
+	cols       []string // 固定列顺序（含生成列，供 SELECT / 游标索引）
+	writableCols []string // 可写入列顺序（RowBatch 输出）
+	writableIdx  []int    // writableCols 在 cols 的下标
 	selectSQL  string   // "`c1`, `c2`, ..."
 	batchRows  int
 	batchBytes int64
@@ -147,8 +149,14 @@ func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchB
 		return nil, fmt.Errorf("chunk %s has no table columns", chunk.ID)
 	}
 	cols := make([]string, 0, len(id.Columns))
-	for _, c := range id.Columns {
+	writableCols := make([]string, 0, len(id.Columns))
+	writableIdx := make([]int, 0, len(id.Columns))
+	for i, c := range id.Columns {
 		cols = append(cols, c.Name)
+		if c.IsWritable() {
+			writableCols = append(writableCols, c.Name)
+			writableIdx = append(writableIdx, i)
+		}
 	}
 	parts := make([]string, len(cols))
 	for i, c := range cols {
@@ -156,10 +164,12 @@ func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchB
 	}
 
 	cr := &chunkReader{
-		queryer:    queryer,
-		chunk:      chunk,
-		cols:       cols,
-		selectSQL:  strings.Join(parts, ", "),
+		queryer:      queryer,
+		chunk:        chunk,
+		cols:         cols,
+		writableCols: writableCols,
+		writableIdx:  writableIdx,
+		selectSQL:    strings.Join(parts, ", "),
 		batchRows:  batchRows,
 		batchBytes: batchBytes,
 		opt:        opt,
@@ -737,13 +747,27 @@ func (r *chunkReader) orderBy() string {
 }
 
 func (r *chunkReader) makeBatch(rowsData [][]any, bytes int64) *RowBatch {
+	outRows := rowsData
+	outCols := r.writableCols
+	if len(r.writableIdx) > 0 && len(r.writableIdx) != len(r.cols) {
+		outRows = make([][]any, len(rowsData))
+		for i, row := range rowsData {
+			filtered := make([]any, len(r.writableIdx))
+			for j, idx := range r.writableIdx {
+				filtered[j] = row[idx]
+			}
+			outRows[i] = filtered
+		}
+	} else if len(outCols) == 0 {
+		outCols = r.cols
+	}
 	b := &RowBatch{
 		Schema:       r.chunk.Spec.SourceSchema,
 		Table:        r.chunk.Spec.SourceTable,
 		TargetSchema: r.chunk.Spec.TargetSchema,
 		TargetTable:  r.chunk.Spec.TargetTable,
-		Columns:      r.cols,
-		Rows:         rowsData,
+		Columns:      outCols,
+		Rows:         outRows,
 		ApproxBytes:  bytes,
 		ChunkID:      r.chunk.ID,
 		AttemptID:    r.attemptID,

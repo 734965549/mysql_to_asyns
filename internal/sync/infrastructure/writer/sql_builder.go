@@ -47,6 +47,9 @@ func (b *SQLBuilder) BuildInsert(row map[string]interface{}) (string, []interfac
 	updates := make([]string, 0, len(row))      // 创建更新列表
 
 	for _, col := range b.identity.Columns { // 遍历所有列
+		if !col.IsWritable() {
+			continue
+		}
 		if val, ok := row[col.Name]; ok { // 如果列存在值
 			columns = append(columns, "`"+col.Name+"`") // 添加列名
 			placeholders = append(placeholders, "?")    // 添加占位符
@@ -86,6 +89,9 @@ func (b *SQLBuilder) BuildUpdate(row map[string]interface{}) (string, []interfac
 	values := make([]interface{}, 0, len(row)) // 创建值列表
 
 	for _, col := range b.identity.Columns { // 遍历所有列
+		if !col.IsWritable() {
+			continue
+		}
 		if val, ok := row[col.Name]; ok && !col.IsPrimaryKey { // 如果列存在值且不是主键
 			sets = append(sets, fmt.Sprintf("`%s` = ?", col.Name)) // 添加SET子句
 			values = append(values, val)                           // 添加值
@@ -110,6 +116,9 @@ func (b *SQLBuilder) BuildUpdateWithBeforeImage(row, beforeImage map[string]inte
 	values := make([]interface{}, 0, len(row)) // 创建值列表
 
 	for _, col := range b.identity.Columns { // 遍历所有列
+		if !col.IsWritable() {
+			continue
+		}
 		if val, ok := row[col.Name]; ok && !col.IsPrimaryKey { // 如果列存在值且不是主键
 			sets = append(sets, fmt.Sprintf("`%s` = ?", col.Name)) // 添加SET子句
 			values = append(values, val)                           // 添加值
@@ -205,7 +214,7 @@ func (b *SQLBuilder) BuildBatchUpsert(rows []map[string]interface{}) (string, []
 	// 有 PK/UK：拼 ON DUPLICATE KEY UPDATE 子句，只更新非主键列（避免 PK 列自我覆盖）
 	updates := make([]string, 0, len(b.identity.Columns))
 	for _, col := range b.identity.Columns {
-		if col.IsPrimaryKey {
+		if col.IsPrimaryKey || !col.IsWritable() {
 			continue
 		}
 		updates = append(updates, fmt.Sprintf("`%s` = VALUES(`%s`)", col.Name, col.Name))
@@ -235,6 +244,9 @@ func (b *SQLBuilder) collectBatchValues(rows []map[string]interface{}) ([]string
 	columns := make([]string, 0, len(b.identity.Columns))
 	columnNames := make([]string, 0, len(b.identity.Columns))
 	for _, col := range b.identity.Columns {
+		if !col.IsWritable() {
+			continue
+		}
 		columns = append(columns, "`"+col.Name+"`")
 		columnNames = append(columnNames, col.Name)
 	}

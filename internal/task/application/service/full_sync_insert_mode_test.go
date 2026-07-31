@@ -559,3 +559,37 @@ func TestSyncDatabasePair_ParallelSamplePath_InsertMode(t *testing.T) {
 		runSyncDatabasePairInsertModeTest(t, varcharPKIdentity(), "events", false, skipExtra, setupSource, setupTargetWithBinlog)
 	})
 }
+
+func generatedColumnContractIdentity() *entity.TableIdentity {
+	return &entity.TableIdentity{
+		TableName:    "cps_quick_sign_contract",
+		Strategy:     entity.PKStrategy,
+		HasPK:        true,
+		IdentifyCols: []string{"id"},
+		Columns: []entity.ColumnMeta{
+			{Name: "id", DataType: "bigint", IsPrimaryKey: true},
+			{Name: "sign_no", DataType: "varchar"},
+			{Name: "active_sign_no", DataType: "varchar", GeneratedKind: entity.GeneratedVirtual},
+		},
+	}
+}
+
+// TestSyncDatabasePair_KeysetPath_ExcludesGeneratedColumns 验证 v1 全量 keyset 路径读取全部列但 INSERT 排除生成列。
+func TestSyncDatabasePair_KeysetPath_ExcludesGeneratedColumns(t *testing.T) {
+	tableName := "cps_quick_sign_contract"
+	identity := generatedColumnContractIdentity()
+	insertSQL := "INSERT INTO `" + fullSyncTgtSchema + "`.`" + tableName + "` (`id`, `sign_no`) VALUES (?, ?)"
+
+	setupSource := func(mock sqlmock.Sqlmock) {
+		rows := sqlmock.NewRows([]string{"id", "sign_no", "active_sign_no"}).AddRow(int64(1), "S001", "computed")
+		mock.ExpectQuery("SELECT `id`, `sign_no`, `active_sign_no` FROM `" + fullSyncSrcSchema + "`.`" + tableName + "` ORDER BY `id` ASC LIMIT \\?").
+			WillReturnRows(rows)
+		mock.ExpectQuery("SELECT `id`, `sign_no`, `active_sign_no` FROM `" + fullSyncSrcSchema + "`.`" + tableName + "` WHERE `id` > \\? ORDER BY `id` ASC LIMIT \\?").
+			WillReturnRows(sqlmock.NewRows([]string{"id", "sign_no", "active_sign_no"}))
+	}
+	setupTarget := func(mock sqlmock.Sqlmock, _ string) {
+		expectTargetWriteSession(mock, insertSQL)
+	}
+
+	runSyncDatabasePairInsertModeTest(t, identity, tableName, false, nil, setupSource, setupTarget)
+}
