@@ -854,3 +854,30 @@ func TestNewChunkReader_WritableColumnIndices(t *testing.T) {
 		t.Fatalf("unexpected writableIdx: %#v", cr.writableIdx)
 	}
 }
+
+func TestChunkReader_makeBatch_OnlyGeneratedColumns(t *testing.T) {
+	spec := &TableSpec{
+		SourceSchema: "db",
+		SourceTable:  "generated_only",
+		TargetSchema: "db",
+		TargetTable:  "generated_only",
+		Identity: &entity.TableIdentity{
+			Strategy:     entity.FullColumnsStrategy,
+			IdentifyCols: []string{"active_sign_no"},
+			Columns: []entity.ColumnMeta{
+				{Name: "active_sign_no", GeneratedKind: entity.GeneratedVirtual},
+			},
+		},
+	}
+	cr, err := newChunkReader(nil, &Chunk{ID: "c1", Spec: spec}, 100, 0, Options{}, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newChunkReader: %v", err)
+	}
+	batch := cr.makeBatch([][]any{{"computed"}}, 8)
+	if len(batch.Columns) != 0 {
+		t.Fatalf("expected empty columns, got %#v", batch.Columns)
+	}
+	if len(batch.Rows) != 1 || len(batch.Rows[0]) != 0 {
+		t.Fatalf("expected one default row with no values, got %#v", batch.Rows)
+	}
+}

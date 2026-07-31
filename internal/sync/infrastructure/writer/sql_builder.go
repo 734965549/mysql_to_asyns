@@ -61,6 +61,11 @@ func (b *SQLBuilder) BuildInsert(row map[string]interface{}) (string, []interfac
 		}
 	}
 
+	if len(columns) == 0 {
+		query := fmt.Sprintf("INSERT IGNORE INTO %s () VALUES ()", b.tableRef())
+		return query, nil
+	}
+
 	var query string       // 定义查询语句
 	if len(updates) == 0 { // 如果没有需要更新的列（全是主键）
 		query = fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES (%s)", // 使用INSERT IGNORE
@@ -98,6 +103,10 @@ func (b *SQLBuilder) BuildUpdate(row map[string]interface{}) (string, []interfac
 		}
 	}
 
+	if len(sets) == 0 {
+		return "", nil
+	}
+
 	whereClause := b.matchStrategy.BuildWhereClause(row) // 构建WHERE子句
 	whereArgs := b.matchStrategy.GetWhereArgs(row)       // 获取WHERE参数
 
@@ -123,6 +132,10 @@ func (b *SQLBuilder) BuildUpdateWithBeforeImage(row, beforeImage map[string]inte
 			sets = append(sets, fmt.Sprintf("`%s` = ?", col.Name)) // 添加SET子句
 			values = append(values, val)                           // 添加值
 		}
+	}
+
+	if len(sets) == 0 {
+		return "", nil
 	}
 
 	// 使用 before image 构建 WHERE 子句
@@ -255,6 +268,10 @@ func (b *SQLBuilder) collectBatchValues(rows []map[string]interface{}) ([]string
 	rowPlaceholders := make([]string, 0, len(rows))
 
 	for _, row := range rows {
+		if len(columnNames) == 0 {
+			rowPlaceholders = append(rowPlaceholders, "()")
+			continue
+		}
 		placeholders := make([]string, 0, len(columnNames))
 		for _, colName := range columnNames {
 			placeholders = append(placeholders, "?")

@@ -54,27 +54,27 @@ func decideTableReaders(job *tableReadJob, opt Options) int {
 
 // chunkReader 以 map-free 方式读取单个 chunk，直接扫描成 [][]any。
 type chunkReader struct {
-	queryer    snapshotQueryer
-	chunk      *Chunk
-	cols       []string // 固定列顺序（含生成列，供 SELECT / 游标索引）
+	queryer      snapshotQueryer
+	chunk        *Chunk
+	cols         []string // 固定列顺序（含生成列，供 SELECT / 游标索引）
 	writableCols []string // 可写入列顺序（RowBatch 输出）
 	writableIdx  []int    // writableCols 在 cols 的下标
-	selectSQL  string   // "`c1`, `c2`, ..."
-	batchRows  int
-	batchBytes int64
-	opt        Options // 查询超时和慢查询阈值
-	attemptID  int     // 表级重试序号（P2.2），填充到每个 RowBatch
-	stats      *Stats  // P3.6: 用于查询超时/慢查询计数
-	sink       EventSink
+	selectSQL    string   // "`c1`, `c2`, ..."
+	batchRows    int
+	batchBytes   int64
+	opt          Options // 查询超时和慢查询阈值
+	attemptID    int     // 表级重试序号（P2.2），填充到每个 RowBatch
+	stats        *Stats  // P3.6: 用于查询超时/慢查询计数
+	sink         EventSink
 
 	cursorCols []string
 	cursorIdx  []int // cursorCols 在 cols 的位置
 
-	stream       *sql.Rows // 仅无主键流式使用
-	cursor       []any     // keyset 游标当前值
-	done         bool
-	slowWarnOnce bool // 标记是否已输出慢查询告警，避免重复刷屏
-	twoPhaseWide bool // 宽表自动两阶段读（每 chunkReader 仅 emit 一次事件）
+	stream            *sql.Rows // 仅无主键流式使用
+	cursor            []any     // keyset 游标当前值
+	done              bool
+	slowWarnOnce      bool // 标记是否已输出慢查询告警，避免重复刷屏
+	twoPhaseWide      bool // 宽表自动两阶段读（每 chunkReader 仅 emit 一次事件）
 	rowExceedWarnOnce bool // 超大单行 WARN 事件节流
 
 	// queryCancel/slowCancel 必须存活到 Rows.Close，覆盖整个结果集消费周期。
@@ -119,8 +119,8 @@ func (r *chunkReader) maybeEmitWideTableTwoPhase() {
 		EventCodeWideTableTwoPhaseEnabled, EventCategoryTable, EventSeverityInfo,
 		"wide table two-phase read auto-enabled (pk_probe + payload_fetch)",
 		map[string]interface{}{
-			"chunk_id": r.chunk.ID,
-			"batch_rows": r.batchRows,
+			"chunk_id":    r.chunk.ID,
+			"batch_rows":  r.batchRows,
 			"batch_bytes": r.batchBytes,
 		})
 }
@@ -170,12 +170,12 @@ func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchB
 		writableCols: writableCols,
 		writableIdx:  writableIdx,
 		selectSQL:    strings.Join(parts, ", "),
-		batchRows:  batchRows,
-		batchBytes: batchBytes,
-		opt:        opt,
-		attemptID:  attemptID,
-		stats:      stats,
-		sink:       sink,
+		batchRows:    batchRows,
+		batchBytes:   batchBytes,
+		opt:          opt,
+		attemptID:    attemptID,
+		stats:        stats,
+		sink:         sink,
 	}
 	if !chunk.NoPK {
 		cr.cursorCols = id.EffectiveCursorCols()
@@ -758,8 +758,11 @@ func (r *chunkReader) makeBatch(rowsData [][]any, bytes int64) *RowBatch {
 			}
 			outRows[i] = filtered
 		}
-	} else if len(outCols) == 0 {
-		outCols = r.cols
+	} else if len(r.writableIdx) == 0 && len(rowsData) > 0 {
+		outRows = make([][]any, len(rowsData))
+		for i := range rowsData {
+			outRows[i] = []any{}
+		}
 	}
 	b := &RowBatch{
 		Schema:       r.chunk.Spec.SourceSchema,

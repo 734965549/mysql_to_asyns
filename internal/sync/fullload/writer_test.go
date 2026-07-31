@@ -21,6 +21,24 @@ func TestInsertPrefix(t *testing.T) {
 	}
 }
 
+func TestInsertPrefix_EmptyColumns(t *testing.T) {
+	b := &RowBatch{TargetSchema: "db", TargetTable: "generated_only", Columns: nil}
+	got := insertPrefix(b)
+	want := "INSERT INTO `db`.`generated_only` () VALUES "
+	if got != want {
+		t.Fatalf("prefix=%q want %q", got, want)
+	}
+}
+
+func TestEmptyRowPlaceholder(t *testing.T) {
+	if got := emptyRowPlaceholder(0); got != "()" {
+		t.Fatalf("empty placeholder=%q", got)
+	}
+	if got := emptyRowPlaceholder(2); got != "(?, ?)" {
+		t.Fatalf("two-col placeholder=%q", got)
+	}
+}
+
 func TestIsRetryableTxConflict(t *testing.T) {
 	cases := map[string]bool{
 		"Error 1213: Deadlock found when trying to get lock": true,

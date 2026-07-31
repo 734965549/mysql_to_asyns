@@ -626,21 +626,28 @@ func writeBatchInTx(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Option
 }
 
 func writeBatchInTxCached(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Options, stmtCache *preparedStmtCache) error {
-	nCols := len(batch.Columns)
-	if nCols == 0 || len(batch.Rows) == 0 {
+	if len(batch.Rows) == 0 {
 		return nil
 	}
-	maxRowsByPlaceholder := mysqlMaxPlaceholders / nCols
-	if maxRowsByPlaceholder < 1 {
-		maxRowsByPlaceholder = 1
-	}
+	nCols := len(batch.Columns)
 	maxRowsPerStmt := opt.BatchRows
-	if maxRowsPerStmt < 1 || maxRowsPerStmt > maxRowsByPlaceholder {
-		maxRowsPerStmt = maxRowsByPlaceholder
+	if maxRowsPerStmt < 1 {
+		maxRowsPerStmt = 1
+	}
+	if nCols > 0 {
+		maxRowsByPlaceholder := mysqlMaxPlaceholders / nCols
+		if maxRowsByPlaceholder < 1 {
+			maxRowsByPlaceholder = 1
+		}
+		if maxRowsPerStmt > maxRowsByPlaceholder {
+			maxRowsPerStmt = maxRowsByPlaceholder
+		}
+	} else if maxRowsPerStmt > mysqlMaxPlaceholders {
+		maxRowsPerStmt = mysqlMaxPlaceholders
 	}
 
 	prefix := insertPrefix(batch)
-	rowPlaceholder := "(" + strings.TrimSuffix(strings.Repeat("?, ", nCols), ", ") + ")"
+	rowPlaceholder := emptyRowPlaceholder(nCols)
 	for rowIndex, row := range batch.Rows {
 		if len(row) != nCols {
 			return fmt.Errorf("row %d has %d values, want %d columns", rowIndex, len(row), nCols)
@@ -692,16 +699,31 @@ func writeBatchInTxCached(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt 
 }
 
 func insertPrefix(batch *RowBatch) string {
-	cols := make([]string, len(batch.Columns))
-	for i, c := range batch.Columns {
-		cols[i] = quoteIdentifier(c)
-	}
+	colList := quotedColumnList(batch.Columns)
 	writeTable := batch.TargetTable
 	if batch.StagingTable != "" {
 		writeTable = batch.StagingTable
 	}
 	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES ",
-		quoteIdentifier(batch.TargetSchema), quoteIdentifier(writeTable), strings.Join(cols, ", "))
+		quoteIdentifier(batch.TargetSchema), quoteIdentifier(writeTable), colList)
+}
+
+func quotedColumnList(cols []string) string {
+	if len(cols) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = quoteIdentifier(c)
+	}
+	return strings.Join(quoted, ", ")
+}
+
+func emptyRowPlaceholder(nCols int) string {
+	if nCols == 0 {
+		return "()"
+	}
+	return "(" + strings.TrimSuffix(strings.Repeat("?, ", nCols), ", ") + ")"
 }
 
 // isRetryableTxConflict 仅判断事务内语句可安全重放的锁冲突。
