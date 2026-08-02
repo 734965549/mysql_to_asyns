@@ -74,7 +74,10 @@ type chunkReader struct {
 	cursor            []any     // keyset 游标当前值
 	done              bool
 	slowWarnOnce      bool // 标记是否已输出慢查询告警，避免重复刷屏
-	twoPhaseWide      bool // 宽表自动两阶段读（每 chunkReader 仅 emit 一次事件）
+	twoPhaseWide      bool // 宽表显式两阶段读（每 chunkReader 仅 emit 一次事件）
+	adaptiveWindow    bool // 大字段表按实际行大小自适应 SQL LIMIT，避免重复拉取未消费 payload
+	adaptiveWide      bool // 自适应窗口事件节流
+	queryRows         int  // 当前 SQL 查询窗口；不大于 batchRows
 	rowExceedWarnOnce bool // 超大单行 WARN 事件节流
 
 	// queryCancel/slowCancel 必须存活到 Rows.Close，覆盖整个结果集消费周期。
@@ -89,8 +92,8 @@ type chunkReader struct {
 	streamEnqueueWatched bool
 }
 
-// shouldUseTwoPhaseRead 判定是否走两阶段读：单列 PK +（显式开启或宽表自动启用）。
-// full_load_two_phase_read=true 强制开启；false（默认）时宽表（含 JSON/BLOB/TEXT）自动启用。
+// shouldUseTwoPhaseRead 判定是否走两阶段读。
+// 两阶段读会生成 WHERE pk IN (...)；仅保留给显式配置，宽表默认走自适应 keyset。
 func shouldUseTwoPhaseRead(spec *TableSpec, chunk *Chunk, opt Options) bool {
 	if chunk == nil || chunk.NoPK || chunk.Sequential {
 		return false
@@ -101,10 +104,7 @@ func shouldUseTwoPhaseRead(spec *TableSpec, chunk *Chunk, opt Options) bool {
 	if len(spec.Identity.EffectiveCursorCols()) != 1 {
 		return false
 	}
-	if opt.TwoPhaseRead {
-		return true
-	}
-	return hasLargeColumnTypes(spec)
+	return opt.TwoPhaseRead
 }
 
 func (r *chunkReader) maybeEmitWideTableTwoPhase() {
@@ -117,12 +117,71 @@ func (r *chunkReader) maybeEmitWideTableTwoPhase() {
 	r.twoPhaseWide = true
 	tableEvent(r.sink, r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable,
 		EventCodeWideTableTwoPhaseEnabled, EventCategoryTable, EventSeverityInfo,
-		"wide table two-phase read auto-enabled (pk_probe + payload_fetch)",
+		"wide table two-phase read explicitly enabled (pk_probe + payload_fetch)",
 		map[string]interface{}{
 			"chunk_id":    r.chunk.ID,
 			"batch_rows":  r.batchRows,
 			"batch_bytes": r.batchBytes,
 		})
+}
+
+func (r *chunkReader) maybeEmitWideAdaptiveWindow() {
+	if r == nil || !r.adaptiveWindow || r.adaptiveWide || r.sink == nil || r.chunk == nil || r.chunk.Spec == nil {
+		return
+	}
+	r.adaptiveWide = true
+	tableEvent(r.sink, r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable,
+		EventCodeWideTableAdaptiveWindowEnabled, EventCategoryTable, EventSeverityInfo,
+		"wide table adaptive keyset window enabled (no automatic WHERE IN)",
+		map[string]interface{}{
+			"chunk_id":           r.chunk.ID,
+			"initial_query_rows": r.queryRows,
+			"max_query_rows":     r.batchRows,
+			"batch_bytes":        r.batchBytes,
+		})
+}
+
+// currentQueryRows 返回本次 SQL LIMIT。宽表从 1 行探测起步，随后按实际 payload 大小扩缩。
+func (r *chunkReader) currentQueryRows() int {
+	if r == nil {
+		return 1
+	}
+	n := r.queryRows
+	if n < 1 {
+		n = r.batchRows
+	}
+	if n < 1 {
+		n = 1
+	}
+	if r.batchRows > 0 && n > r.batchRows {
+		n = r.batchRows
+	}
+	return n
+}
+
+// observeQueryWindow 以约 75% batch_bytes 为目标调整下一次 SQL LIMIT。
+// 上调最多翻倍，避免首批小行后突然请求大量超大 JSON；下调立即生效。
+func (r *chunkReader) observeQueryWindow(rows int, bytes int64) {
+	if r == nil || !r.adaptiveWindow || rows < 1 || bytes < 1 || r.batchBytes < 1 {
+		return
+	}
+	avg := (bytes + int64(rows) - 1) / int64(rows)
+	targetBytes := r.batchBytes - r.batchBytes/4
+	target := int(targetBytes / avg)
+	if target < 1 {
+		target = 1
+	}
+	if target > r.batchRows {
+		target = r.batchRows
+	}
+	current := r.currentQueryRows()
+	if maxGrowth := current * 2; target > maxGrowth {
+		target = maxGrowth
+	}
+	if target < 1 {
+		target = 1
+	}
+	r.queryRows = target
 }
 
 func (r *chunkReader) maybeEmitRowExceedsBatchBytes(rowBytes int64) {
@@ -141,6 +200,19 @@ func (r *chunkReader) maybeEmitRowExceedsBatchBytes(rowBytes int64) {
 			"row_bytes":   rowBytes,
 			"batch_bytes": r.batchBytes,
 		})
+}
+
+// noteAdaptiveRows 保留 ROW_EXCEEDS_BATCH_BYTES 诊断；自适应查询为完整消费结果而向 scanUpTo 传 0。
+func (r *chunkReader) noteAdaptiveRows(rows [][]any) {
+	if r == nil || !r.adaptiveWindow || r.rowExceedWarnOnce {
+		return
+	}
+	for _, row := range rows {
+		r.noteRowBytes(estimateRowBytes(row))
+		if r.rowExceedWarnOnce {
+			return
+		}
+	}
 }
 
 func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchBytes int64, opt Options, attemptID int, stats *Stats, sink EventSink) (*chunkReader, error) {
@@ -176,6 +248,12 @@ func newChunkReader(queryer snapshotQueryer, chunk *Chunk, batchRows int, batchB
 		attemptID:    attemptID,
 		stats:        stats,
 		sink:         sink,
+		queryRows:    batchRows,
+	}
+	if !chunk.NoPK && hasLargeColumnTypes(chunk.Spec) {
+		// 大字段无法从类型元数据推断真实长度。先取 1 行测量，再快速放大查询窗口。
+		cr.adaptiveWindow = true
+		cr.queryRows = 1
 	}
 	if !chunk.NoPK {
 		cr.cursorCols = id.EffectiveCursorCols()
@@ -533,7 +611,11 @@ func (r *chunkReader) nextBatch(ctx context.Context) (*RowBatch, error) {
 	if r.chunk.NoPK {
 		return r.nextStreamBatch(ctx)
 	}
-	if shouldUseTwoPhaseRead(r.chunk.Spec, r.chunk, r.opt) && len(r.cursorCols) == 1 {
+	twoPhase := shouldUseTwoPhaseRead(r.chunk.Spec, r.chunk, r.opt) && len(r.cursorCols) == 1
+	if !twoPhase {
+		r.maybeEmitWideAdaptiveWindow()
+	}
+	if twoPhase {
 		r.maybeEmitWideTableTwoPhase()
 		return r.nextTwoPhaseKeysetBatch(ctx)
 	}
@@ -584,13 +666,14 @@ func (r *chunkReader) nextStreamBatch(ctx context.Context) (*RowBatch, error) {
 
 func (r *chunkReader) nextKeysetBatch(ctx context.Context) (*RowBatch, error) {
 	where, args := r.buildWhere()
+	queryRows := r.currentQueryRows()
 	q := fmt.Sprintf("SELECT %s FROM %s.%s", r.selectSQL,
 		quoteIdentifier(r.chunk.Spec.SourceSchema), quoteIdentifier(r.chunk.Spec.SourceTable))
 	if where != "" {
 		q += " WHERE " + where
 	}
 	q += " ORDER BY " + r.orderBy() + " LIMIT ?"
-	args = append(args, r.batchRows)
+	args = append(args, queryRows)
 
 	rows, elapsed, err := r.runQuery(ctx, "keyset", q, args...)
 	if err != nil {
@@ -600,7 +683,12 @@ func (r *chunkReader) nextKeysetBatch(ctx context.Context) (*RowBatch, error) {
 	logger.Debug("[FullLoadV2] source query completed: table=%s.%s chunk=%s phase=keyset elapsed=%s",
 		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
 
-	rowsData, bytes, exhausted, err := scanUpTo(rows, len(r.cols), r.batchRows, r.batchBytes, nil, r.noteRowBytes)
+	maxBytes := r.batchBytes
+	if r.adaptiveWindow {
+		// SQL LIMIT 已由实际行大小控制；必须消费本窗口全部结果，不能关闭后再重复拉取。
+		maxBytes = 0
+	}
+	rowsData, bytes, exhausted, err := scanUpTo(rows, len(r.cols), queryRows, maxBytes, nil, r.noteRowBytes)
 	if err != nil {
 		err = r.classifyScanError(ctx, err)
 	}
@@ -612,6 +700,8 @@ func (r *chunkReader) nextKeysetBatch(ctx context.Context) (*RowBatch, error) {
 		r.done = true
 		return nil, nil
 	}
+	r.noteAdaptiveRows(rowsData)
+	r.observeQueryWindow(len(rowsData), bytes)
 
 	// 推进游标到最后一行的游标列值。
 	lastRow := rowsData[len(rowsData)-1]
@@ -630,6 +720,7 @@ func (r *chunkReader) nextKeysetBatch(ctx context.Context) (*RowBatch, error) {
 func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, error) {
 	where, args := r.buildWhere()
 	pkCol := r.cursorCols[0]
+	queryRows := r.currentQueryRows()
 
 	// Phase 1: pk_probe - 只查主键列，快速扫过稀疏/删除行
 	pkQuery := fmt.Sprintf("SELECT %s FROM %s.%s", quoteIdentifier(pkCol),
@@ -638,7 +729,7 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 		pkQuery += " WHERE " + where
 	}
 	pkQuery += " ORDER BY " + quoteIdentifier(pkCol) + " LIMIT ?"
-	pkArgs := append(args, r.batchRows)
+	pkArgs := append(args, queryRows)
 
 	pkRows, elapsed, err := r.runQuery(ctx, "pk_probe", pkQuery, pkArgs...)
 	if err != nil {
@@ -647,8 +738,8 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 	logger.Debug("[FullLoadV2] pk_probe completed: table=%s.%s chunk=%s elapsed=%s",
 		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, elapsed)
 
-	// pk_probe 只取主键列，PK 值极小（远低于 batchBytes），maxBytes 传 0 确保取满 batchRows。
-	pkValues, _, pkExhausted, err := scanUpTo(pkRows, 1, r.batchRows, 0, nil, nil)
+	// pk_probe 只取主键列，PK 值极小（远低于 batchBytes），maxBytes 传 0 确保取满查询窗口。
+	pkValues, _, pkExhausted, err := scanUpTo(pkRows, 1, queryRows, 0, nil, nil)
 	if err != nil {
 		err = r.classifyScanError(ctx, err)
 	}
@@ -682,7 +773,12 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 		r.chunk.Spec.SourceSchema, r.chunk.Spec.SourceTable, r.chunk.ID, len(pkValues), elapsed2)
 
 	// payload 可能被 batchBytes 截断（大 JSON）；未截断时 payloadExhausted=true。
-	rowsData, bytes, payloadExhausted, err := scanUpTo(payloadRows, len(r.cols), r.batchRows, r.batchBytes, nil, r.noteRowBytes)
+	maxBytes := r.batchBytes
+	if r.adaptiveWindow {
+		// 避免只消费 IN 结果前几行后关闭，导致剩余大字段在下一轮被反复查询和传输。
+		maxBytes = 0
+	}
+	rowsData, bytes, payloadExhausted, err := scanUpTo(payloadRows, len(r.cols), len(pkValues), maxBytes, nil, r.noteRowBytes)
 	if err != nil {
 		err = r.classifyScanError(ctx, err)
 	}
@@ -697,15 +793,22 @@ func (r *chunkReader) nextTwoPhaseKeysetBatch(ctx context.Context) (*RowBatch, e
 		r.cursor[0] = lastProbe
 		return nil, nil
 	}
+	r.noteAdaptiveRows(rowsData)
+	r.observeQueryWindow(len(rowsData), bytes)
 
 	// 推进游标到最后一行的主键列值（与 nextKeysetBatch 逻辑一致）。
 	// 若 payload 被 batchBytes 截断，游标停在已扫描的最后一行，下一轮 pk_probe 从该 PK 之后继续，
 	// 未扫描的 PK 会被重新探测，不丢行。
 	lastRow := rowsData[len(rowsData)-1]
 	r.cursor = make([]any, 1)
-	r.cursor[0] = lastRow[r.cursorIdx[0]]
+	if r.adaptiveWindow {
+		// 自适应窗口会完整消费本次 IN 结果；缺失键视为已删除，可直接越过整个 probe 窗口。
+		r.cursor[0] = pkValues[len(pkValues)-1][0]
+	} else {
+		r.cursor[0] = lastRow[r.cursorIdx[0]]
+	}
 
-	// 仅当 payload 已完整扫完且 pk_probe 是尾批（不足 batchRows）时，才判定 chunk 结束。
+	// 仅当 payload 已完整扫完且 pk_probe 是尾批（不足查询窗口）时，才判定 chunk 结束。
 	if payloadExhausted && pkExhausted {
 		r.done = true
 	}

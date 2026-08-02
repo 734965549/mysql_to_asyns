@@ -474,7 +474,8 @@ chunk 边界规划与读取共用同一连接池，改善负载均衡。开启
   "full_load_commit_bytes_mb": 32,
   "full_load_query_timeout_sec": 300,
   "full_load_stream_idle_timeout_sec": 300,
-  "full_load_stream_max_duration_sec": 0
+  "full_load_stream_max_duration_sec": 0,
+  "full_load_two_phase_read": false
 }
 ```
 
@@ -492,6 +493,7 @@ chunk 边界规划与读取共用同一连接池，改善负载均衡。开启
 | `full_load_query_timeout_sec` | 源端查询超时（秒）。keyset：整次查询绝对超时；stream：仅打开查询等待上限 | 300（范围 1–7200） |
 | `full_load_stream_idle_timeout_sec` | 无主键流式查询无进展超时（秒）。每次 `Rows.Next` 成功后重置；等待写队列时暂停 | 300（范围 1–7200） |
 | `full_load_stream_max_duration_sec` | 无主键流式查询绝对最长时长（秒）；`0` 表示不限制整表复制总时长 | 0（不限制；显式值范围 1–86400） |
+| `full_load_two_phase_read` | 单列主键显式启用 `pk_probe + WHERE pk IN (...)`；通常无需开启 | `false` |
 
 说明：
 
@@ -517,6 +519,10 @@ chunk 边界规划与读取共用同一连接池，改善负载均衡。开启
   仍按 `read_workers` 推导以保持兼容。`ComputeGlobalReadBudget` / `CapBySourcePool` 会
   用真实源库连接池上限（保留约 10% 或至少 2 条连接）进一步裁剪预算；chunk 按表公平
   轮询派发（A1,B1,C1…），避免单表占满连接与队列。
+- 含 JSON/TEXT/BLOB 的有主键表默认使用直接 keyset，并从 1 行开始按实际 payload 字节数
+  自适应 SQL `LIMIT`；一次查询的结果会完整消费，避免达到 `full_load_batch_bytes_mb` 后
+  丢弃剩余结果并在下一轮重复拉取。只有显式设置 `full_load_two_phase_read=true` 才会生成
+  `WHERE pk IN (...)`，该路径也使用同一自适应窗口。
 - `full_load_lock_wait_timeout_sec`、`full_load_degrade_on_align_lock_fail` 已废弃：
   aligned snapshot 架构移除后这两个字段不再产生任何执行语义，API/任务存档仍可接收、
   持久化并回显以兼容旧任务，Web UI 已隐藏对应控件。

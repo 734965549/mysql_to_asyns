@@ -183,6 +183,7 @@ go test -tags=integration -count=1 -timeout=10m -v ./internal/sync/fullload/ -ru
 | `events_test.go` | 背压状态机、EventSink nil 安全 |
 | `chunk_test.go` → `TestPlanKeysetBoundaries_EstimateFailedEmitsEvent` | TABLE_ROWS 失败 fallback + 事件 |
 | `reader_test.go` → `TestScanUpTo_BytesSplitAndOversizedRowCallback` | 字节拆批与超大单行回调 |
+| `reader_test.go` → `TestChunkReaderWideAdaptiveKeyset*` / `TestChunkReaderTwoPhaseWideUsesAdaptiveProbeWindow` | 大字段直接 keyset 不生成 IN；显式两阶段读取限制 IN 窗口且不重复 payload |
 | `fault_injection_test.go`（`//go:build integration`） | 源查询超时 → 表级重试 → staging 发布 |
 
 ### TaskEvent（B1/B5）

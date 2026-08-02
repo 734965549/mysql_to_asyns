@@ -439,14 +439,81 @@ func TestShouldUseTwoPhaseRead(t *testing.T) {
 		},
 	}
 	chunk := &Chunk{Spec: wideSpec}
-	if !shouldUseTwoPhaseRead(wideSpec, chunk, Options{}) {
-		t.Fatal("wide table should auto-enable two-phase")
+	if shouldUseTwoPhaseRead(wideSpec, chunk, Options{}) {
+		t.Fatal("wide table should use adaptive keyset, not auto-enable WHERE IN")
 	}
 	if shouldUseTwoPhaseRead(narrowSpec, &Chunk{Spec: narrowSpec}, Options{}) {
 		t.Fatal("narrow table should not use two-phase by default")
 	}
 	if !shouldUseTwoPhaseRead(narrowSpec, &Chunk{Spec: narrowSpec}, Options{TwoPhaseRead: true}) {
 		t.Fatal("TwoPhaseRead=true should force enable")
+	}
+}
+
+func TestChunkReaderWideAdaptiveKeysetAvoidsINAndRepeatedPayload(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "payload", DataType: "json"}},
+		},
+	}
+	chunk := &Chunk{ID: "wide", Spec: spec}
+	payload := make([]byte, 1024*1024)
+
+	// 宽表先用 1 行测量；第二次按实际大小扩大到 2 行。两次都是直接 keyset，不生成 IN。
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` ORDER BY `id` ASC LIMIT \\?").
+		WithArgs(1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(1), payload))
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE \\(`id` > \\?\\) ORDER BY `id` ASC LIMIT \\?").
+		WithArgs(int64(1), 2).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).
+			AddRow(int64(2), payload).AddRow(int64(3), payload))
+
+	opt := Options{BatchRows: 1000, BatchBytes: defaultBatchBytes, QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour}
+	cr, err := newChunkReader(db, chunk, opt.BatchRows, opt.BatchBytes, opt, 1, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cr.close()
+
+	first, err := cr.nextBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil || len(first.Rows) != 1 || cr.currentQueryRows() != 2 {
+		t.Fatalf("unexpected first adaptive batch: rows=%v next_window=%d", first, cr.currentQueryRows())
+	}
+	second, err := cr.nextBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == nil || len(second.Rows) != 2 || cr.cursor[0] != int64(3) {
+		t.Fatalf("unexpected second adaptive batch: batch=%+v cursor=%v", second, cr.cursor)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChunkReaderAdaptiveWindowPreservesOversizedRowEvent(t *testing.T) {
+	sink := &recordingSink{}
+	r := &chunkReader{
+		chunk:          &Chunk{ID: "wide", Spec: &TableSpec{SourceSchema: "s", SourceTable: "t"}},
+		adaptiveWindow: true,
+		batchBytes:     128,
+		sink:           sink,
+	}
+	r.noteAdaptiveRows([][]any{{int64(1), make([]byte, 256)}})
+	codes := sink.codes()
+	if len(codes) != 1 || codes[0] != EventCodeRowExceedsBatchBytes {
+		t.Fatalf("expected oversized-row event from adaptive scan, got %v", codes)
 	}
 }
 
@@ -461,7 +528,7 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
 		Identity: &entity.TableIdentity{
 			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
-			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload", DataType: "json"}},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload", DataType: "varchar(64)"}},
 		},
 	}
 	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{0}, End: []any{100}}
@@ -473,7 +540,7 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE `id` IN").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(1), "x").AddRow(int64(2), "y"))
 
-	opt := Options{QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour}
+	opt := Options{QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour, TwoPhaseRead: true}
 	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -495,6 +562,60 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 	}
 }
 
+func TestChunkReaderTwoPhaseWideUsesAdaptiveProbeWindow(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "payload", DataType: "json"}},
+		},
+	}
+	chunk := &Chunk{ID: "wide-two-phase", Spec: spec}
+	payload := make([]byte, 1024*1024)
+
+	mock.ExpectQuery("SELECT `id` FROM `s`.`t` ORDER BY `id` LIMIT \\?").
+		WithArgs(1).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(1)))
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE `id` IN \\(\\?\\) ORDER BY `id`").
+		WithArgs(int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(1), payload))
+	mock.ExpectQuery("SELECT `id` FROM `s`.`t` WHERE \\(`id` > \\?\\) ORDER BY `id` LIMIT \\?").
+		WithArgs(int64(1), 2).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(2)).AddRow(int64(3)))
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE `id` IN \\(\\?, \\?\\) ORDER BY `id`").
+		WithArgs(int64(2), int64(3)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).
+			AddRow(int64(2), payload).AddRow(int64(3), payload))
+
+	opt := Options{
+		BatchRows: 1000, BatchBytes: defaultBatchBytes, TwoPhaseRead: true,
+		QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour,
+	}
+	cr, err := newChunkReader(db, chunk, opt.BatchRows, opt.BatchBytes, opt, 1, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cr.close()
+
+	first, err := cr.nextBatch(context.Background())
+	if err != nil || first == nil || len(first.Rows) != 1 || cr.currentQueryRows() != 2 {
+		t.Fatalf("unexpected first two-phase adaptive batch: batch=%+v err=%v next_window=%d", first, err, cr.currentQueryRows())
+	}
+	second, err := cr.nextBatch(context.Background())
+	if err != nil || second == nil || len(second.Rows) != 2 || cr.cursor[0] != int64(3) {
+		t.Fatalf("unexpected second two-phase adaptive batch: batch=%+v err=%v cursor=%v", second, err, cr.cursor)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestChunkReaderTwoPhaseEmptyPayloadContinuesScan 验证 probe 有键但 payload 为空时不提前结束 chunk。
 func TestChunkReaderTwoPhaseEmptyPayloadContinuesScan(t *testing.T) {
 	db, mock, err := sqlmock.New()
@@ -506,7 +627,7 @@ func TestChunkReaderTwoPhaseEmptyPayloadContinuesScan(t *testing.T) {
 		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
 		Identity: &entity.TableIdentity{
 			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
-			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload", DataType: "json"}},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload", DataType: "varchar(64)"}},
 		},
 	}
 	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{0}, End: []any{100}}

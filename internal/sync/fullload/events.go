@@ -65,6 +65,8 @@ const (
 	EventCodeRowExceedsBatchBytes     = "ROW_EXCEEDS_BATCH_BYTES"
 )
 
+const EventCodeWideTableAdaptiveWindowEnabled = "WIDE_TABLE_ADAPTIVE_WINDOW_ENABLED"
+
 // FullLoadEvent 全量引擎上报的事件载荷（不含 task 包类型）。
 type FullLoadEvent struct {
 	Severity     EventSeverity

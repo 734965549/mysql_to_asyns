@@ -482,7 +482,7 @@ Content-Type: application/json
 
 - **V1 全量（默认 `full_load_engine=v1`）**：全量读取为普通短查询，不长期持有源库 MDL。ALL + 无 PK/UK 表为 best-effort，增量接管阶段存在重复 INSERT 风险，需显式确认 `allow_nopk_all=true`。
 
-- **V2 全量（`full_load_engine=v2`）**：全量读取同样为普通短查询，不持有表级 MDL，不再使用长生命周期 RR 快照事务；历史版本的表级 binlog HWM（`table_binlog_hwms`）已下线，仅保留用于读取旧任务存档，新一轮全量开始时清空。ALL + 无 PK/UK 表同样为 best-effort，依赖 P0..P1 有界追平收敛，不保证严格去重，需 `allow_nopk_all=true`。写入侧在每个目标 schema 自动创建 `__mts_fl_tx` 事务标记表（与业务 INSERT 同事务提交，含 `run_id`），用于 Commit 结果未知时的锁定探测，避免业务行存在性误判；启动前以 `GET_LOCK` 强制同 schema 单任务，并 fail-closed 校验目标业务表 InnoDB、marker 表结构（含完整唯一索引），拒绝业务表占用保留名 `__mts_fl_tx`；数据流水线成功后在仍持有 schema 互斥锁时执行 `DROP TABLE IF EXISTS __mts_fl_tx`；清理失败会让任务明确失败，失败/暂停路径保留 marker。目标账号需对 marker 表具备 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DROP`，以及 `GET_LOCK`/`RELEASE_LOCK`。
+- **V2 全量（`full_load_engine=v2`）**：全量读取同样为普通短查询，不持有表级 MDL，不再使用长生命周期 RR 快照事务；JSON/TEXT/BLOB 主键表默认使用按实际行字节数自适应的直接 keyset 查询，不再自动生成 `WHERE id IN (...)`，也不会关闭未消费完的 payload 结果后重复拉取。只有显式设置 `full_load_two_phase_read=true` 才启用两阶段读取。历史版本的表级 binlog HWM（`table_binlog_hwms`）已下线，仅保留用于读取旧任务存档，新一轮全量开始时清空。ALL + 无 PK/UK 表同样为 best-effort，依赖 P0..P1 有界追平收敛，不保证严格去重，需 `allow_nopk_all=true`。写入侧在每个目标 schema 自动创建 `__mts_fl_tx` 事务标记表（与业务 INSERT 同事务提交，含 `run_id`），用于 Commit 结果未知时的锁定探测，避免业务行存在性误判；启动前以 `GET_LOCK` 强制同 schema 单任务，并 fail-closed 校验目标业务表 InnoDB、marker 表结构（含完整唯一索引），拒绝业务表占用保留名 `__mts_fl_tx`；数据流水线成功后在仍持有 schema 互斥锁时执行 `DROP TABLE IF EXISTS __mts_fl_tx`；清理失败会让任务明确失败，失败/暂停路径保留 marker。目标账号需对 marker 表具备 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DROP`，以及 `GET_LOCK`/`RELEASE_LOCK`。
 
 - 历史版本曾提供 `enable_consistent_snapshot` 任务级字段，现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
 
@@ -825,7 +825,7 @@ GET /api/tasks/:id/event-executions
 | 阶段 | `PHASE_DDL_PREP_*` / `PHASE_P0_CAPTURED` / `PHASE_BASE_SCAN_*` / `PHASE_P1_*` / `PHASE_CATCHUP_*` / `PHASE_INDEX_RESTORE_*` / `PHASE_INCREMENTAL_STARTED` | ALL/FULL 各阶段起止 |
 | 表规划 | `TABLE_PLAN_CREATED` / `TABLE_ESTIMATE_FAILED` / `TABLE_CHUNK_PLAN_FALLBACK` / `TABLE_PARALLELISM_REDUCED` / `NOPK_SEQUENTIAL_FALLBACK` | 分片规划与降级 |
 | 表进展 | `TABLE_NO_PROGRESS` / `TABLE_PROGRESS_RECOVERED` | 表长时间无读进展及恢复 |
-| 宽表/拆批 | `WIDE_TABLE_TWO_PHASE_ENABLED` / `ROW_EXCEEDS_BATCH_BYTES` | 宽表两阶段读、单行超 batch_bytes |
+| 宽表/拆批 | `WIDE_TABLE_ADAPTIVE_WINDOW_ENABLED` / `WIDE_TABLE_TWO_PHASE_ENABLED` / `ROW_EXCEEDS_BATCH_BYTES` | 宽表自适应 keyset、显式两阶段读、单行超 batch_bytes |
 | 连接池 | `SOURCE_POOL_BUDGET_CAPPED` / `SOURCE_POOL_WAIT_HIGH` / `TARGET_POOL_BUDGET_CAPPED` | 池上限裁剪与等待压力 |
 | 队列背压 | `QUEUE_BACKPRESSURE_HIGH` / `QUEUE_BACKPRESSURE_RECOVERED` | 写队列高水位与恢复 |
 | 重试 | `WRITE_LOCK_RETRY` / `TABLE_READ_RETRY*` / `TX_COMMIT_*` / `TX_REPLAY_*` | 写锁、读重试、提交不确定与重放 |

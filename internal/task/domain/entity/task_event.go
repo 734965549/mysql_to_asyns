@@ -107,6 +107,8 @@ const (
 	EventCodeTableAbortedByTaskFailure = "TABLE_ABORTED_BY_TASK_FAILURE"
 )
 
+const EventCodeWideTableAdaptiveWindowEnabled = "WIDE_TABLE_ADAPTIVE_WINDOW_ENABLED"
+
 // TaskEvent 任务关键事件，持久化供详情页追溯。
 type TaskEvent struct {
 	Seq          int64                  `json:"seq"`
