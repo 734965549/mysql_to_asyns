@@ -1625,6 +1625,110 @@ func TestStartTask_AlreadyRunning(t *testing.T) {
 	assert.Contains(t, err.Error(), "already running")
 }
 
+func TestStartTask_ClearsPreviousExecutionError(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newScheduledTestTaskService(dataDir)
+
+	taskID := "failed_restart"
+	_, err := ts.CreateTask(taskEntity.TaskConfig{
+		ID:   taskID,
+		Name: "Failed Restart",
+		Mode: taskEntity.SyncModeIncremental,
+	})
+	require.NoError(t, err)
+
+	task, ok := ts.GetTask(taskID)
+	require.True(t, ok)
+	endTime := time.Now().Add(-time.Hour)
+	task.Context.Status = taskEntity.TaskStatusFailed
+	task.Context.ErrorStack = "previous round exploded"
+	task.Context.EndTime = endTime
+	task.Context.StartTime = endTime.Add(-2 * time.Hour)
+	task.Context.SyncPhase = taskEntity.SyncPhaseIncrementalStarted
+	task.Context.FullSyncFailedReason = "historical full sync note"
+	task.Context.ProcessedRows = 12345
+
+	require.NoError(t, ts.StartTask(context.Background(), taskID))
+
+	task, ok = ts.GetTask(taskID)
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusRunning, task.Context.Status)
+	assert.Empty(t, task.Context.ErrorStack)
+	assert.True(t, task.Context.EndTime.IsZero())
+	assert.True(t, task.Context.StartTime.After(endTime))
+	assert.Equal(t, taskEntity.SyncPhaseIncrementalStarted, task.Context.SyncPhase)
+	assert.Equal(t, "historical full sync note", task.Context.FullSyncFailedReason)
+	assert.Equal(t, int64(12345), task.Context.ProcessedRows)
+
+	reloaded, err := ts.storage.LoadAll()
+	require.NoError(t, err)
+	require.Len(t, reloaded, 1)
+	assert.Empty(t, reloaded[0].Context.ErrorStack)
+	assert.True(t, reloaded[0].Context.EndTime.IsZero())
+}
+
+func TestStartTask_InitFailurePreservesPreviousError(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newTestTaskService(dataDir)
+
+	taskID := "init_fail_preserve"
+	_, err := ts.CreateTask(taskEntity.TaskConfig{
+		ID:   taskID,
+		Name: "Init Fail Preserve",
+		Mode: taskEntity.SyncModeFull,
+	})
+	require.NoError(t, err)
+
+	task, ok := ts.GetTask(taskID)
+	require.True(t, ok)
+	endTime := time.Now()
+	task.Context.Status = taskEntity.TaskStatusFailed
+	task.Context.ErrorStack = "sync error from previous round"
+	task.Context.EndTime = endTime
+
+	ts.initRuntimeFn = func(*taskEntity.SyncTask) (*taskRuntime, error) {
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	err = ts.StartTask(context.Background(), taskID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to initialize database connections")
+
+	task, ok = ts.GetTask(taskID)
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Equal(t, "sync error from previous round", task.Context.ErrorStack)
+	assert.False(t, task.Context.EndTime.IsZero())
+}
+
+func TestStartTask_BlockedRestartDoesNotBeginNewExecution(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newScheduledTestTaskService(dataDir)
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:                       "blocked_restart",
+		Name:                     "Blocked Restart",
+		Mode:                     taskEntity.SyncModeFull,
+		EnableDropTableBeforeDDL: false,
+	})
+	task.Context.SyncPhase = taskEntity.SyncPhaseFullStarted
+	task.Context.Status = taskEntity.TaskStatusFailed
+	task.Context.ErrorStack = "original failure"
+	task.Context.FullSyncFailedReason = "full sync interrupted"
+	endTime := time.Now().Add(-time.Minute)
+	task.Context.EndTime = endTime
+	ts.tasks[task.Config.ID] = task
+
+	err := ts.StartTask(context.Background(), task.Config.ID)
+	require.Error(t, err)
+
+	task, ok := ts.GetTask(task.Config.ID)
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Contains(t, task.Context.ErrorStack, "enable_drop_table_before_ddl=false")
+	assert.False(t, task.Context.EndTime.IsZero())
+}
+
 func TestStartTask_ConcurrentRuntimeIsolation(t *testing.T) {
 	dataDir := t.TempDir()
 

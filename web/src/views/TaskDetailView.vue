@@ -69,6 +69,18 @@ function getMySQLSinkDisplay(sink, config) {
 const detailPageResumeTables = computed(() => resumeTableList(detailPageTask.value));
 const detailPageRowMeta = computed(() => getRowCountMeta(detailPageTask.value));
 const detailPageTaskStatus = computed(() => detailPageTask.value?.context?.status || "");
+const detailPageShowErrorStack = computed(() => {
+  const ctx = detailPageTask.value?.context;
+  return ctx?.status === "FAILED" && !!ctx?.error_stack;
+});
+const detailPageShowFullSyncFailedReason = computed(() => {
+  const ctx = detailPageTask.value?.context;
+  return (
+    ctx?.status === "FAILED" &&
+    ctx?.sync_phase === "FULL_FAILED" &&
+    !!ctx?.full_sync_failed_reason
+  );
+});
 
 const {
   events: detailPageEvents,
@@ -842,7 +854,7 @@ onUnmounted(() => {
                 </a-descriptions>
 
                 <a-alert
-                  v-if="detailPageTask.context.error_stack"
+                  v-if="detailPageShowErrorStack"
                   type="error"
                   :show-icon="true"
                   style="margin-bottom: 16px"
@@ -854,7 +866,7 @@ onUnmounted(() => {
                 </a-alert>
 
                 <a-alert
-                  v-if="detailPageTask.context.full_sync_failed_reason"
+                  v-if="detailPageShowFullSyncFailedReason"
                   type="warning"
                   :show-icon="true"
                   style="margin-bottom: 16px"
@@ -920,7 +932,7 @@ onUnmounted(() => {
                 </a-table>
 
                 <a-empty
-                  v-else-if="!detailPageTask.context.error_stack && !detailPageTask.context.full_sync_failed_reason"
+                  v-else-if="!detailPageShowErrorStack && !detailPageShowFullSyncFailedReason"
                   description="暂无关键事件"
                   style="margin-top: 24px"
                 />

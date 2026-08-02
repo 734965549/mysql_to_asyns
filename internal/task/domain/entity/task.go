@@ -431,10 +431,13 @@ func NewSyncTask(config TaskConfig) *SyncTask { // 创建同步任务实例
 	}
 }
 
-// Start 启动任务方法（仅管理生命周期状态，不清除全量统计）
+// Start 启动任务方法：重置当前执行轮次字段（ErrorStack/EndTime/StartTime），
+// 不清除 SyncPhase、全量恢复状态、增量位点及全量统计等阶段/历史字段。
 func (t *SyncTask) Start() { // 启动任务
 	t.Context.Status = TaskStatusRunning  // 设置状态为执行中
 	t.Context.StartTime = time.Now()      // 记录开始时间
+	t.Context.EndTime = time.Time{}       // 清除上一轮结束时间
+	t.Context.ErrorStack = ""             // 清除上一轮错误
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
 	t.Context.ScheduledAt = nil           // 清除定时启动时间
 	t.Context.ScheduledFromStatus = nil

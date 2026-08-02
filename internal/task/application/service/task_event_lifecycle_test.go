@@ -203,3 +203,60 @@ func TestTaskEventStorePath_UnderDataDir(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, hasEventCode(events, taskEntity.EventCodeTaskStarted))
 }
+
+func TestTaskEventLifecycle_FailedRestartClearsContextError(t *testing.T) {
+	ts := newTaskServiceWithEvents(t)
+	taskID := "lifecycle_failed_restart"
+	_, err := ts.CreateTask(taskEntity.TaskConfig{
+		ID:   taskID,
+		Name: "Failed Restart",
+		Mode: taskEntity.SyncModeFull,
+	})
+	require.NoError(t, err)
+
+	ts.initRuntimeFn = func(*taskEntity.SyncTask) (*taskRuntime, error) {
+		return &taskRuntime{}, nil
+	}
+	ts.executeSyncFn = func(context.Context, string, *taskRuntime) {}
+
+	require.NoError(t, ts.StartTask(context.Background(), taskID))
+	exec1 := ts.EventRecorder().CurrentExecutionID(taskID)
+	require.NotEmpty(t, exec1)
+
+	task, ok := ts.GetTask(taskID)
+	require.True(t, ok)
+	ts.failTaskUnlessCancelled(context.Background(), taskID, "round 1 error")
+	task, ok = ts.GetTask(taskID)
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Equal(t, "round 1 error", task.Context.ErrorStack)
+
+	require.NoError(t, ts.StartTask(context.Background(), taskID))
+	exec2 := ts.EventRecorder().CurrentExecutionID(taskID)
+	require.NotEmpty(t, exec2)
+	assert.NotEqual(t, exec1, exec2)
+
+	task, ok = ts.GetTask(taskID)
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusRunning, task.Context.Status)
+	assert.Empty(t, task.Context.ErrorStack)
+	assert.True(t, task.Context.EndTime.IsZero())
+
+	flushTaskEvents(t, ts)
+	round2Events, err := ts.ListTaskEvents(port.TaskEventListFilter{
+		TaskID:      taskID,
+		ExecutionID: exec2,
+		Limit:       200,
+	})
+	require.NoError(t, err)
+	for _, ev := range round2Events {
+		assert.Equal(t, exec2, ev.ExecutionID)
+		assert.NotEqual(t, "round 1 error", ev.Message)
+	}
+
+	ts.failTaskUnlessCancelled(context.Background(), taskID, "round 2 error")
+	task, ok = ts.GetTask(taskID)
+	require.True(t, ok)
+	assert.Equal(t, "round 2 error", task.Context.ErrorStack)
+	assert.NotContains(t, task.Context.ErrorStack, "round 1 error")
+}
