@@ -1,16 +1,20 @@
+function isValidDisplayTime(time) {
+  if (!time) return false;
+  const date = new Date(time);
+  return !Number.isNaN(date.getTime()) && date.getFullYear() >= 2000;
+}
+
 export function formatTime(time) {
-  if (!time) return "-";
+  if (!isValidDisplayTime(time)) return "-";
   return new Date(time).toLocaleString("zh-CN");
 }
 
 export function calculateDuration(startTime, endTime) {
-  if (!startTime) return "-";
+  if (!isValidDisplayTime(startTime)) return "-";
 
   const start = new Date(startTime);
-  if (isNaN(start.getTime()) || start.getFullYear() < 2000) return "-";
-
-  const endDate = endTime ? new Date(endTime) : null;
-  const end = endDate && endDate.getFullYear() >= 2000 ? endDate : new Date();
+  const endDate = isValidDisplayTime(endTime) ? new Date(endTime) : new Date();
+  const end = endDate;
   const diff = Math.floor((end - start) / 1000);
 
   if (diff < 0) return "-";
@@ -20,6 +24,16 @@ export function calculateDuration(startTime, endTime) {
   const hours = Math.floor(diff / 3600);
   const minutes = Math.floor((diff % 3600) / 60);
   return `${hours}小时${minutes}分`;
+}
+
+// shouldShowFullSyncFailedReason 判断是否展示全量阶段历史失败原因。
+// 本轮已有 error_stack 时优先展示当前轮错误，避免旧 FULL_FAILED 原因串轮。
+export function shouldShowFullSyncFailedReason(context) {
+  if (!context || context.status !== "FAILED" || context.sync_phase !== "FULL_FAILED") {
+    return false;
+  }
+  if (context.error_stack) return false;
+  return !!context.full_sync_failed_reason;
 }
 
 export function formatSpeed(rowsPerSec) {

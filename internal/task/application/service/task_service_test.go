@@ -4017,6 +4017,44 @@ func TestExecuteFullSync_ALLAnalyzeFailureIsFailClosedPreflight(t *testing.T) {
 	assert.NotEqual(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
 }
 
+func TestExecuteSync_PreflightFailureAfterRestartKeepsStaleFullSyncFailedReason(t *testing.T) {
+	sourceDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer sourceDB.Close()
+	targetDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	ts := newTestTaskService(t.TempDir())
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{
+		ID:           "all_meta_fail_restart",
+		Name:         "ALL Meta Fail Restart",
+		Mode:         taskEntity.SyncModeAll,
+		SourceSchema: "src",
+		Tables:       []string{"t1"},
+		AllowNopkAll: true,
+	})
+	task.AcknowledgeNopkAllRisk(time.Now())
+	task.Context.SyncPhase = taskEntity.SyncPhaseFullFailed
+	task.Context.FullSyncFailedReason = "previous round table copy failed"
+	task.Fail(fmt.Errorf("previous round table copy failed"))
+	task.Start()
+	ts.tasks[task.Config.ID] = task
+
+	runtime := &taskRuntime{
+		sourceDB: sourceDB,
+		targetDB: targetDB,
+		analyzer: &failingAnalyzeAnalyzer{err: fmt.Errorf("metadata unavailable")},
+	}
+	ts.executeSync(context.Background(), task.Config.ID, runtime)
+
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Equal(t, taskEntity.SyncPhaseFullFailed, task.Context.SyncPhase)
+	assert.Equal(t, "previous round table copy failed", task.Context.FullSyncFailedReason)
+	assert.Contains(t, task.Context.ErrorStack, "analyze table")
+	assert.NotContains(t, task.Context.ErrorStack, "previous round table copy failed")
+}
+
 // TestFormatBinlogPosition ??????????????????
 func TestFormatBinlogPosition(t *testing.T) {
 	cases := []struct {

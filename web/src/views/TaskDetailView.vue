@@ -40,6 +40,7 @@ import {
   rowComparisonStatusColor,
   getTotalRowDescriptionLabel,
   formatTotalRowDisplay,
+  shouldShowFullSyncFailedReason,
 } from "../utils/taskFormatters.js";
 import { useTaskEvents } from "../composables/useTaskEvents.js";
 
@@ -73,14 +74,9 @@ const detailPageShowErrorStack = computed(() => {
   const ctx = detailPageTask.value?.context;
   return ctx?.status === "FAILED" && !!ctx?.error_stack;
 });
-const detailPageShowFullSyncFailedReason = computed(() => {
-  const ctx = detailPageTask.value?.context;
-  return (
-    ctx?.status === "FAILED" &&
-    ctx?.sync_phase === "FULL_FAILED" &&
-    !!ctx?.full_sync_failed_reason
-  );
-});
+const detailPageShowFullSyncFailedReason = computed(() =>
+  shouldShowFullSyncFailedReason(detailPageTask.value?.context),
+);
 
 const {
   events: detailPageEvents,
