@@ -133,6 +133,45 @@ func TestTaskStart(t *testing.T) {
 	if task.Context.StartTime.IsZero() {
 		t.Error("start time should not be zero")
 	}
+
+	if !task.Context.EndTime.IsZero() {
+		t.Error("end time should be zero at start of a new execution round")
+	}
+
+	if task.Context.ErrorStack != "" {
+		t.Errorf("error stack should be empty at start, got %q", task.Context.ErrorStack)
+	}
+}
+
+func TestStart_ClearsCurrentExecutionFields(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "test_start_clear", Name: "Test"})
+	task.Fail(assertAnError("previous round error"))
+	previousStart := task.Context.StartTime
+
+	task.Start()
+
+	assert.Equal(t, TaskStatusRunning, task.Context.Status)
+	assert.Empty(t, task.Context.ErrorStack)
+	assert.True(t, task.Context.EndTime.IsZero())
+	assert.False(t, task.Context.StartTime.Equal(previousStart))
+}
+
+func TestStart_PreservesPhaseAndRecoveryFields(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "test_start_preserve", Name: "Test"})
+	task.Fail(assertAnError("boom"))
+	task.Context.SyncPhase = SyncPhaseFullStarted
+	task.Context.FullSyncFailedReason = "stage failure reason"
+	task.Context.ProcessedRows = 5000
+	task.Context.FullLoadV2States = map[string]*FullLoadV2TableState{
+		"db.t1": {Phase: "COPYING", AttemptID: 2},
+	}
+
+	task.Start()
+
+	assert.Equal(t, SyncPhaseFullStarted, task.Context.SyncPhase)
+	assert.Equal(t, "stage failure reason", task.Context.FullSyncFailedReason)
+	assert.Equal(t, int64(5000), task.Context.ProcessedRows)
+	assert.Equal(t, "COPYING", task.Context.FullLoadV2States["db.t1"].Phase)
 }
 
 // TestStart_DoesNotResetCounters 验证 Start 不再重置运行计数字段，
@@ -756,6 +795,21 @@ func TestTableBinlogHWM_Lifecycle(t *testing.T) {
 	task.SetTableBinlogHWM("db.nopk", "mysql-bin.000002:200")
 	task.ResetSyncPhase()
 	assert.Nil(t, task.Context.TableBinlogHWMs)
+}
+
+func TestNopkAllRiskAcknowledgementLifecycle(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "nopk_ack", Mode: SyncModeAll})
+	assert.False(t, task.HasNopkAllRiskAcknowledgement())
+
+	task.AcknowledgeNopkAllRisk(time.Time{})
+	require.True(t, task.HasNopkAllRiskAcknowledgement())
+	assert.True(t, task.Config.AllowNopkAll)
+	require.NotNil(t, task.Context.NopkAllRiskAcknowledgedAt)
+
+	task.ClearNopkAllRiskAcknowledgement()
+	assert.False(t, task.HasNopkAllRiskAcknowledgement())
+	assert.False(t, task.Config.AllowNopkAll)
+	assert.Nil(t, task.Context.NopkAllRiskAcknowledgedAt)
 }
 
 // TestFullLoadV2State_Lifecycle 验证 V2 表级状态的持久化生命周期(P3)。

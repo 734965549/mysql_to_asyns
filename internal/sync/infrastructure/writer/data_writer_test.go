@@ -691,3 +691,31 @@ func TestBufferedWriter_PauseAutoFlushSkipsTimerFlush(t *testing.T) {
 	assert.NoError(t, bw.Close())
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestBatchWriter_WriteBatch_OnlyGeneratedColumns(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create mock db: %v", err)
+	}
+	defer db.Close()
+
+	identity := &entity.TableIdentity{
+		TableName:    "generated_only",
+		Strategy:     entity.FullColumnsStrategy,
+		IdentifyCols: []string{"active_sign_no"},
+		Columns: []entity.ColumnMeta{
+			{Name: "active_sign_no", GeneratedKind: entity.GeneratedVirtual},
+		},
+	}
+	writer := NewBatchWriter(db, identity, 100)
+	writer.EnablePlainInsert()
+
+	mock.ExpectExec("INSERT INTO `generated_only` \\(\\) VALUES \\(\\)").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = writer.WriteBatch(context.Background(), []map[string]interface{}{
+		{"active_sign_no": "computed"},
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}

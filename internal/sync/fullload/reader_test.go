@@ -2,6 +2,7 @@ package fullload
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ func TestChunkReaderCompositeBoundsAndBatchKeys(t *testing.T) {
 		WithArgs(1, 10, 1, 2, 2, 20, 2).
 		WillReturnRows(sqlmock.NewRows([]string{"a", "b", "payload"}).
 			AddRow(1, 11, "x").AddRow(2, 20, "y"))
-	cr, err := newChunkReader(db, chunk, 2, defaultBatchBytes, Options{}, 1, nil)
+	cr, err := newChunkReader(db, chunk, 2, defaultBatchBytes, Options{}, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +63,7 @@ func TestChunkReaderCloseClosesNoPKStream(t *testing.T) {
 	}
 	rows := sqlmock.NewRows([]string{"c`1"}).AddRow("a").AddRow("b")
 	mock.ExpectQuery("SELECT `c``1` FROM `s``1`.`t``1`").WillReturnRows(rows).RowsWillBeClosed()
-	cr, err := newChunkReader(db, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 1, defaultBatchBytes, Options{}, 1, nil)
+	cr, err := newChunkReader(db, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 1, defaultBatchBytes, Options{}, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +86,7 @@ func TestNewChunkReaderRejectsMissingCursorColumn(t *testing.T) {
 	spec := &TableSpec{Identity: &entity.TableIdentity{
 		Strategy: entity.PKStrategy, CursorCols: []string{"missing"}, Columns: []entity.ColumnMeta{{Name: "id"}},
 	}}
-	if _, err := newChunkReader(db, &Chunk{ID: "bad", Spec: spec}, 10, defaultBatchBytes, Options{}, 1, nil); err == nil {
+	if _, err := newChunkReader(db, &Chunk{ID: "bad", Spec: spec}, 10, defaultBatchBytes, Options{}, 1, nil, nil); err == nil {
 		t.Fatal("expected missing cursor column error")
 	}
 }
@@ -102,7 +103,7 @@ func TestChunkReaderSplitsWideRowsByBytesWithoutLosingStreamRows(t *testing.T) {
 	}}
 	mock.ExpectQuery("SELECT `payload` FROM `s`.`t`").WillReturnRows(
 		sqlmock.NewRows([]string{"payload"}).AddRow("12345678").AddRow("abcdefgh").AddRow("ABCDEFGH"))
-	cr, err := newChunkReader(db, &Chunk{ID: "wide", Spec: spec, NoPK: true}, 10, 10, Options{}, 1, nil)
+	cr, err := newChunkReader(db, &Chunk{ID: "wide", Spec: spec, NoPK: true}, 10, 10, Options{}, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +153,7 @@ func TestChunkReaderKeysetQueryTimeoutReturnsStructuredError(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(101, "x"))
 
 	opt := Options{QueryTimeout: 20 * time.Millisecond, SlowQueryWarnThreshold: time.Hour}
-	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil)
+	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +196,7 @@ func TestChunkReaderStreamQueryTimeoutReturnsStructuredError(t *testing.T) {
 		StreamIdleTimeout:      time.Hour,
 		SlowQueryWarnThreshold: time.Hour,
 	}
-	cr, err := newChunkReader(db, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 10, defaultBatchBytes, opt, 1, nil)
+	cr, err := newChunkReader(db, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 10, defaultBatchBytes, opt, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +234,7 @@ func TestChunkReaderStreamMaxDurationDuringOpenReportsActualLimit(t *testing.T) 
 		StreamMaxDuration:      maxDur,
 		SlowQueryWarnThreshold: time.Hour,
 	}
-	cr, err := newChunkReader(db, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 10, defaultBatchBytes, opt, 1, nil)
+	cr, err := newChunkReader(db, &Chunk{ID: "c1", Spec: spec, NoPK: true}, 10, defaultBatchBytes, opt, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +293,7 @@ func TestReadChunkStreamMaxDurationDuringQueueBackpressure(t *testing.T) {
 	}
 
 	stats := &Stats{}
-	err = readChunk(context.Background(), db, chunk, q, opt, stats, nil, nil, nil, nil, 1)
+	err = readChunk(context.Background(), db, chunk, q, opt, stats, nil, nil, nil, nil, 1, nil)
 	if !IsReadQueryTimeout(err) {
 		t.Fatalf("expected ReadQueryTimeoutError, got %T: %v", err, err)
 	}
@@ -329,7 +330,7 @@ func TestChunkReaderUserCancelNotReportedAsTimeout(t *testing.T) {
 
 	// QueryTimeout 足够长，确保超时不会先触发；用户取消应优先。
 	opt := Options{QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour}
-	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil)
+	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +376,7 @@ func TestChunkReaderZeroOptionTimeoutGuarded(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 
 	// 零值 Options：QueryTimeout=0 应被防护为默认值，不能立即超时。
-	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, Options{}, 1, nil)
+	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, Options{}, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,51 +391,62 @@ func TestChunkReaderZeroOptionTimeoutGuarded(t *testing.T) {
 	}
 }
 
-// TestEffectiveBatchRows_LargeFields 验证含大字段表按规则缩小 BatchRows。
-func TestEffectiveBatchRows_LargeFields(t *testing.T) {
+// TestLogicalWindowRows 验证逻辑窗口固定为 batch_size，不再按列类型缩小。
+func TestLogicalWindowRows(t *testing.T) {
 	opt := Options{BatchRows: 1000}
+	if got := logicalWindowRows(opt); got != 1000 {
+		t.Fatalf("logicalWindowRows=%d want 1000", got)
+	}
+	opt.BatchRows = 0
+	if got := logicalWindowRows(opt); got != defaultBatchRows {
+		t.Fatalf("zero batch rows should fall back to default, got %d", got)
+	}
+}
+
+// TestHasLargeColumnTypes 验证宽列判定。
+func TestHasLargeColumnTypes(t *testing.T) {
 	cases := []struct {
 		name    string
 		columns []entity.ColumnMeta
-		want    int
+		want    bool
 	}{
-		{"no_large", []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "name", DataType: "varchar(64)"}}, 1000},
-		{"one_json", []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "data", DataType: "json"}}, 250},
-		{"two_json", []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "req", DataType: "json"}, {Name: "resp", DataType: "json"}}, 100},
-		{"longtext", []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "body", DataType: "longtext"}}, 50},
-		{"one_text", []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "note", DataType: "text"}}, 250},
+		{"no_large", []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "name", DataType: "varchar(64)"}}, false},
+		{"json", []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "data", DataType: "json"}}, true},
+		{"longtext", []entity.ColumnMeta{{Name: "body", DataType: "longtext"}}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			spec := &TableSpec{Identity: &entity.TableIdentity{Columns: c.columns}}
-			got := effectiveBatchRows(spec, opt)
-			if got != c.want {
-				t.Fatalf("effectiveBatchRows=%d want %d", got, c.want)
+			if got := hasLargeColumnTypes(spec); got != c.want {
+				t.Fatalf("hasLargeColumnTypes=%v want %v", got, c.want)
 			}
 		})
 	}
 }
 
-// TestEffectiveBatchRows_FloorAt25 验证极小 BatchRows 下大字段表不低于下限 25。
-func TestEffectiveBatchRows_FloorAt25(t *testing.T) {
-	opt := Options{BatchRows: 100}
-	spec := &TableSpec{Identity: &entity.TableIdentity{Columns: []entity.ColumnMeta{
-		{Name: "id", DataType: "bigint"}, {Name: "body", DataType: "longblob"},
-	}}}
-	// 100/20=5，应被抬到下限 25
-	if got := effectiveBatchRows(spec, opt); got != 25 {
-		t.Fatalf("effectiveBatchRows=%d want floor 25", got)
+// TestShouldUseTwoPhaseRead 验证宽表自动两阶段与显式开关。
+func TestShouldUseTwoPhaseRead(t *testing.T) {
+	wideSpec := &TableSpec{
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "payload", DataType: "json"}},
+		},
 	}
-}
-
-// TestEffectiveBatchRows_NilSpec 验证 nil spec/identity 回退到 opt.BatchRows。
-func TestEffectiveBatchRows_NilSpec(t *testing.T) {
-	opt := Options{BatchRows: 777}
-	if got := effectiveBatchRows(nil, opt); got != 777 {
-		t.Fatalf("nil spec should return opt.BatchRows, got %d", got)
+	narrowSpec := &TableSpec{
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "name", DataType: "varchar(32)"}},
+		},
 	}
-	if got := effectiveBatchRows(&TableSpec{}, opt); got != 777 {
-		t.Fatalf("nil identity should return opt.BatchRows, got %d", got)
+	chunk := &Chunk{Spec: wideSpec}
+	if !shouldUseTwoPhaseRead(wideSpec, chunk, Options{}) {
+		t.Fatal("wide table should auto-enable two-phase")
+	}
+	if shouldUseTwoPhaseRead(narrowSpec, &Chunk{Spec: narrowSpec}, Options{}) {
+		t.Fatal("narrow table should not use two-phase by default")
+	}
+	if !shouldUseTwoPhaseRead(narrowSpec, &Chunk{Spec: narrowSpec}, Options{TwoPhaseRead: true}) {
+		t.Fatal("TwoPhaseRead=true should force enable")
 	}
 }
 
@@ -449,7 +461,7 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
 		Identity: &entity.TableIdentity{
 			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
-			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload"}},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload", DataType: "json"}},
 		},
 	}
 	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{0}, End: []any{100}}
@@ -461,8 +473,8 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE `id` IN").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(1), "x").AddRow(int64(2), "y"))
 
-	opt := Options{QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour, TwoPhaseRead: true}
-	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil)
+	opt := Options{QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour}
+	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,6 +489,120 @@ func TestChunkReaderTwoPhaseKeysetBatch(t *testing.T) {
 	}
 	if len(cr.cursor) != 1 || cr.cursor[0].(int64) != 2 {
 		t.Fatalf("cursor should advance to last pk=2, got %v", cr.cursor)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestChunkReaderTwoPhaseEmptyPayloadContinuesScan 验证 probe 有键但 payload 为空时不提前结束 chunk。
+func TestChunkReaderTwoPhaseEmptyPayloadContinuesScan(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload", DataType: "json"}},
+		},
+	}
+	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{0}, End: []any{100}}
+
+	mock.ExpectQuery("SELECT `id` FROM `s`.`t` WHERE").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow(int64(1)).AddRow(int64(2)).AddRow(int64(3)).AddRow(int64(4)).AddRow(int64(5)).
+			AddRow(int64(6)).AddRow(int64(7)).AddRow(int64(8)).AddRow(int64(9)).AddRow(int64(10)))
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE `id` IN").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}))
+	mock.ExpectQuery("SELECT `id` FROM `s`.`t` WHERE").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(11)))
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE `id` IN").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(11), "z"))
+
+	opt := Options{QueryTimeout: 10 * time.Second, SlowQueryWarnThreshold: time.Hour, TwoPhaseRead: true}
+	cr, err := newChunkReader(db, chunk, 10, defaultBatchBytes, opt, 1, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cr.close()
+
+	batch, err := cr.nextBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch != nil {
+		t.Fatalf("expected nil batch after deleted probe keys, got %+v", batch)
+	}
+	if cr.done {
+		t.Fatal("chunk should not be marked done when probe keys were skipped")
+	}
+	if len(cr.cursor) != 1 || cr.cursor[0].(int64) != 10 {
+		t.Fatalf("cursor should advance past deleted probe keys to 10, got %v", cr.cursor)
+	}
+
+	batch, err = cr.nextBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch == nil || len(batch.Rows) != 1 {
+		t.Fatalf("expected one row after continuing scan, got %+v", batch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadChunksParallelPlainRetriesBadConnectionWithFreshPoolConn(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload"}},
+		},
+	}
+	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{0}, End: []any{100}}
+
+	// 第一次结果集在扫描时断线；该批次尚未完成，也没有推进 keyset 游标。
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).
+			AddRow(int64(1), "discarded").
+			RowError(0, driver.ErrBadConn))
+	// 重试必须经 *sql.DB 获取新连接，并从原游标重新读取完整批次。
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(1), "ok"))
+
+	opt := Options{
+		BatchRows:              10,
+		BatchBytes:             defaultBatchBytes,
+		QueryTimeout:           10 * time.Second,
+		SlowQueryWarnThreshold: time.Hour,
+	}
+	stats := &Stats{}
+	q := newBatchQueue(defaultBufferBytes, stats)
+
+	err = readChunksParallelPlain(context.Background(), db, 1, []*Chunk{chunk}, q, opt, stats, nil, nil, nil, nil, nil, 0, nil)
+	if err != nil {
+		t.Fatalf("expected bad connection to recover through the pool, got %v", err)
+	}
+
+	batch, ok := q.Get(context.Background())
+	if !ok || batch == nil || len(batch.Rows) != 1 {
+		t.Fatalf("expected one recovered batch, got ok=%v batch=%+v", ok, batch)
+	}
+	if got := batch.Rows[0][1]; got != "ok" {
+		t.Fatalf("failed partial batch must be discarded, got payload %v", got)
+	}
+	if stats.ChunksDone != 1 {
+		t.Fatalf("expected one completed chunk, got %d", stats.ChunksDone)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -516,6 +642,109 @@ func TestClassifyScanError_QueryTimeoutRetryable(t *testing.T) {
 	}
 }
 
+func TestChunkReaderUsesSnapshotQueryer(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", TargetSchema: "d", TargetTable: "u",
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id"}, {Name: "payload"}},
+		},
+	}
+	chunk := &Chunk{ID: "c1", Spec: spec, Start: []any{int64(0)}, End: []any{int64(10)}}
+	mock.ExpectQuery("SELECT `id`, `payload` FROM `s`.`t` WHERE").
+		WithArgs(int64(0), int64(10), 10).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "payload"}).AddRow(int64(1), "x"))
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	cr, err := newChunkReader(conn, chunk, 10, defaultBatchBytes, Options{}, 1, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cr.close()
+	batch, err := cr.nextBatch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Rows) != 1 {
+		t.Fatalf("rows=%d", len(batch.Rows))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlanIntegerRange_UsesPlanQueryer(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &TableSpec{
+		SourceSchema: "s", SourceTable: "t", EstimatedRows: 100,
+		Identity: &entity.TableIdentity{
+			Strategy: entity.PKStrategy, IdentifyCols: []string{"id"}, CursorCols: []string{"id"},
+			Columns: []entity.ColumnMeta{{Name: "id", DataType: "bigint"}},
+		},
+	}
+	mock.ExpectQuery("SELECT MIN\\(`id`\\), MAX\\(`id`\\) FROM `s`.`t`").
+		WillReturnRows(sqlmock.NewRows([]string{"min", "max"}).AddRow(int64(1), int64(100)))
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	chunks, err := NewPlanner(conn).planTable(context.Background(), spec, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 4 {
+		t.Fatalf("chunks=%d want 4", len(chunks))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDecideTableReaders 验证按估算行数/chunk 数决定单表内并行读连接数。
+func TestDecideTableReaders(t *testing.T) {
+	opt := ResolveOptions(RawOptions{ReadWorkers: 4})
+	job := &tableReadJob{
+		spec: &TableSpec{
+			EstimatedRows: 50,
+			Identity:      &entity.TableIdentity{Strategy: entity.PKStrategy, Columns: []entity.ColumnMeta{{Name: "id"}}},
+		},
+		chunks: []*Chunk{{ID: "1"}, {ID: "2"}, {ID: "3"}},
+	}
+	if got := decideTableReaders(job, opt); got != 1 {
+		t.Fatalf("small table readers=%d want 1", got)
+	}
+	job.spec.EstimatedRows = defaultLargeTableRows
+	if got := decideTableReaders(job, opt); got != 3 {
+		t.Fatalf("large table readers=%d want 3 (min chunks)", got)
+	}
+	if got := decideTableReadersForSpec(job.spec, opt); got != 4 {
+		t.Fatalf("large table pre-plan readers=%d want 4", got)
+	}
+	job.chunks = []*Chunk{{ID: "only"}}
+	if got := decideTableReaders(job, opt); got != 1 {
+		t.Fatalf("single chunk readers=%d want 1", got)
+	}
+}
+
 // TestClassifyScanError_ParentCancelNotTimeout 验证父 ctx 取消时不误判为查询超时。
 func TestClassifyScanError_ParentCancelNotTimeout(t *testing.T) {
 	spec := &TableSpec{
@@ -532,5 +761,123 @@ func TestClassifyScanError_ParentCancelNotTimeout(t *testing.T) {
 	got := cr.classifyScanError(parent, context.Canceled)
 	if IsReadQueryTimeout(got) {
 		t.Fatalf("parent cancel must not become query timeout: %v", got)
+	}
+}
+
+func TestScanUpTo_BytesSplitAndOversizedRowCallback(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	large := make([]byte, 5000)
+	rows := sqlmock.NewRows([]string{"id", "payload"}).
+		AddRow(int64(1), large).
+		AddRow(int64(2), []byte("x"))
+	mock.ExpectQuery("SELECT").WillReturnRows(rows)
+
+	r, err := db.Query("SELECT id, payload FROM s.t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	var oversized int64
+	got, bytes, _, err := scanUpTo(r, 2, 1000, 4096, nil, func(n int64) { oversized = n })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || bytes <= 4096 {
+		t.Fatalf("expected byte-truncated batch with oversized first row, rows=%d bytes=%d", len(got), bytes)
+	}
+	if oversized <= 4096 {
+		t.Fatalf("expected oversized row callback, got %d", oversized)
+	}
+}
+
+func TestChunkReader_makeBatch_ExcludesGeneratedColumns(t *testing.T) {
+	spec := &TableSpec{
+		SourceSchema: "jg_cps",
+		SourceTable:  "cps_quick_sign_contract",
+		TargetSchema: "jg_cps",
+		TargetTable:  "cps_quick_sign_contract",
+		Identity: &entity.TableIdentity{
+			Strategy:     entity.PKStrategy,
+			IdentifyCols: []string{"id"},
+			CursorCols:   []string{"id"},
+			Columns: []entity.ColumnMeta{
+				{Name: "id", IsPrimaryKey: true},
+				{Name: "sign_no"},
+				{Name: "active_sign_no", GeneratedKind: entity.GeneratedVirtual},
+			},
+		},
+	}
+	chunk := &Chunk{ID: "c1", Spec: spec}
+	cr, err := newChunkReader(nil, chunk, 100, 0, Options{}, 1, nil, nil)
+	if err != nil {
+		t.Fatalf("newChunkReader: %v", err)
+	}
+	batch := cr.makeBatch([][]any{{int64(1), "S001", "computed"}}, 32)
+	if len(batch.Columns) != 2 || batch.Columns[0] != "id" || batch.Columns[1] != "sign_no" {
+		t.Fatalf("unexpected batch columns: %#v", batch.Columns)
+	}
+	if len(batch.Rows) != 1 || len(batch.Rows[0]) != 2 {
+		t.Fatalf("unexpected batch rows: %#v", batch.Rows)
+	}
+	if batch.Rows[0][1] != "S001" {
+		t.Fatalf("unexpected row values: %#v", batch.Rows[0])
+	}
+}
+
+func TestNewChunkReader_WritableColumnIndices(t *testing.T) {
+	spec := &TableSpec{
+		Identity: &entity.TableIdentity{
+			Strategy:     entity.PKStrategy,
+			IdentifyCols: []string{"id"},
+			CursorCols:   []string{"id"},
+			Columns: []entity.ColumnMeta{
+				{Name: "id", IsPrimaryKey: true},
+				{Name: "sign_no"},
+				{Name: "hash_col", GeneratedKind: entity.GeneratedStored},
+			},
+		},
+	}
+	cr, err := newChunkReader(nil, &Chunk{ID: "c1", Spec: spec}, 100, 0, Options{}, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newChunkReader: %v", err)
+	}
+	if len(cr.cols) != 3 || len(cr.writableCols) != 2 || len(cr.writableIdx) != 2 {
+		t.Fatalf("cols=%d writableCols=%d writableIdx=%d", len(cr.cols), len(cr.writableCols), len(cr.writableIdx))
+	}
+	if cr.writableIdx[0] != 0 || cr.writableIdx[1] != 1 {
+		t.Fatalf("unexpected writableIdx: %#v", cr.writableIdx)
+	}
+}
+
+func TestChunkReader_makeBatch_OnlyGeneratedColumns(t *testing.T) {
+	spec := &TableSpec{
+		SourceSchema: "db",
+		SourceTable:  "generated_only",
+		TargetSchema: "db",
+		TargetTable:  "generated_only",
+		Identity: &entity.TableIdentity{
+			Strategy:     entity.FullColumnsStrategy,
+			IdentifyCols: []string{"active_sign_no"},
+			Columns: []entity.ColumnMeta{
+				{Name: "active_sign_no", GeneratedKind: entity.GeneratedVirtual},
+			},
+		},
+	}
+	cr, err := newChunkReader(nil, &Chunk{ID: "c1", Spec: spec}, 100, 0, Options{}, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newChunkReader: %v", err)
+	}
+	batch := cr.makeBatch([][]any{{"computed"}}, 8)
+	if len(batch.Columns) != 0 {
+		t.Fatalf("expected empty columns, got %#v", batch.Columns)
+	}
+	if len(batch.Rows) != 1 || len(batch.Rows[0]) != 0 {
+		t.Fatalf("expected one default row with no values, got %#v", batch.Rows)
 	}
 }

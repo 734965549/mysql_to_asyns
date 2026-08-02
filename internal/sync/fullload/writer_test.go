@@ -21,6 +21,24 @@ func TestInsertPrefix(t *testing.T) {
 	}
 }
 
+func TestInsertPrefix_EmptyColumns(t *testing.T) {
+	b := &RowBatch{TargetSchema: "db", TargetTable: "generated_only", Columns: nil}
+	got := insertPrefix(b)
+	want := "INSERT INTO `db`.`generated_only` () VALUES "
+	if got != want {
+		t.Fatalf("prefix=%q want %q", got, want)
+	}
+}
+
+func TestEmptyRowPlaceholder(t *testing.T) {
+	if got := emptyRowPlaceholder(0); got != "()" {
+		t.Fatalf("empty placeholder=%q", got)
+	}
+	if got := emptyRowPlaceholder(2); got != "(?, ?)" {
+		t.Fatalf("two-col placeholder=%q", got)
+	}
+}
+
 func TestIsRetryableTxConflict(t *testing.T) {
 	cases := map[string]bool{
 		"Error 1213: Deadlock found when trying to get lock": true,
@@ -38,6 +56,38 @@ func TestIsRetryableTxConflict(t *testing.T) {
 	}
 	if isRetryableTxConflict(nil) {
 		t.Error("nil should be non-retryable")
+	}
+}
+
+// TestWriterReconnectBackoffGrowsAndCaps 验证换连接退避随尝试次数指数增长且封顶，
+// 累计等待时间足以覆盖目标库短暂重启/网络抖动（此前固定 25~150ms 极短退避，
+// 遇到 "connection refused" 几乎在 1 秒内耗尽 5 次重试即失败，参见线上工单）。
+func TestWriterReconnectBackoffGrowsAndCaps(t *testing.T) {
+	var total time.Duration
+	var prev time.Duration
+	for attempt := 1; attempt <= writeConnMaxRetries; attempt++ {
+		got := writerReconnectBackoff(attempt)
+		if got <= 0 {
+			t.Fatalf("attempt %d: backoff must be positive, got %v", attempt, got)
+		}
+		if got > writerReconnectBackoffCap {
+			t.Fatalf("attempt %d: backoff %v exceeds cap %v", attempt, got, writerReconnectBackoffCap)
+		}
+		if attempt > 1 && got < prev {
+			t.Fatalf("attempt %d: backoff %v should not shrink from previous %v", attempt, got, prev)
+		}
+		prev = got
+		total += got
+	}
+	if total < 20*time.Second {
+		t.Fatalf("total backoff across %d attempts too short to tolerate a brief target outage: %v", writeConnMaxRetries, total)
+	}
+	// 越界 attempt 也应被封顶保护，不能无限增长或返回非正值。
+	if got := writerReconnectBackoff(0); got != writerReconnectBackoffBase {
+		t.Fatalf("attempt 0 should clamp to base, got %v", got)
+	}
+	if got := writerReconnectBackoff(100); got != writerReconnectBackoffCap {
+		t.Fatalf("large attempt should clamp to cap, got %v", got)
 	}
 }
 
@@ -208,9 +258,9 @@ func TestWriterLoopReplaysWholeTransactionOnDeadlock(t *testing.T) {
 	q.Close()
 	stats := &Stats{}
 	var committed int64
-	err = writerLoop(context.Background(), 0, db, q,
+	err = writerLoop(context.Background(), "test", 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 10}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -263,9 +313,9 @@ func TestWriterLoopReconnectsOnInvalidConnection(t *testing.T) {
 	q.Close()
 	stats := &Stats{}
 	var committed int64
-	err = writerLoop(context.Background(), 0, db, q,
+	err = writerLoop(context.Background(), "test", 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 10}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -319,8 +369,8 @@ func TestWriterLoopRecoversUnknownCommitWhenRolledBack(t *testing.T) {
 	q.Close()
 	stats := &Stats{}
 	var committed int64
-	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+	err = writerLoop(context.Background(), "test", 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats,
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -366,8 +416,8 @@ func TestWriterLoopRecoversUnknownCommitWhenApplied(t *testing.T) {
 	q.Close()
 	stats := &Stats{}
 	var committed int64
-	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+	err = writerLoop(context.Background(), "test", 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), stats,
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -404,7 +454,7 @@ func TestWriterLoopCommitNonConnErrorStillFails(t *testing.T) {
 		Rows:    [][]any{{int64(1)}}, ApproxBytes: 8,
 	})
 	q.Close()
-	err = writerLoop(context.Background(), 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), &Stats{}, nil, nil, nil, nil, "run-1")
+	err = writerLoop(context.Background(), "test", 0, db, q, ResolveOptions(RawOptions{BatchSize: 1}), &Stats{}, nil, nil, nil, nil, "run-1", nil)
 	if err == nil || !strings.Contains(err.Error(), "disk full") || strings.Contains(err.Error(), "outcome unknown") {
 		t.Fatalf("expected plain commit error, got %v", err)
 	}
@@ -467,9 +517,9 @@ func TestWriterLoopFullColumnsIdenticalRowsAcrossTxUsesDistinctMarkers(t *testin
 	q.Close()
 	stats := &Stats{}
 	var committed int64
-	err = writerLoop(context.Background(), 0, db, q,
+	err = writerLoop(context.Background(), "test", 0, db, q,
 		ResolveOptions(RawOptions{BatchSize: 1, CommitRows: 1}), stats,
-		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1")
+		func(_, _ string, rows, _ int64) { committed += rows }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}
@@ -564,7 +614,7 @@ func TestWriterLoopCommitsOnIntervalWithoutNextBatch(t *testing.T) {
 	opt.CommitInterval = 20 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err = writerLoop(ctx, 0, db, q, opt, &Stats{}, func(_, _ string, _, _ int64) { q.Close() }, nil, nil, nil, "run-1")
+	err = writerLoop(ctx, "test", 0, db, q, opt, &Stats{}, func(_, _ string, _, _ int64) { q.Close() }, nil, nil, nil, "run-1", nil)
 	if err != nil {
 		t.Fatalf("writerLoop: %v", err)
 	}

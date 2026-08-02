@@ -113,22 +113,22 @@ StartTask
   -> MarkFullSyncCompleted
 ```
 
-全量起点位点通过短暂 `FLUSH TABLES WITH READ LOCK` 捕获，随后立即 `UNLOCK TABLES`。不要重新引入长事务全局快照或 `enable_consistent_snapshot`。
+全量起点位点通过无锁 `SHOW MASTER STATUS` 捕获（不再使用 `FLUSH TABLES WITH READ LOCK`）。基线扫描完成后再捕获 P1，从 P0 做有界追平到 P1。不要重新引入长事务全局快照、表级长生命周期 RR 快照或 `enable_consistent_snapshot`。
 
-### 短锁起点与增量追平
+### 无锁起点与增量追平
 
 本项目不依赖“全量期间一直持锁”来保证一致性，而是使用“起点位点 + 空目标全量写 + 增量追平”：
 
 ```text
-1. 全量开始前短锁拿到 binlog 位点 P0。
-2. 立即解锁，并把 P0 保存为增量 checkpoint。
+1. 全量开始前以无锁 `SHOW MASTER STATUS` 拿到 binlog 位点 P0。
+2. 把 P0 保存为增量 checkpoint。
 3. 全量阶段执行普通短查询，目标端使用普通 INSERT 写入；目标表必须为空，或通过 `enable_drop_table_before_ddl=true` 在全量前重建为空。
    - 「DDL 前删除目标」按 `sync_level` 分支：DATABASE 级别在 `MarkFullSyncStarted` 后、任何目标表 DDL/数据写入前，对去重后的唯一目标库执行 `DROP DATABASE IF EXISTS` + `CREATE DATABASE IF NOT EXISTS`（utf8mb4/utf8mb4_unicode_ci），任一步失败终止全量；之后建表不再逐表 `DROP TABLE`。TABLE 级别保持每张表建表前 `DROP TABLE IF EXISTS`。两种级别均使用用户配置的目标库名/目标表名，仅在全量阶段执行一次，增量阶段不执行。
-4. ALL 模式全量完成后，增量从 P0 开始回放。
+4. ALL 模式全量基线扫描完成后捕获 P1，增量从 P0 开始回放，做有界追平到 P1。
 5. P0 之后发生的变更会再次应用到目标库，用于追平全量读取期间的时间差。
 ```
 
-> **重要限制**：上述"短锁位点 + 非快照全量 + binlog 回放"的严格收敛保证**仅适用于有可靠非空 PK/UK 的表**。无 PK/UK 的表无法保证收敛，原因如下：
+> **重要限制**：上述"无锁位点 + 非快照全量 + binlog 回放"的严格收敛保证**仅适用于有可靠非空 PK/UK 的表**。无 PK/UK 的表无法保证收敛，原因如下：
 > 1. P0 之后源库插入了一行新数据；
 > 2. 全量扫描也读取到了该行并写入目标表；
 > 3. 随后增量 binlog 回放再次 INSERT 该行；
@@ -158,7 +158,7 @@ StartTask
 
 #### V2 写事务提交与 `__mts_fl_tx`
 
-`full_load_engine=v2` 时，写入侧在每个目标 schema 维护系统表 `__mts_fl_tx`（InnoDB，带表/列注释，含 `run_id`）。每个写事务提交前插入唯一 UUID marker，与业务行同事务提交。客户端遇到连接类 Commit 错误时，**不得**用业务行存在性推断结果（无主键跨事务相同行会误判；非锁定读可能与仍在处理的 COMMIT 竞态），而是对该 marker 做 `SELECT ... FOR UPDATE`：命中则只推进进度，无行则整事务重放；无法判定则 fail-closed。启动前还会：在首次目标端 DDL 前对目标 schema 获取 `GET_LOCK` 强制互斥（禁止同 schema 并发 V2；持有至任务级收尾；要求 MySQL ≥ 5.7.5 以支持同连接多锁；`target_max_open_conns` ≥ 2）；拒绝业务目标表占用保留名 `__mts_fl_tx`（大小写不敏感）；校验所有目标业务表为 InnoDB；并对已存在的 marker 表 fail-closed 校验 `BASE TABLE`/InnoDB/`id` 完整唯一键（`SUB_PART` NULL 或 ≥ 36）与 `run_id` 列。数据流水线成功后按本趟 `run_id` 删除本任务行（**不** `DROP` 共享表；清理独立短超时；失败/暂停保留行）。目标账号除 `CREATE TABLE` 外，还需对 marker 表具备 `INSERT`、`SELECT ... FOR UPDATE`、`DELETE`，以及 `GET_LOCK`/`RELEASE_LOCK`。详见 `docs/CONFIGURATION.md`「写事务提交标记表」。
+`full_load_engine=v2` 时，写入侧在每个目标 schema 维护系统表 `__mts_fl_tx`（InnoDB，带表/列注释，含 `run_id`）。每个写事务提交前插入唯一 UUID marker，与业务行同事务提交。客户端遇到连接类 Commit 错误时，**不得**用业务行存在性推断结果（无主键跨事务相同行会误判；非锁定读可能与仍在处理的 COMMIT 竞态），而是对该 marker 做 `SELECT ... FOR UPDATE`：命中则只推进进度，无行则整事务重放；无法判定则 fail-closed。启动前还会：在首次目标端 DDL 前对目标 schema 获取 `GET_LOCK` 强制互斥（禁止同 schema 并发 V2；持有至任务级收尾；要求 MySQL ≥ 5.7.5 以支持同连接多锁；`target_max_open_conns` ≥ 2）；拒绝业务目标表占用保留名 `__mts_fl_tx`（大小写不敏感）；校验所有目标业务表为 InnoDB；并对已存在的 marker 表 fail-closed 校验 `BASE TABLE`/InnoDB/`id` 完整唯一键（`SUB_PART` NULL 或 ≥ 36）与 `run_id` 列。数据流水线确认成功后，在 writer 全部退出且仍持有目标 schema 互斥锁时 `DROP TABLE IF EXISTS __mts_fl_tx`；清理使用独立短超时，失败会使任务明确失败；失败/暂停路径保留 marker 表。源端出现 `__mts_fl_tx` 时仍 fail-closed 报错，不静默跳过旧残留。目标账号除 `CREATE TABLE` 外，还需对 marker 表具备 `INSERT`、`SELECT ... FOR UPDATE`、`DROP`，以及 `GET_LOCK`/`RELEASE_LOCK`。详见 `docs/CONFIGURATION.md`「写事务提交标记表」。
 
 ## 4. 全量中断处理
 
@@ -234,7 +234,7 @@ TaskService.executeIncrementalSync
 
 - 如果目标库已有漂移，UPDATE/DELETE 可能匹配 0 行。
 - 如果存在完全重复行，无主键场景无法精确定位逻辑上的"第几行"。
-- ALL 模式下"短锁位点 + 非快照全量 + binlog 回放"无法保证无主键表收敛：全量扫描和 binlog 回放可能写入同一行，`INSERT IGNORE` 无冲突键可去重，产生重复行。该风险对应默认 `full_load_engine=v1` 旧语义；`full_load_engine=v2` 在表级一致性快照窗口内捕获 HWM，增量启动时对无 PK/UK 表 fail-closed 校验并按 HWM 过滤，避免重复 INSERT。V1 ALL 不强校验 HWM，以免默认引擎在 `FULL_COMPLETED` 后永久卡死增量启动。
+- ALL 模式依赖"短锁位点 P0 + 普通短查询全量 + 捕获 P1 + bounded catch-up 到 P1 + 持续增量"收敛无主键表：全量扫描期间发生的变更由 P0..P1 catch-up 阶段重放覆盖，之后转入持续增量。`full_load_engine=v1`/`v2` 均不再生成或依赖表级 binlog HWM（历史上 v2 曾在表级一致性快照窗口内捕获 HWM 并 fail-closed 校验，该机制已下线）。
 - 推荐给业务表补主键或唯一键。
 
 ## 7. 存储与安全

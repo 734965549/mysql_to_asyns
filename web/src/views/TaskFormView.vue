@@ -47,6 +47,7 @@ const expandedTableDatabaseKeys = ref([]);
 const expandedTargetTableDatabaseKeys = ref([]);
 
 const editingTaskId = ref(null);
+// 复制任务时携带的源任务 ID；提交时作为 clone_from_task_id 传给后端，供后端克隆增量位点/配置。
 const cloneFromTaskId = ref(null);
 
 const useCustomSourceDB = ref(false);
@@ -94,6 +95,8 @@ function getSinkTypeLabel(type) {
   return SINK_TYPES.find((t) => t.value === type)?.label || type;
 }
 
+// 将后端结构化 sink options 规范化为表单编辑格式：
+// MYSQL/KAFKA 密码脱敏清空（unmaskSecret）；KAFKA brokers 数组转逗号串；WEBHOOK headers 对象转 "k: v\n" 文本。
 function normalizeSinkOptionsForForm(type, options) {
   const opts = { ...(options || {}) };
   if (type === "MYSQL") {
@@ -121,9 +124,11 @@ const taskForm = ref({
   enable_drop_table_before_ddl: false, enable_skip_binlog: false,
   tx_commit_every_n_parallel: 0, index_restore_worker_count: 0,
   full_load_engine: "v1",
-  full_load_read_workers: 0, full_load_write_workers: 0, full_load_buffer_mb: 0,
+  full_load_read_workers: 0, full_load_table_workers: 0, full_load_per_table_readers: 0,
+  full_load_write_workers: 0, full_load_buffer_mb: 0,
   full_load_batch_bytes_mb: 0, full_load_commit_rows: 0, full_load_commit_bytes_mb: 0,
-  full_load_lock_wait_timeout_sec: 0, full_load_degrade_on_align_lock_fail: true,
+  full_load_lock_wait_timeout_sec: 0, full_load_degrade_on_align_lock_fail: false,
+  allow_nopk_all: false,
 });
 
 function applyFullLoadPreset(name) {
@@ -149,6 +154,8 @@ const fullLoadEffective = computed(() => {
     : 10000;
   return {
     read: orDefault(f.full_load_read_workers, 4),
+    table: orDefault(f.full_load_table_workers, orDefault(f.full_load_read_workers, 4)),
+    perTable: orDefault(f.full_load_per_table_readers, orDefault(f.full_load_read_workers, 4)),
     write: orDefault(f.full_load_write_workers, 4),
     buffer: orDefault(f.full_load_buffer_mb, 128),
     commitRows: orDefault(f.full_load_commit_rows, legacyCommitRows),
@@ -302,10 +309,12 @@ function resetForm() {
     enable_limit_one: false, optimize_index: false, index_restore_worker_count: 0,
     enable_read_only: false, enable_drop_table_before_ddl: false,
     enable_skip_binlog: false, tx_commit_every_n_parallel: 0,
-    full_load_engine: "v1", full_load_read_workers: 0, full_load_write_workers: 0,
+    full_load_engine: "v1", full_load_read_workers: 0, full_load_table_workers: 0,
+    full_load_per_table_readers: 0, full_load_write_workers: 0,
     full_load_buffer_mb: 0, full_load_batch_bytes_mb: 0, full_load_commit_rows: 0,
     full_load_commit_bytes_mb: 0, full_load_lock_wait_timeout_sec: 0,
-    full_load_degrade_on_align_lock_fail: true,
+    full_load_degrade_on_align_lock_fail: false,
+    allow_nopk_all: false,
   };
   selectedSyncLevel.value = "database";
   selectedDatabases.value = [];
@@ -452,13 +461,16 @@ function fillTaskFormFromTask(task) {
     tx_commit_every_n_parallel: task.config.tx_commit_every_n_parallel ?? 0,
     full_load_engine: task.config.full_load_engine || "v1",
     full_load_read_workers: task.config.full_load_read_workers ?? 0,
+    full_load_table_workers: task.config.full_load_table_workers ?? 0,
+    full_load_per_table_readers: task.config.full_load_per_table_readers ?? 0,
     full_load_write_workers: task.config.full_load_write_workers ?? 0,
     full_load_buffer_mb: task.config.full_load_buffer_mb ?? 0,
     full_load_batch_bytes_mb: task.config.full_load_batch_bytes_mb ?? 0,
     full_load_commit_rows: task.config.full_load_commit_rows ?? 0,
     full_load_commit_bytes_mb: task.config.full_load_commit_bytes_mb ?? 0,
     full_load_lock_wait_timeout_sec: task.config.full_load_lock_wait_timeout_sec ?? 0,
-    full_load_degrade_on_align_lock_fail: task.config.full_load_degrade_on_align_lock_fail !== false,
+    full_load_degrade_on_align_lock_fail: false,
+    allow_nopk_all: !!(task.config.allow_nopk_all || task.context?.nopk_all_risk_acknowledged_at),
   };
 
   if (task.config.sync_level === "DATABASE") {
@@ -512,6 +524,8 @@ function fillTaskFormFromTask(task) {
   }
 
   if (hasExplicitSinkConfigs(task.config.sink_configs)) {
+    // 单个显式 MYSQL sink 等价于自定义目标端：回退为 MYSQL 单目标形态（避免误进 MULTI 编辑），
+    // 仅当任务自身无 target_db 时才从 sink options 回填 customTargetDB。
     if (isSingleExplicitMySQLSink(task.config.sink_configs)) {
       targetType.value = "MYSQL";
       sinkConfigs.value = [];
@@ -1131,6 +1145,27 @@ onUnmounted(() => {
 
                         <a-option value="ALL">全量+增量</a-option>
                       </a-select>
+                      <a-alert
+                        v-if="taskForm.mode === 'FULL'"
+                        type="warning"
+                        style="margin-top: 8px"
+                        show-icon
+                      >
+                        FULL 是一次性基线拷贝，不捕获执行期间的增量；同表不同分片可能读到不同时间点。
+                        在线不停写迁移请选 ALL；需要严格静态副本请在 FULL 期间暂停源端写入。
+                      </a-alert>
+                      <div v-if="taskForm.mode === 'ALL'" style="margin-top: 8px">
+                        <a-alert type="warning" show-icon>
+                          ALL 会先做基线扫描再从 binlog 追平。若包含无主键/唯一键表，只能提供
+                          best-effort 一致性（可能重复 INSERT，UPDATE/DELETE 依赖 before image）。
+                        </a-alert>
+                        <a-checkbox
+                          v-model="taskForm.allow_nopk_all"
+                          style="margin-top: 8px"
+                        >
+                          我已理解无主键/唯一键表无法保证严格一致性，仍继续 ALL
+                        </a-checkbox>
+                      </div>
                     </a-form-item>
                   </a-col>
                 </a-row>
@@ -1484,7 +1519,9 @@ onUnmounted(() => {
                         type="secondary"
                         style="font-size: 12px; display: block; margin-top: 4px"
                       >
-                        当前生效：读 {{ fullLoadEffective.read }} / 写
+                        当前生效：全局读取预算 {{ fullLoadEffective.read }} / 表并发
+                        {{ fullLoadEffective.table }} / 单表并行
+                        {{ fullLoadEffective.perTable }}，写
                         {{ fullLoadEffective.write }} worker，队列
                         {{ fullLoadEffective.buffer }} MiB，单事务
                         {{ fullLoadEffective.commitRows }} 行 /
@@ -1495,7 +1532,7 @@ onUnmounted(() => {
 
                     <a-row :gutter="16">
                       <a-col :span="12">
-                        <a-form-item label="源读取并发 (read workers)">
+                        <a-form-item label="源读取总预算 (read workers)">
                           <a-input-number
                             :model-value="taskForm.full_load_read_workers"
                             @change="(v) => (taskForm.full_load_read_workers = v ?? 0)"
@@ -1503,6 +1540,39 @@ onUnmounted(() => {
                             :max="64"
                             style="width: 100%"
                             placeholder="0=自动(4)"
+                          />
+                          <a-typography-text
+                            type="secondary"
+                            style="font-size: 12px"
+                          >
+                            全局源库并发连接上限；与表并发、单表并行解耦
+                          </a-typography-text>
+                        </a-form-item>
+                      </a-col>
+                      <a-col :span="12">
+                        <a-form-item label="并发表调度 (table workers)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_table_workers"
+                            @change="(v) => (taskForm.full_load_table_workers = v ?? 0)"
+                            :min="0"
+                            :max="64"
+                            style="width: 100%"
+                            placeholder="0=沿用 read workers"
+                          />
+                        </a-form-item>
+                      </a-col>
+                    </a-row>
+
+                    <a-row :gutter="16">
+                      <a-col :span="12">
+                        <a-form-item label="单表并行读 (per-table readers)">
+                          <a-input-number
+                            :model-value="taskForm.full_load_per_table_readers"
+                            @change="(v) => (taskForm.full_load_per_table_readers = v ?? 0)"
+                            :min="0"
+                            :max="64"
+                            style="width: 100%"
+                            placeholder="0=沿用 read workers"
                           />
                         </a-form-item>
                       </a-col>
@@ -1574,37 +1644,6 @@ onUnmounted(() => {
                       </a-col>
                     </a-row>
 
-                    <a-row :gutter="16">
-                      <a-col :span="12">
-                        <a-form-item label="对齐取锁等待 (秒)">
-                          <a-input-number
-                            :model-value="taskForm.full_load_lock_wait_timeout_sec"
-                            @change="(v) => (taskForm.full_load_lock_wait_timeout_sec = v ?? 0)"
-                            :min="0"
-                            :max="3600"
-                            style="width: 100%"
-                            placeholder="0=自动(10)"
-                          />
-                        </a-form-item>
-                      </a-col>
-                      <a-col :span="12">
-                        <a-form-item label="对齐取锁失败策略">
-                          <a-switch
-                            v-model="taskForm.full_load_degrade_on_align_lock_fail"
-                          />
-                          <a-typography-text
-                            type="secondary"
-                            style="margin-left: 8px; font-size: 12px"
-                          >
-                            {{
-                              taskForm.full_load_degrade_on_align_lock_fail
-                                ? "降级为单连接快照"
-                                : "fail-closed（任务失败）"
-                            }}
-                          </a-typography-text>
-                        </a-form-item>
-                      </a-col>
-                    </a-row>
                   </template>
 
                   <a-form-item v-if="targetType === 'MYSQL'">

@@ -50,6 +50,7 @@ func (d *SchemaDetector) GetTableColumns(schema, tableName string) ([]entity.Col
 		col.IsPrimaryKey = columnKey == "PRI" // 设置是否主键
 		col.IsUnique = columnKey == "UNI"     // 设置是否唯一
 		col.IsAutoIncrement = strings.Contains(strings.ToLower(extra), "auto_increment")
+		col.GeneratedKind = entity.ParseGeneratedKindFromExtra(extra)
 		if defaultValue.Valid { // 如果默认值有效
 			col.DefaultValue = defaultValue.String // 设置默认值
 		}

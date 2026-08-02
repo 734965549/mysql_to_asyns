@@ -402,16 +402,8 @@ func TestSQLBuilder_BuildUpdate_OnlyPrimaryKey(t *testing.T) {
 
 	query, args := builder.BuildUpdate(row)
 
-	// 只有主键时，SET 子句应该为空，但SQL语法要求SET后面至少有一个列
-	// 实际实现中，如果没有非主键列，SET子句会是空的
-	// 验证查询包含WHERE子句
-	if !strings.Contains(query, "WHERE id = ?") {
-		t.Errorf("expected WHERE clause with id, got: %s", query)
-	}
-
-	// 参数应该只有 WHERE 参数
-	if len(args) != 1 {
-		t.Errorf("expected 1 arg for WHERE clause, got %d", len(args))
+	if query != "" || args != nil {
+		t.Errorf("UPDATE with only primary key should be skipped, got query=%q args=%v", query, args)
 	}
 }
 
@@ -667,13 +659,13 @@ func TestSQLBuilder_BuildBatchUpsert_EmptyRowsReturnsEmpty(t *testing.T) {
 
 func TestSQLBuilder_IdentityChanged(t *testing.T) {
 	tests := []struct {
-		name        string
-		strategy    entity.IdentityStrategy
-		columns     []entity.ColumnMeta
+		name         string
+		strategy     entity.IdentityStrategy
+		columns      []entity.ColumnMeta
 		identifyCols []string
-		before      map[string]interface{}
-		after       map[string]interface{}
-		want        bool
+		before       map[string]interface{}
+		after        map[string]interface{}
+		want         bool
 	}{
 		{
 			name:         "PK unchanged",
@@ -758,5 +750,94 @@ func TestSQLBuilder_IdentityChanged(t *testing.T) {
 				t.Errorf("IdentityChanged() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSQLBuilder_GeneratedColumnsExcludedFromWrites(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "id", IsPrimaryKey: true},
+		{Name: "sign_no"},
+		{Name: "active_sign_no", GeneratedKind: entity.GeneratedVirtual},
+		{Name: "hash_col", GeneratedKind: entity.GeneratedStored},
+	}
+	identity := createTestIdentity(entity.PKStrategy, "cps_quick_sign_contract", columns, []string{"id"})
+	builder := NewSQLBuilder(identity)
+
+	row := map[string]interface{}{
+		"id":             1,
+		"sign_no":        "S001",
+		"active_sign_no": "computed",
+		"hash_col":       "stored-hash",
+	}
+
+	insertQuery, insertArgs := builder.BuildInsert(row)
+	if strings.Contains(insertQuery, "`active_sign_no`") || strings.Contains(insertQuery, "`hash_col`") {
+		t.Fatalf("INSERT must exclude generated columns: %s", insertQuery)
+	}
+	if len(insertArgs) != 2 {
+		t.Fatalf("expected 2 insert args, got %d: %v", len(insertArgs), insertArgs)
+	}
+
+	updateQuery, updateArgs := builder.BuildUpdate(row)
+	if strings.Contains(updateQuery, "`active_sign_no` = ?") || strings.Contains(updateQuery, "`hash_col` = ?") {
+		t.Fatalf("UPDATE SET must exclude generated columns: %s", updateQuery)
+	}
+	if len(updateArgs) != 2 {
+		t.Fatalf("expected 2 update args, got %d: %v", len(updateArgs), updateArgs)
+	}
+
+	upsertQuery, upsertArgs := builder.BuildBatchUpsert([]map[string]interface{}{row})
+	if strings.Contains(upsertQuery, "`active_sign_no` = VALUES") || strings.Contains(upsertQuery, "`hash_col` = VALUES") {
+		t.Fatalf("ON DUPLICATE KEY UPDATE must exclude generated columns: %s", upsertQuery)
+	}
+	if !strings.Contains(upsertQuery, "`sign_no` = VALUES(`sign_no`)") {
+		t.Fatalf("upsert should still update writable columns: %s", upsertQuery)
+	}
+	if len(upsertArgs) != 2 {
+		t.Fatalf("expected 2 upsert args, got %d: %v", len(upsertArgs), upsertArgs)
+	}
+
+	plainQuery, plainArgs := builder.BuildBatchInsertPlain([]map[string]interface{}{row})
+	if strings.Contains(plainQuery, "`active_sign_no`") {
+		t.Fatalf("plain batch INSERT must exclude generated columns: %s", plainQuery)
+	}
+	if len(plainArgs) != 2 {
+		t.Fatalf("expected 2 plain insert args, got %d", len(plainArgs))
+	}
+}
+
+func TestSQLBuilder_ZeroWritableColumnsDefaultRowInsert(t *testing.T) {
+	columns := []entity.ColumnMeta{
+		{Name: "active_sign_no", GeneratedKind: entity.GeneratedVirtual},
+		{Name: "hash_col", GeneratedKind: entity.GeneratedStored},
+	}
+	identity := createTestIdentity(entity.FullColumnsStrategy, "generated_only", columns, []string{"active_sign_no", "hash_col"})
+	builder := NewSQLBuilder(identity)
+
+	row := map[string]interface{}{
+		"active_sign_no": "computed",
+		"hash_col":       "stored",
+	}
+
+	insertQuery, insertArgs := builder.BuildInsert(row)
+	if insertQuery != "INSERT IGNORE INTO `generated_only` () VALUES ()" {
+		t.Fatalf("unexpected insert query: %s", insertQuery)
+	}
+	if len(insertArgs) != 0 {
+		t.Fatalf("expected no insert args, got %v", insertArgs)
+	}
+
+	plainQuery, plainArgs := builder.BuildBatchInsertPlain([]map[string]interface{}{row, row})
+	wantPlain := "INSERT INTO `generated_only` () VALUES (), ()"
+	if plainQuery != wantPlain {
+		t.Fatalf("plain query=%q want=%q", plainQuery, wantPlain)
+	}
+	if len(plainArgs) != 0 {
+		t.Fatalf("expected no plain args, got %v", plainArgs)
+	}
+
+	updateQuery, updateArgs := builder.BuildUpdate(row)
+	if updateQuery != "" || updateArgs != nil {
+		t.Fatalf("UPDATE with no writable columns should be skipped, got query=%q args=%v", updateQuery, updateArgs)
 	}
 }

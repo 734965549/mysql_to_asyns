@@ -41,7 +41,8 @@ type Chunk struct {
 // Planner 负责为每张表生成 chunk。
 // 查询应绑定到表级一致性快照连接，使边界与后续读取看到同一 ReadView（P2）。
 type Planner struct {
-	q planQueryer
+	q    planQueryer
+	sink EventSink
 }
 
 // planQueryer 是 chunk 边界规划所需的最小查询接口（*sql.DB / *sql.Conn / *sql.Tx 均满足）。
@@ -52,6 +53,11 @@ type planQueryer interface {
 // NewPlanner 创建 chunk 规划器。推荐传入表级快照连接；测试可用 *sql.DB。
 func NewPlanner(q planQueryer) *Planner {
 	return &Planner{q: q}
+}
+
+// NewPlannerWithSink 创建带事件出口的 chunk 规划器。
+func NewPlannerWithSink(q planQueryer, sink EventSink) *Planner {
+	return &Planner{q: q, sink: sink}
 }
 
 // Plan 为一批表生成全部 chunk。targetChunks 是期望的总 chunk 数（读取 worker × overshoot）。
@@ -83,7 +89,6 @@ func (p *Planner) planTable(ctx context.Context, spec *TableSpec, targetChunks i
 	if id.Strategy == entity.FullColumnsStrategy {
 		return []*Chunk{{ID: chunkID(spec, 0), Spec: spec, NoPK: true, Sequential: true}}, nil
 	}
-
 	cursorCols := id.EffectiveCursorCols()
 	if len(cursorCols) == 0 {
 		return nil, fmt.Errorf("table identity has no cursor columns")
@@ -131,6 +136,16 @@ func (p *Planner) planIntegerRange(ctx context.Context, spec *TableSpec, col str
 		if span.Cmp(threshold) > 0 {
 			logger.Info("[FullLoadV2] sparse PK detected for %s.%s (range=%s estimated_rows=%d ratio>%d), switching to keyset sampling",
 				spec.SourceSchema, spec.SourceTable, span.String(), spec.EstimatedRows, pkSparseRatioThreshold)
+			tableEvent(p.sink, spec.SourceSchema, spec.SourceTable, EventCodeTableChunkPlanFallback, EventCategoryTable,
+				EventSeverityInfo,
+				fmt.Sprintf("sparse PK range; switched from integer range to keyset sampling (range=%s est_rows=%d)",
+					span.String(), spec.EstimatedRows),
+				map[string]interface{}{
+					"fallback":        "integer_range_to_keyset",
+					"pk_range":        span.String(),
+					"estimated_rows":  spec.EstimatedRows,
+					"sparse_ratio_gt": pkSparseRatioThreshold,
+				})
 			return p.planKeysetBoundaries(ctx, spec, []string{col}, targetChunks)
 		}
 	}
@@ -170,6 +185,12 @@ func (p *Planner) planKeysetBoundaries(ctx context.Context, spec *TableSpec, col
 	est := spec.EstimatedRows
 	if est <= 0 {
 		est = p.estimateCount(ctx, spec)
+		if est <= 0 {
+			tableEvent(p.sink, spec.SourceSchema, spec.SourceTable, EventCodeTableEstimateFailed, EventCategoryTable,
+				EventSeverityWarn,
+				"TABLE_ROWS estimate unavailable; chunk plan uses single-chunk fallback",
+				map[string]interface{}{"estimated_rows": 0})
+		}
 	}
 	// 行数很少时不切分。
 	if est <= int64(defaultBatchRows) || targetChunks <= 1 {

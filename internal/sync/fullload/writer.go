@@ -20,6 +20,34 @@ const writeConnMaxRetries = 5
 
 const writerConnCloseTimeout = 3 * time.Second
 
+// writerReconnectBackoffBase/Cap 换连接重试的指数退避参数。
+// 目标库短暂重启或网络抖动通常需要数秒到数十秒才能恢复监听，
+// 早期版本仅用 25~150ms 的固定极短退避，遇到 "connection refused"
+// 这类整个 TCP 连接都建立不了的故障时，5 次重试几乎在 1 秒内就耗尽，
+// 导致全量任务被误判为不可恢复而直接失败。这里改为指数退避（含封顶），
+// 5 次重试总计可容忍约 27s 的目标库不可达时间。
+const writerReconnectBackoffBase = 300 * time.Millisecond
+const writerReconnectBackoffCap = 15 * time.Second
+
+// writerReconnectBackoff 计算第 attempt 次换连接重试前的等待时间（attempt 从 1 开始）。
+func writerReconnectBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	wait := writerReconnectBackoffBase
+	for i := 1; i < attempt; i++ {
+		wait *= 3
+		if wait >= writerReconnectBackoffCap {
+			wait = writerReconnectBackoffCap
+			break
+		}
+	}
+	if wait > writerReconnectBackoffCap {
+		wait = writerReconnectBackoffCap
+	}
+	return wait
+}
+
 const maxPreparedStatementsPerWriter = 128
 
 // forceCloseWriterConn 关闭 writer 持有的连接；若 Close 因残留事务等阻塞，超时后放弃等待，避免拖死整个写入循环。
@@ -47,7 +75,7 @@ type CommitCallback func(schema, table string, rows, bytes int64)
 // P0 正确性：一个事务内可能已成功写入若干批次，后续批次遇到可重试锁错误时，
 // 回滚整个事务并重放全部未提交批次，而不是只重试当前批次；只有事务提交成功后
 // 才通过 onCommit 推进进度，避免静默缺数。
-func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string) error {
+func runWriters(ctx context.Context, taskID string, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string, sink EventSink) error {
 	if runID == "" {
 		return fmt.Errorf("runWriters: run_id is required")
 	}
@@ -73,7 +101,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 			defer wg.Done()
 			atomic.AddInt64(&stats.ActiveWriters, 1)
 			defer atomic.AddInt64(&stats.ActiveWriters, -1)
-			if err := writerLoop(workerCtx, id, targetDB, q, opt, stats, onCommit, tracker, stateTracker, isStopped, runID); err != nil {
+			if err := writerLoop(workerCtx, taskID, id, targetDB, q, opt, stats, onCommit, tracker, stateTracker, isStopped, runID, sink); err != nil {
 				setErr(err)
 			}
 		}(w)
@@ -83,7 +111,7 @@ func runWriters(ctx context.Context, targetDB *sql.DB, q *batchQueue, opt Option
 	return firstErr
 }
 
-func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string) error {
+func writerLoop(ctx context.Context, taskID string, id int, targetDB *sql.DB, q *batchQueue, opt Options, stats *Stats, onCommit CommitCallback, tracker *tableCompletionTracker, stateTracker *tableStateTracker, isStopped func() bool, runID string, sink EventSink) error {
 	conn, err := targetDB.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("writer %d get conn: %w", id, err)
@@ -94,7 +122,10 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			stmtCache.Close()
 		}
 		if conn != nil {
-			restoreWriteSession(conn, opt.SkipBinlog)
+			// ctx 已取消（流水线停止/失败）时跳过 restoreWriteSession：连接即将被 forceCloseWriterConn
+			// 强制关闭，此时在独立 ctx 上执行 SET FK_CHECKS=1 等恢复语句既无意义又会产生告警噪音/阻塞。
+			skipRestore := ctx.Err() != nil
+			restoreWriteSession(conn, opt.SkipBinlog, taskID, id, skipRestore)
 			forceCloseWriterConn(conn)
 		}
 	}()
@@ -108,7 +139,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	// 未提交事务会随断连被服务端回滚，因此可安全重放；Commit 失败仍禁止重放。
 	// 调用方须先结束当前 *sql.Tx（Rollback），否则 Conn.Close 会与 awaitDone 死锁。
 	reconnect := func(cause error) error {
-		logger.Warn("[FullLoadV2] writer %d reconnecting after connection error: %v", id, cause)
+		logger.Warn("[FullLoadV2] task=%s writer %d reconnecting after connection error: %v", taskID, id, cause)
 		oldCache := stmtCache
 		oldConn := conn
 		stmtCache = nil
@@ -120,19 +151,24 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 
 		var lastErr error
 		for attempt := 1; attempt <= writeConnMaxRetries; attempt++ {
+			backoff := writerReconnectBackoff(attempt)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(25+attempt*25) * time.Millisecond):
+			case <-time.After(backoff):
 			}
 			c, cErr := targetDB.Conn(ctx)
 			if cErr != nil {
 				lastErr = cErr
+				logger.Warn("[FullLoadV2] task=%s writer %d reconnect attempt %d/%d failed (retried in %s): %v",
+					taskID, id, attempt, writeConnMaxRetries, backoff, cErr)
 				continue
 			}
 			if sErr := setupWriteSession(ctx, c, opt.SkipBinlog); sErr != nil {
 				forceCloseWriterConn(c)
 				lastErr = sErr
+				logger.Warn("[FullLoadV2] task=%s writer %d reconnect attempt %d/%d setup session failed (retried in %s): %v",
+					taskID, id, attempt, writeConnMaxRetries, backoff, sErr)
 				continue
 			}
 			conn = c
@@ -151,6 +187,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 		txRows           int64
 		txBytes          int64
 		txStart          time.Time
+		txTableKey       string
 		commitRecoveries int
 		txMarkerID       string
 		txMarkerSchema   string
@@ -159,6 +196,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	clearTxMarker := func() {
 		txMarkerID = ""
 		txMarkerSchema = ""
+		txTableKey = ""
 	}
 
 	rollback := func() {
@@ -224,7 +262,12 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 				return fmt.Errorf("writer %d commit (outcome unknown; recover exhausted): %w", id, cErr)
 			}
 			commitRecoveries++
-			logger.Warn("[FullLoadV2] writer %d commit connection error (outcome unknown), verifying marker: %v", id, cErr)
+			logger.Warn("[FullLoadV2] task=%s writer %d commit connection error (outcome unknown), verifying marker: %v", taskID, id, cErr)
+			retryEvent(sink, markerSchema, "",
+				EventCodeTxCommitUnknown,
+				fmt.Sprintf("writer %d commit outcome unknown; verifying tx marker", id),
+				EventSeverityWarn,
+				map[string]interface{}{"writer_id": id, "marker_id": markerID, "error": cErr.Error()})
 			buf = nil
 			txRows, txBytes = 0, 0
 			if rErr := reconnect(cErr); rErr != nil {
@@ -237,14 +280,27 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 				return fmt.Errorf("writer %d commit (outcome unknown; verify failed): %w", id, vErr)
 			}
 			if applied {
-				logger.Warn("[FullLoadV2] writer %d commit verified applied via tx marker after connection error", id)
+				logger.Warn("[FullLoadV2] task=%s writer %d commit verified applied via tx marker after connection error", taskID, id)
+				verifiedRows, _ := sumBuf(pending)
+				retryEvent(sink, markerSchema, "", EventCodeTxCommitVerifiedApplied,
+					fmt.Sprintf("writer %d commit verified applied via tx marker", id),
+					EventSeverityWarn,
+					map[string]interface{}{"writer_id": id, "marker_id": markerID, "rows": verifiedRows})
 				rows, bytes := sumBuf(pending)
 				stats.addCommit(rows, bytes, time.Since(cs))
 				commitRecoveries = 0
 				clearTxMarker()
 				return reportCommitted(pending, onCommit, tracker, stateTracker)
 			}
-			logger.Warn("[FullLoadV2] writer %d commit verified rolled back via tx marker; replaying %d batches", id, len(pending))
+			logger.Warn("[FullLoadV2] task=%s writer %d commit verified rolled back via tx marker; replaying %d batches", taskID, id, len(pending))
+			retryEvent(sink, markerSchema, "", EventCodeTxCommitVerifiedRolledBack,
+				fmt.Sprintf("writer %d commit rolled back; replaying %d batches", id, len(pending)),
+				EventSeverityWarn,
+				map[string]interface{}{"writer_id": id, "marker_id": markerID, "batches": len(pending)})
+			retryEvent(sink, markerSchema, "", EventCodeTxReplayStarted,
+				fmt.Sprintf("writer %d tx replay started (%d batches)", id, len(pending)),
+				EventSeverityWarn,
+				map[string]interface{}{"writer_id": id, "batches": len(pending)})
 			clearTxMarker()
 			newTx, rErr := replayInFreshTx(ctx, conn, pending, opt, stmtCache, stats)
 			if rErr != nil {
@@ -268,6 +324,10 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 				rollback()
 				return fmt.Errorf("writer %d allocate tx marker after replay: %w", id, mErr)
 			}
+			retryEvent(sink, txMarkerSchema, "", EventCodeTxReplaySucceeded,
+				fmt.Sprintf("writer %d tx replay succeeded", id),
+				EventSeverityInfo,
+				map[string]interface{}{"writer_id": id, "batches": len(pending)})
 			return commit()
 		}
 		dur := time.Since(cs)
@@ -319,6 +379,14 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 	// replayAfterFailure 在锁冲突或连接失效后重放未提交批次。
 	// 连接失效先换连；重放过程再次断连则继续换连，直到成功或耗尽重试。
 	replayAfterFailure = func(cause error, replayBatches []*RowBatch) (*sql.Tx, error) {
+		schema, table := "", ""
+		if len(replayBatches) > 0 && replayBatches[0] != nil {
+			schema, table = replayBatches[0].Schema, replayBatches[0].Table
+		}
+		retryEvent(sink, schema, table, EventCodeTxReplayStarted,
+			fmt.Sprintf("writer %d replay after failure (%d batches)", id, len(replayBatches)),
+			EventSeverityWarn,
+			map[string]interface{}{"writer_id": id, "batches": len(replayBatches), "error": cause.Error()})
 		needReconnect := isConnRetryable(cause)
 		var lastErr error = cause
 		for attempt := 0; attempt <= writeConnMaxRetries; attempt++ {
@@ -329,6 +397,10 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			}
 			newTx, rErr := replayInFreshTx(ctx, conn, replayBatches, opt, stmtCache, stats)
 			if rErr == nil {
+				retryEvent(sink, schema, table, EventCodeTxReplaySucceeded,
+					fmt.Sprintf("writer %d replay succeeded", id),
+					EventSeverityInfo,
+					map[string]interface{}{"writer_id": id, "batches": len(replayBatches)})
 				return newTx, nil
 			}
 			lastErr = rErr
@@ -337,6 +409,10 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			}
 			needReconnect = true
 		}
+		retryEvent(sink, schema, table, EventCodeTxReplayExhausted,
+			fmt.Sprintf("writer %d replay exhausted", id),
+			EventSeverityError,
+			map[string]interface{}{"writer_id": id, "error": lastErr.Error()})
 		return nil, fmt.Errorf("replay after connection error exhausted: %w", lastErr)
 	}
 
@@ -350,8 +426,14 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 		var deadline time.Time
 		if tx != nil {
 			deadline = txStart.Add(opt.CommitInterval)
+			if txTableKey != "" && !q.hasBatchForKey(txTableKey) && q.hasOtherTableBatches(txTableKey) {
+				if err := commit(); err != nil {
+					return err
+				}
+				continue
+			}
 		}
-		batch, ok, timedOut := q.GetUntil(ctx, deadline)
+		batch, ok, timedOut := q.GetUntil(ctx, deadline, txTableKey)
 		if ctx.Err() != nil || (isStopped != nil && isStopped()) {
 			rollback()
 			return nil
@@ -381,6 +463,7 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			if err := beginTx(); err != nil {
 				return fmt.Errorf("writer %d begin tx: %w", id, err)
 			}
+			txTableKey = tableQueueKey(batch.Schema, batch.Table)
 		}
 
 		wErr := writeBatchInTxCached(ctx, tx, batch, opt, stmtCache)
@@ -391,6 +474,15 @@ func writerLoop(ctx context.Context, id int, targetDB *sql.DB, q *batchQueue, op
 			}
 			if isRetryableTxConflict(wErr) {
 				stats.incLockRetries()
+				retryEvent(sink, batch.Schema, batch.Table, EventCodeWriteLockRetry,
+					fmt.Sprintf("writer %d lock conflict on chunk %s; replaying %d batches", id, batch.ChunkID, len(buf)+1),
+					EventSeverityWarn,
+					map[string]interface{}{
+						"writer_id": id,
+						"chunk_id":  batch.ChunkID,
+						"batches":   len(buf) + 1,
+						"error":     wErr.Error(),
+					})
 			}
 			// 无论锁冲突还是连接失效，都先 Rollback 释放 *sql.Tx 对 Conn 的占用；
 			// 否则后续 conn.Close()/换连会卡在 awaitDone。断连时 Rollback 可能失败，可忽略。
@@ -534,21 +626,28 @@ func writeBatchInTx(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Option
 }
 
 func writeBatchInTxCached(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt Options, stmtCache *preparedStmtCache) error {
-	nCols := len(batch.Columns)
-	if nCols == 0 || len(batch.Rows) == 0 {
+	if len(batch.Rows) == 0 {
 		return nil
 	}
-	maxRowsByPlaceholder := mysqlMaxPlaceholders / nCols
-	if maxRowsByPlaceholder < 1 {
-		maxRowsByPlaceholder = 1
-	}
+	nCols := len(batch.Columns)
 	maxRowsPerStmt := opt.BatchRows
-	if maxRowsPerStmt < 1 || maxRowsPerStmt > maxRowsByPlaceholder {
-		maxRowsPerStmt = maxRowsByPlaceholder
+	if maxRowsPerStmt < 1 {
+		maxRowsPerStmt = 1
+	}
+	if nCols > 0 {
+		maxRowsByPlaceholder := mysqlMaxPlaceholders / nCols
+		if maxRowsByPlaceholder < 1 {
+			maxRowsByPlaceholder = 1
+		}
+		if maxRowsPerStmt > maxRowsByPlaceholder {
+			maxRowsPerStmt = maxRowsByPlaceholder
+		}
+	} else if maxRowsPerStmt > mysqlMaxPlaceholders {
+		maxRowsPerStmt = mysqlMaxPlaceholders
 	}
 
 	prefix := insertPrefix(batch)
-	rowPlaceholder := "(" + strings.TrimSuffix(strings.Repeat("?, ", nCols), ", ") + ")"
+	rowPlaceholder := emptyRowPlaceholder(nCols)
 	for rowIndex, row := range batch.Rows {
 		if len(row) != nCols {
 			return fmt.Errorf("row %d has %d values, want %d columns", rowIndex, len(row), nCols)
@@ -600,16 +699,31 @@ func writeBatchInTxCached(ctx context.Context, tx *sql.Tx, batch *RowBatch, opt 
 }
 
 func insertPrefix(batch *RowBatch) string {
-	cols := make([]string, len(batch.Columns))
-	for i, c := range batch.Columns {
-		cols[i] = quoteIdentifier(c)
-	}
+	colList := quotedColumnList(batch.Columns)
 	writeTable := batch.TargetTable
 	if batch.StagingTable != "" {
 		writeTable = batch.StagingTable
 	}
 	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES ",
-		quoteIdentifier(batch.TargetSchema), quoteIdentifier(writeTable), strings.Join(cols, ", "))
+		quoteIdentifier(batch.TargetSchema), quoteIdentifier(writeTable), colList)
+}
+
+func quotedColumnList(cols []string) string {
+	if len(cols) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = quoteIdentifier(c)
+	}
+	return strings.Join(quoted, ", ")
+}
+
+func emptyRowPlaceholder(nCols int) string {
+	if nCols == 0 {
+		return "()"
+	}
+	return "(" + strings.TrimSuffix(strings.Repeat("?, ", nCols), ", ") + ")"
 }
 
 // isRetryableTxConflict 仅判断事务内语句可安全重放的锁冲突。

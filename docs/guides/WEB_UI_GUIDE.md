@@ -577,21 +577,22 @@ curl http://localhost:8080/api/tasks/abc123/progress
 - 如果表达式不合法，接口会返回校验错误
 - 已设置定时的任务可点击「取消定时」恢复为定时前的状态
 
-### 全量起点位点（无需配置，默认走"短锁取位点"）
+### 全量起点位点（无需配置，默认走"无锁取位点"）
 
 **作用**:
-- 全量同步开始前，自动短暂执行一次 `FLUSH TABLES WITH READ LOCK` 取到 binlog 位点，
-  随后立即 `UNLOCK TABLES`，整个过程毫秒级。
+- 全量同步开始前，自动执行一次 `SHOW MASTER STATUS` 取到 binlog 位点（P0），
+  不再使用 `FLUSH TABLES WITH READ LOCK`，无锁、毫秒级。
 - 该位点被持久化为后续增量同步的起点，保证全量期间的所有 DML 都能被增量阶段完整回放。
+- ALL 模式下，全量基线扫描完成后还会捕获位点 P1，从 P0 做有界追平（bounded catch-up）到 P1。
 
 **接口传参**:
 - 无任何前端开关、无任何任务请求体字段需要配置；该行为对所有任务默认生效。
 
 **历史变更**:
 - 老版本曾提供 `enable_consistent_snapshot` 字段以及"严格全局快照 + 长事务连接池"
-  模式，现已移除。当前实现统一使用"短锁取位点 + 全量短查询"，避免长事务长期
-  持有源库 `MDL_SHARED_READ`。如果你的客户端代码仍在传 `enable_consistent_snapshot`
-  字段，请直接删除，服务端会忽略。
+  模式，现已移除。当前实现统一使用"无锁 `SHOW MASTER STATUS` 取位点 + 全量短查询"，
+  不再使用 `FLUSH TABLES WITH READ LOCK`，也避免长事务长期持有源库 `MDL_SHARED_READ`。
+  如果你的客户端代码仍在传 `enable_consistent_snapshot` 字段，请直接删除，服务端会忽略。
 
 ---
 

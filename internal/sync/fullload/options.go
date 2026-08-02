@@ -25,10 +25,8 @@ const (
 	defaultCommitInterval = 2 * time.Second
 	defaultChunkOvershoot = 8 // 每表 chunk 数量约为读取 worker 数的 8 倍，用于单连接顺序分段
 
-	// 超大表判定：估算行数达到该阈值且 chunk>1 时，走短暂 FTWRL 对齐多连接快照。
+	// 超大表判定：估算行数达到该阈值且 chunk>1 时，单表内用多连接并行读。
 	defaultLargeTableRows = int64(1_000_000)
-	// 取表锁等待超时（秒），同时用于客户端 context 与 SESSION lock_wait_timeout。
-	defaultLockWaitTimeoutSec = 10
 
 	// 单次源端查询超时（秒）：keyset 为整次查询绝对超时；stream 仅覆盖打开查询。
 	defaultQueryTimeoutSec = 300
@@ -44,19 +42,20 @@ const (
 	// mysqlMaxPlaceholders 单条预处理语句占位符上限（留余量），与 writer 包保持一致。
 	mysqlMaxPlaceholders = 62000
 
-	hardMaxWorkers            = 64
-	hardMaxBatchRow           = 100000
-	hardMaxBufferMB           = 4096
-	hardMaxBatchMB            = 64
-	hardMaxCommitMB           = 4096
-	hardMaxCommitRows         = 10000000
-	hardMaxLockWaitTimeoutSec = 3600
+	hardMaxWorkers    = 64
+	hardMaxBatchRow   = 100000
+	hardMaxBufferMB   = 4096
+	hardMaxBatchMB    = 64
+	hardMaxCommitMB   = 4096
+	hardMaxCommitRows = 10000000
 )
 
 // RawOptions 是从任务配置直接读取的原始参数（未经默认值推导）。
 type RawOptions struct {
-	ReadWorkers   int // full_load_read_workers
-	WriteWorkers  int // full_load_write_workers
+	ReadWorkers      int // full_load_read_workers：全局源库读取总预算
+	TableWorkers     int // full_load_table_workers：并发表规划/调度上限
+	PerTableReaders  int // full_load_per_table_readers：单表内并行读上限
+	WriteWorkers     int // full_load_write_workers
 	BufferMB      int // full_load_buffer_mb
 	BatchBytesMB  int // full_load_batch_bytes_mb
 	CommitRows    int // full_load_commit_rows
@@ -69,11 +68,6 @@ type RawOptions struct {
 	LegacyTxCommitEveryNParallel int
 
 	SkipBinlog bool // enable_skip_binlog
-
-	// LockWaitTimeoutSec 取表锁等待超时（秒）；<=0 时使用默认 10。
-	LockWaitTimeoutSec int
-	// DegradeOnAlignLockFail nil 时默认 true（降级单连接）；显式 false 为 fail-closed。
-	DegradeOnAlignLockFail *bool
 
 	// QueryTimeoutSec 单次源端查询超时（秒）；<=0 时使用默认 300。
 	// keyset：整次查询绝对超时；stream：仅打开查询等待上限。
@@ -96,7 +90,9 @@ type RawOptions struct {
 
 // Options 是经过默认值推导后引擎实际使用的运行参数。
 type Options struct {
-	ReadWorkers    int
+	ReadWorkers    int // 用户配置的读取预算（Resolve 后仍保留，Cap 前）
+	GlobalReadBudget int // 经连接池裁剪后的全局读取令牌数
+	TableWorkers   int // 并发表调度上限
 	WriteWorkers   int
 	BufferBytes    int64
 	BatchRows      int
@@ -107,18 +103,10 @@ type Options struct {
 	ChunkOvershoot int
 	SkipBinlog     bool
 
-	// TableParallelReaders 单表内对齐快照的最大并行读连接数（超大表）。
+	// TableParallelReaders 单表内并行读连接数（超大表）。
 	TableParallelReaders int
-	// LargeTableRows 触发单表多连接对齐快照的估算行数阈值。
+	// LargeTableRows 触发单表多连接并行读的估算行数阈值。
 	LargeTableRows int64
-	// MaxSnapshotGroups 同时活跃的表级 snapshot group 上限（并发表数）。
-	MaxSnapshotGroups int
-	// MaxSnapshotConns 同时持有的快照连接上限（含短暂协调锁连接预留）。
-	MaxSnapshotConns int
-	// LockWaitTimeoutSec 取表锁的双保险超时（context + SESSION lock_wait_timeout）。
-	LockWaitTimeoutSec int
-	// DegradeOnAlignLockFail 对齐多连接取锁失败时是否降级为单连接快照（ALL+无PK 捕获 HWM 时仍 fail-closed）。
-	DegradeOnAlignLockFail bool
 
 	// QueryTimeout 单次源端查询超时（keyset 绝对超时；stream 仅打开查询）。
 	QueryTimeout time.Duration
@@ -150,21 +138,29 @@ func (opt Options) Validate() error {
 
 // ResolveOptions 将原始配置推导为生效运行参数，应用 4C8G 平衡预设。
 func ResolveOptions(raw RawOptions) Options {
-	degrade := true
-	if raw.DegradeOnAlignLockFail != nil {
-		degrade = *raw.DegradeOnAlignLockFail
+	readBudget := clampInt(raw.ReadWorkers, defaultReadWorkers, 1, hardMaxWorkers)
+	tableWorkers := raw.TableWorkers
+	perTable := raw.PerTableReaders
+	// 旧任务兼容：仅配置 read_workers 时，表并发与单表并行仍沿用该值。
+	if tableWorkers <= 0 {
+		tableWorkers = readBudget
 	}
+	if perTable <= 0 {
+		perTable = readBudget
+	}
+	tableWorkers = clampInt(tableWorkers, defaultReadWorkers, 1, hardMaxWorkers)
+	perTable = clampInt(perTable, defaultReadWorkers, 1, hardMaxWorkers)
 
 	opt := Options{
-		ReadWorkers:            clampInt(raw.ReadWorkers, defaultReadWorkers, 1, hardMaxWorkers),
-		WriteWorkers:           clampInt(raw.WriteWorkers, defaultWriteWorkers, 1, hardMaxWorkers),
-		BatchRows:              clampInt(raw.BatchSize, defaultBatchRows, 1, hardMaxBatchRow),
-		CommitInterval:         defaultCommitInterval,
-		ChunkOvershoot:         defaultChunkOvershoot,
-		SkipBinlog:             raw.SkipBinlog,
-		LargeTableRows:         defaultLargeTableRows,
-		LockWaitTimeoutSec:     clampInt(raw.LockWaitTimeoutSec, defaultLockWaitTimeoutSec, 1, hardMaxLockWaitTimeoutSec),
-		DegradeOnAlignLockFail: degrade,
+		ReadWorkers:      readBudget,
+		GlobalReadBudget: readBudget,
+		TableWorkers:     tableWorkers,
+		WriteWorkers:     clampInt(raw.WriteWorkers, defaultWriteWorkers, 1, hardMaxWorkers),
+		BatchRows:      clampInt(raw.BatchSize, defaultBatchRows, 1, hardMaxBatchRow),
+		CommitInterval: defaultCommitInterval,
+		ChunkOvershoot: defaultChunkOvershoot,
+		SkipBinlog:     raw.SkipBinlog,
+		LargeTableRows: defaultLargeTableRows,
 	}
 
 	// 单次查询超时、流式无进展超时与慢查询告警阈值。
@@ -208,45 +204,25 @@ func ResolveOptions(raw RawOptions) Options {
 		opt.CommitBytes = opt.BatchBytes
 	}
 
-	// 表级并行与信号量：默认单表并行度=ReadWorkers，并发表数=ReadWorkers，
-	// 连接上限预留协调锁连接（每组 +1）。
-	opt.TableParallelReaders = opt.ReadWorkers
-	opt.MaxSnapshotGroups = opt.ReadWorkers
-	opt.MaxSnapshotConns = opt.ReadWorkers * (opt.TableParallelReaders + 1)
+	opt.TableParallelReaders = perTable
 
 	return opt
 }
 
-// CapBySourcePool 用真实源库连接池上限约束快照预算，避免 limiter 允许超过 pool 的占用量，
-// 进而在持表锁后阻塞于 db.Conn。maxOpen<=0 时不调整。
+// CapBySourcePool 用真实源库连接池上限约束全局读取预算。maxOpen<=0 时不调整。
 func (opt *Options) CapBySourcePool(maxOpen int) {
-	if opt == nil || maxOpen <= 0 {
+	if opt == nil {
 		return
 	}
-	// 单组最坏需要 readers + 1（协调锁连接）。
-	if opt.TableParallelReaders+1 > maxOpen {
-		opt.TableParallelReaders = maxOpen - 1
-		if opt.TableParallelReaders < 1 {
-			opt.TableParallelReaders = 1
-		}
+	before := opt.GlobalReadBudget
+	opt.GlobalReadBudget = ComputeGlobalReadBudget(opt.ReadWorkers, maxOpen)
+	if maxOpen > 0 && opt.TableParallelReaders > opt.GlobalReadBudget {
+		opt.TableParallelReaders = opt.GlobalReadBudget
 	}
-	if opt.MaxSnapshotConns > maxOpen {
-		opt.MaxSnapshotConns = maxOpen
+	if maxOpen > 0 && opt.TableWorkers > opt.GlobalReadBudget {
+		opt.TableWorkers = opt.GlobalReadBudget
 	}
-	if opt.MaxSnapshotGroups > maxOpen {
-		opt.MaxSnapshotGroups = maxOpen
-	}
-	// 保证至少能开一组单 reader（可选 +锁）。
-	minPerGroup := 1
-	if opt.TableParallelReaders > 1 {
-		minPerGroup = opt.TableParallelReaders + 1
-	}
-	if opt.MaxSnapshotConns < minPerGroup {
-		opt.MaxSnapshotConns = minPerGroup
-		if opt.MaxSnapshotConns > maxOpen {
-			opt.MaxSnapshotConns = maxOpen
-		}
-	}
+	_ = before
 }
 
 func mebibytes(valueMB int, defaultBytes int64, maxMB int) int64 {

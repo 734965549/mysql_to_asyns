@@ -34,40 +34,8 @@ func TestResolveOptions_Defaults(t *testing.T) {
 	if opt.TableParallelReaders != defaultReadWorkers {
 		t.Errorf("TableParallelReaders=%d want %d", opt.TableParallelReaders, defaultReadWorkers)
 	}
-	if opt.MaxSnapshotGroups != defaultReadWorkers {
-		t.Errorf("MaxSnapshotGroups=%d want %d", opt.MaxSnapshotGroups, defaultReadWorkers)
-	}
-	wantConns := defaultReadWorkers * (defaultReadWorkers + 1)
-	if opt.MaxSnapshotConns != wantConns {
-		t.Errorf("MaxSnapshotConns=%d want %d", opt.MaxSnapshotConns, wantConns)
-	}
 	if opt.LargeTableRows != defaultLargeTableRows {
 		t.Errorf("LargeTableRows=%d want %d", opt.LargeTableRows, defaultLargeTableRows)
-	}
-	if !opt.DegradeOnAlignLockFail {
-		t.Error("DegradeOnAlignLockFail should default true")
-	}
-	if opt.LockWaitTimeoutSec != defaultLockWaitTimeoutSec {
-		t.Errorf("LockWaitTimeoutSec=%d want %d", opt.LockWaitTimeoutSec, defaultLockWaitTimeoutSec)
-	}
-}
-
-func TestResolveOptions_LockPolicyFromRaw(t *testing.T) {
-	failClosed := false
-	opt := ResolveOptions(RawOptions{
-		LockWaitTimeoutSec:     30,
-		DegradeOnAlignLockFail: &failClosed,
-	})
-	if opt.LockWaitTimeoutSec != 30 {
-		t.Errorf("LockWaitTimeoutSec=%d want 30", opt.LockWaitTimeoutSec)
-	}
-	if opt.DegradeOnAlignLockFail {
-		t.Error("DegradeOnAlignLockFail should be false when explicitly disabled")
-	}
-
-	opt2 := ResolveOptions(RawOptions{LockWaitTimeoutSec: 99999})
-	if opt2.LockWaitTimeoutSec != hardMaxLockWaitTimeoutSec {
-		t.Errorf("LockWaitTimeoutSec=%d want clamp %d", opt2.LockWaitTimeoutSec, hardMaxLockWaitTimeoutSec)
 	}
 }
 
@@ -180,23 +148,39 @@ func TestResolveOptions_CommitIntervalStable(t *testing.T) {
 
 func TestOptions_CapBySourcePool(t *testing.T) {
 	opt := ResolveOptions(RawOptions{ReadWorkers: 8})
-	if opt.MaxSnapshotConns != 8*(8+1) {
-		t.Fatalf("precondition MaxSnapshotConns=%d", opt.MaxSnapshotConns)
-	}
 	opt.CapBySourcePool(32)
-	if opt.MaxSnapshotConns != 32 {
-		t.Fatalf("MaxSnapshotConns=%d want 32", opt.MaxSnapshotConns)
+	if opt.GlobalReadBudget != 8 {
+		t.Fatalf("GlobalReadBudget=%d want 8 (unchanged, 8 <= 32)", opt.GlobalReadBudget)
 	}
 	if opt.TableParallelReaders != 8 {
-		t.Fatalf("TableParallelReaders=%d want 8 (8+1 <= 32)", opt.TableParallelReaders)
+		t.Fatalf("TableParallelReaders=%d want 8 (unchanged, 8 <= 32)", opt.TableParallelReaders)
 	}
 
 	opt2 := ResolveOptions(RawOptions{ReadWorkers: 8})
 	opt2.CapBySourcePool(5)
-	if opt2.TableParallelReaders != 4 {
-		t.Fatalf("TableParallelReaders=%d want 4", opt2.TableParallelReaders)
+	// pool 5, reserved 2 -> avail 3
+	if opt2.GlobalReadBudget != 3 {
+		t.Fatalf("GlobalReadBudget=%d want 3", opt2.GlobalReadBudget)
 	}
-	if opt2.MaxSnapshotConns != 5 {
-		t.Fatalf("MaxSnapshotConns=%d want 5", opt2.MaxSnapshotConns)
+	if opt2.TableParallelReaders != 3 {
+		t.Fatalf("TableParallelReaders=%d want 3", opt2.TableParallelReaders)
+	}
+	if opt2.TableWorkers != 3 {
+		t.Fatalf("TableWorkers=%d want 3", opt2.TableWorkers)
+	}
+}
+
+func TestResolveOptions_LegacyTableParallelDerivation(t *testing.T) {
+	opt := ResolveOptions(RawOptions{ReadWorkers: 6})
+	if opt.TableWorkers != 6 || opt.TableParallelReaders != 6 {
+		t.Fatalf("legacy derive table=%d parallel=%d want 6/6", opt.TableWorkers, opt.TableParallelReaders)
+	}
+	opt2 := ResolveOptions(RawOptions{
+		ReadWorkers:     4,
+		TableWorkers:    2,
+		PerTableReaders: 3,
+	})
+	if opt2.TableWorkers != 2 || opt2.TableParallelReaders != 3 {
+		t.Fatalf("explicit table=%d parallel=%d want 2/3", opt2.TableWorkers, opt2.TableParallelReaders)
 	}
 }

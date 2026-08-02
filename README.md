@@ -177,15 +177,13 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'username'@'%';
 
 GRANT SELECT ON *.* TO 'username'@'%';
 
-# ALL 必须具备 RELOAD；FULL 默认可在缺权限时降级单连接，
-
-# 但超大表多连接对齐或 degrade=false 同样需要
+# ALL/FULL V2 多连接对齐均需要 RELOAD（或 FLUSH_TABLES）；缺权限立即失败，不再自动降级
 
 GRANT RELOAD ON *.* TO 'username'@'%';
 
 FLUSH PRIVILEGES;
 
-``
+```
 
 
 
@@ -472,6 +470,7 @@ Content-Type: application/json
 | enable_skip_binlog | bool | 否 | 全量同步写入前在目标端临时关闭 sql_log_bin（`SET SESSION sql_log_bin=0`），写入后恢复；可加速全量导入并减少目标 binlog 体积。需目标库账号具备 SUPER 权限。默认false |
 | index_restore_worker_count | int | 否 | 索引回放表级并发度，0=自动推导 min(worker_count,4)，默认0 |
 | sink_configs | array | 否 | 增量同步目标 Sink 配置列表，不传默认 `[{type:MYSQL}]`，详见下方「Sink 配置说明」 |
+| allow_nopk_all | bool | 否 | ALL 模式下含无 PK/UK 表时必须显式设为 `true` 以确认 best-effort 风险（不保证严格去重），否则任务被拒绝。默认 false |
 
 
 
@@ -479,13 +478,23 @@ Content-Type: application/json
 
 - **FULL 模式**不捕获 binlog 位点、不保存增量 checkpoint。FULL 只做一次无缝全表遍历，保证分片边界与读取流程不漏数据；同步期间发生的新增、更新和删除不进行追平。
 
-- **ALL 模式**在全量扫描开始前，短暂执行 `FLUSH TABLES WITH READ LOCK` 取全局 binlog 位点（P0），随后立即 `UNLOCK TABLES`（毫秒级）。P0 捕获或持久化失败时任务立即终止。全量完成后从 P0 回放 binlog 追平变化并进入持续同步。
+- **ALL 模式**在全量扫描开始前，以无锁方式执行 `SHOW MASTER STATUS` 取全局 binlog 位点（P0），不再使用 `FLUSH TABLES WITH READ LOCK`。P0 捕获或持久化失败时任务立即终止。全量基线扫描完成后再捕获一次位点 P1，随后从 P0 回放 binlog 做有界追平（bounded catch-up）到 P1，追平后恢复非 identity 索引并进入持续同步。无 PK/UK 表的 ALL 需任务请求体显式确认 `allow_nopk_all=true`（best-effort，不保证严格去重）。
 
-- **V1 全量（默认 `full_load_engine=v1`）**：P0 之外不生成表级 HWM；全量读取为普通短查询，不长期持有源库 MDL。ALL + 无主键/无唯一键表在增量接管阶段存在重复 INSERT 风险。
+- **V1 全量（默认 `full_load_engine=v1`）**：全量读取为普通短查询，不长期持有源库 MDL。ALL + 无 PK/UK 表为 best-effort，增量接管阶段存在重复 INSERT 风险，需显式确认 `allow_nopk_all=true`。
 
-- **V2 全量（`full_load_engine=v2`）**：除 P0 外，ALL 模式下无 PK/UK 表在表级一致性快照窗口内额外捕获**表级 binlog HWM**（持久化到 `table_binlog_hwms`）；增量启动时对这类表 fail-closed 校验，并按 HWM 过滤已覆盖行。V2 全量读取使用表级长生命周期 `REPEATABLE READ` 快照事务，读期间持有表级 `MDL_SHARED_READ`，大表并行读前可能短暂表锁；运维需关注源库 undo 保留与 MDL 等待。写入侧在每个目标 schema 自动创建 `__mts_fl_tx` 事务标记表（与业务 INSERT 同事务提交，含 `run_id`），用于 Commit 结果未知时的锁定探测，避免业务行存在性误判；启动前以 `GET_LOCK` 强制同 schema 单任务，并 fail-closed 校验目标业务表 InnoDB、marker 表结构（含完整唯一索引），拒绝业务表占用保留名 `__mts_fl_tx`；数据流水线成功后按 `run_id` 删除本任务 marker 行（不 `DROP` 共享表）；目标账号需对 marker 表具备 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DELETE`，以及 `GET_LOCK`/`RELEASE_LOCK`。
+- **V2 全量（`full_load_engine=v2`）**：全量读取同样为普通短查询，不持有表级 MDL，不再使用长生命周期 RR 快照事务；历史版本的表级 binlog HWM（`table_binlog_hwms`）已下线，仅保留用于读取旧任务存档，新一轮全量开始时清空。ALL + 无 PK/UK 表同样为 best-effort，依赖 P0..P1 有界追平收敛，不保证严格去重，需 `allow_nopk_all=true`。写入侧在每个目标 schema 自动创建 `__mts_fl_tx` 事务标记表（与业务 INSERT 同事务提交，含 `run_id`），用于 Commit 结果未知时的锁定探测，避免业务行存在性误判；启动前以 `GET_LOCK` 强制同 schema 单任务，并 fail-closed 校验目标业务表 InnoDB、marker 表结构（含完整唯一索引），拒绝业务表占用保留名 `__mts_fl_tx`；数据流水线成功后在仍持有 schema 互斥锁时执行 `DROP TABLE IF EXISTS __mts_fl_tx`；清理失败会让任务明确失败，失败/暂停路径保留 marker。目标账号需对 marker 表具备 `CREATE TABLE`/`INSERT`/`SELECT ... FOR UPDATE`/`DROP`，以及 `GET_LOCK`/`RELEASE_LOCK`。
 
 - 历史版本曾提供 `enable_consistent_snapshot` 任务级字段，现已下线。如果客户端代码仍在传该字段，请直接删除，服务端会忽略。
+
+**ALL 模式运行状态字段（任务详情接口返回）：**
+
+| 字段 | 含义 |
+|------|------|
+| `full_sync_start_position` | 全量基线扫描开始前的 binlog 位点 P0（`file:pos`） |
+| `full_sync_end_position` | 基线扫描完成后的 binlog 位点 P1（bounded catch-up 目标） |
+| `full_sync_catchup_position` | catch-up 阶段当前已提交位点，逐步逼近 `full_sync_end_position` |
+| `full_sync_subphase` | ALL 全量子阶段：`BASE_SCAN`（基线扫描）/ `CATCH_UP`（有界追平）/ `RESTORE_INDEX`（恢复非 identity 索引）/ `STREAMING`（持续增量） |
+| `nopk_all_risk_acknowledged_at` | 用户确认 ALL 无 PK/UK best-effort 风险的时间戳（服务端写入，真正生效以此为准） |
 
 **`enable_drop_table_before_ddl` 说明：**
 
@@ -793,9 +802,37 @@ DELETE /api/tasks/:id
 
 GET /api/tasks/:id/metrics
 
+GET /api/tasks/:id/events
+
+GET /api/tasks/:id/event-executions
+
 ```
 
+**任务事件 API**（`GET /api/tasks/:id/events`）支持查询参数：
 
+- `execution_id` / `after_seq` / `before_seq` / `limit`
+- `min_severity`（INFO/WARN/ERROR）/ `visibility`（KEY/DIAGNOSTIC）
+- `category` / `code` / `source_schema` / `source_table`
+
+任务详情页「日志与错误」页签默认展示当前 execution 的 KEY 事件（最新在前），运行中每 3 秒增量轮询。
+
+**关键事件码索引**（`visibility=KEY`，不含 5 秒 progress 等 DIAGNOSTIC 事件）：
+
+| 分类 | 事件码 | 说明 |
+|------|--------|------|
+| 生命周期 | `TASK_SCHEDULED` / `TASK_STARTED` / `TASK_RESUMED` / `TASK_PAUSED` / `TASK_STOPPED` / `TASK_COMPLETED` / `TASK_FAILED` | 任务调度与状态变更 |
+| 配置 | `TASK_CONFIG_EFFECTIVE` / `FULL_LOAD_CONFIG_EFFECTIVE` | 每轮启动/V2 池 cap 后的生效配置 |
+| 阶段 | `PHASE_DDL_PREP_*` / `PHASE_P0_CAPTURED` / `PHASE_BASE_SCAN_*` / `PHASE_P1_*` / `PHASE_CATCHUP_*` / `PHASE_INDEX_RESTORE_*` / `PHASE_INCREMENTAL_STARTED` | ALL/FULL 各阶段起止 |
+| 表规划 | `TABLE_PLAN_CREATED` / `TABLE_ESTIMATE_FAILED` / `TABLE_CHUNK_PLAN_FALLBACK` / `TABLE_PARALLELISM_REDUCED` / `NOPK_SEQUENTIAL_FALLBACK` | 分片规划与降级 |
+| 表进展 | `TABLE_NO_PROGRESS` / `TABLE_PROGRESS_RECOVERED` | 表长时间无读进展及恢复 |
+| 宽表/拆批 | `WIDE_TABLE_TWO_PHASE_ENABLED` / `ROW_EXCEEDS_BATCH_BYTES` | 宽表两阶段读、单行超 batch_bytes |
+| 连接池 | `SOURCE_POOL_BUDGET_CAPPED` / `SOURCE_POOL_WAIT_HIGH` / `TARGET_POOL_BUDGET_CAPPED` | 池上限裁剪与等待压力 |
+| 队列背压 | `QUEUE_BACKPRESSURE_HIGH` / `QUEUE_BACKPRESSURE_RECOVERED` | 写队列高水位与恢复 |
+| 重试 | `WRITE_LOCK_RETRY` / `TABLE_READ_RETRY*` / `TX_COMMIT_*` / `TX_REPLAY_*` | 写锁、读重试、提交不确定与重放 |
+| Staging | `STAGING_TABLE_CREATED` / `STAGING_TABLE_PUBLISHED` / `STAGING_TABLE_DROPPED` | V2 staging 表生命周期 |
+| 其它 | `SLOW_SOURCE_QUERY` / `SCHEMA_LOCK_LOST` / `INDEX_RESTORE_FAILED` / `CHECKPOINT_PERSIST_FAILED` | 慢查询与任务级故障 |
+
+同一 `(code, 表, details 指纹)` 在 60 秒内重复出现会聚合为 `*_REPEATED` 汇总事件（`repeat_count` / `first_at` / `last_at`）。删除任务会联动清理该任务全部事件。
 
 **响应示例：**
 
@@ -1346,24 +1383,27 @@ FULL 模式执行一次无缝全表遍历，保证分片边界与读取流程本
 
 **语义定义**：
 
-ALL 模式先捕获全局 binlog 位点（P0），再执行全量扫描，全量结束后从 P0 回放 binlog 追平变化，最终进入持续同步。
+ALL 模式先以无锁方式捕获全局 binlog 位点 P0，执行全量基线扫描，再捕获位点 P1，从 P0 回放 binlog 做有界追平（bounded catch-up）到 P1，追平后恢复非 identity 索引，最终进入持续同步。
 
-- 第一次读取前获取并持久化 P0（`FLUSH TABLES WITH READ LOCK` → `SHOW MASTER STATUS` → `UNLOCK TABLES`，毫秒级），失败必须终止
-- 全量引擎：`full_load_engine=v1`（默认）使用普通短查询；`v2` 使用表级一致性快照（长生命周期 RR 事务，读期间持有表级 MDL，详见配置文档）；V2 写入侧使用目标库 `__mts_fl_tx` 事务标记表做 Commit 未知恢复
-- V2 + ALL：无 PK/UK 表在快照窗口内额外捕获表级 binlog HWM（`table_binlog_hwms`），增量启动 fail-closed 校验并按 HWM 过滤
-- 全量结束后从 P0 回放 binlog：PK/UK INSERT 使用 upsert，UPDATE 正确处理 before/after key
-- 追平后进入实时同步
-- V1 ALL + 无 PK/UK 表不能承诺严格收敛；需正确去重时请使用 `full_load_engine=v2`
+- 第一次读取前以无锁 `SHOW MASTER STATUS` 获取并持久化 P0（不再使用 `FLUSH TABLES WITH READ LOCK`），失败必须终止
+- 全量引擎：`full_load_engine=v1`（默认）与 `v2` 均使用普通短查询，不持有表级 MDL，不再使用长生命周期 RR 快照事务；V2 写入侧使用目标库 `__mts_fl_tx` 事务标记表做 Commit 未知恢复
+- 全量基线扫描完成后捕获 P1，从 P0 回放 binlog 做有界追平到 P1：PK/UK INSERT 使用 upsert，UPDATE 正确处理 before/after key
+- 追平完成后恢复非 identity 索引，再进入实时同步
+- 无 PK/UK 表的 ALL 为 best-effort，不保证严格去重，需任务请求体显式确认 `allow_nopk_all=true`；历史版本的表级 binlog HWM（`table_binlog_hwms`）已下线，仅保留用于读取旧任务存档
 
 **工作流程**：
 
-1. 捕获并持久化 binlog 起始位点 P0
+1. 以无锁 `SHOW MASTER STATUS` 捕获并持久化 binlog 起始位点 P0
 
-2. 执行全量同步（与 FULL 相同的无缝遍历）
+2. 执行全量基线扫描（与 FULL 相同的无缝遍历，普通短查询）
 
-3. 全量完成后从 P0 自动启动增量同步
+3. 基线扫描完成后捕获位点 P1
 
-4. 持续实时同步
+4. 从 P0 回放 binlog 做有界追平（bounded catch-up）到 P1
+
+5. 追平后恢复非 identity 索引
+
+6. 持续实时同步
 
 
 

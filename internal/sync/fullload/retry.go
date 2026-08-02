@@ -94,7 +94,7 @@ func retryBackoff(attempt int) time.Duration {
 	return wait
 }
 
-// readTableWithRetry 包装 readTableWithSnapshot，提供表级自动重试。
+// readTableWithRetry 包装 readTable，提供表级自动重试。
 //
 // 当 StagingEnabled=true 时，每次 attempt 创建独立 staging 表，读取完成后发布到最终表。
 // ReadRetryTimes 是额外重试次数：总 attempt = 1 + ReadRetryTimes。
@@ -107,12 +107,12 @@ func readTableWithRetry(
 	job *tableReadJob,
 	q *batchQueue,
 	eng *Engine,
-	lim *snapshotLimiter,
 	opt Options,
 	stats *Stats,
 	isStopped func() bool,
 	taskCancel context.CancelFunc,
 	stateTracker *tableStateTracker,
+	coord *readCoordinator,
 ) error {
 	if job == nil || job.spec == nil {
 		return fmt.Errorf("invalid table read job")
@@ -122,10 +122,10 @@ func readTableWithRetry(
 
 	maxRetries := opt.ReadRetryTimes
 	if maxRetries <= 0 && !opt.StagingEnabled {
-		return readTableWithSnapshot(ctx, db, job, q, eng, lim, opt, stats, isStopped, taskCancel, nil)
+		return readTable(ctx, db, job, q, eng, opt, stats, isStopped, taskCancel, nil, coord)
 	}
 	if stateTracker == nil {
-		return readTableWithSnapshot(ctx, db, job, q, eng, lim, opt, stats, isStopped, taskCancel, nil)
+		return readTable(ctx, db, job, q, eng, opt, stats, isStopped, taskCancel, nil, coord)
 	}
 	if maxRetries > 0 && !opt.StagingEnabled {
 		return fmt.Errorf("table %s.%s: read retry requires staging (fail-closed)", schema, table)
@@ -153,6 +153,10 @@ func readTableWithRetry(
 				return fmt.Errorf("inflight barrier before retry for %s.%s: %w", schema, table, err)
 			}
 			_ = dropStagingTable(ctx, eng.TargetDB, targetSchema, targetTable, prevAttemptID)
+			tableEvent(eng.EventSink, schema, table, EventCodeStagingTableDropped, EventCategoryTable,
+				EventSeverityInfo,
+				fmt.Sprintf("dropped staging table for failed attempt %d", prevAttemptID),
+				map[string]interface{}{"attempt_id": prevAttemptID})
 			if stats != nil {
 				atomic.AddInt64(&stats.ActiveStagingTables, -1)
 			}
@@ -169,6 +173,10 @@ func readTableWithRetry(
 				return fmt.Errorf("create staging table for %s.%s attempt %d: %w", targetSchema, targetTable, attemptID, err)
 			}
 			stagingName := stagingTableName(targetTable, attemptID)
+			tableEvent(eng.EventSink, schema, table, EventCodeStagingTableCreated, EventCategoryTable,
+				EventSeverityInfo,
+				fmt.Sprintf("staging table created: %s", stagingName),
+				map[string]interface{}{"staging_table": stagingName, "attempt_id": attemptID})
 			if err := stateTracker.setStagingTable(schema, table, stagingName); err != nil {
 				_ = dropStagingTable(ctx, eng.TargetDB, targetSchema, targetTable, attemptID)
 				return err
@@ -182,9 +190,13 @@ func readTableWithRetry(
 			return err
 		}
 
+		if attempt > 1 && coord != nil {
+			coord.prepareTableRetry(schema, table)
+		}
+
 		// attempt 级子 context：并行 chunk 失败只取消本 attempt
 		attemptCtx, attemptCancel := context.WithCancel(ctx)
-		readErr := readTableWithSnapshot(attemptCtx, db, job, q, eng, lim, opt, stats, isStopped, taskCancel, attemptCancel)
+		readErr := readTable(attemptCtx, db, job, q, eng, opt, stats, isStopped, taskCancel, attemptCancel, coord)
 		attemptCancel()
 
 		if readErr == nil {
@@ -199,6 +211,10 @@ func readTableWithRetry(
 				if err := publishStagingTable(ctx, eng.TargetDB, targetSchema, targetTable, attemptID); err != nil {
 					return fmt.Errorf("publish staging table for %s.%s: %w", targetSchema, targetTable, err)
 				}
+				tableEvent(eng.EventSink, schema, table, EventCodeStagingTablePublished, EventCategoryTable,
+					EventSeverityInfo,
+					fmt.Sprintf("staging table published to %s.%s (attempt %d)", targetSchema, targetTable, attemptID),
+					map[string]interface{}{"attempt_id": attemptID})
 				if stats != nil {
 					atomic.AddInt64(&stats.ActiveStagingTables, -1)
 				}
@@ -238,6 +254,10 @@ func readTableWithRetry(
 		// attempt 已用尽额外重试：1+maxRetries
 		if attempt > maxRetries {
 			logger.Warn("[FullLoadV2] table %s.%s retry exhausted after %d attempts: %v", schema, table, attempt, readErr)
+			retryEvent(eng.EventSink, schema, table, EventCodeTableReadRetryExhausted,
+				fmt.Sprintf("table read retry exhausted after %d attempts", attempt),
+				EventSeverityError,
+				map[string]interface{}{"attempts": attempt, "error": readErr.Error()})
 			if stats != nil {
 				atomic.AddInt64(&stats.TableRetryExhausted, 1)
 			}
@@ -256,6 +276,10 @@ func readTableWithRetry(
 		backoff := retryBackoff(attempt)
 		logger.Warn("[FullLoadV2] table %s.%s read failed (attempt %d), retrying in %s: %v",
 			schema, table, attempt, backoff, readErr)
+		retryEvent(eng.EventSink, schema, table, EventCodeTableReadRetry,
+			fmt.Sprintf("table read failed attempt %d; retry in %s", attempt, backoff),
+			EventSeverityWarn,
+			map[string]interface{}{"attempt": attempt, "backoff": backoff.String(), "error": readErr.Error()})
 		if stats != nil {
 			atomic.AddInt64(&stats.TableRetries, 1)
 		}

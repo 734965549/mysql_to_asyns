@@ -138,13 +138,16 @@ func (w *BatchWriter) WriteBatch(ctx context.Context, rows []map[string]interfac
 		return nil // 返回成功
 	}
 
-	nCols := len(w.sqlBuilder.identity.Columns) // 获取列数
-	if nCols == 0 {                             // 如果没有列
-		return fmt.Errorf("table %s has no columns in identity", w.sqlBuilder.identity.TableName) // 返回错误
+	nCols := w.sqlBuilder.identity.WritableColumnCount() // 获取可写入列数
+	if nCols == 0 && len(w.sqlBuilder.identity.Columns) == 0 {
+		return fmt.Errorf("table %s has no columns in identity", w.sqlBuilder.identity.TableName)
 	}
-	maxRowsPerStmt := mysqlMaxPreparedPlaceholders / nCols // 计算每条语句最大行数
-	if maxRowsPerStmt < 1 {                                // 如果小于1
-		maxRowsPerStmt = 1 // 设置为最小值1
+	maxRowsPerStmt := mysqlMaxPreparedPlaceholders
+	if nCols > 0 {
+		maxRowsPerStmt = mysqlMaxPreparedPlaceholders / nCols
+	}
+	if maxRowsPerStmt < 1 {
+		maxRowsPerStmt = 1
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, w.timeout) // 设置超时上下文
@@ -193,6 +196,9 @@ func (w *BatchWriter) WriteBatch(ctx context.Context, rows []map[string]interfac
 // Update 更新数据方法
 func (w *BatchWriter) Update(ctx context.Context, row map[string]interface{}) error { // 更新数据
 	query, args := w.sqlBuilder.BuildUpdate(row) // 构建更新语句
+	if query == "" {
+		return nil
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, w.timeout) // 设置超时上下文
 	defer cancel()                                     // 延迟取消
@@ -229,6 +235,9 @@ func (w *BatchWriter) Update(ctx context.Context, row map[string]interface{}) er
 // UpdateWithBeforeImage 使用 before image 进行更新方法（针对无主键表）
 func (w *BatchWriter) UpdateWithBeforeImage(ctx context.Context, row, beforeImage map[string]interface{}) error { // 使用before image更新
 	query, args := w.sqlBuilder.BuildUpdateWithBeforeImage(row, beforeImage) // 构建更新语句
+	if query == "" {
+		return nil
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, w.timeout) // 设置超时上下文
 	defer cancel()                                     // 延迟取消

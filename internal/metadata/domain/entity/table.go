@@ -1,5 +1,7 @@
 package entity // 声明当前文件属于entity包，用于定义数据实体
 
+import "strings"
+
 // IdentityStrategy 标识策略类型
 type IdentityStrategy string // 定义标识策略为字符串类型
 
@@ -37,15 +39,76 @@ func (t *TableIdentity) EffectiveCursorCols() []string {
 	return t.IdentifyCols
 }
 
+// GeneratedKind MySQL 生成列类型（information_schema.COLUMNS.EXTRA）。
+type GeneratedKind string
+
+const (
+	GeneratedNone    GeneratedKind = ""
+	GeneratedVirtual GeneratedKind = "VIRTUAL"
+	GeneratedStored  GeneratedKind = "STORED"
+)
+
+// ParseGeneratedKindFromExtra 从 COLUMNS.EXTRA 解析生成列类型。
+func ParseGeneratedKindFromExtra(extra string) GeneratedKind {
+	lower := strings.ToLower(extra)
+	switch {
+	case strings.Contains(lower, "virtual generated"):
+		return GeneratedVirtual
+	case strings.Contains(lower, "stored generated"):
+		return GeneratedStored
+	default:
+		return GeneratedNone
+	}
+}
+
 // ColumnMeta 列元数据
 type ColumnMeta struct { // 定义列元数据结构体，存储列的详细信息
-	Name            string // 列名：列的名称
-	DataType        string // 数据类型：列的数据类型
-	IsNullable      bool   // 是否可空：列是否允许为空值
-	IsPrimaryKey    bool   // 是否主键：列是否为主键
-	IsUnique        bool   // 是否唯一：列是否有唯一约束
-	IsAutoIncrement bool   // 是否自增：EXTRA 含 auto_increment
-	DefaultValue    string // 默认值：列的默认值
+	Name            string        // 列名：列的名称
+	DataType        string        // 数据类型：列的数据类型
+	IsNullable      bool          // 是否可空：列是否允许为空值
+	IsPrimaryKey    bool          // 是否主键：列是否为主键
+	IsUnique        bool          // 是否唯一：列是否有唯一约束
+	IsAutoIncrement bool          // 是否自增：EXTRA 含 auto_increment
+	GeneratedKind   GeneratedKind // 生成列类型；非生成列为空
+	DefaultValue    string        // 默认值：列的默认值
+}
+
+// IsGenerated 是否为 MySQL 生成列（VIRTUAL / STORED）。
+func (c ColumnMeta) IsGenerated() bool {
+	return c.GeneratedKind != GeneratedNone
+}
+
+// IsWritable 是否可在 INSERT/UPDATE SET 中显式赋值（生成列只能由目标库表达式计算）。
+func (c ColumnMeta) IsWritable() bool {
+	return !c.IsGenerated()
+}
+
+// WritableColumns 返回可写入列子集，保留 TableIdentity.Columns 完整元数据供匹配与 binlog 映射。
+func WritableColumns(columns []ColumnMeta) []ColumnMeta {
+	if len(columns) == 0 {
+		return nil
+	}
+	out := make([]ColumnMeta, 0, len(columns))
+	for _, col := range columns {
+		if col.IsWritable() {
+			out = append(out, col)
+		}
+	}
+	return out
+}
+
+// WritableColumnCount 返回可写入列数量。
+func (t *TableIdentity) WritableColumnCount() int {
+	if t == nil {
+		return 0
+	}
+	n := 0
+	for _, col := range t.Columns {
+		if col.IsWritable() {
+			n++
+		}
+	}
+	return n
 }
 
 // TableInfo 表信息

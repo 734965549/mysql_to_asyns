@@ -40,7 +40,9 @@ import {
   rowComparisonStatusColor,
   getTotalRowDescriptionLabel,
   formatTotalRowDisplay,
+  shouldShowFullSyncFailedReason,
 } from "../utils/taskFormatters.js";
+import { useTaskEvents } from "../composables/useTaskEvents.js";
 
 const route = useRoute();
 const { configForm, ensureDefaultConfig } = useDefaultConfig();
@@ -52,6 +54,7 @@ const detailPageMetrics = ref({});
 const detailPageProgress = ref(null);
 const detailPageLoading = ref(false);
 const detailPageActiveTab = ref("runtime");
+// 表列表默认折叠：表数量大时一次性渲染会造成卡顿，用户按需展开。
 const isTablesCollapsed = ref(true);
 
 let detailPageRefreshInterval = null;
@@ -66,7 +69,47 @@ function getMySQLSinkDisplay(sink, config) {
 
 const detailPageResumeTables = computed(() => resumeTableList(detailPageTask.value));
 const detailPageRowMeta = computed(() => getRowCountMeta(detailPageTask.value));
+const detailPageTaskStatus = computed(() => detailPageTask.value?.context?.status || "");
+const detailPageShowErrorStack = computed(() => {
+  const ctx = detailPageTask.value?.context;
+  return ctx?.status === "FAILED" && !!ctx?.error_stack;
+});
+const detailPageShowFullSyncFailedReason = computed(() =>
+  shouldShowFullSyncFailedReason(detailPageTask.value?.context),
+);
 
+const {
+  events: detailPageEvents,
+  loading: detailPageEventsLoading,
+  warnCount: detailPageEventWarnCount,
+  errorCount: detailPageEventErrorCount,
+  latestProgressEvent: detailPageLatestProgressEvent,
+  currentExecutionId: detailPageCurrentExecutionId,
+  eventFilter: detailPageEventFilter,
+  sourceTableFilter: detailPageSourceTableFilter,
+  eventFilterPresets: detailPageEventFilterPresets,
+} = useTaskEvents(detailPageTaskId, detailPageActiveTab, detailPageTaskStatus);
+
+const detailPageLogsTabTitle = computed(() => {
+  let title = "日志与错误";
+  if (detailPageEventWarnCount.value > 0 || detailPageEventErrorCount.value > 0) {
+    title += ` ⚠${detailPageEventWarnCount.value} ✕${detailPageEventErrorCount.value}`;
+  }
+  return title;
+});
+
+function eventSeverityColor(severity) {
+  switch (severity) {
+    case "ERROR":
+      return "red";
+    case "WARN":
+      return "orange";
+    default:
+      return "arcoblue";
+  }
+}
+
+// 拉取任务详情。silent=true 时跳过 loading 状态切换，用于定时轮询避免全屏 loading 闪烁。
 async function fetchTaskDetailPage(taskId, silent = false) {
   if (!taskId) return;
   if (!silent) {
@@ -331,6 +374,7 @@ onUnmounted(() => {
             </a-col>
           </a-row>
 
+          <!-- lazy-load: 延迟渲染非活动 tab，减少首屏渲染负担 -->
           <a-tabs v-model:active-key="detailPageActiveTab" class="detail-tabs" lazy-load>
             <!-- 实时进度 -->
             <a-tab-pane key="runtime" title="实时进度">
@@ -785,55 +829,110 @@ onUnmounted(() => {
             </a-tab-pane>
 
             <!-- 日志与错误 -->
-            <a-tab-pane key="logs" title="日志与错误">
-              <a-alert
-                v-if="detailPageTask.context.error_stack"
-                type="error"
-                :show-icon="true"
-                style="margin-bottom: 16px"
-                title="任务错误堆栈"
-              >
-                <pre style="margin: 0; white-space: pre-wrap; word-break: break-word">{{
-                  detailPageTask.context.error_stack
-                }}</pre>
-              </a-alert>
+            <a-tab-pane key="logs" :title="detailPageLogsTabTitle">
+              <a-spin :loading="detailPageEventsLoading" style="width: 100%">
+                <a-descriptions
+                  v-if="detailPageCurrentExecutionId || detailPageLatestProgressEvent"
+                  title="事件摘要"
+                  :column="2"
+                  bordered
+                  style="margin-bottom: 16px"
+                >
+                  <a-descriptions-item label="当前轮次">
+                    {{ detailPageCurrentExecutionId || '-' }}
+                  </a-descriptions-item>
+                  <a-descriptions-item label="WARN / ERROR">
+                    {{ detailPageEventWarnCount }} / {{ detailPageEventErrorCount }}
+                  </a-descriptions-item>
+                  <a-descriptions-item label="最后阶段进展" :span="2">
+                    {{ detailPageLatestProgressEvent?.message || '-' }}
+                  </a-descriptions-item>
+                </a-descriptions>
 
-              <a-alert
-                v-if="detailPageTask.context.full_sync_failed_reason"
-                type="warning"
-                :show-icon="true"
-                style="margin-bottom: 16px"
-                title="全量同步失败原因"
-              >
-                {{ detailPageTask.context.full_sync_failed_reason }}
-              </a-alert>
+                <a-alert
+                  v-if="detailPageShowErrorStack"
+                  type="error"
+                  :show-icon="true"
+                  style="margin-bottom: 16px"
+                  title="任务错误堆栈"
+                >
+                  <pre style="margin: 0; white-space: pre-wrap; word-break: break-word">{{
+                    detailPageTask.context.error_stack
+                  }}</pre>
+                </a-alert>
 
-              <a-descriptions title="同步阶段时间线" :column="2" bordered>
-                <a-descriptions-item label="全量开始时间">
-                  {{ formatTime(detailPageTask.context.full_sync_started_at) }}
-                </a-descriptions-item>
-                <a-descriptions-item label="全量完成时间">
-                  {{ formatTime(detailPageTask.context.full_sync_completed_at) }}
-                </a-descriptions-item>
-                <a-descriptions-item label="全量起始位点" :span="2">
-                  {{ detailPageTask.context.full_sync_start_position || '-' }}
-                </a-descriptions-item>
-                <a-descriptions-item label="最近增量位点" :span="2">
-                  {{ detailPageTask.context.last_incremental_position || '-' }}
-                </a-descriptions-item>
-                <a-descriptions-item label="当前位点" :span="2">
-                  {{ detailPageTask.context.current_position || '-' }}
-                </a-descriptions-item>
-              </a-descriptions>
+                <a-alert
+                  v-if="detailPageShowFullSyncFailedReason"
+                  type="warning"
+                  :show-icon="true"
+                  style="margin-bottom: 16px"
+                  title="全量同步失败原因"
+                >
+                  {{ detailPageTask.context.full_sync_failed_reason }}
+                </a-alert>
 
-              <a-alert
-                v-if="!detailPageTask.context.error_stack && !detailPageTask.context.full_sync_failed_reason"
-                type="info"
-                :show-icon="true"
-                style="margin-top: 16px"
-                title="暂无错误日志"
-                description="任务当前没有记录到错误堆栈或全量失败原因。"
-              />
+                <a-space wrap style="margin-bottom: 12px">
+                  <a-select
+                    v-model="detailPageEventFilter"
+                    :options="detailPageEventFilterPresets.map((p) => ({ value: p.id, label: p.label }))"
+                    style="width: 180px"
+                    placeholder="事件分类"
+                  />
+                  <a-input
+                    v-model="detailPageSourceTableFilter"
+                    allow-clear
+                    placeholder="按表名筛选"
+                    style="width: 200px"
+                  />
+                </a-space>
+
+                <a-table
+                  v-if="detailPageEvents.length > 0"
+                  :columns="[
+                    { title: '时间', slotName: 'time', width: 180 },
+                    { title: '级别', slotName: 'severity', width: 80 },
+                    { title: '事件', slotName: 'code', width: 220 },
+                    { title: '说明', slotName: 'message' },
+                  ]"
+                  :data="detailPageEvents"
+                  :pagination="{ pageSize: 20 }"
+                  size="small"
+                  row-key="seq"
+                >
+                  <template #time="{ record }">
+                    {{ formatTime(record.timestamp) }}
+                    <div
+                      v-if="record.repeat_count > 1"
+                      class="event-repeat-meta"
+                    >
+                      ×{{ record.repeat_count }}
+                      <span v-if="record.first_at && record.last_at">
+                        （{{ formatTime(record.first_at) }} ~ {{ formatTime(record.last_at) }}）
+                      </span>
+                    </div>
+                  </template>
+                  <template #severity="{ record }">
+                    <a-tag :color="eventSeverityColor(record.severity)" size="small">
+                      {{ record.severity }}
+                    </a-tag>
+                  </template>
+                  <template #code="{ record }">
+                    <div>{{ record.code }}</div>
+                    <div v-if="record.source_schema" class="event-table-ref">
+                      {{ record.source_schema }}.{{ record.source_table }}
+                    </div>
+                  </template>
+                  <template #message="{ record }">
+                    {{ record.message }}
+                  </template>
+                </a-table>
+
+                <a-empty
+                  v-else-if="!detailPageShowErrorStack && !detailPageShowFullSyncFailedReason"
+                  description="暂无关键事件"
+                  style="margin-top: 24px"
+                />
+              </a-spin>
             </a-tab-pane>
 
             <!-- 行数对比 -->
@@ -1211,5 +1310,14 @@ onUnmounted(() => {
   overflow-y: auto;
 }
 
+.event-repeat-meta {
+  font-size: 12px;
+  color: var(--color-text-3);
+}
+
+.event-table-ref {
+  font-size: 12px;
+  color: var(--color-text-3);
+}
 
 </style>

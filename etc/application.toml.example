@@ -66,6 +66,13 @@
   # 也可通过环境变量 MYSQL_TO_ASYNC_SECURITY_ENCRYPT_KEY 设置
   # encrypt_key = "your-32-byte-secret-key-here!!!!"
 
+[task_events]
+  # 任务关键事件保留：每任务 KEY 事件上限 / 最长保留天数 / ERROR 最少保留 / 清理间隔（小时）
+  # max_key_events = 2000
+  # retain_days = 30
+  # min_error_events = 200
+  # prune_hours = 24
+
 [redis]
   # Redis配置（可选）
   # 用于保存增量同步的Checkpoint位点
