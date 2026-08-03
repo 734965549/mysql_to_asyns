@@ -379,6 +379,23 @@ func (s *MySQLTaskStorage) initTable() error { // 初始化数据表
 
 }
 
+// loadStoredTaskLocked 读取已持久化的任务存档；调用方需已持有 storage 写锁。
+func loadStoredTaskFileLocked(dataDir, taskID string) (*taskEntity.SyncTask, error) {
+	filePath := filepath.Join(dataDir, taskID+".json")
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var stored taskEntity.SyncTask
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal stored task %s: %w", taskID, err)
+	}
+	return &stored, nil
+}
+
 // Save 保存任务到数据库
 
 func (s *MySQLTaskStorage) Save(task *taskEntity.SyncTask) error {
@@ -407,6 +424,20 @@ func (s *MySQLTaskStorage) Save(task *taskEntity.SyncTask) error {
 	}()
 	if err := task.EncryptPasswords(s.encryptKey); err != nil {
 		return fmt.Errorf("encrypt passwords: %w", err)
+	}
+
+	var existingContent []byte
+	loadErr := s.db.QueryRow("SELECT content FROM sys_sync_tasks WHERE id = ?", task.Config.ID).Scan(&existingContent)
+	if loadErr == nil {
+		var stored taskEntity.SyncTask
+		if err := json.Unmarshal(existingContent, &stored); err != nil {
+			return fmt.Errorf("unmarshal stored task %s: %w", task.Config.ID, err)
+		}
+		if taskEntity.ShouldRejectArchiveOverwrite(&stored, task) {
+			return nil
+		}
+	} else if loadErr != sql.ErrNoRows {
+		return loadErr
 	}
 
 	data, err := json.Marshal(task) // 序列化任务
@@ -6818,9 +6849,12 @@ func (s *TaskService) clearLastProgressPersistLocked(taskID string) {
 }
 
 // shouldPersistAsyncProgressSnapshot 判断锁外进度快照是否仍应落盘。
-// incrementTaskProgress 在锁内序列化、锁外 Save；Pause/End/Fail 等在锁内同步保存较新状态。
-// 若不做校验，滞后的 RUNNING 快照可能在终态存档之后落盘，进程崩溃时重启会读到错误状态。
+// incrementTaskProgress 在锁内序列化、锁外 Save；Pause/End/Fail/Complete 等在锁内同步保存较新状态。
+// 校验 archiveGen 与终态，避免滞后的 RUNNING 快照在终态存档之后落盘。
 func (s *TaskService) shouldPersistAsyncProgressSnapshot(taskID string, snapshot *taskEntity.SyncTask) bool {
+	if snapshot == nil {
+		return false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -6828,13 +6862,46 @@ func (s *TaskService) shouldPersistAsyncProgressSnapshot(taskID string, snapshot
 	if !exists {
 		return false
 	}
+	if taskEntity.IsTerminalTaskStatus(task.Context.Status) {
+		return false
+	}
+	if snapshot.Context.ArchiveGen != task.Context.ArchiveGen {
+		return false
+	}
 	if task.Context.Status != snapshot.Context.Status {
+		return false
+	}
+	if snapshot.Context.Status != taskEntity.TaskStatusRunning {
 		return false
 	}
 	if task.Context.LastUpdateTime.After(snapshot.Context.LastUpdateTime) {
 		return false
 	}
 	return true
+}
+
+// persistTaskArchive 持久化任务存档，带短重试；失败时打 ERROR 并写入生命周期事件。
+func (s *TaskService) persistTaskArchive(taskID string, task *taskEntity.SyncTask, reason string) error {
+	if s.storage == nil || task == nil {
+		return nil
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := s.storage.Save(task); err != nil {
+			lastErr = err
+			if attempt < 2 {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			break
+		}
+		return nil
+	}
+	logger.Error("[Task %s] Failed to persist task archive (%s, status=%s): %v", taskID, reason, task.Context.Status, lastErr)
+	s.emitLifecycle(taskID, taskEntity.EventCodeTaskPersistFailed,
+		fmt.Sprintf("任务存档持久化失败 (%s): %v", reason, lastErr),
+		taskEntity.EventSeverityError)
+	return lastErr
 }
 
 // updateTaskProgress 更新任务进度
@@ -6871,7 +6938,9 @@ func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position
 			effectiveTotal = task.Context.EstimatedTotalRows
 		}
 		if effectiveTotal > 0 {
-			task.Context.ProgressPercent = float64(task.Context.ProcessedRows) / float64(effectiveTotal) * 100
+			task.Context.ProgressPercent = taskEntity.CapProgressPercent(
+				float64(task.Context.ProcessedRows) / float64(effectiveTotal) * 100,
+			)
 		}
 
 		// 节流：至少间隔 1 秒才落盘一次，减少存储 I/O
@@ -6879,8 +6948,7 @@ func (s *TaskService) incrementTaskProgress(taskID string, delta int64, position
 		last, ok := s.lastProgressPersist[taskID]
 		if !ok || now.Sub(last) >= time.Second {
 			s.lastProgressPersist[taskID] = now
-			// 在锁内冻结一份不可变快照；真正的文件/MySQL I/O 在释放全局任务锁后执行。
-			// 这样慢存储不会阻塞其他 worker，同时避免把仍在变化的任务指针交给存储层。
+			// 在锁内冻结一份不可变快照（含 archiveGen）；真正的 I/O 在释放全局任务锁后执行。
 			snapshotJSON, _ = json.Marshal(task)
 		}
 	}
@@ -6944,7 +7012,17 @@ func (s *TaskService) updateTaskStatus(taskID string, status taskEntity.TaskStat
 
 		}
 
-		s.storage.Save(task)
+		task.BumpArchiveGen()
+
+		if err := s.persistTaskArchive(taskID, task, "update_status"); err != nil {
+			if status != taskEntity.TaskStatusFailed {
+				task.Context.Status = taskEntity.TaskStatusFailed
+				task.Context.ErrorStack = fmt.Sprintf("failed to persist task status %s: %v", status, err)
+				task.Context.EndTime = time.Now()
+				task.BumpArchiveGen()
+				_ = s.persistTaskArchive(taskID, task, "update_status_failed")
+			}
+		}
 
 	}
 
@@ -6981,8 +7059,6 @@ func (s *TaskService) completeTask(taskID string) {
 
 		task.Complete()
 
-		s.emitLifecycle(taskID, taskEntity.EventCodeTaskCompleted, "任务已完成", taskEntity.EventSeverityInfo)
-
 		if task.Context.ScheduleMode == "cron" {
 			next, err := nextCronRun(task, time.Now())
 			if err != nil {
@@ -6992,6 +7068,7 @@ func (s *TaskService) completeTask(taskID string) {
 				task.Context.Status = taskEntity.TaskStatusScheduled
 				task.Context.ScheduledAt = &next
 				task.Context.LastUpdateTime = time.Now()
+				task.BumpArchiveGen()
 			}
 		} else if task.Context.RepeatRemaining > 0 && task.ConsumeScheduledRun() {
 			interval := time.Duration(task.Context.RepeatIntervalSec) * time.Second
@@ -7002,11 +7079,24 @@ func (s *TaskService) completeTask(taskID string) {
 			task.Context.Status = taskEntity.TaskStatusScheduled
 			task.Context.ScheduledAt = &next
 			task.Context.LastUpdateTime = time.Now()
+			task.BumpArchiveGen()
 		} else {
 			task.ClearScheduleConfig()
 		}
 
-		s.storage.Save(task)
+		if err := s.persistTaskArchive(taskID, task, "complete"); err != nil {
+			task.Context.Status = taskEntity.TaskStatusFailed
+			task.Context.ErrorStack = fmt.Sprintf("failed to persist completed state: %v", err)
+			if task.Context.EndTime.IsZero() {
+				task.Context.EndTime = time.Now()
+			}
+			task.BumpArchiveGen()
+			_ = s.persistTaskArchive(taskID, task, "complete_failed")
+			s.emitLifecycle(taskID, taskEntity.EventCodeTaskFailed, task.Context.ErrorStack, taskEntity.EventSeverityError)
+			return
+		}
+
+		s.emitLifecycle(taskID, taskEntity.EventCodeTaskCompleted, "任务已完成", taskEntity.EventSeverityInfo)
 
 	}
 
@@ -7482,7 +7572,7 @@ func (s *TaskService) GetTaskMetrics(taskID string) (map[string]interface{}, err
 
 		"estimated_total_rows": task.Context.EstimatedTotalRows,
 
-		"progress_percent": task.Context.ProgressPercent,
+		"progress_percent": taskEntity.CapProgressPercent(task.Context.ProgressPercent),
 
 		"tables_completed": 0,
 
@@ -7589,6 +7679,12 @@ func (s *FileTaskStorage) Save(task *taskEntity.SyncTask) error {
 	}()
 	if err := task.EncryptPasswords(s.encryptKey); err != nil {
 		return fmt.Errorf("encrypt passwords: %w", err)
+	}
+
+	if stored, err := loadStoredTaskFileLocked(s.dataDir, task.Config.ID); err != nil {
+		return err
+	} else if taskEntity.ShouldRejectArchiveOverwrite(stored, task) {
+		return nil
 	}
 
 	// 序列化任务

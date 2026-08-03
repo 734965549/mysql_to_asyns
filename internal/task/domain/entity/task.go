@@ -163,6 +163,9 @@ type ProcessContext struct { // 定义处理上下文结构体
 	StartTime           time.Time   `json:"start_time"`                     // 开始时间
 	EndTime             time.Time   `json:"end_time"`                       // 结束时间
 	LastUpdateTime      time.Time   `json:"last_update_time"`               // 最后更新时间
+	// ArchiveGen 任务存档世代号：每次生命周期变更（Start/Complete/Pause/Fail/Stop 等）递增。
+	// 进度异步落盘携带造快照时的世代号，Save 前若内存世代已变大则丢弃，避免终态被 RUNNING 快照覆盖。
+	ArchiveGen uint64 `json:"archive_gen,omitempty"`
 	ErrorStack          string      `json:"error_stack"`                    // 错误堆栈
 	ScheduledAt         *time.Time  `json:"scheduled_at,omitempty"`         // 下次定时启动时间（为空表示立即启动）
 	ScheduledFromStatus *TaskStatus `json:"scheduled_from_status,omitempty"`
@@ -431,6 +434,52 @@ func NewSyncTask(config TaskConfig) *SyncTask { // 创建同步任务实例
 	}
 }
 
+// ShouldRejectArchiveOverwrite 判断 incoming 是否不得覆盖 stored 存档。
+// 在 storage Save 内原子调用，关闭 shouldPersist 与 Save 之间的 TOCTOU 窗口。
+func ShouldRejectArchiveOverwrite(stored, incoming *SyncTask) bool {
+	if stored == nil || incoming == nil {
+		return false
+	}
+	if incoming.Context.ArchiveGen < stored.Context.ArchiveGen {
+		return true
+	}
+	if incoming.Context.ArchiveGen == stored.Context.ArchiveGen &&
+		IsTerminalTaskStatus(stored.Context.Status) &&
+		incoming.Context.Status == TaskStatusRunning {
+		return true
+	}
+	return false
+}
+
+// IsTerminalTaskStatus 判断任务是否已进入不可被进度快照覆盖的终态。
+func IsTerminalTaskStatus(status TaskStatus) bool {
+	switch status {
+	case TaskStatusCompleted, TaskStatusPaused, TaskStatusStopped, TaskStatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// CapProgressPercent 对外展示进度封顶在 [0, 100]。
+func CapProgressPercent(p float64) float64 {
+	if p > 100 {
+		return 100
+	}
+	if p < 0 {
+		return 0
+	}
+	return p
+}
+
+// BumpArchiveGen 递增存档世代号；生命周期变更后调用，配合进度异步落盘防写序。
+func (t *SyncTask) BumpArchiveGen() {
+	if t == nil {
+		return
+	}
+	t.Context.ArchiveGen++
+}
+
 // Start 启动任务方法：重置当前执行轮次字段（ErrorStack/EndTime/StartTime），
 // 不清除 SyncPhase、全量恢复状态、增量位点及全量统计等阶段/历史字段。
 func (t *SyncTask) Start() { // 启动任务
@@ -441,6 +490,7 @@ func (t *SyncTask) Start() { // 启动任务
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
 	t.Context.ScheduledAt = nil           // 清除定时启动时间
 	t.Context.ScheduledFromStatus = nil
+	t.BumpArchiveGen()
 }
 
 // ResetFullSyncCounters 重置全量同步运行计数。
@@ -515,6 +565,7 @@ func (t *SyncTask) Schedule(scheduledAt time.Time) { // 设置定时启动
 	t.Context.Status = TaskStatusScheduled // 设置状态为已计划
 	t.Context.ScheduledAt = &scheduledAt   // 记录定时启动时间
 	t.Context.LastUpdateTime = time.Now()  // 更新最后更新时间
+	t.BumpArchiveGen()
 }
 
 // CancelSchedule 取消定时启动
@@ -526,12 +577,14 @@ func (t *SyncTask) CancelSchedule() { // 取消定时启动
 	t.Context.Status = restoreStatus
 	t.ClearScheduleConfig()
 	t.Context.LastUpdateTime = time.Now()
+	t.BumpArchiveGen()
 }
 
 // Pause 暂停任务方法
 func (t *SyncTask) Pause() { // 暂停任务
 	t.Context.Status = TaskStatusPaused   // 设置状态为已暂停
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
+	t.BumpArchiveGen()
 }
 
 // Stop 结束任务方法。
@@ -544,6 +597,7 @@ func (t *SyncTask) Stop() {
 	t.Context.EndTime = now              // 记录结束时间
 	t.Context.LastUpdateTime = now       // 更新最后更新时间
 	t.ClearScheduleConfig()              // 清除 Cron/repeat/once 调度配置
+	t.BumpArchiveGen()
 }
 
 // Complete 完成任务方法
@@ -552,6 +606,7 @@ func (t *SyncTask) Complete() { // 完成任务
 	t.Context.EndTime = time.Now()         // 记录结束时间
 	t.Context.LastUpdateTime = time.Now()  // 更新最后更新时间
 	t.Context.ProgressPercent = 100        // 设置进度为100%
+	t.BumpArchiveGen()
 }
 
 // Fail 任务失败方法
@@ -560,6 +615,7 @@ func (t *SyncTask) Fail(err error) { // 任务失败处理
 	t.Context.ErrorStack = err.Error()    // 记录错误信息
 	t.Context.EndTime = time.Now()        // 记录结束时间
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
+	t.BumpArchiveGen()
 }
 
 // UpdateProgress 更新进度方法
@@ -572,7 +628,7 @@ func (t *SyncTask) UpdateProgress(processedRows int64, position string) { // 更
 		effectiveTotal = t.Context.EstimatedTotalRows
 	}
 	if effectiveTotal > 0 {
-		t.Context.ProgressPercent = float64(processedRows) / float64(effectiveTotal) * 100
+		t.Context.ProgressPercent = CapProgressPercent(float64(processedRows) / float64(effectiveTotal) * 100)
 	}
 	t.Context.LastUpdateTime = time.Now() // 更新最后更新时间
 }

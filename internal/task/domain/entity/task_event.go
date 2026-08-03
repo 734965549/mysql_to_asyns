@@ -45,6 +45,7 @@ const (
 	EventCodeTaskStopped         = "TASK_STOPPED"
 	EventCodeTaskCompleted       = "TASK_COMPLETED"
 	EventCodeTaskFailed          = "TASK_FAILED"
+	EventCodeTaskPersistFailed   = "TASK_PERSIST_FAILED"
 	EventCodeTaskConfigEffective = "TASK_CONFIG_EFFECTIVE"
 )
 
@@ -192,7 +193,7 @@ func IsNeverSuppressEventCode(code string) bool {
 	switch code {
 	case EventCodeTaskStarted, EventCodeTaskFailed, EventCodeTaskCompleted,
 		EventCodeTaskStopped, EventCodeTaskPaused, EventCodeTaskResumed,
-		EventCodeTaskScheduled, EventCodeTaskConfigEffective:
+		EventCodeTaskScheduled, EventCodeTaskPersistFailed, EventCodeTaskConfigEffective:
 		return true
 	}
 	if strings.HasPrefix(code, "PHASE_") {

@@ -418,6 +418,77 @@ func TestTaskUpdateProgress(t *testing.T) {
 	}
 }
 
+func TestCapProgressPercent(t *testing.T) {
+	if CapProgressPercent(108) != 100 {
+		t.Fatalf("expected cap at 100, got %f", CapProgressPercent(108))
+	}
+	if CapProgressPercent(-1) != 0 {
+		t.Fatalf("expected floor at 0, got %f", CapProgressPercent(-1))
+	}
+}
+
+func TestBumpArchiveGenOnLifecycle(t *testing.T) {
+	task := NewSyncTask(TaskConfig{ID: "gen", Name: "Gen"})
+	if task.Context.ArchiveGen != 0 {
+		t.Fatalf("expected initial gen 0, got %d", task.Context.ArchiveGen)
+	}
+	task.Start()
+	if task.Context.ArchiveGen != 1 {
+		t.Fatalf("expected gen 1 after start, got %d", task.Context.ArchiveGen)
+	}
+	task.Complete()
+	if task.Context.ArchiveGen != 2 {
+		t.Fatalf("expected gen 2 after complete, got %d", task.Context.ArchiveGen)
+	}
+}
+
+func TestIsTerminalTaskStatus(t *testing.T) {
+	for _, st := range []TaskStatus{TaskStatusCompleted, TaskStatusPaused, TaskStatusStopped, TaskStatusFailed} {
+		if !IsTerminalTaskStatus(st) {
+			t.Fatalf("expected terminal status %s", st)
+		}
+	}
+	if IsTerminalTaskStatus(TaskStatusRunning) {
+		t.Fatal("RUNNING must not be terminal")
+	}
+}
+
+func TestShouldRejectArchiveOverwrite(t *testing.T) {
+	stored := NewSyncTask(TaskConfig{ID: "a", Name: "A"})
+	stored.Start()
+	stored.Complete()
+
+	incoming := stored.CloneForRead()
+	incoming.Context.ArchiveGen = stored.Context.ArchiveGen - 1
+	incoming.Context.Status = TaskStatusRunning
+	if !ShouldRejectArchiveOverwrite(stored, incoming) {
+		t.Fatal("lower archive_gen RUNNING must be rejected")
+	}
+
+	fresh := stored.CloneForRead()
+	fresh.BumpArchiveGen()
+	if ShouldRejectArchiveOverwrite(stored, fresh) {
+		t.Fatal("newer archive_gen COMPLETED must be accepted")
+	}
+
+	paused := NewSyncTask(TaskConfig{ID: "b", Name: "B"})
+	paused.Start()
+	paused.Pause()
+	storedPaused := paused.CloneForRead()
+
+	restarted := paused.CloneForRead()
+	restarted.Start()
+	if ShouldRejectArchiveOverwrite(storedPaused, restarted) {
+		t.Fatal("higher archive_gen RUNNING restart after PAUSED must be accepted")
+	}
+
+	staleRunning := paused.CloneForRead()
+	staleRunning.Context.Status = TaskStatusRunning
+	if !ShouldRejectArchiveOverwrite(storedPaused, staleRunning) {
+		t.Fatal("same archive_gen RUNNING must not overwrite PAUSED")
+	}
+}
+
 func TestTaskFail(t *testing.T) {
 	config := TaskConfig{
 		ID:   "test_task_6",

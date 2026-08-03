@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -349,4 +350,78 @@ func TestFileTaskStorage_PreservesRowCountComparison(t *testing.T) {
 		t.Error("expected mismatched table")
 	}
 	// 行数对比结果不得包含密码等敏感信息（结构体本身无密码字段，此处确保 SourceDB.Password 不在结果 JSON 中）
+}
+
+func TestFileTaskStorage_RejectsStaleRunningOverwrite(t *testing.T) {
+	dataDir := t.TempDir()
+	storage := NewFileTaskStorage(dataDir)
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "stale_overwrite", Name: "Stale"})
+	task.Start()
+	task.Context.ProcessedRows = 800
+	task.Context.TotalRows = 1000
+	task.Context.ProgressPercent = 80
+	staleGen := task.Context.ArchiveGen
+
+	staleJSON, err := json.Marshal(task)
+	if err != nil {
+		t.Fatalf("marshal stale: %v", err)
+	}
+	var stale taskEntity.SyncTask
+	if err := json.Unmarshal(staleJSON, &stale); err != nil {
+		t.Fatalf("unmarshal stale: %v", err)
+	}
+
+	task.Complete()
+	if err := storage.Save(task); err != nil {
+		t.Fatalf("save completed: %v", err)
+	}
+
+	stale.Context.ArchiveGen = staleGen
+	stale.Context.Status = taskEntity.TaskStatusRunning
+	if err := storage.Save(&stale); err != nil {
+		t.Fatalf("save stale should noop without error: %v", err)
+	}
+
+	loaded, err := storage.LoadAll()
+	if err != nil {
+		t.Fatalf("load all: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(loaded))
+	}
+	if loaded[0].Context.Status != taskEntity.TaskStatusCompleted {
+		t.Fatalf("expected COMPLETED, got %s", loaded[0].Context.Status)
+	}
+}
+
+func TestFileTaskStorage_AcceptsRunningRestartAfterPaused(t *testing.T) {
+	dataDir := t.TempDir()
+	storage := NewFileTaskStorage(dataDir)
+
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "resume_after_pause", Name: "Resume"})
+	task.Start()
+	task.Pause()
+	if err := storage.Save(task); err != nil {
+		t.Fatalf("save paused: %v", err)
+	}
+
+	task.Start()
+	if err := storage.Save(task); err != nil {
+		t.Fatalf("save running restart: %v", err)
+	}
+
+	loaded, err := storage.LoadAll()
+	if err != nil {
+		t.Fatalf("load all: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(loaded))
+	}
+	if loaded[0].Context.Status != taskEntity.TaskStatusRunning {
+		t.Fatalf("expected RUNNING after resume, got %s", loaded[0].Context.Status)
+	}
+	if loaded[0].Context.ArchiveGen <= 1 {
+		t.Fatalf("expected archive_gen bumped after restart, got %d", loaded[0].Context.ArchiveGen)
+	}
 }

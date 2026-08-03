@@ -39,6 +39,60 @@ func (s *failingTaskStorage) Save(task *taskEntity.SyncTask) error {
 	return s.err
 }
 
+type failFirstSaveStorage struct {
+	inner   TaskStorage
+	failErr error
+	failed  bool
+}
+
+func (s *failFirstSaveStorage) Save(task *taskEntity.SyncTask) error {
+	if !s.failed {
+		s.failed = true
+		return s.failErr
+	}
+	return s.inner.Save(task)
+}
+
+func (s *failFirstSaveStorage) Delete(taskID string) error {
+	return s.inner.Delete(taskID)
+}
+
+func (s *failFirstSaveStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
+	return s.inner.LoadAll()
+}
+
+func (s *failFirstSaveStorage) QueryTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int, error) {
+	return s.inner.QueryTasksPage(page, pageSize, status, keyword, sortBy)
+}
+
+// failCompletedSaveStorage 拒绝 COMPLETED/SCHEDULED 落盘，用于测试 complete 失败分支。
+type failCompletedSaveStorage struct {
+	inner TaskStorage
+	err   error
+}
+
+func (s *failCompletedSaveStorage) Save(task *taskEntity.SyncTask) error {
+	if task != nil {
+		switch task.Context.Status {
+		case taskEntity.TaskStatusCompleted, taskEntity.TaskStatusScheduled:
+			return s.err
+		}
+	}
+	return s.inner.Save(task)
+}
+
+func (s *failCompletedSaveStorage) Delete(taskID string) error {
+	return s.inner.Delete(taskID)
+}
+
+func (s *failCompletedSaveStorage) LoadAll() ([]*taskEntity.SyncTask, error) {
+	return s.inner.LoadAll()
+}
+
+func (s *failCompletedSaveStorage) QueryTasksPage(page, pageSize int, status, keyword, sortBy string) ([]*taskEntity.SyncTask, int, int, int, error) {
+	return s.inner.QueryTasksPage(page, pageSize, status, keyword, sortBy)
+}
+
 func (s *failingTaskStorage) Delete(taskID string) error {
 	return nil
 }
@@ -2300,6 +2354,7 @@ func TestIncrementTaskProgress_Throttle(t *testing.T) {
 
 	// ?????CreateTask ??????? Save???????
 	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	task.Start()
 	task.Context.TotalRows = 1000
 	spy.ResetCount()
 
@@ -2342,6 +2397,7 @@ func TestIncrementTaskProgress_ThrottleReset(t *testing.T) {
 
 	// ????
 	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	task.Start()
 	task.Context.TotalRows = 1000
 	spy.ResetCount()
 
@@ -2361,6 +2417,7 @@ func TestIncrementTaskProgress_ThrottleReset(t *testing.T) {
 
 	// ??????????? taskID ???????
 	task2, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	task2.Start()
 	task2.Context.TotalRows = 1000
 	spy.ResetCount()
 
@@ -2412,6 +2469,199 @@ func TestIncrementTaskProgress_SkipsStaleSnapshotAfterLifecycleSave(t *testing.T
 	assert.Equal(t, int64(100), loaded.Context.ProcessedRows)
 }
 
+// delayingRunningSaveStorage 在 RUNNING 存档写入前延迟，用于复现 check→Save TOCTOU。
+type delayingRunningSaveStorage struct {
+	*FileTaskStorage
+	delay time.Duration
+}
+
+func (d *delayingRunningSaveStorage) Save(task *taskEntity.SyncTask) error {
+	if task != nil && task.Context.Status == taskEntity.TaskStatusRunning {
+		time.Sleep(d.delay)
+	}
+	return d.FileTaskStorage.Save(task)
+}
+
+func TestIncrementTaskProgress_SkipsStaleSnapshotByArchiveGen(t *testing.T) {
+	dataDir := t.TempDir()
+	ts, spy := newTestTaskServiceWithSpy(dataDir)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "task_gen", Name: "Task Gen"})
+	require.NoError(t, err)
+	task.Start()
+	task.Context.TotalRows = 1000
+
+	ts.mu.Lock()
+	task.Context.ProcessedRows = 900
+	task.Context.ProgressPercent = 90
+	staleGen := task.Context.ArchiveGen
+	staleJSON, marshalErr := json.Marshal(task)
+	require.NoError(t, marshalErr)
+	var staleSnapshot taskEntity.SyncTask
+	require.NoError(t, json.Unmarshal(staleJSON, &staleSnapshot))
+	ts.mu.Unlock()
+
+	ts.completeTask("task_gen")
+	spy.ResetCount()
+
+	staleSnapshot.Context.ArchiveGen = staleGen
+	staleSnapshot.Context.Status = taskEntity.TaskStatusRunning
+	assert.False(t, ts.shouldPersistAsyncProgressSnapshot("task_gen", &staleSnapshot))
+	require.NoError(t, ts.storage.Save(&staleSnapshot))
+
+	loadedTasks, loadErr := ts.storage.LoadAll()
+	require.NoError(t, loadErr)
+	require.Len(t, loadedTasks, 1)
+	assert.Equal(t, taskEntity.TaskStatusCompleted, loadedTasks[0].Context.Status)
+	assert.Greater(t, loadedTasks[0].Context.ArchiveGen, staleGen)
+}
+
+// TestIncrementTaskProgress_CompleteRace 并发进度落盘与 completeTask 交错，存档终态必须为 COMPLETED。
+func TestIncrementTaskProgress_CompleteRace(t *testing.T) {
+	dataDir := t.TempDir()
+	ts, _ := newTestTaskServiceWithSpy(dataDir)
+
+	task, err := ts.CreateTask(taskEntity.TaskConfig{ID: "task_race", Name: "Task Race"})
+	require.NoError(t, err)
+	task.Start()
+	task.Context.TotalRows = 1000
+
+	var wg sync.WaitGroup
+	stopProgress := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopProgress:
+				return
+			default:
+				ts.incrementTaskProgress("task_race", 10, "pos")
+			}
+		}
+	}()
+
+	for i := 0; i < 20; i++ {
+		ts.completeTask("task_race")
+	}
+
+	close(stopProgress)
+	wg.Wait()
+
+	loadedTasks, loadErr := ts.storage.LoadAll()
+	require.NoError(t, loadErr)
+	require.Len(t, loadedTasks, 1)
+	assert.Equal(t, taskEntity.TaskStatusCompleted, loadedTasks[0].Context.Status)
+	assert.Equal(t, float64(100), loadedTasks[0].Context.ProgressPercent)
+
+	live, ok := ts.GetTask("task_race")
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusCompleted, live.Context.Status)
+	items, _, _, _ := ts.GetTasksPage(1, 10, "", "", "created_at_desc")
+	require.Len(t, items, 1)
+	assert.Equal(t, taskEntity.TaskStatusCompleted, items[0].Context.Status)
+}
+
+// TestIncrementTaskProgress_StorageRejectsStaleAfterCompleteDuringSave 模拟 check 通过后、Save 前 completeTask 落盘，旧快照不得覆盖。
+func TestIncrementTaskProgress_StorageRejectsStaleAfterCompleteDuringSave(t *testing.T) {
+	dataDir := t.TempDir()
+	inner := NewFileTaskStorage(dataDir)
+	delayStorage := &delayingRunningSaveStorage{FileTaskStorage: inner, delay: 300 * time.Millisecond}
+	ts := &TaskService{
+		tasks:               make(map[string]*taskEntity.SyncTask),
+		runtimes:            make(map[string]*taskRuntime),
+		runningProgress:     make(map[string]*taskEntity.RunningProgress),
+		lastProgressPersist: make(map[string]time.Time),
+		storage:             delayStorage,
+	}
+	task := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "task_toctou", Name: "TOCTOU"})
+	task.Start()
+	task.Context.TotalRows = 1000
+	ts.tasks[task.Config.ID] = task
+
+	ts.mu.Lock()
+	task.Context.ProcessedRows = 500
+	task.Context.ProgressPercent = 50
+	snapshotJSON, err := json.Marshal(task)
+	require.NoError(t, err)
+	ts.lastProgressPersist[task.Config.ID] = time.Time{}
+	ts.mu.Unlock()
+
+	var snapshot taskEntity.SyncTask
+	require.NoError(t, json.Unmarshal(snapshotJSON, &snapshot))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		require.True(t, ts.shouldPersistAsyncProgressSnapshot(task.Config.ID, &snapshot))
+		require.NoError(t, delayStorage.Save(&snapshot))
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	ts.completeTask(task.Config.ID)
+	<-done
+
+	loaded, loadErr := inner.LoadAll()
+	require.NoError(t, loadErr)
+	require.Len(t, loaded, 1)
+	assert.Equal(t, taskEntity.TaskStatusCompleted, loaded[0].Context.Status)
+	assert.Equal(t, float64(100), loaded[0].Context.ProgressPercent)
+
+	live, ok := ts.GetTask(task.Config.ID)
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusCompleted, live.Context.Status)
+}
+
+// TestCompleteTask_PersistFailureMarksFailed completeTask 存档失败时内存与存档均为 FAILED。
+func TestCompleteTask_PersistFailureMarksFailed(t *testing.T) {
+	storageErr := fmt.Errorf("storage unavailable")
+	dataDir := t.TempDir()
+	inner := NewFileTaskStorage(dataDir)
+	storage := &failCompletedSaveStorage{inner: inner, err: storageErr}
+	ts := &TaskService{
+		tasks: map[string]*taskEntity.SyncTask{
+			"persist_fail": func() *taskEntity.SyncTask {
+				t := taskEntity.NewSyncTask(taskEntity.TaskConfig{ID: "persist_fail", Name: "Persist Fail"})
+				t.Start()
+				return t
+			}(),
+		},
+		runtimes:            make(map[string]*taskRuntime),
+		runningProgress:     make(map[string]*taskEntity.RunningProgress),
+		lastProgressPersist: make(map[string]time.Time),
+		storage:             storage,
+	}
+
+	ts.completeTask("persist_fail")
+
+	task, ok := ts.GetTask("persist_fail")
+	require.True(t, ok)
+	assert.Equal(t, taskEntity.TaskStatusFailed, task.Context.Status)
+	assert.Contains(t, task.Context.ErrorStack, "failed to persist completed state")
+
+	loaded, loadErr := inner.LoadAll()
+	require.NoError(t, loadErr)
+	require.Len(t, loaded, 1)
+	assert.Equal(t, taskEntity.TaskStatusFailed, loaded[0].Context.Status)
+}
+
+// TestIncrementTaskProgress_CapsProgressPercent 进度展示封顶 100%。
+func TestIncrementTaskProgress_CapsProgressPercent(t *testing.T) {
+	dataDir := t.TempDir()
+	ts := newTestTaskService(dataDir)
+
+	task, _ := ts.CreateTask(taskEntity.TaskConfig{ID: "task_cap", Name: "Task Cap"})
+	task.Context.TotalRows = 100
+	ts.incrementTaskProgress("task_cap", 150, "pos")
+	live, _ := ts.GetTask("task_cap")
+	assert.Equal(t, int64(150), live.Context.ProcessedRows)
+	assert.Equal(t, float64(100), live.Context.ProgressPercent)
+
+	metrics, err := ts.GetTaskMetrics("task_cap")
+	require.NoError(t, err)
+	assert.Equal(t, float64(100), metrics["progress_percent"])
+}
+
 // TestDeleteTask_CleansThrottleRecord ?? DeleteTask ??? lastProgressPersist?
 func TestDeleteTask_CleansThrottleRecord(t *testing.T) {
 	dataDir := t.TempDir()
@@ -2420,6 +2670,8 @@ func TestDeleteTask_CleansThrottleRecord(t *testing.T) {
 
 	// ????
 	_, _ = ts.CreateTask(taskEntity.TaskConfig{ID: "task_1", Name: "Task 1"})
+	task, _ := ts.GetTask("task_1")
+	task.Start()
 	spy.ResetCount()
 
 	// ???? progress ?? lastProgressPersist ?????
@@ -2429,6 +2681,8 @@ func TestDeleteTask_CleansThrottleRecord(t *testing.T) {
 	// ??????
 	_, exists := ts.lastProgressPersist["task_1"]
 	assert.True(t, exists, "?? incrementTaskProgress ????????")
+
+	require.NoError(t, ts.PauseTask("task_1"))
 
 	// ????
 	err := ts.DeleteTask("task_1")
