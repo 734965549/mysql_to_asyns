@@ -216,12 +216,13 @@ func TestDropDeferredIndexes_FailClosedRestoresDropped(t *testing.T) {
 		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
 		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
 	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectQuery("SHOW CREATE TABLE").WillReturnError(fmt.Errorf("skip create capture in test"))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_phone`").WillReturnError(fmt.Errorf("cannot drop"))
 	// rollback already-dropped uk_code
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("tgt", "users", "uk_code").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{}
@@ -252,12 +253,13 @@ func TestDropDeferredIndexes_ContextCanceled_RestoresWithCleanupContext(t *testi
 		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
 		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
 	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectQuery("SHOW CREATE TABLE").WillReturnError(fmt.Errorf("skip create capture in test"))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 	// 父 ctx 在第一次 DROP 后取消：第二次 DROP 在进入 driver 前即以 context.Canceled 失败。
 	// rollback 必须走独立 cleanup context，否则 restoreIndexes 会立刻因同一已取消 ctx 失败。
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("tgt", "users", "uk_code").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -294,11 +296,12 @@ func TestDropDeferredIndexes_SchemaLockLost_RestoresWithCleanupContext(t *testin
 		AddRow("users", 0, "uk_phone", 1, "phone", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil).
 		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
 	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectQuery("SHOW CREATE TABLE").WillReturnError(fmt.Errorf("skip create capture in test"))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 	// second DROP is not attempted after schema lock lost; rollback uk_code instead
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("tgt", "users", "uk_code").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ctx, cancel := context.WithCancelCause(context.Background())
@@ -333,11 +336,12 @@ func TestDropDeferredIndexes_SingleIndexCancelAfterDrop_Restores(t *testing.T) {
 	}).
 		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
 	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectQuery("SHOW CREATE TABLE").WillReturnError(fmt.Errorf("skip create capture in test"))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 	// 唯一待删索引 DROP 后立即取消：无下一轮循环，依赖 return 前检查触发回滚。
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("tgt", "users", "uk_code").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -372,10 +376,11 @@ func TestDropDeferredIndexes_SingleIndexSchemaLockLostAfterDrop_Restores(t *test
 	}).
 		AddRow("users", 0, "uk_code", 1, "code", "A", 1, nil, nil, "YES", "BTREE", "", "", "YES", nil)
 	mock.ExpectQuery("SHOW INDEX FROM").WillReturnRows(indexRows)
+	mock.ExpectQuery("SHOW CREATE TABLE").WillReturnError(fmt.Errorf("skip create capture in test"))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` DROP INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("tgt", "users", "uk_code").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}))
 	mock.ExpectExec("ALTER TABLE `tgt`.`users` ADD UNIQUE INDEX `uk_code`").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ctx, cancel := context.WithCancelCause(context.Background())
@@ -460,7 +465,7 @@ func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	defer targetDB.Close()
 
 	emptyIndexStatsRows := func() *sqlmock.Rows {
-		return sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+		return sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"})
 	}
 
 	// sqlmock checks expectations in order by default. Disable ordered matching
@@ -469,15 +474,15 @@ func TestRestorePendingIndexes_ProcessesTablesConcurrently(t *testing.T) {
 	// ?? ExpectQuery ?????? Rows?????????????????
 	// *sqlmock.Rows ??? data race?
 	mock.MatchExpectationsInOrder(false)
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("target_db", "users", "idx_users_name").
 		WillReturnRows(emptyIndexStatsRows())
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("target_db", "orders", "uk_orders_no").
 		WillReturnRows(emptyIndexStatsRows())
-	mock.ExpectExec("ALTER TABLE `target_db`.`users` ADD INDEX `idx_users_name` \\(`name`\\)").
+	mock.ExpectExec("ALTER TABLE `target_db`.`users` ADD INDEX `idx_users_name` \\(`name`\\) USING BTREE").
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("ALTER TABLE `target_db`.`orders` ADD UNIQUE INDEX `uk_orders_no` \\(`order_no`\\)").
+	mock.ExpectExec("ALTER TABLE `target_db`.`orders` ADD UNIQUE INDEX `uk_orders_no` \\(`order_no`\\) USING BTREE").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{
@@ -539,13 +544,13 @@ func TestRestorePendingIndexes_FailsFastOnFirstError_Sequential(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	emptyStatsRows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+	emptyStatsRows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"})
 
 	// workers=1 ????????? a ?????? break ?????? b ? Exec ????????
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "a", "idx_a").
 		WillReturnRows(emptyStatsRows)
-	mock.ExpectExec("ALTER TABLE `db`.`a` ADD INDEX `idx_a` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`a` ADD INDEX `idx_a` \\(`c`\\) USING BTREE").
 		WillReturnError(fmt.Errorf("DDL failed"))
 
 	ts := &TaskService{
@@ -778,11 +783,12 @@ func TestDropNonPrimaryKeyIndexes_FailClosedRestoresDropped(t *testing.T) {
 		AddRow("t", 1, "idx_b", 1, "b", "A", 0, nil, nil, "YES", "BTREE", "", "", "YES", nil)
 
 	mock.ExpectQuery("SHOW INDEX FROM `db`.`t`").WillReturnRows(rows)
+	mock.ExpectQuery("SHOW CREATE TABLE").WillReturnError(fmt.Errorf("skip create capture in test"))
 	mock.ExpectExec("ALTER TABLE `db`.`t` DROP INDEX `idx_a`").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `db`.`t` DROP INDEX `idx_b`").WillReturnError(fmt.Errorf("lock wait timeout"))
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_a").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}))
 	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a`").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{}
@@ -800,9 +806,9 @@ func TestTargetIndexExists_MatchingIndex(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
-		AddRow(1, "BTREE", "c", nil, 1)
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}).
+		AddRow(1, "BTREE", "c", nil, 1, "A")
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_c").
 		WillReturnRows(rows)
 
@@ -819,9 +825,9 @@ func TestTargetIndexExists_ConflictingIndex(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
-		AddRow(1, "BTREE", "d", nil, 1)
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}).
+		AddRow(1, "BTREE", "d", nil, 1, "A")
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_c").
 		WillReturnRows(rows)
 
@@ -838,9 +844,9 @@ func TestRestoreIndexes_SkipsExistingMatchingIndex(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
-		AddRow(1, "BTREE", "c", nil, 1)
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}).
+		AddRow(1, "BTREE", "c", nil, 1, "A")
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_c").
 		WillReturnRows(rows)
 	// ????? ALTER TABLE ADD INDEX
@@ -862,9 +868,9 @@ func TestRestoreIndexes_FailsOnConflictingExistingIndex(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
-		AddRow(1, "BTREE", "d", nil, 1)
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}).
+		AddRow(1, "BTREE", "d", nil, 1, "A")
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_c").
 		WillReturnRows(rows)
 
@@ -887,18 +893,18 @@ func TestRestoreIndexes_BatchesMultipleIndexesIntoOneAlter(t *testing.T) {
 	defer targetDB.Close()
 
 	empty := func() *sqlmock.Rows {
-		return sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
+		return sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"})
 	}
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_a").
 		WillReturnRows(empty())
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "uk_b").
 		WillReturnRows(empty())
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "ft_c").
 		WillReturnRows(empty())
-	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a` \\(`a`\\), ADD UNIQUE INDEX `uk_b` \\(`b`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_a` \\(`a`\\) USING BTREE, ADD UNIQUE INDEX `uk_b` \\(`b`\\) USING BTREE").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE `db`.`t` ADD FULLTEXT INDEX `ft_c` \\(`c`\\)").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -919,18 +925,70 @@ func TestRestoreIndexes_BatchesMultipleIndexesIntoOneAlter(t *testing.T) {
 
 func TestBuildAlterAddIndexesSQL(t *testing.T) {
 	sql := buildAlterAddIndexesSQL("db", "t", []string{
-		buildAddIndexClause("idx_a", 1, "BTREE", "`a`"),
-		buildAddIndexClause("uk_b", 0, "BTREE", "`b`"),
+		buildAddIndexClause("idx_a", 1, "BTREE", "`a`", "", true),
+		buildAddIndexClause("uk_b", 0, "BTREE", "`b`", "", true),
 	})
-	assert.Equal(t, "ALTER TABLE `db`.`t` ADD INDEX `idx_a` (`a`), ADD UNIQUE INDEX `uk_b` (`b`)", sql)
+	assert.Equal(t, "ALTER TABLE `db`.`t` ADD INDEX `idx_a` (`a`) USING BTREE, ADD UNIQUE INDEX `uk_b` (`b`) USING BTREE", sql)
+}
+
+func TestBuildAddIndexClause_PreservesHashAndAttributes(t *testing.T) {
+	assert.Equal(t,
+		"ADD INDEX `idx_h` (`id`) USING HASH",
+		buildAddIndexClause("idx_h", 1, "HASH", "`id`", "", true))
+	assert.Equal(t,
+		"ADD UNIQUE INDEX `uk_h` (`id`) USING HASH COMMENT 'mem' INVISIBLE",
+		buildAddIndexClause("uk_h", 0, "HASH", "`id`", "mem", false))
+	assert.Equal(t,
+		"ADD INDEX `idx_d` (`a` DESC) USING BTREE",
+		buildAddIndexClause("idx_d", 1, "BTREE", "`a` DESC", "", true))
+}
+
+func TestAttachIndexAddClausesFromCreateSQL_PreservesUsingHash(t *testing.T) {
+	createSQL := "CREATE TABLE `t` (\n" +
+		"  `id` int,\n" +
+		"  KEY `idx_h` (`id`) USING HASH COMMENT 'x',\n" +
+		"  UNIQUE KEY `uk_b` (`id`) USING BTREE\n" +
+		") ENGINE=MEMORY"
+	indexes := []map[string]interface{}{
+		{"name": "idx_h", "non_unique": 1, "type": "HASH", "columns": "`id`"},
+		{"name": "uk_b", "non_unique": 0, "type": "BTREE", "columns": "`id`"},
+	}
+	attachIndexAddClausesFromCreateSQL(createSQL, indexes)
+	assert.Equal(t, "ADD KEY `idx_h` (`id`) USING HASH COMMENT 'x'", indexes[0]["add_clause"])
+	assert.Equal(t, "ADD UNIQUE KEY `uk_b` (`id`) USING BTREE", indexes[1]["add_clause"])
+}
+
+func TestRestoreIndexes_UsesAddClauseFromCreateSQL(t *testing.T) {
+	targetDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer targetDB.Close()
+
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
+		WithArgs("db", "t", "idx_h").
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}))
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD KEY `idx_h` \\(`id`\\) USING HASH COMMENT 'x'").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ts := &TaskService{}
+	err = ts.restoreIndexes(context.Background(), &taskRuntime{targetDB: targetDB}, "db", "t", []map[string]interface{}{
+		{
+			"name":       "idx_h",
+			"non_unique": 1,
+			"type":       "HASH",
+			"columns":    "`id`",
+			"add_clause": "ADD KEY `idx_h` (`id`) USING HASH COMMENT 'x'",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestGroupIndexRestoreBatches_SplitsByType(t *testing.T) {
 	items := []indexRestoreItem{
-		{"idx_a", 1, "BTREE", "`a`"},
-		{"uk_b", 0, "BTREE", "`b`"},
-		{"ft_c", 1, "FULLTEXT", "`c`"},
-		{"sp_d", 1, "SPATIAL", "`d`"},
+		{name: "idx_a", nonUnique: 1, indexType: "BTREE", columns: "`a`"},
+		{name: "uk_b", nonUnique: 0, indexType: "BTREE", columns: "`b`"},
+		{name: "ft_c", nonUnique: 1, indexType: "FULLTEXT", columns: "`c`"},
+		{name: "sp_d", nonUnique: 1, indexType: "SPATIAL", columns: "`d`"},
 	}
 	batches := groupIndexRestoreBatches(items)
 	require.Len(t, batches, 3)
@@ -947,13 +1005,13 @@ func TestRestoreIndexes_RetriesInvalidConnection(t *testing.T) {
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"})
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	rows := sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"})
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_c").
 		WillReturnRows(rows)
-	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\) USING BTREE").
 		WillReturnError(fmt.Errorf("invalid connection"))
-	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\) USING BTREE").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ts := &TaskService{}
@@ -973,19 +1031,19 @@ func TestRestoreIndexes_TreatsAlreadyAppliedBatchAsSuccessAfterRetryError(t *tes
 	require.NoError(t, err)
 	defer targetDB.Close()
 
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_c").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}))
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}))
 
-	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\) USING BTREE").
 		WillReturnError(fmt.Errorf("invalid connection"))
-	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\)").
+	mock.ExpectExec("ALTER TABLE `db`.`t` ADD INDEX `idx_c` \\(`c`\\) USING BTREE").
 		WillReturnError(fmt.Errorf("Error 1061: Duplicate key name 'idx_c'"))
 
-	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX").
+	mock.ExpectQuery("SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION").
 		WithArgs("db", "t", "idx_c").
-		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX"}).
-			AddRow(1, "BTREE", "c", nil, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"NON_UNIQUE", "INDEX_TYPE", "COLUMN_NAME", "SUB_PART", "SEQ_IN_INDEX", "COLLATION"}).
+			AddRow(1, "BTREE", "c", nil, 1, "A"))
 
 	ts := &TaskService{}
 	runtime := &taskRuntime{targetDB: targetDB}

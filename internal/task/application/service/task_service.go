@@ -5310,6 +5310,8 @@ func (s *TaskService) ensureTargetTable(ctx context.Context, runtime *taskRuntim
 
 		savedIndexes = filterIndexesUsingAutoIncrementColumns(savedIndexes, autoIncrementColumns)
 		savedIndexes = selectDeferredIndexes(savedIndexes, identity, mode, optimizeIndex)
+		// 在剥离前保存 CREATE TABLE 中的原始索引定义，回放时保留 USING/COMMENT/INVISIBLE 等属性。
+		attachIndexAddClausesFromCreateSQL(createSQL, savedIndexes)
 
 		createSQL = stripIndexesByNameFromCreateSQL(createSQL, indexNamesSet(savedIndexes))
 
@@ -5464,6 +5466,58 @@ func secondaryIndexNameFromDefinitionLine(line string) string {
 		return ""
 	}
 	return ""
+}
+
+// secondaryIndexLineToAddClause 将 CREATE TABLE 中的二级索引定义行转为 ALTER TABLE ADD 子句。
+func secondaryIndexLineToAddClause(line string) string {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
+	if trimmed == "" {
+		return ""
+	}
+	return "ADD " + trimmed
+}
+
+// attachIndexAddClausesFromCreateSQL 把 SHOW CREATE TABLE 中的二级索引定义原样挂到 indexes[*]["add_clause"]，
+// 供 restoreIndexes 优先使用，避免仅靠 SHOW INDEX 重建时丢失 USING HASH/BTREE、COMMENT、INVISIBLE 等属性。
+func attachIndexAddClausesFromCreateSQL(createSQL string, indexes []map[string]interface{}) {
+	if createSQL == "" || len(indexes) == 0 {
+		return
+	}
+	byName := make(map[string]string)
+	for _, line := range strings.Split(createSQL, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !isSecondaryIndexDefinitionLine(trimmed) {
+			continue
+		}
+		name := secondaryIndexNameFromDefinitionLine(trimmed)
+		if name == "" {
+			continue
+		}
+		if clause := secondaryIndexLineToAddClause(trimmed); clause != "" {
+			byName[name] = clause
+		}
+	}
+	for _, idx := range indexes {
+		name, _ := idx["name"].(string)
+		if name == "" {
+			continue
+		}
+		if clause, ok := byName[name]; ok {
+			idx["add_clause"] = clause
+		}
+	}
+}
+
+// loadShowCreateTableSQL 获取表的 CREATE TABLE 语句，供索引回放捕获原始 ADD 子句。
+func loadShowCreateTableSQL(ctx context.Context, db *sql.DB, schema, tableName string) (string, error) {
+	if db == nil {
+		return "", fmt.Errorf("db is not initialized")
+	}
+	var showName, createSQL string
+	if err := db.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, tableName)).Scan(&showName, &createSQL); err != nil {
+		return "", err
+	}
+	return createSQL, nil
 }
 
 // indexNamesSet 把索引列表（[]map[string]interface{}）转为以 "name" 键值为准的名字集合。
@@ -5699,6 +5753,11 @@ func (s *TaskService) collectMissingDeferredIndexes(ctx context.Context, task *t
 			}
 			if len(missing) == 0 {
 				continue
+			}
+			if createSQL, createErr := loadShowCreateTableSQL(ctx, runtime.sourceDB, p.src, tableName); createErr != nil {
+				logger.Warn("Failed to capture source index DDL for `%s`.`%s`: %v; fallback to SHOW INDEX reconstruction", p.src, tableName, createErr)
+			} else {
+				attachIndexAddClausesFromCreateSQL(createSQL, missing)
 			}
 			pending = append(pending, pendingIndexRestore{
 				targetSchema: p.dst,
@@ -8041,12 +8100,15 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 		Column     string
 		SeqInIndex int
 		SubPart    string
+		Collation  string
 	}
 
 	type indexMeta struct {
-		NonUnique int
-		IndexType string
-		Columns   []indexColumn
+		NonUnique    int
+		IndexType    string
+		IndexComment string
+		Visible      bool
+		Columns      []indexColumn
 	}
 
 	indexMap := make(map[string]*indexMeta)
@@ -8080,17 +8142,41 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 		nonUnique := dbScanToInt(vals[1])
 		seqInIndex := dbScanToInt(vals[3])
 		columnName := dbScanToString(vals[4])
+		collation := ""
+		if len(vals) > 5 {
+			collation = dbScanToString(vals[5])
+		}
 		subPart := dbScanToString(vals[7])
 		indexType := dbScanToString(vals[10])
+		indexComment := ""
+		if len(vals) > 12 {
+			indexComment = dbScanToString(vals[12])
+		}
+		visible := true
+		if len(vals) > 13 {
+			if strings.EqualFold(dbScanToString(vals[13]), "NO") {
+				visible = false
+			}
+		}
 
 		meta, exists := indexMap[keyName]
 
 		if !exists {
-			meta = &indexMeta{NonUnique: nonUnique, IndexType: indexType}
+			meta = &indexMeta{
+				NonUnique:    nonUnique,
+				IndexType:    indexType,
+				IndexComment: indexComment,
+				Visible:      visible,
+			}
 			indexMap[keyName] = meta
 		}
 
-		meta.Columns = append(meta.Columns, indexColumn{Column: columnName, SeqInIndex: seqInIndex, SubPart: subPart})
+		meta.Columns = append(meta.Columns, indexColumn{
+			Column:     columnName,
+			SeqInIndex: seqInIndex,
+			SubPart:    subPart,
+			Collation:  collation,
+		})
 
 	}
 
@@ -8127,11 +8213,16 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 		var colDefs []string
 
 		for _, c := range meta.Columns {
+			var def string
 			if c.SubPart != "" && c.SubPart != "0" {
-				colDefs = append(colDefs, fmt.Sprintf("`%s`(%s)", c.Column, c.SubPart))
+				def = fmt.Sprintf("`%s`(%s)", c.Column, c.SubPart)
 			} else {
-				colDefs = append(colDefs, fmt.Sprintf("`%s`", c.Column))
+				def = fmt.Sprintf("`%s`", c.Column)
 			}
+			if strings.EqualFold(c.Collation, "D") {
+				def += " DESC"
+			}
+			colDefs = append(colDefs, def)
 		}
 
 		savedIndexes = append(savedIndexes, map[string]interface{}{
@@ -8139,6 +8230,8 @@ func scanNonPrimaryKeyIndexes(rows *sql.Rows) ([]map[string]interface{}, error) 
 			"non_unique": meta.NonUnique,
 			"type":       meta.IndexType,
 			"columns":    strings.Join(colDefs, ", "),
+			"comment":    meta.IndexComment,
+			"visible":    meta.Visible,
 		})
 
 	}
@@ -8194,6 +8287,13 @@ func (s *TaskService) dropDeferredIndexes(ctx context.Context, runtime *taskRunt
 
 		return nil, nil
 
+	}
+
+	// DROP 前从目标表 SHOW CREATE TABLE 捕获完整索引定义，避免回放丢失 HASH/COMMENT 等属性。
+	if createSQL, createErr := loadShowCreateTableSQL(ctx, targetDB, schema, tableName); createErr != nil {
+		logger.Warn("Failed to capture index DDL from `%s`.`%s` before drop: %v; fallback to SHOW INDEX reconstruction", schema, tableName, createErr)
+	} else {
+		attachIndexAddClausesFromCreateSQL(createSQL, savedIndexes)
 	}
 
 	// 只有成功删除的索引才需要恢复，避免恢复阶段再次创建失败。
@@ -8345,7 +8445,7 @@ func targetIndexExists(ctx context.Context, targetDB *sql.DB, schema, tableName,
 
 	rows, err := targetDB.QueryContext(ctx,
 
-		`SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX
+		`SELECT NON_UNIQUE, INDEX_TYPE, COLUMN_NAME, SUB_PART, SEQ_IN_INDEX, COLLATION
 
 		 FROM information_schema.STATISTICS
 
@@ -8380,9 +8480,11 @@ func targetIndexExists(ctx context.Context, targetDB *sql.DB, schema, tableName,
 
 		var subPart sql.NullString
 
+		var collation sql.NullString
+
 		var seqInIndex int
 
-		if err := rows.Scan(&actualNonUnique, &actualIndexType, &colName, &subPart, &seqInIndex); err != nil {
+		if err := rows.Scan(&actualNonUnique, &actualIndexType, &colName, &subPart, &seqInIndex, &collation); err != nil {
 
 			return false, false, err
 
@@ -8390,15 +8492,25 @@ func targetIndexExists(ctx context.Context, targetDB *sql.DB, schema, tableName,
 
 		firstRowScanned = true
 
+		var part string
+
 		if subPart.Valid && subPart.String != "" && subPart.String != "0" {
 
-			parts = append(parts, fmt.Sprintf("`%s`(%s)", colName, subPart.String))
+			part = fmt.Sprintf("`%s`(%s)", colName, subPart.String)
 
 		} else {
 
-			parts = append(parts, fmt.Sprintf("`%s`", colName))
+			part = fmt.Sprintf("`%s`", colName)
 
 		}
+
+		if collation.Valid && strings.EqualFold(collation.String, "D") {
+
+			part += " DESC"
+
+		}
+
+		parts = append(parts, part)
 
 	}
 
@@ -8453,10 +8565,13 @@ type indexRestoreBatch struct {
 
 // indexRestoreItem 是 restoreIndexes 内部使用的索引恢复项，记录单个索引的恢复所需信息。
 type indexRestoreItem struct {
-	name      string
-	nonUnique int
-	indexType string
-	columns   string
+	name       string
+	nonUnique  int
+	indexType  string
+	columns    string
+	comment    string
+	invisible  bool // zero value = visible，兼容旧复合字面量
+	addClause  string
 }
 
 // groupIndexRestoreBatches 按索引类型分组，同组内合并为一条 ALTER TABLE。
@@ -8470,7 +8585,11 @@ func groupIndexRestoreBatches(items []indexRestoreItem) []indexRestoreBatch {
 	for _, item := range items {
 		kind := indexRestoreBatchKind(item.indexType)
 		batch := byKind[kind]
-		batch.clauses = append(batch.clauses, buildAddIndexClause(item.name, item.nonUnique, item.indexType, item.columns))
+		clause := item.addClause
+		if clause == "" {
+			clause = buildAddIndexClause(item.name, item.nonUnique, item.indexType, item.columns, item.comment, !item.invisible)
+		}
+		batch.clauses = append(batch.clauses, clause)
 		batch.names = append(batch.names, item.name)
 		batch.items = append(batch.items, item)
 	}
@@ -8484,17 +8603,47 @@ func groupIndexRestoreBatches(items []indexRestoreItem) []indexRestoreBatch {
 }
 
 // buildAddIndexClause 构造 ALTER TABLE 中的单条 ADD INDEX 子句。
-func buildAddIndexClause(indexName string, nonUnique int, indexType, columns string) string {
-	if nonUnique == 0 {
-		return fmt.Sprintf("ADD UNIQUE INDEX `%s` (%s)", indexName, columns)
-	}
+// 在缺少 CREATE TABLE 原样 add_clause 时作为回退路径，需显式保留 USING/COMMENT/INVISIBLE。
+func buildAddIndexClause(indexName string, nonUnique int, indexType, columns, comment string, visible bool) string {
+	attrSuffix := indexRestoreAttributeSuffix(indexType, comment, visible)
 	if strings.EqualFold(indexType, "FULLTEXT") {
-		return fmt.Sprintf("ADD FULLTEXT INDEX `%s` (%s)", indexName, columns)
+		return fmt.Sprintf("ADD FULLTEXT INDEX `%s` (%s)%s", indexName, columns, indexCommentVisibleSuffix(comment, visible))
 	}
 	if strings.EqualFold(indexType, "SPATIAL") {
-		return fmt.Sprintf("ADD SPATIAL INDEX `%s` (%s)", indexName, columns)
+		return fmt.Sprintf("ADD SPATIAL INDEX `%s` (%s)%s", indexName, columns, indexCommentVisibleSuffix(comment, visible))
 	}
-	return fmt.Sprintf("ADD INDEX `%s` (%s)", indexName, columns)
+	if nonUnique == 0 {
+		return fmt.Sprintf("ADD UNIQUE INDEX `%s` (%s)%s", indexName, columns, attrSuffix)
+	}
+	return fmt.Sprintf("ADD INDEX `%s` (%s)%s", indexName, columns, attrSuffix)
+}
+
+func indexUsingClause(indexType string) string {
+	upper := strings.ToUpper(strings.TrimSpace(indexType))
+	switch upper {
+	case "", "FULLTEXT", "SPATIAL", "RTREE":
+		return ""
+	default:
+		// BTREE / HASH 及其他引擎支持的类型都显式写出，避免回落到默认 BTREE。
+		return " USING " + upper
+	}
+}
+
+func indexCommentVisibleSuffix(comment string, visible bool) string {
+	var b strings.Builder
+	if comment != "" {
+		b.WriteString(" COMMENT '")
+		b.WriteString(strings.ReplaceAll(comment, `'`, `''`))
+		b.WriteString("'")
+	}
+	if !visible {
+		b.WriteString(" INVISIBLE")
+	}
+	return b.String()
+}
+
+func indexRestoreAttributeSuffix(indexType, comment string, visible bool) string {
+	return indexUsingClause(indexType) + indexCommentVisibleSuffix(comment, visible)
 }
 
 // buildAlterAddIndexesSQL 将同表多个索引合并为一条 ALTER TABLE，避免多次全表扫描建索引。
@@ -8620,8 +8769,29 @@ func (s *TaskService) restoreIndexes(ctx context.Context, runtime *taskRuntime, 
 			indexType = v
 		}
 
+		comment := ""
+		if v, ok := indexInfo["comment"].(string); ok {
+			comment = v
+		}
+		invisible := false
+		if v, ok := indexInfo["visible"].(bool); ok {
+			invisible = !v
+		}
+		addClause := ""
+		if v, ok := indexInfo["add_clause"].(string); ok {
+			addClause = v
+		}
+
 		// 恢复前检查目标表上是否已存在同名索引；定义一致则跳过，不一致则报错。
-		item := indexRestoreItem{name: indexName, nonUnique: nonUnique, indexType: indexType, columns: columns}
+		item := indexRestoreItem{
+			name:      indexName,
+			nonUnique: nonUnique,
+			indexType: indexType,
+			columns:   columns,
+			comment:   comment,
+			invisible: invisible,
+			addClause: addClause,
+		}
 		exists, match, err := checkExistingIndexWithRetry(ctx, targetDB, schema, tableName, item)
 		if err != nil {
 			return fmt.Errorf("check existing index `%s` on `%s`.`%s`: %w", indexName, schema, tableName, err)
